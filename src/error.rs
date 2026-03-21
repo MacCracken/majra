@@ -29,6 +29,16 @@ pub enum MajraError {
 
     #[error("capacity exceeded: {0}")]
     CapacityExceeded(String),
+
+    #[error("invalid state transition: {0}")]
+    InvalidStateTransition(String),
+
+    #[error("resource unavailable: {0}")]
+    ResourceUnavailable(String),
+
+    #[cfg(feature = "sqlite")]
+    #[error("persistence: {0}")]
+    Persistence(String),
 }
 
 /// IPC-specific errors.

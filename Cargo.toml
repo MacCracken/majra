@@ -22,7 +22,8 @@ ipc = ["dep:tokio-util"]
 heartbeat = []
 ratelimit = []
 barrier = []
-full = ["pubsub", "queue", "relay", "ipc", "heartbeat", "ratelimit", "barrier"]
+sqlite = ["dep:rusqlite"]
+full = ["pubsub", "queue", "relay", "ipc", "heartbeat", "ratelimit", "barrier", "sqlite"]
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
@@ -34,6 +35,7 @@ tokio = { version = "1", features = ["sync", "time", "net", "macros", "rt", "io-
 tokio-util = { version = "0.7", optional = true }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -46,4 +48,8 @@ harness = false
 
 [[bench]]
 name = "queue"
+harness = false
+
+[[bench]]
+name = "concurrent"
 harness = false

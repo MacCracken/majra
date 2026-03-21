@@ -3,8 +3,9 @@
 //! Lazy refill — tokens are replenished on each `check()` call based on
 //! elapsed time. No background tasks required.
 
-use std::collections::HashMap;
 use std::time::Instant;
+
+use dashmap::DashMap;
 
 /// State for a single key's bucket.
 struct Bucket {
@@ -13,12 +14,14 @@ struct Bucket {
 }
 
 /// Token bucket rate limiter with per-key tracking.
+///
+/// Thread-safe — backed by [`DashMap`] for concurrent per-key access.
 pub struct RateLimiter {
     /// Tokens replenished per second.
     rate: f64,
     /// Maximum token capacity (burst size).
     burst: usize,
-    buckets: std::sync::Mutex<HashMap<String, Bucket>>,
+    buckets: DashMap<String, Bucket>,
 }
 
 impl RateLimiter {
@@ -27,20 +30,21 @@ impl RateLimiter {
         Self {
             rate,
             burst,
-            buckets: std::sync::Mutex::new(HashMap::new()),
+            buckets: DashMap::new(),
         }
     }
 
     /// Check if a request for `key` is allowed. Consumes one token if yes.
     pub fn check(&self, key: &str) -> bool {
-        let mut buckets = self.buckets.lock().unwrap();
         let now = Instant::now();
         let burst = self.burst as f64;
 
-        let bucket = buckets.entry(key.to_string()).or_insert(Bucket {
+        let mut entry = self.buckets.entry(key.to_string()).or_insert(Bucket {
             tokens: burst,
             last_refill: now,
         });
+
+        let bucket = entry.value_mut();
 
         // Refill based on elapsed time.
         let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
@@ -57,7 +61,7 @@ impl RateLimiter {
 
     /// Number of tracked keys.
     pub fn key_count(&self) -> usize {
-        self.buckets.lock().unwrap().len()
+        self.buckets.len()
     }
 }
 
@@ -99,5 +103,33 @@ mod tests {
         limiter.check("a");
         limiter.check("b");
         assert_eq!(limiter.key_count(), 2);
+    }
+
+    #[test]
+    fn concurrent_access() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let limiter = Arc::new(RateLimiter::new(1000.0, 10));
+        let mut handles = Vec::new();
+
+        for i in 0..4 {
+            let l = limiter.clone();
+            handles.push(thread::spawn(move || {
+                let key = format!("key-{i}");
+                let mut allowed = 0;
+                for _ in 0..20 {
+                    if l.check(&key) {
+                        allowed += 1;
+                    }
+                }
+                allowed
+            }));
+        }
+
+        let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        // Each key has burst=10, 4 keys = up to 40 allowed initially
+        assert!(total >= 40, "expected at least 40 allowed, got {total}");
+        assert_eq!(limiter.key_count(), 4);
     }
 }

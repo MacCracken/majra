@@ -3,11 +3,10 @@
 //! Each node gets an atomic sequence counter. Receivers track the last seen
 //! sequence per sender, dropping duplicates and out-of-order messages.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::{debug, trace};
@@ -51,12 +50,16 @@ pub struct RelayStats {
 }
 
 /// Sequenced message relay with deduplication.
+///
+/// Thread-safe — uses [`DashMap`] for the dedup table and atomics for counters.
 pub struct Relay {
     node_id: NodeId,
     next_seq: AtomicU64,
-    seen: Mutex<HashMap<NodeId, u64>>,
+    seen: DashMap<NodeId, u64>,
     tx: broadcast::Sender<IncomingMessage>,
-    stats: Mutex<RelayStats>,
+    messages_sent: AtomicU64,
+    messages_received: AtomicU64,
+    duplicates_dropped: AtomicU64,
 }
 
 impl Relay {
@@ -66,9 +69,11 @@ impl Relay {
         Self {
             node_id: node_id.into(),
             next_seq: AtomicU64::new(1),
-            seen: Mutex::new(HashMap::new()),
+            seen: DashMap::new(),
             tx,
-            stats: Mutex::new(RelayStats::default()),
+            messages_sent: AtomicU64::new(0),
+            messages_received: AtomicU64::new(0),
+            duplicates_dropped: AtomicU64::new(0),
         }
     }
 
@@ -100,9 +105,7 @@ impl Relay {
             is_broadcast,
         });
 
-        let mut stats = self.stats.lock().unwrap();
-        stats.messages_sent += 1;
-
+        self.messages_sent.fetch_add(1, Ordering::Relaxed);
         debug!(seq, "relay: sent");
         seq
     }
@@ -132,19 +135,16 @@ impl Relay {
 
         // Dedup by sequence.
         {
-            let mut seen = self.seen.lock().unwrap();
-            let last = seen.entry(msg.from.clone()).or_insert(0);
+            let mut last = self.seen.entry(msg.from.clone()).or_insert(0);
             if msg.seq <= *last {
-                let mut stats = self.stats.lock().unwrap();
-                stats.duplicates_dropped += 1;
+                self.duplicates_dropped.fetch_add(1, Ordering::Relaxed);
                 trace!(seq = msg.seq, from = %msg.from, "relay: duplicate dropped");
                 return None;
             }
             *last = msg.seq;
         }
 
-        let mut stats = self.stats.lock().unwrap();
-        stats.messages_received += 1;
+        self.messages_received.fetch_add(1, Ordering::Relaxed);
 
         let incoming = IncomingMessage {
             message: msg,
@@ -162,7 +162,11 @@ impl Relay {
 
     /// Current relay statistics.
     pub fn stats(&self) -> RelayStats {
-        self.stats.lock().unwrap().clone()
+        RelayStats {
+            messages_sent: self.messages_sent.load(Ordering::Relaxed),
+            messages_received: self.messages_received.load(Ordering::Relaxed),
+            duplicates_dropped: self.duplicates_dropped.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -249,5 +253,42 @@ mod tests {
         };
         let result = relay.receive(msg).unwrap();
         assert!(result.is_broadcast);
+    }
+
+    #[test]
+    fn concurrent_receive() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let relay = Arc::new(Relay::with_defaults("node-1"));
+        let mut handles = Vec::new();
+
+        for sender_idx in 0..4 {
+            let r = relay.clone();
+            handles.push(thread::spawn(move || {
+                let from = format!("node-{}", sender_idx + 10);
+                let mut received = 0;
+                for seq in 1..=10u64 {
+                    let msg = RelayMessage {
+                        seq,
+                        from: from.clone(),
+                        to: "node-1".into(),
+                        topic: "t".into(),
+                        payload: serde_json::Value::Null,
+                        timestamp: Utc::now(),
+                    };
+                    if r.receive(msg).is_some() {
+                        received += 1;
+                    }
+                }
+                received
+            }));
+        }
+
+        let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(total, 40); // 4 senders * 10 unique messages each
+        let stats = relay.stats();
+        assert_eq!(stats.messages_received, 40);
+        assert_eq!(stats.duplicates_dropped, 0);
     }
 }

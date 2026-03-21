@@ -22,6 +22,7 @@
 //! | `heartbeat` | yes | TTL-based health tracking with Online→Suspect→Offline FSM |
 //! | `ratelimit` | no | Per-key token bucket rate limiter |
 //! | `barrier` | no | N-way barrier synchronisation with deadlock recovery |
+//! | `sqlite` | no | SQLite persistence for managed queue |
 //! | `full` | — | Enables all features |
 
 pub mod envelope;
@@ -47,3 +48,45 @@ pub mod ratelimit;
 
 #[cfg(feature = "barrier")]
 pub mod barrier;
+
+// ---------------------------------------------------------------------------
+// Compile-time Send + Sync assertions
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod sync_assertions {
+    fn _assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn public_types_are_send_sync() {
+        // Envelope & error
+        _assert_send_sync::<super::envelope::Envelope>();
+
+        // PubSub
+        #[cfg(feature = "pubsub")]
+        _assert_send_sync::<super::pubsub::PubSub>();
+
+        // Queue
+        #[cfg(feature = "queue")]
+        {
+            _assert_send_sync::<super::queue::ConcurrentPriorityQueue<String>>();
+            _assert_send_sync::<super::queue::ManagedQueue<String>>();
+        }
+
+        // Relay
+        #[cfg(feature = "relay")]
+        _assert_send_sync::<super::relay::Relay>();
+
+        // Heartbeat
+        #[cfg(feature = "heartbeat")]
+        _assert_send_sync::<super::heartbeat::ConcurrentHeartbeatTracker>();
+
+        // Rate limiter
+        #[cfg(feature = "ratelimit")]
+        _assert_send_sync::<super::ratelimit::RateLimiter>();
+
+        // Barrier
+        #[cfg(feature = "barrier")]
+        _assert_send_sync::<super::barrier::ConcurrentBarrierSet>();
+    }
+}
