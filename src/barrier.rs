@@ -16,7 +16,12 @@ use tokio::sync::Notify;
 #[non_exhaustive]
 pub enum BarrierResult {
     /// Still waiting for more participants.
-    Waiting { arrived: usize, expected: usize },
+    Waiting {
+        /// Number of participants that have arrived so far.
+        arrived: usize,
+        /// Total number of participants the barrier expects.
+        expected: usize,
+    },
     /// All participants have arrived.
     Released,
     /// Unknown barrier name.
@@ -31,6 +36,19 @@ struct BarrierState {
     was_forced: bool,
 }
 
+/// Check if a barrier's arrived set satisfies its expected set, returning the
+/// appropriate `BarrierResult`.
+fn barrier_status(arrived: &HashSet<String>, expected: &HashSet<String>) -> BarrierResult {
+    if arrived.is_superset(expected) {
+        BarrierResult::Released
+    } else {
+        BarrierResult::Waiting {
+            arrived: arrived.len(),
+            expected: expected.len(),
+        }
+    }
+}
+
 /// Manages multiple named barriers.
 pub struct BarrierSet {
     barriers: HashMap<String, BarrierState>,
@@ -39,12 +57,16 @@ pub struct BarrierSet {
 /// Persistent record of barrier completion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BarrierRecord {
+    /// Name of the completed barrier.
     pub name: String,
+    /// Participants that arrived before the barrier released.
     pub participants: Vec<String>,
+    /// Whether the barrier was released via `force()` rather than normal arrival.
     pub forced: bool,
 }
 
 impl BarrierSet {
+    /// Create an empty barrier set.
     pub fn new() -> Self {
         Self {
             barriers: HashMap::new(),
@@ -71,15 +93,7 @@ impl BarrierSet {
         };
 
         state.arrived.insert(participant.to_string());
-
-        if state.arrived.is_superset(&state.expected) {
-            BarrierResult::Released
-        } else {
-            BarrierResult::Waiting {
-                arrived: state.arrived.len(),
-                expected: state.expected.len(),
-            }
-        }
+        barrier_status(&state.arrived, &state.expected)
     }
 
     /// Force a barrier to release, removing a dead participant from the expected set.
@@ -94,15 +108,7 @@ impl BarrierSet {
         state.expected.remove(dead_participant);
         state.arrived.remove(dead_participant);
         state.was_forced = true;
-
-        if state.arrived.is_superset(&state.expected) {
-            BarrierResult::Released
-        } else {
-            BarrierResult::Waiting {
-                arrived: state.arrived.len(),
-                expected: state.expected.len(),
-            }
-        }
+        barrier_status(&state.arrived, &state.expected)
     }
 
     /// Remove a completed barrier and return a record.
@@ -120,6 +126,7 @@ impl BarrierSet {
         self.barriers.len()
     }
 
+    /// Returns `true` if there are no active barriers.
     pub fn is_empty(&self) -> bool {
         self.barriers.is_empty()
     }
@@ -135,7 +142,9 @@ impl Default for BarrierSet {
 // Thread-safe async barrier set
 // ---------------------------------------------------------------------------
 
-/// Backward-compatible alias — use [`AsyncBarrierSet`] directly.
+/// Backward-compatible alias for [`AsyncBarrierSet`].
+///
+/// Prefer using `AsyncBarrierSet` directly in new code.
 pub type ConcurrentBarrierSet = AsyncBarrierSet;
 
 /// Async state for a single named barrier.
@@ -157,6 +166,7 @@ pub struct AsyncBarrierSet {
 }
 
 impl AsyncBarrierSet {
+    /// Create an empty async barrier set.
     pub fn new() -> Self {
         Self {
             barriers: DashMap::new(),
@@ -279,6 +289,7 @@ impl AsyncBarrierSet {
         self.barriers.len()
     }
 
+    /// Returns `true` if there are no active barriers.
     pub fn is_empty(&self) -> bool {
         self.barriers.is_empty()
     }

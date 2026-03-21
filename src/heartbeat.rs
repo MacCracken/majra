@@ -16,6 +16,17 @@ use tracing::debug;
 /// Default suspect threshold: 30 seconds without heartbeat.
 const DEFAULT_SUSPECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Classify a node's status based on time since last heartbeat.
+fn classify_status(elapsed: Duration, config: &HeartbeatConfig) -> Status {
+    if elapsed >= config.offline_after {
+        Status::Offline
+    } else if elapsed >= config.suspect_after {
+        Status::Suspect
+    } else {
+        Status::Online
+    }
+}
+
 /// Default offline threshold: 90 seconds without heartbeat.
 const DEFAULT_OFFLINE_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -24,29 +35,43 @@ const DEFAULT_OFFLINE_TIMEOUT: Duration = Duration::from_secs(90);
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Status {
+    /// Node is healthy and responding within the suspect timeout.
     Online,
+    /// Node has not responded within the suspect timeout but is not yet offline.
     Suspect,
+    /// Node has not responded within the offline timeout.
     Offline,
 }
 
 /// Structured GPU telemetry data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuTelemetry {
+    /// GPU compute utilization as a percentage (0.0–100.0).
     pub utilization_pct: f32,
+    /// GPU memory currently in use, in megabytes.
     pub memory_used_mb: u64,
+    /// Total GPU memory capacity, in megabytes.
     pub memory_total_mb: u64,
+    /// GPU temperature in degrees Celsius, if available.
     pub temperature_c: Option<f32>,
 }
 
 /// Aggregated fleet statistics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FleetStats {
+    /// Total number of tracked nodes across all statuses.
     pub total_nodes: usize,
+    /// Number of nodes currently online.
     pub online: usize,
+    /// Number of nodes in suspect state.
     pub suspect: usize,
+    /// Number of nodes currently offline.
     pub offline: usize,
+    /// Total number of GPUs across all nodes.
     pub total_gpus: usize,
+    /// Total VRAM capacity across all GPUs, in megabytes.
     pub total_vram_mb: u64,
+    /// Available (unused) VRAM across all GPUs, in megabytes.
     pub available_vram_mb: u64,
 }
 
@@ -62,8 +87,11 @@ pub struct EvictionPolicy {
 /// Configuration for health thresholds.
 #[derive(Debug, Clone)]
 pub struct HeartbeatConfig {
+    /// Duration after which a silent node is marked suspect.
     pub suspect_after: Duration,
+    /// Duration after which a silent node is marked offline.
     pub offline_after: Duration,
+    /// Optional policy for auto-evicting persistently offline nodes.
     pub eviction_policy: Option<EvictionPolicy>,
 }
 
@@ -80,7 +108,9 @@ impl Default for HeartbeatConfig {
 /// Tracked state for a single node.
 #[derive(Debug, Clone)]
 pub struct NodeState {
+    /// Current health status of the node.
     pub status: Status,
+    /// Timestamp of the last received heartbeat.
     pub last_seen: Instant,
     /// Arbitrary metadata (capabilities, tags, etc.).
     pub metadata: serde_json::Value,
@@ -93,6 +123,7 @@ pub struct HeartbeatTracker {
 }
 
 impl HeartbeatTracker {
+    /// Create a new tracker with the given configuration.
     pub fn new(config: HeartbeatConfig) -> Self {
         Self {
             nodes: HashMap::new(),
@@ -153,13 +184,7 @@ impl HeartbeatTracker {
             let elapsed = now.duration_since(node.last_seen);
             let prev = node.status;
 
-            node.status = if elapsed >= self.config.offline_after {
-                Status::Offline
-            } else if elapsed >= self.config.suspect_after {
-                Status::Suspect
-            } else {
-                Status::Online
-            };
+            node.status = classify_status(elapsed, &self.config);
 
             if node.status != prev {
                 debug!(node = %id, from = ?prev, to = ?node.status, "heartbeat: transition");
@@ -194,6 +219,7 @@ impl HeartbeatTracker {
         self.nodes.len()
     }
 
+    /// Returns `true` if no nodes are being tracked.
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
@@ -245,6 +271,7 @@ pub struct ConcurrentHeartbeatTracker {
 }
 
 impl ConcurrentHeartbeatTracker {
+    /// Create a new concurrent tracker with the given configuration.
     pub fn new(config: HeartbeatConfig) -> Self {
         Self {
             nodes: DashMap::new(),
@@ -345,13 +372,7 @@ impl ConcurrentHeartbeatTracker {
             let elapsed = now.duration_since(entry.last_seen);
             let prev = entry.status;
 
-            entry.status = if elapsed >= self.config.offline_after {
-                Status::Offline
-            } else if elapsed >= self.config.suspect_after {
-                Status::Suspect
-            } else {
-                Status::Online
-            };
+            entry.status = classify_status(elapsed, &self.config);
 
             // Track offline cycles for eviction.
             if entry.status == Status::Offline {
@@ -377,8 +398,8 @@ impl ConcurrentHeartbeatTracker {
         }
 
         // Perform evictions outside the iterator.
-        for id in &evict_ids {
-            self.nodes.remove(id);
+        for id in evict_ids {
+            self.nodes.remove(&id);
             debug!(node = %id, "heartbeat: evicted");
             if let Some(tx) = self
                 .config
@@ -386,7 +407,7 @@ impl ConcurrentHeartbeatTracker {
                 .as_ref()
                 .and_then(|p| p.eviction_tx.as_ref())
             {
-                let _ = tx.send(id.clone());
+                let _ = tx.send(id);
             }
         }
 
@@ -424,6 +445,7 @@ impl ConcurrentHeartbeatTracker {
         self.nodes.len()
     }
 
+    /// Returns `true` if no nodes are being tracked.
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }

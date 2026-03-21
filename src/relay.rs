@@ -39,15 +39,20 @@ pub struct RelayMessage {
 /// An inbound message after dedup filtering.
 #[derive(Debug, Clone)]
 pub struct IncomingMessage {
+    /// The underlying relay message after dedup filtering.
     pub message: RelayMessage,
+    /// `true` if the message was sent to all nodes (empty `to` field).
     pub is_broadcast: bool,
 }
 
 /// Relay statistics.
 #[derive(Debug, Clone, Default)]
 pub struct RelayStats {
+    /// Total number of messages sent from this node.
     pub messages_sent: u64,
+    /// Total number of unique messages received (after dedup).
     pub messages_received: u64,
+    /// Number of duplicate messages that were dropped.
     pub duplicates_dropped: u64,
 }
 

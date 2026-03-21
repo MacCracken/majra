@@ -109,7 +109,6 @@ impl PubSub {
         let mut delivered = 0usize;
         for entry in self.subscriptions.iter() {
             if matches_pattern(entry.key(), topic) {
-                // Ignore send errors — means no active receivers for this pattern.
                 let _ = entry.value().send(msg.clone());
                 delivered += 1;
             }

@@ -24,11 +24,16 @@ use crate::error::MajraError;
 #[non_exhaustive]
 #[repr(u8)]
 pub enum Priority {
+    /// Lowest priority, suitable for non-urgent background work.
     Background = 0,
+    /// Below-normal priority.
     Low = 1,
+    /// Default priority for standard tasks.
     #[default]
     Normal = 2,
+    /// Elevated priority for time-sensitive tasks.
     High = 3,
+    /// Highest priority, processed before all other tiers.
     Critical = 4,
 }
 
@@ -38,12 +43,16 @@ pub type TaskId = Uuid;
 /// A schedulable work item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueItem<T> {
+    /// Unique identifier for this item.
     pub id: TaskId,
+    /// Priority tier of this item.
     pub priority: Priority,
+    /// The user-defined work payload.
     pub payload: T,
 }
 
 impl<T> QueueItem<T> {
+    /// Create a new queue item with a generated UUID and the given priority.
     pub fn new(priority: Priority, payload: T) -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -67,6 +76,7 @@ pub struct PriorityQueue<T> {
 }
 
 impl<T> PriorityQueue<T> {
+    /// Create an empty priority queue.
     pub fn new() -> Self {
         Self {
             tiers: Default::default(),
@@ -93,6 +103,7 @@ impl<T> PriorityQueue<T> {
         self.tiers.iter().map(VecDeque::len).sum()
     }
 
+    /// Returns `true` if all tiers are empty.
     pub fn is_empty(&self) -> bool {
         self.tiers.iter().all(VecDeque::is_empty)
     }
@@ -217,6 +228,7 @@ pub struct ConcurrentPriorityQueue<T> {
 }
 
 impl<T: Send> ConcurrentPriorityQueue<T> {
+    /// Create an empty concurrent priority queue.
     pub fn new() -> Self {
         Self {
             inner: tokio::sync::Mutex::new(PriorityQueue::new()),
@@ -253,6 +265,7 @@ impl<T: Send> ConcurrentPriorityQueue<T> {
         self.inner.lock().await.len()
     }
 
+    /// Returns `true` if all tiers are empty.
     pub async fn is_empty(&self) -> bool {
         self.inner.lock().await.is_empty()
     }
@@ -271,14 +284,18 @@ impl<T: Send> Default for ConcurrentPriorityQueue<T> {
 /// Optional resource requirements for a queue item.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResourceReq {
+    /// Number of GPUs required.
     pub gpu_count: u32,
+    /// GPU VRAM required, in megabytes.
     pub vram_mb: u64,
 }
 
 /// Available resource pool for dequeue filtering.
 #[derive(Debug, Clone, Default)]
 pub struct ResourcePool {
+    /// Number of GPUs available in the pool.
     pub gpu_count: u32,
+    /// Total GPU VRAM available, in megabytes.
     pub vram_mb: u64,
 }
 
@@ -294,10 +311,15 @@ impl ResourcePool {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum JobState {
+    /// Job is waiting in the queue.
     Queued,
+    /// Job is currently executing.
     Running,
+    /// Job finished successfully.
     Completed,
+    /// Job terminated with an error.
     Failed,
+    /// Job was cancelled before completion.
     Cancelled,
 }
 
@@ -311,15 +333,23 @@ impl JobState {
 /// A managed queue item with resource requirements and lifecycle tracking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagedItem<T> {
+    /// Unique identifier for this job.
     pub id: TaskId,
+    /// Priority tier of this job.
     pub priority: Priority,
+    /// The user-defined work payload.
     pub payload: T,
+    /// Optional resource requirements for scheduling.
     pub resource_req: Option<ResourceReq>,
+    /// Current lifecycle state.
     pub state: JobState,
+    /// Timestamp when the job was enqueued.
     #[serde(skip)]
     pub enqueued_at: Option<Instant>,
+    /// Timestamp when the job started running.
     #[serde(skip)]
     pub started_at: Option<Instant>,
+    /// Timestamp when the job reached a terminal state.
     #[serde(skip)]
     pub finished_at: Option<Instant>,
 }
@@ -328,9 +358,25 @@ pub struct ManagedItem<T> {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum QueueEvent {
-    Enqueued { id: TaskId },
-    Dequeued { id: TaskId },
-    StateChanged { id: TaskId, from: JobState, to: JobState },
+    /// A job was added to the queue.
+    Enqueued {
+        /// The task identifier.
+        id: TaskId,
+    },
+    /// A job was removed from the queue for execution.
+    Dequeued {
+        /// The task identifier.
+        id: TaskId,
+    },
+    /// A job transitioned between lifecycle states.
+    StateChanged {
+        /// The task identifier.
+        id: TaskId,
+        /// Previous state.
+        from: JobState,
+        /// New state.
+        to: JobState,
+    },
 }
 
 /// Configuration for the managed queue.
@@ -367,6 +413,7 @@ pub struct ManagedQueue<T: Send> {
 }
 
 impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
+    /// Create a new managed queue with the given configuration.
     pub fn new(config: ManagedQueueConfig) -> Self {
         let (events_tx, _) = broadcast::channel(256);
         Self {
@@ -616,6 +663,7 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
 // SQLite persistence
 // ---------------------------------------------------------------------------
 
+/// SQLite-backed persistence for the managed queue.
 #[cfg(feature = "sqlite")]
 pub mod persistence {
     use rusqlite::Connection;
@@ -1120,5 +1168,135 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].payload, serde_json::json!("test-payload"));
         assert_eq!(loaded[0].state, JobState::Queued);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn managed_sqlite_update_state_and_reload() {
+        use std::sync::Arc;
+        let backend = Arc::new(persistence::SqliteBackend::in_memory().unwrap());
+
+        let q = ManagedQueue::<serde_json::Value>::with_sqlite(
+            ManagedQueueConfig::default(),
+            backend.clone(),
+        );
+
+        // Enqueue jobs at different priorities.
+        let id1 = q
+            .enqueue(Priority::Critical, serde_json::json!("crit-job"), None)
+            .await;
+        let id2 = q
+            .enqueue(Priority::Low, serde_json::json!("low-job"), None)
+            .await;
+        let _id3 = q
+            .enqueue(
+                Priority::Background,
+                serde_json::json!("bg-job"),
+                Some(ResourceReq {
+                    gpu_count: 2,
+                    vram_mb: 16000,
+                }),
+            )
+            .await;
+
+        // Dequeue triggers update_state(Running) via the backend.
+        q.dequeue_any().await; // crit-job → Running
+
+        // update_state is called by finish_job via complete/fail.
+        q.complete(id1).unwrap();
+
+        // Load should return only non-terminal items (Queued or Running).
+        let loaded = backend.load_all::<serde_json::Value>().unwrap();
+        // id1 was completed (terminal → excluded by load_all query),
+        // but update_state only changes state, doesn't delete.
+        // load_all filters by state IN ('queued', 'running').
+        assert!(loaded.len() >= 2); // id2 (Queued) + id3 (Queued)
+
+        // Verify priority round-trip.
+        let low_job = loaded.iter().find(|j| j.payload == serde_json::json!("low-job"));
+        assert!(low_job.is_some());
+        assert_eq!(low_job.unwrap().priority, Priority::Low);
+
+        // Verify resource_req round-trip.
+        let bg_job = loaded.iter().find(|j| j.payload == serde_json::json!("bg-job"));
+        assert!(bg_job.is_some());
+        let req = bg_job.unwrap().resource_req.as_ref().unwrap();
+        assert_eq!(req.gpu_count, 2);
+        assert_eq!(req.vram_mb, 16000);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn managed_sqlite_evict() {
+        use std::sync::Arc;
+        let backend = Arc::new(persistence::SqliteBackend::in_memory().unwrap());
+
+        let config = ManagedQueueConfig {
+            max_concurrency: 0,
+            finished_ttl: Duration::from_millis(10),
+        };
+        let q = ManagedQueue::<serde_json::Value>::with_sqlite(config, backend.clone());
+
+        let id = q
+            .enqueue(Priority::Normal, serde_json::json!("evict-me"), None)
+            .await;
+        q.dequeue_any().await;
+        q.complete(id).unwrap();
+
+        // Before eviction: item still in backend.
+        let loaded = backend.load_all::<serde_json::Value>().unwrap();
+        // load_all only returns non-terminal, so completed won't show.
+        // But the row exists in the DB.
+        assert_eq!(loaded.len(), 0); // completed = terminal, filtered out
+
+        std::thread::sleep(Duration::from_millis(15));
+        q.evict_expired(); // This calls backend.evict()
+
+        // After eviction: row deleted from DB.
+        // Verify by loading ALL rows (not just non-terminal).
+        // We can check the job_count in the queue itself.
+        assert_eq!(q.job_count(), 0);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_backend_open_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("majra-test-{}.db", uuid::Uuid::new_v4()));
+
+        let backend = persistence::SqliteBackend::open(&path).unwrap();
+        // Verify the file was created.
+        assert!(path.exists());
+
+        // Can persist and load.
+        let item = ManagedItem {
+            id: uuid::Uuid::new_v4(),
+            priority: Priority::Normal,
+            payload: serde_json::json!("file-test"),
+            resource_req: None,
+            state: JobState::Queued,
+            enqueued_at: None,
+            started_at: None,
+            finished_at: None,
+        };
+        backend.persist(&item).unwrap();
+
+        let loaded = backend.load_all::<serde_json::Value>().unwrap();
+        assert_eq!(loaded.len(), 1);
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn priority_queue_default() {
+        let q: PriorityQueue<i32> = Default::default();
+        assert!(q.is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_priority_queue_default() {
+        let q: ConcurrentPriorityQueue<i32> = Default::default();
+        assert!(q.is_empty().await);
     }
 }
