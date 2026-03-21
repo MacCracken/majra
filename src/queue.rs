@@ -1262,7 +1262,7 @@ mod tests {
         let id1 = q
             .enqueue(Priority::Critical, serde_json::json!("crit-job"), None)
             .await;
-        let id2 = q
+        let _id2 = q
             .enqueue(Priority::Low, serde_json::json!("low-job"), None)
             .await;
         let _id3 = q

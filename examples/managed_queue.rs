@@ -43,7 +43,7 @@ async fn main() {
         )
         .await;
 
-    let no_gpu_job = queue
+    let _no_gpu_job = queue
         .enqueue(Priority::Low, "index-dataset".to_string(), None)
         .await;
 
