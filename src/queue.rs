@@ -429,49 +429,54 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
             return None;
         }
 
-        let mut tiers = self.tiers.lock().await;
+        let dequeued_id = {
+            let mut tiers = self.tiers.lock().await;
 
-        // Scan tiers highest-first, within each tier find first fitting item.
-        for tier in tiers.iter_mut().rev() {
-            let pos = tier.iter().position(|id| {
-                if let Some(job) = self.jobs.get(id) {
-                    match &job.resource_req {
-                        Some(req) => available.satisfies(req),
-                        None => true,
+            // Scan tiers highest-first, within each tier find first fitting item.
+            let mut found = None;
+            for tier in tiers.iter_mut().rev() {
+                let pos = tier.iter().position(|id| {
+                    if let Some(job) = self.jobs.get(id) {
+                        match &job.resource_req {
+                            Some(req) => available.satisfies(req),
+                            None => true,
+                        }
+                    } else {
+                        false
                     }
-                } else {
-                    false
-                }
-            });
-
-            if let Some(idx) = pos {
-                let id = tier.remove(idx).unwrap();
-                drop(tiers);
-
-                let result = if let Some(mut job) = self.jobs.get_mut(&id) {
-                    job.state = JobState::Running;
-                    job.started_at = Some(Instant::now());
-                    Some(job.clone())
-                } else {
-                    None
-                };
-
-                self.running_count.fetch_add(1, Ordering::Relaxed);
-
-                #[cfg(feature = "sqlite")]
-                if let Some(ref backend) = self.backend {
-                    let _ = backend.update_state(id, JobState::Running);
-                }
-
-                let _ = self.events_tx.send(QueueEvent::Dequeued { id });
-                let _ = self.events_tx.send(QueueEvent::StateChanged {
-                    id,
-                    from: JobState::Queued,
-                    to: JobState::Running,
                 });
 
-                return result;
+                if let Some(idx) = pos {
+                    found = Some(tier.remove(idx).unwrap());
+                    break;
+                }
             }
+            found
+        };
+
+        let id = dequeued_id?;
+
+        if let Some(mut job) = self.jobs.get_mut(&id) {
+            job.state = JobState::Running;
+            job.started_at = Some(Instant::now());
+            let result = job.clone();
+            drop(job);
+
+            self.running_count.fetch_add(1, Ordering::Relaxed);
+
+            #[cfg(feature = "sqlite")]
+            if let Some(ref backend) = self.backend {
+                let _ = backend.update_state(id, JobState::Running);
+            }
+
+            let _ = self.events_tx.send(QueueEvent::Dequeued { id });
+            let _ = self.events_tx.send(QueueEvent::StateChanged {
+                id,
+                from: JobState::Queued,
+                to: JobState::Running,
+            });
+
+            return Some(result);
         }
 
         None
@@ -653,7 +658,7 @@ pub mod persistence {
                      finished_at INTEGER
                  );",
             )
-            ?;
+            .map_err(crate::error::persistence_err)?;
             Ok(Self {
                 conn: std::sync::Mutex::new(conn),
             })
@@ -667,7 +672,9 @@ pub mod persistence {
             let resource_req = item
                 .resource_req
                 .as_ref()
-                .map(|r| serde_json::to_string(r).unwrap());
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(crate::error::persistence_err)?;
             let state = serde_json::to_string(&item.state)
                 .map_err(crate::error::persistence_err)?;
             conn.execute(

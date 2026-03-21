@@ -57,8 +57,9 @@ impl ConnectionPool {
 
     /// Get or create a transport connection to the given endpoint.
     pub async fn acquire(&self, endpoint: &str) -> Result<Arc<dyn Transport>, MajraError> {
+        let key = endpoint.to_string();
         let mut conns = self.connections.lock().await;
-        let pool = conns.entry(endpoint.to_string()).or_default();
+        let pool = conns.entry(key.clone()).or_default();
 
         // Reuse an existing connected transport.
         pool.retain(|t| t.is_connected());
@@ -73,7 +74,7 @@ impl ConnectionPool {
 
         // Re-acquire and insert.
         let mut conns = self.connections.lock().await;
-        let pool = conns.entry(endpoint.to_string()).or_default();
+        let pool = conns.entry(key).or_default();
         pool.retain(|t| t.is_connected());
 
         if pool.len() >= self.max_per_endpoint {

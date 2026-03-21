@@ -4,6 +4,7 @@
 //! Supports `force()` to unblock a barrier when a participant is known dead.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -142,6 +143,7 @@ struct AsyncBarrierState {
     expected: HashSet<String>,
     arrived: HashSet<String>,
     notify: Arc<Notify>,
+    released: Arc<AtomicBool>,
     was_forced: bool,
 }
 
@@ -169,6 +171,7 @@ impl AsyncBarrierSet {
                 expected: participants,
                 arrived: HashSet::new(),
                 notify: Arc::new(Notify::new()),
+                released: Arc::new(AtomicBool::new(false)),
                 was_forced: false,
             },
         );
@@ -183,7 +186,7 @@ impl AsyncBarrierSet {
         barrier_name: &str,
         participant: &str,
     ) -> Result<(), crate::error::MajraError> {
-        let notify = {
+        let (notify, released) = {
             let mut state = self.barriers.get_mut(barrier_name).ok_or_else(|| {
                 crate::error::MajraError::Barrier(format!("unknown barrier: {barrier_name}"))
             })?;
@@ -191,17 +194,31 @@ impl AsyncBarrierSet {
             state.arrived.insert(participant.to_string());
 
             if state.arrived.is_superset(&state.expected) {
-                // We are the last — notify everyone.
+                state.released.store(true, Ordering::Release);
                 state.notify.notify_waiters();
                 return Ok(());
             }
 
-            state.notify.clone()
+            (state.notify.clone(), state.released.clone())
         };
 
-        // Wait for the last participant to notify us.
-        notify.notified().await;
-        Ok(())
+        // Spin-check the released flag to handle the race where
+        // notify_waiters() fires between dropping the guard and
+        // registering notified().
+        loop {
+            if released.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            // Register and wait. If released becomes true before
+            // we await, we'll catch it on the next loop iteration.
+            tokio::select! {
+                _ = notify.notified() => {
+                    if released.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
     }
 
     /// Record a participant's arrival without waiting.
@@ -214,6 +231,7 @@ impl AsyncBarrierSet {
         state.arrived.insert(participant.to_string());
 
         if state.arrived.is_superset(&state.expected) {
+            state.released.store(true, Ordering::Release);
             state.notify.notify_waiters();
             BarrierResult::Released
         } else {
@@ -235,6 +253,7 @@ impl AsyncBarrierSet {
         state.was_forced = true;
 
         if state.arrived.is_superset(&state.expected) {
+            state.released.store(true, Ordering::Release);
             state.notify.notify_waiters();
             BarrierResult::Released
         } else {

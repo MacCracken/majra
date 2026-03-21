@@ -382,22 +382,32 @@ impl<T: Clone + Send + Sync + DeserializeOwned + 'static> TypedMessage<T> {
 /// - `*` matches exactly one segment
 /// - `#` matches zero or more trailing segments (must be last)
 pub fn matches_pattern(pattern: &str, topic: &str) -> bool {
-    // Depth guard — count segments without allocating.
-    if pattern.split('/').count() > MAX_MATCH_DEPTH
-        || topic.split('/').count() > MAX_MATCH_DEPTH
-    {
-        return false;
-    }
-
     let mut pat = pattern.split('/');
     let mut top = topic.split('/');
+    let mut depth = 0usize;
 
     loop {
         match (pat.next(), top.next()) {
             (None, None) => return true,
-            (Some("#"), _) => return true,
-            (Some("*"), Some(_)) => continue,
-            (Some(p), Some(t)) if p == t => continue,
+            (Some("#"), top_seg) => {
+                // "#" matches remaining segments — but enforce depth limit.
+                // depth = segments matched so far. Add 1 for the current
+                // topic segment (if any) plus remaining topic segments.
+                let remaining = if top_seg.is_some() { 1 + top.count() } else { 0 };
+                return depth + remaining < MAX_MATCH_DEPTH;
+            }
+            (Some("*"), Some(_)) => {
+                depth += 1;
+                if depth > MAX_MATCH_DEPTH {
+                    return false;
+                }
+            }
+            (Some(p), Some(t)) if p == t => {
+                depth += 1;
+                if depth > MAX_MATCH_DEPTH {
+                    return false;
+                }
+            }
             _ => return false,
         }
     }

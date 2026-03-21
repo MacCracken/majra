@@ -60,13 +60,6 @@ pub enum IpcError {
 
 pub type Result<T> = std::result::Result<T, MajraError>;
 
-#[cfg(feature = "sqlite")]
-impl From<rusqlite::Error> for MajraError {
-    fn from(e: rusqlite::Error) -> Self {
-        Self::Persistence(e.to_string())
-    }
-}
-
 /// Helper for converting any error into `MajraError::Persistence`.
 #[cfg(feature = "sqlite")]
 pub(crate) fn persistence_err(e: impl std::fmt::Display) -> MajraError {
