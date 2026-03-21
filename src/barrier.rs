@@ -163,6 +163,17 @@ impl AsyncBarrierSet {
         }
     }
 
+    /// Check if the barrier is satisfied and release waiters if so.
+    fn check_release(state: &mut AsyncBarrierState) -> bool {
+        if state.arrived.is_superset(&state.expected) {
+            state.released.store(true, Ordering::Release);
+            state.notify.notify_waiters();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Create a barrier that waits for the given set of participants.
     pub fn create(&self, name: impl Into<String>, participants: HashSet<String>) {
         self.barriers.insert(
@@ -193,30 +204,23 @@ impl AsyncBarrierSet {
 
             state.arrived.insert(participant.to_string());
 
-            if state.arrived.is_superset(&state.expected) {
-                state.released.store(true, Ordering::Release);
-                state.notify.notify_waiters();
+            if Self::check_release(&mut state) {
                 return Ok(());
             }
 
             (state.notify.clone(), state.released.clone())
         };
 
-        // Spin-check the released flag to handle the race where
+        // Check the released flag to handle the race where
         // notify_waiters() fires between dropping the guard and
         // registering notified().
         loop {
             if released.load(Ordering::Acquire) {
                 return Ok(());
             }
-            // Register and wait. If released becomes true before
-            // we await, we'll catch it on the next loop iteration.
-            tokio::select! {
-                _ = notify.notified() => {
-                    if released.load(Ordering::Acquire) {
-                        return Ok(());
-                    }
-                }
+            notify.notified().await;
+            if released.load(Ordering::Acquire) {
+                return Ok(());
             }
         }
     }
@@ -230,9 +234,7 @@ impl AsyncBarrierSet {
 
         state.arrived.insert(participant.to_string());
 
-        if state.arrived.is_superset(&state.expected) {
-            state.released.store(true, Ordering::Release);
-            state.notify.notify_waiters();
+        if Self::check_release(&mut state) {
             BarrierResult::Released
         } else {
             BarrierResult::Waiting {
@@ -252,9 +254,7 @@ impl AsyncBarrierSet {
         state.arrived.remove(dead_participant);
         state.was_forced = true;
 
-        if state.arrived.is_superset(&state.expected) {
-            state.released.store(true, Ordering::Release);
-            state.notify.notify_waiters();
+        if Self::check_release(&mut state) {
             BarrierResult::Released
         } else {
             BarrierResult::Waiting {

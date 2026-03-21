@@ -277,7 +277,7 @@ impl<T: Clone + Send + Sync + 'static> TypedPubSub<T> {
         if self.config.replay_capacity > 0 {
             let mut buf = self
                 .replay_buffer
-                .entry(topic.to_string())
+                .entry(msg.topic.clone())
                 .or_default();
             buf.push_back(msg.clone());
             while buf.len() > self.config.replay_capacity {

@@ -64,7 +64,10 @@ pub type IpcClient = IpcConnection;
 
 async fn write_frame(stream: &mut UnixStream, payload: &serde_json::Value) -> Result<()> {
     let data = serde_json::to_vec(payload)?;
-    let len = data.len() as u32;
+    let len = u32::try_from(data.len()).map_err(|_| IpcError::FrameTooLarge {
+        size: u32::MAX,
+        max: MAX_FRAME_SIZE,
+    })?;
     if len > MAX_FRAME_SIZE {
         return Err(IpcError::FrameTooLarge {
             size: len,

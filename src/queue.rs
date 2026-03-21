@@ -548,18 +548,20 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
 
     /// Cancel a job (from Queued or Running state).
     pub async fn cancel(&self, id: TaskId) -> crate::error::Result<()> {
-        // If queued, remove from tiers.
-        {
+        // Read state and priority, then drop the DashMap guard before awaiting.
+        let (state, priority) = {
             let job = self
                 .jobs
                 .get(&id)
                 .ok_or_else(|| MajraError::Queue(format!("job {id} not found")))?;
-            if job.state == JobState::Queued {
-                let mut tiers = self.tiers.lock().await;
-                let tier_idx = job.priority as usize;
-                tiers[tier_idx].retain(|tid| *tid != id);
-            }
+            (job.state, job.priority)
+        };
+
+        if state == JobState::Queued {
+            let mut tiers = self.tiers.lock().await;
+            tiers[priority as usize].retain(|tid| *tid != id);
         }
+
         self.finish_job(id, JobState::Cancelled)
     }
 
@@ -678,15 +680,14 @@ pub mod persistence {
             let state = serde_json::to_string(&item.state)
                 .map_err(crate::error::persistence_err)?;
             conn.execute(
-                "INSERT OR REPLACE INTO managed_queue (id, priority, state, payload, resource_req, enqueued_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT OR REPLACE INTO managed_queue (id, priority, state, payload, resource_req)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 rusqlite::params![
                     item.id.to_string(),
                     item.priority as u8,
                     state,
                     payload,
                     resource_req,
-                    item.enqueued_at.map(|i| i.elapsed().as_secs() as i64),
                 ],
             )
             .map_err(crate::error::persistence_err)?;
