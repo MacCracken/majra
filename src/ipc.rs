@@ -6,8 +6,6 @@
 //! - **Unix**: Uses Unix domain sockets.
 //! - **Windows**: Uses named pipes (`\\.\pipe\majra-*`).
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
 use crate::error::IpcError;
 
 /// Maximum frame size (16 MiB).
