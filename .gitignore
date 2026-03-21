@@ -1,1 +1,42 @@
-/target
+# Build artifacts
+/target/
+
+# Editor / IDE
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Debugging
+*.pdb
+core
+core.*
+
+# Coverage
+lcov.info
+tarpaulin-report.html
+coverage/
+
+# Benchmark output (criterion generates large HTML reports)
+criterion/
+
+# Fuzz artifacts
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+
+# Proptest persistence (regressions are committed, but not other state)
+proptest-regressions/
+
+# cargo-vet downloads
+supply-chain/.cache/
+
+# Environment / secrets
+.env
+.env.*

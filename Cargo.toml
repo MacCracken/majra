@@ -1,6 +1,6 @@
 [package]
 name = "majra"
-version = "0.21.0"
+version = "0.21.3"
 edition = "2024"
 rust-version = "1.89"
 license = "AGPL-3.0-only"
@@ -26,6 +26,7 @@ sqlite = ["dep:rusqlite"]
 full = ["pubsub", "queue", "relay", "ipc", "heartbeat", "ratelimit", "barrier", "sqlite"]
 
 [dependencies]
+async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"
 serde = { version = "1", features = ["derive"] }

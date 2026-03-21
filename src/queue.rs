@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Notify};
+use tracing::instrument;
 use uuid::Uuid;
 
 use crate::error::MajraError;
@@ -20,6 +21,7 @@ use crate::error::MajraError;
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
+#[non_exhaustive]
 #[repr(u8)]
 pub enum Priority {
     Background = 0,
@@ -59,6 +61,7 @@ pub struct Dag {
 }
 
 /// Multi-tier priority queue.
+#[must_use]
 pub struct PriorityQueue<T> {
     tiers: [VecDeque<QueueItem<T>>; 5],
 }
@@ -207,6 +210,7 @@ impl DagScheduler {
 ///
 /// Wraps [`PriorityQueue`] in a `tokio::sync::Mutex`. Supports blocking
 /// dequeue via [`dequeue_wait`](ConcurrentPriorityQueue::dequeue_wait).
+#[must_use]
 pub struct ConcurrentPriorityQueue<T> {
     inner: tokio::sync::Mutex<PriorityQueue<T>>,
     notify: tokio::sync::Notify,
@@ -288,6 +292,7 @@ impl ResourcePool {
 /// Job lifecycle states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum JobState {
     Queued,
     Running,
@@ -321,6 +326,7 @@ pub struct ManagedItem<T> {
 
 /// Events emitted by the managed queue.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum QueueEvent {
     Enqueued { id: TaskId },
     Dequeued { id: TaskId },
@@ -381,6 +387,7 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
     }
 
     /// Enqueue a job. Returns the assigned task ID.
+    #[instrument(skip(self, payload, resource_req), fields(priority = ?priority))]
     pub async fn enqueue(
         &self,
         priority: Priority,
@@ -413,6 +420,7 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
 
     /// Dequeue the highest-priority job that fits within the given resource pool
     /// and respects max concurrency. Returns `None` if nothing eligible.
+    #[instrument(skip(self, available))]
     pub async fn dequeue(&self, available: &ResourcePool) -> Option<ManagedItem<T>> {
         // Check concurrency limit.
         if self.config.max_concurrency > 0
@@ -475,6 +483,7 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
     }
 
     /// Transition a job to a terminal state. Internal helper.
+    #[instrument(skip(self), fields(%id, ?new_state))]
     fn finish_job(&self, id: TaskId, new_state: JobState) -> crate::error::Result<()> {
         let mut job = self
             .jobs

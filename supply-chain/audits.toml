@@ -1,0 +1,7 @@
+# cargo-vet audits for majra
+
+[criteria.safe-to-deploy]
+description = "This crate can be compiled and deployed in production."
+
+[criteria.safe-to-run]
+description = "This crate can be compiled and run locally."

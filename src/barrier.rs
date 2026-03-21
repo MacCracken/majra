@@ -4,12 +4,15 @@
 //! Supports `force()` to unblock a barrier when a participant is known dead.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
 
 /// Result of arriving at a barrier.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BarrierResult {
     /// Still waiting for more participants.
     Waiting { arrived: usize, expected: usize },
@@ -126,17 +129,29 @@ impl Default for BarrierSet {
 }
 
 // ---------------------------------------------------------------------------
-// Thread-safe variant
+// Thread-safe async barrier set
 // ---------------------------------------------------------------------------
 
-/// Thread-safe barrier set backed by [`DashMap`].
-///
-/// All methods take `&self` and are safe for concurrent use.
-pub struct ConcurrentBarrierSet {
-    barriers: DashMap<String, BarrierState>,
+/// Backward-compatible alias — use [`AsyncBarrierSet`] directly.
+pub type ConcurrentBarrierSet = AsyncBarrierSet;
+
+/// Async state for a single named barrier.
+struct AsyncBarrierState {
+    expected: HashSet<String>,
+    arrived: HashSet<String>,
+    notify: Arc<Notify>,
 }
 
-impl ConcurrentBarrierSet {
+/// Thread-safe barrier set where `arrive()` returns a future that resolves
+/// when the barrier releases.
+///
+/// Unlike [`ConcurrentBarrierSet`], callers can `.await` the barrier release
+/// instead of polling for `BarrierResult::Released`.
+pub struct AsyncBarrierSet {
+    barriers: DashMap<String, AsyncBarrierState>,
+}
+
+impl AsyncBarrierSet {
     pub fn new() -> Self {
         Self {
             barriers: DashMap::new(),
@@ -147,14 +162,46 @@ impl ConcurrentBarrierSet {
     pub fn create(&self, name: impl Into<String>, participants: HashSet<String>) {
         self.barriers.insert(
             name.into(),
-            BarrierState {
+            AsyncBarrierState {
                 expected: participants,
                 arrived: HashSet::new(),
+                notify: Arc::new(Notify::new()),
             },
         );
     }
 
-    /// Record a participant's arrival at a barrier.
+    /// Record a participant's arrival and wait until the barrier releases.
+    ///
+    /// Returns `Ok(())` when all participants have arrived,
+    /// or `Err` if the barrier does not exist.
+    pub async fn arrive_and_wait(
+        &self,
+        barrier_name: &str,
+        participant: &str,
+    ) -> Result<(), crate::error::MajraError> {
+        let notify = {
+            let mut state = self.barriers.get_mut(barrier_name).ok_or_else(|| {
+                crate::error::MajraError::Barrier(format!("unknown barrier: {barrier_name}"))
+            })?;
+
+            state.arrived.insert(participant.to_string());
+
+            if state.arrived.is_superset(&state.expected) {
+                // We are the last — notify everyone.
+                state.notify.notify_waiters();
+                return Ok(());
+            }
+
+            state.notify.clone()
+        };
+
+        // Wait for the last participant to notify us.
+        notify.notified().await;
+        Ok(())
+    }
+
+    /// Record a participant's arrival without waiting.
+    /// Returns `BarrierResult` for callers that don't want to block.
     pub fn arrive(&self, barrier_name: &str, participant: &str) -> BarrierResult {
         let Some(mut state) = self.barriers.get_mut(barrier_name) else {
             return BarrierResult::Unknown;
@@ -163,6 +210,7 @@ impl ConcurrentBarrierSet {
         state.arrived.insert(participant.to_string());
 
         if state.arrived.is_superset(&state.expected) {
+            state.notify.notify_waiters();
             BarrierResult::Released
         } else {
             BarrierResult::Waiting {
@@ -182,6 +230,7 @@ impl ConcurrentBarrierSet {
         state.arrived.remove(dead_participant);
 
         if state.arrived.is_superset(&state.expected) {
+            state.notify.notify_waiters();
             BarrierResult::Released
         } else {
             BarrierResult::Waiting {
@@ -212,7 +261,7 @@ impl ConcurrentBarrierSet {
     }
 }
 
-impl Default for ConcurrentBarrierSet {
+impl Default for AsyncBarrierSet {
     fn default() -> Self {
         Self::new()
     }
@@ -367,5 +416,84 @@ mod tests {
             .filter(|r| **r == BarrierResult::Released)
             .count();
         assert_eq!(released, 1);
+    }
+
+    // --- AsyncBarrierSet ---
+
+    #[tokio::test]
+    async fn async_arrive_and_wait() {
+        let set = Arc::new(AsyncBarrierSet::new());
+        set.create("sync-1", participants(&["a", "b", "c"]));
+
+        let mut handles = Vec::new();
+        for name in ["a", "b", "c"] {
+            let s = set.clone();
+            let n = name.to_string();
+            handles.push(tokio::spawn(async move {
+                s.arrive_and_wait("sync-1", &n).await.unwrap();
+            }));
+        }
+
+        // All three should complete (not deadlock).
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn async_arrive_and_wait_with_delay() {
+        let set = Arc::new(AsyncBarrierSet::new());
+        set.create("sync-1", participants(&["a", "b"]));
+
+        let s = set.clone();
+        let waiter = tokio::spawn(async move {
+            s.arrive_and_wait("sync-1", "a").await.unwrap();
+        });
+
+        // Small delay before second participant arrives.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        set.arrive("sync-1", "b");
+
+        // Waiter should now be released.
+        waiter.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn async_unknown_barrier_error() {
+        let set = AsyncBarrierSet::new();
+        let result = set.arrive_and_wait("nope", "a").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn async_force_releases_waiters() {
+        let set = Arc::new(AsyncBarrierSet::new());
+        set.create("sync-1", participants(&["a", "b"]));
+
+        let s = set.clone();
+        let waiter = tokio::spawn(async move {
+            s.arrive_and_wait("sync-1", "a").await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // Force remove b — should release the barrier.
+        set.force("sync-1", "b");
+
+        waiter.await.unwrap();
+    }
+
+    #[test]
+    fn async_non_blocking_arrive() {
+        let set = AsyncBarrierSet::new();
+        set.create("sync-1", participants(&["a", "b"]));
+
+        assert_eq!(
+            set.arrive("sync-1", "a"),
+            BarrierResult::Waiting {
+                arrived: 1,
+                expected: 2
+            }
+        );
+        assert_eq!(set.arrive("sync-1", "b"), BarrierResult::Released);
     }
 }

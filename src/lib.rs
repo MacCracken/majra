@@ -27,6 +27,8 @@
 
 pub mod envelope;
 pub mod error;
+pub mod metrics;
+pub(crate) mod util;
 
 #[cfg(feature = "pubsub")]
 pub mod pubsub;
@@ -36,6 +38,9 @@ pub mod queue;
 
 #[cfg(feature = "relay")]
 pub mod relay;
+
+#[cfg(feature = "relay")]
+pub mod transport;
 
 #[cfg(feature = "ipc")]
 pub mod ipc;
@@ -87,6 +92,6 @@ mod sync_assertions {
 
         // Barrier
         #[cfg(feature = "barrier")]
-        _assert_send_sync::<super::barrier::ConcurrentBarrierSet>();
+        _assert_send_sync::<super::barrier::AsyncBarrierSet>();
     }
 }

@@ -1,0 +1,10 @@
+# cargo-vet configuration for majra
+
+[cargo-vet]
+version = "0.10"
+
+[imports.mozilla]
+url = "https://raw.githubusercontent.com/nickel-org/nickel.rs/main/supply-chain/audits.toml"
+
+[policy.majra]
+audit-as-crates-io = false

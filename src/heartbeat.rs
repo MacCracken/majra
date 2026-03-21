@@ -22,6 +22,7 @@ const DEFAULT_OFFLINE_TIMEOUT: Duration = Duration::from_secs(90);
 /// Node health status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Status {
     Online,
     Suspect,

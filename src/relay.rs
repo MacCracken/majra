@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::{debug, trace};
 
+use crate::util::Counter;
+
 /// A node identifier (typically a UUID or hostname hash).
 pub type NodeId = String;
 
@@ -57,9 +59,9 @@ pub struct Relay {
     next_seq: AtomicU64,
     seen: DashMap<NodeId, u64>,
     tx: broadcast::Sender<IncomingMessage>,
-    messages_sent: AtomicU64,
-    messages_received: AtomicU64,
-    duplicates_dropped: AtomicU64,
+    messages_sent: Counter,
+    messages_received: Counter,
+    duplicates_dropped: Counter,
 }
 
 impl Relay {
@@ -71,9 +73,9 @@ impl Relay {
             next_seq: AtomicU64::new(1),
             seen: DashMap::new(),
             tx,
-            messages_sent: AtomicU64::new(0),
-            messages_received: AtomicU64::new(0),
-            duplicates_dropped: AtomicU64::new(0),
+            messages_sent: Counter::new(),
+            messages_received: Counter::new(),
+            duplicates_dropped: Counter::new(),
         }
     }
 
@@ -105,7 +107,7 @@ impl Relay {
             is_broadcast,
         });
 
-        self.messages_sent.fetch_add(1, Ordering::Relaxed);
+        self.messages_sent.inc();
         debug!(seq, "relay: sent");
         seq
     }
@@ -137,14 +139,14 @@ impl Relay {
         {
             let mut last = self.seen.entry(msg.from.clone()).or_insert(0);
             if msg.seq <= *last {
-                self.duplicates_dropped.fetch_add(1, Ordering::Relaxed);
+                self.duplicates_dropped.inc();
                 trace!(seq = msg.seq, from = %msg.from, "relay: duplicate dropped");
                 return None;
             }
             *last = msg.seq;
         }
 
-        self.messages_received.fetch_add(1, Ordering::Relaxed);
+        self.messages_received.inc();
 
         let incoming = IncomingMessage {
             message: msg,
@@ -163,9 +165,9 @@ impl Relay {
     /// Current relay statistics.
     pub fn stats(&self) -> RelayStats {
         RelayStats {
-            messages_sent: self.messages_sent.load(Ordering::Relaxed),
-            messages_received: self.messages_received.load(Ordering::Relaxed),
-            duplicates_dropped: self.duplicates_dropped.load(Ordering::Relaxed),
+            messages_sent: self.messages_sent.get(),
+            messages_received: self.messages_received.get(),
+            duplicates_dropped: self.duplicates_dropped.get(),
         }
     }
 }

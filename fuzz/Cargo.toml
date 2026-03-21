@@ -1,0 +1,31 @@
+[package]
+name = "majra-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+majra = { path = "..", features = ["full"] }
+serde_json = "1"
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_queue"
+path = "fuzz_targets/fuzz_queue.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_pubsub"
+path = "fuzz_targets/fuzz_pubsub.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_heartbeat"
+path = "fuzz_targets/fuzz_heartbeat.rs"
+doc = false

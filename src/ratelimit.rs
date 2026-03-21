@@ -2,26 +2,49 @@
 //!
 //! Lazy refill — tokens are replenished on each `check()` call based on
 //! elapsed time. No background tasks required.
+//!
+//! Supports stale-key eviction and usage statistics.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+
+use crate::util::{evict_from_dashmap, Counter};
 
 /// State for a single key's bucket.
 struct Bucket {
     tokens: f64,
     last_refill: Instant,
+    last_check: Instant,
+}
+
+/// Rate limiter usage statistics.
+#[derive(Debug, Clone, Default)]
+pub struct RateLimitStats {
+    /// Total number of allowed requests.
+    pub total_allowed: u64,
+    /// Total number of rejected requests.
+    pub total_rejected: u64,
+    /// Currently tracked keys.
+    pub active_keys: usize,
+    /// Total keys evicted since creation.
+    pub total_evicted: u64,
 }
 
 /// Token bucket rate limiter with per-key tracking.
 ///
 /// Thread-safe — backed by [`DashMap`] for concurrent per-key access.
+/// Supports stale-key eviction to prevent unbounded memory growth.
+#[must_use]
 pub struct RateLimiter {
     /// Tokens replenished per second.
     rate: f64,
     /// Maximum token capacity (burst size).
     burst: usize,
     buckets: DashMap<String, Bucket>,
+    total_allowed: Counter,
+    total_rejected: Counter,
+    total_evicted: Counter,
 }
 
 impl RateLimiter {
@@ -31,6 +54,9 @@ impl RateLimiter {
             rate,
             burst,
             buckets: DashMap::new(),
+            total_allowed: Counter::new(),
+            total_rejected: Counter::new(),
+            total_evicted: Counter::new(),
         }
     }
 
@@ -42,6 +68,7 @@ impl RateLimiter {
         let mut entry = self.buckets.entry(key.to_string()).or_insert(Bucket {
             tokens: burst,
             last_refill: now,
+            last_check: now,
         });
 
         let bucket = entry.value_mut();
@@ -50,11 +77,14 @@ impl RateLimiter {
         let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * self.rate).min(burst);
         bucket.last_refill = now;
+        bucket.last_check = now;
 
         if bucket.tokens >= 1.0 {
             bucket.tokens -= 1.0;
+            self.total_allowed.inc();
             true
         } else {
+            self.total_rejected.inc();
             false
         }
     }
@@ -62,6 +92,29 @@ impl RateLimiter {
     /// Number of tracked keys.
     pub fn key_count(&self) -> usize {
         self.buckets.len()
+    }
+
+    /// Evict keys that have not been checked for at least `max_idle`.
+    ///
+    /// Returns the number of keys evicted.
+    pub fn evict_stale(&self, max_idle: Duration) -> usize {
+        let now = Instant::now();
+        let count =
+            evict_from_dashmap(&self.buckets, |_key, bucket| {
+                now.duration_since(bucket.last_check) >= max_idle
+            });
+        self.total_evicted.add(count as u64);
+        count
+    }
+
+    /// Current usage statistics.
+    pub fn stats(&self) -> RateLimitStats {
+        RateLimitStats {
+            total_allowed: self.total_allowed.get(),
+            total_rejected: self.total_rejected.get(),
+            active_keys: self.buckets.len(),
+            total_evicted: self.total_evicted.get(),
+        }
     }
 }
 
@@ -93,7 +146,7 @@ mod tests {
         assert!(limiter.check("a"));
         assert!(!limiter.check("a"));
 
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(20));
         assert!(limiter.check("a"));
     }
 
@@ -128,8 +181,62 @@ mod tests {
         }
 
         let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
-        // Each key has burst=10, 4 keys = up to 40 allowed initially
         assert!(total >= 40, "expected at least 40 allowed, got {total}");
         assert_eq!(limiter.key_count(), 4);
+    }
+
+    #[test]
+    fn stats_tracking() {
+        let limiter = RateLimiter::new(1.0, 2);
+        limiter.check("a"); // allowed
+        limiter.check("a"); // allowed
+        limiter.check("a"); // rejected
+
+        let stats = limiter.stats();
+        assert_eq!(stats.total_allowed, 2);
+        assert_eq!(stats.total_rejected, 1);
+        assert_eq!(stats.active_keys, 1);
+    }
+
+    #[test]
+    fn evict_stale_keys() {
+        let limiter = RateLimiter::new(1.0, 1);
+        limiter.check("fresh");
+        limiter.check("stale");
+
+        // Wait for stale to become idle.
+        std::thread::sleep(Duration::from_millis(20));
+
+        // Touch fresh again to keep it alive.
+        limiter.check("fresh");
+
+        let evicted = limiter.evict_stale(Duration::from_millis(15));
+        assert_eq!(evicted, 1);
+        assert_eq!(limiter.key_count(), 1); // only "fresh" remains
+
+        let stats = limiter.stats();
+        assert_eq!(stats.total_evicted, 1);
+    }
+
+    #[test]
+    fn evict_stale_no_keys() {
+        let limiter = RateLimiter::new(1.0, 1);
+        limiter.check("a");
+        let evicted = limiter.evict_stale(Duration::from_secs(60));
+        assert_eq!(evicted, 0);
+    }
+
+    #[test]
+    fn evict_all_stale() {
+        let limiter = RateLimiter::new(1.0, 1);
+        limiter.check("a");
+        limiter.check("b");
+        limiter.check("c");
+
+        std::thread::sleep(Duration::from_millis(15));
+
+        let evicted = limiter.evict_stale(Duration::from_millis(10));
+        assert_eq!(evicted, 3);
+        assert_eq!(limiter.key_count(), 0);
     }
 }
