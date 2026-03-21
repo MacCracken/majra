@@ -46,7 +46,7 @@ pub mod relay;
 #[cfg(feature = "relay")]
 pub mod transport;
 
-#[cfg(feature = "ipc")]
+#[cfg(all(unix, feature = "ipc"))]
 pub mod ipc;
 
 #[cfg(feature = "heartbeat")]

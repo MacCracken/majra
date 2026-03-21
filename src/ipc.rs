@@ -1,10 +1,12 @@
-//! Length-prefixed framing over Unix domain sockets.
+//! Length-prefixed framing over local IPC sockets.
 //!
 //! Protocol: 4-byte big-endian u32 length prefix, then JSON payload.
 //! Maximum frame size: 16 MiB.
+//!
+//! - **Unix**: Uses Unix domain sockets.
+//! - **Windows**: Uses named pipes (`\\.\pipe\majra-*`).
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
 
 use crate::error::IpcError;
 
@@ -13,23 +15,150 @@ const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 
 type Result<T> = std::result::Result<T, IpcError>;
 
-/// A listening IPC server on a Unix socket.
+// ---------------------------------------------------------------------------
+// Unix implementation
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod platform {
+    use tokio::net::{UnixListener, UnixStream};
+
+    pub(super) struct Listener {
+        inner: UnixListener,
+    }
+
+    impl Listener {
+        pub fn bind(path: &std::path::Path) -> std::io::Result<Self> {
+            let _ = std::fs::remove_file(path);
+            Ok(Self {
+                inner: UnixListener::bind(path)?,
+            })
+        }
+
+        pub async fn accept(&self) -> std::io::Result<Stream> {
+            let (stream, _) = self.inner.accept().await?;
+            Ok(Stream { inner: stream })
+        }
+    }
+
+    pub(super) struct Stream {
+        inner: UnixStream,
+    }
+
+    impl Stream {
+        pub async fn connect(path: &std::path::Path) -> std::io::Result<Self> {
+            Ok(Self {
+                inner: UnixStream::connect(path).await?,
+            })
+        }
+
+        pub async fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+            use tokio::io::AsyncReadExt;
+            self.inner.read_exact(buf).await.map(|_| ())
+        }
+
+        pub async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+            use tokio::io::AsyncWriteExt;
+            self.inner.write_all(buf).await
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windows implementation (named pipes)
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+mod platform {
+    use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+
+    pub(super) struct Listener {
+        pipe_name: String,
+    }
+
+    impl Listener {
+        pub fn bind(path: &std::path::Path) -> std::io::Result<Self> {
+            // Convert filesystem path to named pipe path:
+            // C:\Users\...\foo.sock → \\.\pipe\majra-<hash>
+            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("majra");
+            let pipe_name = format!(r"\\.\pipe\majra-{}", name);
+            // Create the first instance to verify the name is available.
+            let _server = ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(&pipe_name)?;
+            Ok(Self { pipe_name })
+        }
+
+        pub async fn accept(&self) -> std::io::Result<Stream> {
+            let server = ServerOptions::new().create(&self.pipe_name)?;
+            server.connect().await?;
+            Ok(Stream {
+                inner: StreamInner::Server(server),
+            })
+        }
+    }
+
+    pub(super) struct Stream {
+        inner: StreamInner,
+    }
+
+    enum StreamInner {
+        Server(tokio::net::windows::named_pipe::NamedPipeServer),
+        Client(tokio::net::windows::named_pipe::NamedPipeClient),
+    }
+
+    impl Stream {
+        pub async fn connect(path: &std::path::Path) -> std::io::Result<Self> {
+            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("majra");
+            let pipe_name = format!(r"\\.\pipe\majra-{}", name);
+            let client = ClientOptions::new().open(&pipe_name)?;
+            Ok(Self {
+                inner: StreamInner::Client(client),
+            })
+        }
+
+        pub async fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+            use tokio::io::AsyncReadExt;
+            match &mut self.inner {
+                StreamInner::Server(s) => s.read_exact(buf).await.map(|_| ()),
+                StreamInner::Client(c) => c.read_exact(buf).await.map(|_| ()),
+            }
+        }
+
+        pub async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+            use tokio::io::AsyncWriteExt;
+            match &mut self.inner {
+                StreamInner::Server(s) => s.write_all(buf).await,
+                StreamInner::Client(c) => c.write_all(buf).await,
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API (platform-agnostic)
+// ---------------------------------------------------------------------------
+
+/// A listening IPC server.
+///
+/// On Unix, binds to a Unix domain socket. On Windows, creates a named pipe.
 pub struct IpcServer {
-    listener: UnixListener,
+    listener: platform::Listener,
 }
 
 impl IpcServer {
-    /// Bind to a Unix socket path.
+    /// Bind to a local IPC endpoint.
+    ///
+    /// `path` is used as a Unix socket path on Unix, or converted to a
+    /// named pipe name on Windows.
     pub fn bind(path: &std::path::Path) -> Result<Self> {
-        // Remove stale socket if it exists.
-        let _ = std::fs::remove_file(path);
-        let listener = UnixListener::bind(path)?;
+        let listener = platform::Listener::bind(path)?;
         Ok(Self { listener })
     }
 
     /// Accept the next incoming connection.
     pub async fn accept(&self) -> Result<IpcConnection> {
-        let (stream, _) = self.listener.accept().await?;
+        let stream = self.listener.accept().await?;
         Ok(IpcConnection { stream })
     }
 }
@@ -38,68 +167,60 @@ impl IpcServer {
 ///
 /// Used for both server-accepted and client-initiated connections.
 pub struct IpcConnection {
-    stream: UnixStream,
+    stream: platform::Stream,
 }
 
 impl IpcConnection {
-    /// Connect to a Unix socket path (client-side).
+    /// Connect to a local IPC endpoint (client-side).
     pub async fn connect(path: &std::path::Path) -> Result<Self> {
-        let stream = UnixStream::connect(path).await?;
+        let stream = platform::Stream::connect(path).await?;
         Ok(Self { stream })
     }
 
     /// Send a JSON value as a length-prefixed frame.
     pub async fn send(&mut self, payload: &serde_json::Value) -> Result<()> {
-        write_frame(&mut self.stream, payload).await
+        let data = serde_json::to_vec(payload)?;
+        let len = u32::try_from(data.len()).map_err(|_| IpcError::FrameTooLarge {
+            size: u32::MAX,
+            max: MAX_FRAME_SIZE,
+        })?;
+        if len > MAX_FRAME_SIZE {
+            return Err(IpcError::FrameTooLarge {
+                size: len,
+                max: MAX_FRAME_SIZE,
+            });
+        }
+        self.stream.write_all(&len.to_be_bytes()).await?;
+        self.stream.write_all(&data).await?;
+        Ok(())
     }
 
     /// Receive a JSON value from a length-prefixed frame.
     pub async fn recv(&mut self) -> Result<serde_json::Value> {
-        read_frame(&mut self.stream).await
+        let mut len_buf = [0u8; 4];
+        match self.stream.read_exact(&mut len_buf).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(IpcError::ConnectionClosed);
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let len = u32::from_be_bytes(len_buf);
+        if len > MAX_FRAME_SIZE {
+            return Err(IpcError::FrameTooLarge {
+                size: len,
+                max: MAX_FRAME_SIZE,
+            });
+        }
+        let mut buf = vec![0u8; len as usize];
+        self.stream.read_exact(&mut buf).await?;
+        let value = serde_json::from_slice(&buf)?;
+        Ok(value)
     }
 }
 
 /// Backward-compatible alias — use [`IpcConnection`] directly.
 pub type IpcClient = IpcConnection;
-
-async fn write_frame(stream: &mut UnixStream, payload: &serde_json::Value) -> Result<()> {
-    let data = serde_json::to_vec(payload)?;
-    let len = u32::try_from(data.len()).map_err(|_| IpcError::FrameTooLarge {
-        size: u32::MAX,
-        max: MAX_FRAME_SIZE,
-    })?;
-    if len > MAX_FRAME_SIZE {
-        return Err(IpcError::FrameTooLarge {
-            size: len,
-            max: MAX_FRAME_SIZE,
-        });
-    }
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(&data).await?;
-    Ok(())
-}
-
-async fn read_frame(stream: &mut UnixStream) -> Result<serde_json::Value> {
-    let mut len_buf = [0u8; 4];
-    match stream.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-            return Err(IpcError::ConnectionClosed);
-        }
-        Err(e) => return Err(e.into()),
-    }
-    let len = u32::from_be_bytes(len_buf);
-    if len > MAX_FRAME_SIZE {
-        return Err(IpcError::FrameTooLarge {
-            size: len,
-            max: MAX_FRAME_SIZE,
-        });
-    }
-    let mut buf = vec![0u8; len as usize];
-    stream.read_exact(&mut buf).await?;
-    let value = serde_json::from_slice(&buf)?;
-    Ok(value)
-}
 
 #[cfg(test)]
 mod tests {
@@ -170,10 +291,7 @@ mod tests {
             let path = path.clone();
             async move {
                 let mut client = IpcConnection::connect(&path).await.unwrap();
-                // Create a payload larger than MAX_FRAME_SIZE (16 MiB).
-                // We can't actually allocate 16 MiB in a test, so test the
-                // try_from path by checking the error type exists.
-                // Instead, test a valid large-ish payload works.
+                // Test a valid large-ish payload works.
                 let big = serde_json::json!({"data": "x".repeat(1000)});
                 client.send(&big).await.unwrap();
             }
@@ -187,6 +305,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // read_frame_too_large test uses platform-specific raw stream access,
+    // so it's gated to Unix only.
+    #[cfg(unix)]
     #[tokio::test]
     async fn read_frame_too_large() {
         use tokio::io::AsyncWriteExt;

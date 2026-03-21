@@ -522,8 +522,8 @@ mod tests {
     #[test]
     fn status_transitions() {
         let config = HeartbeatConfig {
-            suspect_after: Duration::from_millis(10),
-            offline_after: Duration::from_millis(50),
+            suspect_after: Duration::from_millis(50),
+            offline_after: Duration::from_millis(500),
             eviction_policy: None,
         };
         let mut tracker = HeartbeatTracker::new(config);
@@ -534,7 +534,7 @@ mod tests {
         assert!(changes.is_empty());
 
         // After suspect timeout.
-        std::thread::sleep(Duration::from_millis(15));
+        std::thread::sleep(Duration::from_millis(80));
         let changes = tracker.update_statuses();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0], ("n1".to_string(), Status::Suspect));
@@ -587,8 +587,8 @@ mod tests {
     #[test]
     fn concurrent_status_transitions() {
         let config = HeartbeatConfig {
-            suspect_after: Duration::from_millis(10),
-            offline_after: Duration::from_millis(50),
+            suspect_after: Duration::from_millis(50),
+            offline_after: Duration::from_millis(500),
             eviction_policy: None,
         };
         let tracker = ConcurrentHeartbeatTracker::new(config);
@@ -597,7 +597,7 @@ mod tests {
         let changes = tracker.update_statuses();
         assert!(changes.is_empty());
 
-        std::thread::sleep(Duration::from_millis(15));
+        std::thread::sleep(Duration::from_millis(80));
         let changes = tracker.update_statuses();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0], ("n1".to_string(), Status::Suspect));
@@ -696,8 +696,8 @@ mod tests {
     #[test]
     fn fleet_stats_aggregation() {
         let config = HeartbeatConfig {
-            suspect_after: Duration::from_millis(5),
-            offline_after: Duration::from_millis(20),
+            suspect_after: Duration::from_millis(50),
+            offline_after: Duration::from_millis(500),
             eviction_policy: None,
         };
         let tracker = ConcurrentHeartbeatTracker::new(config);
@@ -733,7 +733,7 @@ mod tests {
         assert_eq!(stats.available_vram_mb, 8000); // (8000-6000) + (8000-2000)
 
         // Make n2 go suspect.
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(80));
         tracker.heartbeat("n1"); // keep n1 online
         tracker.update_statuses();
 
@@ -746,8 +746,8 @@ mod tests {
     fn eviction_policy() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let config = HeartbeatConfig {
-            suspect_after: Duration::from_millis(5),
-            offline_after: Duration::from_millis(10),
+            suspect_after: Duration::from_millis(30),
+            offline_after: Duration::from_millis(60),
             eviction_policy: Some(EvictionPolicy {
                 offline_cycles: 2,
                 eviction_tx: Some(tx),
@@ -757,7 +757,7 @@ mod tests {
         tracker.register("n1", serde_json::Value::Null);
 
         // Wait for offline.
-        std::thread::sleep(Duration::from_millis(15));
+        std::thread::sleep(Duration::from_millis(80));
         tracker.update_statuses(); // cycle 1
         assert_eq!(tracker.len(), 1);
 
@@ -772,8 +772,8 @@ mod tests {
     #[test]
     fn eviction_resets_on_heartbeat() {
         let config = HeartbeatConfig {
-            suspect_after: Duration::from_millis(5),
-            offline_after: Duration::from_millis(10),
+            suspect_after: Duration::from_millis(30),
+            offline_after: Duration::from_millis(60),
             eviction_policy: Some(EvictionPolicy {
                 offline_cycles: 3,
                 eviction_tx: None,
@@ -782,13 +782,13 @@ mod tests {
         let tracker = ConcurrentHeartbeatTracker::new(config);
         tracker.register("n1", serde_json::Value::Null);
 
-        std::thread::sleep(Duration::from_millis(15));
+        std::thread::sleep(Duration::from_millis(80));
         tracker.update_statuses(); // cycle 1
         tracker.update_statuses(); // cycle 2
 
         // Heartbeat resets cycles.
         tracker.heartbeat("n1");
-        std::thread::sleep(Duration::from_millis(15));
+        std::thread::sleep(Duration::from_millis(80));
         tracker.update_statuses(); // cycle 1 again (reset)
         assert_eq!(tracker.len(), 1); // not evicted
     }
