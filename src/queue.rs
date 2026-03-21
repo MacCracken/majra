@@ -850,8 +850,7 @@ pub mod persistence {
             let mut result = Vec::new();
             for (id_str, priority_u8, state_str, payload_str, resource_req_str) in items {
                 let id: TaskId = id_str.parse().map_err(crate::error::persistence_err)?;
-                let priority = super::Priority::try_from(priority_u8)
-                    .unwrap_or_default();
+                let priority = super::Priority::try_from(priority_u8).unwrap_or_default();
                 let state: JobState =
                     serde_json::from_str(&state_str).map_err(crate::error::persistence_err)?;
                 let payload: T =
