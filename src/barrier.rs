@@ -4,8 +4,8 @@
 //! Supports `force()` to unblock a barrier when a participant is known dead.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -74,16 +74,21 @@ impl BarrierSet {
     }
 
     /// Create a barrier that waits for the given set of participants.
-    pub fn create(&mut self, name: impl Into<String>, participants: HashSet<String>) {
+    ///
+    /// Returns `true` if the barrier was created fresh, `false` if an existing
+    /// barrier with the same name was replaced (previous waiters will not be notified).
+    pub fn create(&mut self, name: impl Into<String>, participants: HashSet<String>) -> bool {
         let name = name.into();
-        self.barriers.insert(
-            name,
-            BarrierState {
-                expected: participants,
-                arrived: HashSet::new(),
-                was_forced: false,
-            },
-        );
+        self.barriers
+            .insert(
+                name,
+                BarrierState {
+                    expected: participants,
+                    arrived: HashSet::new(),
+                    was_forced: false,
+                },
+            )
+            .is_none()
     }
 
     /// Record a participant's arrival at a barrier.
@@ -185,17 +190,22 @@ impl AsyncBarrierSet {
     }
 
     /// Create a barrier that waits for the given set of participants.
-    pub fn create(&self, name: impl Into<String>, participants: HashSet<String>) {
-        self.barriers.insert(
-            name.into(),
-            AsyncBarrierState {
-                expected: participants,
-                arrived: HashSet::new(),
-                notify: Arc::new(Notify::new()),
-                released: Arc::new(AtomicBool::new(false)),
-                was_forced: false,
-            },
-        );
+    ///
+    /// Returns `true` if the barrier was created fresh, `false` if an existing
+    /// barrier with the same name was replaced (previous waiters will not be notified).
+    pub fn create(&self, name: impl Into<String>, participants: HashSet<String>) -> bool {
+        self.barriers
+            .insert(
+                name.into(),
+                AsyncBarrierState {
+                    expected: participants,
+                    arrived: HashSet::new(),
+                    notify: Arc::new(Notify::new()),
+                    released: Arc::new(AtomicBool::new(false)),
+                    was_forced: false,
+                },
+            )
+            .is_none()
     }
 
     /// Record a participant's arrival and wait until the barrier releases.

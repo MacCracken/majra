@@ -67,7 +67,10 @@ async fn main() {
 
     // Third dequeue blocked by max_concurrency=2.
     assert!(queue.dequeue(&pool).await.is_none());
-    println!("Max concurrency reached ({} running)", queue.running_count());
+    println!(
+        "Max concurrency reached ({} running)",
+        queue.running_count()
+    );
 
     // Complete one job.
     queue.complete(small_job).unwrap();

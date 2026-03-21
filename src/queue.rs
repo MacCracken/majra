@@ -6,16 +6,18 @@
 //!    only those whose predecessors have completed.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, Notify};
-use tracing::instrument;
+use tokio::sync::{Notify, broadcast};
+use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
 use crate::error::MajraError;
+use crate::metrics::{MajraMetrics, NoopMetrics};
 
 /// Task priority tiers (highest = 4, lowest = 0).
 #[derive(
@@ -35,6 +37,33 @@ pub enum Priority {
     High = 3,
     /// Highest priority, processed before all other tiers.
     Critical = 4,
+}
+
+impl std::fmt::Display for Priority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Background => write!(f, "background"),
+            Self::Low => write!(f, "low"),
+            Self::Normal => write!(f, "normal"),
+            Self::High => write!(f, "high"),
+            Self::Critical => write!(f, "critical"),
+        }
+    }
+}
+
+impl TryFrom<u8> for Priority {
+    type Error = u8;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Background),
+            1 => Ok(Self::Low),
+            2 => Ok(Self::Normal),
+            3 => Ok(Self::High),
+            4 => Ok(Self::Critical),
+            other => Err(other),
+        }
+    }
 }
 
 /// A unique task identifier.
@@ -323,6 +352,18 @@ pub enum JobState {
     Cancelled,
 }
 
+impl std::fmt::Display for JobState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Queued => write!(f, "queued"),
+            Self::Running => write!(f, "running"),
+            Self::Completed => write!(f, "completed"),
+            Self::Failed => write!(f, "failed"),
+            Self::Cancelled => write!(f, "cancelled"),
+        }
+    }
+}
+
 impl JobState {
     /// Whether this is a terminal state.
     pub fn is_terminal(self) -> bool {
@@ -408,6 +449,7 @@ pub struct ManagedQueue<T: Send> {
     running_count: AtomicUsize,
     notify: Notify,
     events_tx: broadcast::Sender<QueueEvent>,
+    metrics: Arc<dyn MajraMetrics>,
     #[cfg(feature = "sqlite")]
     backend: Option<std::sync::Arc<persistence::SqliteBackend>>,
 }
@@ -415,6 +457,11 @@ pub struct ManagedQueue<T: Send> {
 impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
     /// Create a new managed queue with the given configuration.
     pub fn new(config: ManagedQueueConfig) -> Self {
+        Self::with_metrics(config, Arc::new(NoopMetrics))
+    }
+
+    /// Create a managed queue with a custom metrics reporter.
+    pub fn with_metrics(config: ManagedQueueConfig, metrics: Arc<dyn MajraMetrics>) -> Self {
         let (events_tx, _) = broadcast::channel(256);
         Self {
             tiers: tokio::sync::Mutex::new(Default::default()),
@@ -423,6 +470,7 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
             running_count: AtomicUsize::new(0),
             notify: Notify::new(),
             events_tx,
+            metrics,
             #[cfg(feature = "sqlite")]
             backend: None,
         }
@@ -454,13 +502,17 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
         };
 
         #[cfg(feature = "sqlite")]
-        if let Some(ref backend) = self.backend {
-            let _ = backend.persist(&item);
+        if let Some(ref backend) = self.backend
+            && let Err(e) = backend.persist(&item)
+        {
+            warn!(%id, error = %e, "sqlite: failed to persist job");
         }
 
         self.jobs.insert(id, item);
         self.tiers.lock().await[priority as usize].push_back(id);
         let _ = self.events_tx.send(QueueEvent::Enqueued { id });
+        self.metrics.queue_enqueued("managed", priority as u8);
+        info!(%id, ?priority, "job enqueued");
         self.notify.notify_one();
         id
     }
@@ -512,8 +564,10 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
             self.running_count.fetch_add(1, Ordering::Relaxed);
 
             #[cfg(feature = "sqlite")]
-            if let Some(ref backend) = self.backend {
-                let _ = backend.update_state(id, JobState::Running);
+            if let Some(ref backend) = self.backend
+                && let Err(e) = backend.update_state(id, JobState::Running)
+            {
+                warn!(%id, error = %e, "sqlite: failed to update state to running");
             }
 
             let _ = self.events_tx.send(QueueEvent::Dequeued { id });
@@ -522,6 +576,11 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
                 from: JobState::Queued,
                 to: JobState::Running,
             });
+            self.metrics
+                .queue_dequeued("managed", result.priority as u8);
+            self.metrics
+                .queue_state_changed("managed", "queued", "running");
+            info!(%id, "job dequeued → running");
 
             return Some(result);
         }
@@ -570,8 +629,10 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
         }
 
         #[cfg(feature = "sqlite")]
-        if let Some(ref backend) = self.backend {
-            let _ = backend.update_state(id, new_state);
+        if let Some(ref backend) = self.backend
+            && let Err(e) = backend.update_state(id, new_state)
+        {
+            warn!(%id, error = %e, "sqlite: failed to update job state");
         }
 
         let _ = self.events_tx.send(QueueEvent::StateChanged {
@@ -579,6 +640,10 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
             from,
             to: new_state,
         });
+
+        self.metrics
+            .queue_state_changed("managed", &from.to_string(), &new_state.to_string());
+        info!(%id, %from, to = %new_state, "job state changed");
 
         Ok(())
     }
@@ -649,8 +714,10 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
         }
 
         #[cfg(feature = "sqlite")]
-        if let Some(ref backend) = self.backend {
-            let _ = backend.evict(&to_remove);
+        if let Some(ref backend) = self.backend
+            && let Err(e) = backend.evict(&to_remove)
+        {
+            warn!(error = %e, "sqlite: failed to evict expired jobs");
         }
 
         for id in &to_remove {
@@ -667,7 +734,7 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
 #[cfg(feature = "sqlite")]
 pub mod persistence {
     use rusqlite::Connection;
-    use serde::{de::DeserializeOwned, Serialize};
+    use serde::{Serialize, de::DeserializeOwned};
 
     use super::{JobState, ManagedItem, TaskId};
 
@@ -681,15 +748,13 @@ pub mod persistence {
     impl SqliteBackend {
         /// Open or create a WAL-mode SQLite database at the given path.
         pub fn open(path: &std::path::Path) -> crate::error::Result<Self> {
-            let conn = Connection::open(path)
-                .map_err(crate::error::persistence_err)?;
+            let conn = Connection::open(path).map_err(crate::error::persistence_err)?;
             Self::init(conn)
         }
 
         /// Open an in-memory database (for testing).
         pub fn in_memory() -> crate::error::Result<Self> {
-            let conn = Connection::open_in_memory()
-                .map_err(crate::error::persistence_err)?;
+            let conn = Connection::open_in_memory().map_err(crate::error::persistence_err)?;
             Self::init(conn)
         }
 
@@ -717,16 +782,16 @@ pub mod persistence {
         /// Persist a queued item.
         pub fn persist<T: Serialize>(&self, item: &ManagedItem<T>) -> crate::error::Result<()> {
             let conn = self.conn.lock().unwrap();
-            let payload = serde_json::to_string(&item.payload)
-                .map_err(crate::error::persistence_err)?;
+            let payload =
+                serde_json::to_string(&item.payload).map_err(crate::error::persistence_err)?;
             let resource_req = item
                 .resource_req
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()
                 .map_err(crate::error::persistence_err)?;
-            let state = serde_json::to_string(&item.state)
-                .map_err(crate::error::persistence_err)?;
+            let state =
+                serde_json::to_string(&item.state).map_err(crate::error::persistence_err)?;
             conn.execute(
                 "INSERT OR REPLACE INTO managed_queue (id, priority, state, payload, resource_req)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -743,14 +808,9 @@ pub mod persistence {
         }
 
         /// Update the state of a persisted item.
-        pub fn update_state(
-            &self,
-            id: TaskId,
-            state: JobState,
-        ) -> crate::error::Result<()> {
+        pub fn update_state(&self, id: TaskId, state: JobState) -> crate::error::Result<()> {
             let conn = self.conn.lock().unwrap();
-            let state_str = serde_json::to_string(&state)
-                .map_err(crate::error::persistence_err)?;
+            let state_str = serde_json::to_string(&state).map_err(crate::error::persistence_err)?;
             conn.execute(
                 "UPDATE managed_queue SET state = ?1 WHERE id = ?2",
                 rusqlite::params![state_str, id.to_string()],
@@ -760,9 +820,7 @@ pub mod persistence {
         }
 
         /// Load all non-terminal items (crash recovery).
-        pub fn load_all<T: DeserializeOwned>(
-            &self,
-        ) -> crate::error::Result<Vec<ManagedItem<T>>> {
+        pub fn load_all<T: DeserializeOwned>(&self) -> crate::error::Result<Vec<ManagedItem<T>>> {
             let conn = self.conn.lock().unwrap();
             let mut stmt = conn
                 .prepare(
@@ -777,7 +835,13 @@ pub mod persistence {
                     let state_str: String = row.get(2)?;
                     let payload_str: String = row.get(3)?;
                     let resource_req_str: Option<String> = row.get(4)?;
-                    Ok((id_str, priority_u8, state_str, payload_str, resource_req_str))
+                    Ok((
+                        id_str,
+                        priority_u8,
+                        state_str,
+                        payload_str,
+                        resource_req_str,
+                    ))
                 })
                 .map_err(crate::error::persistence_err)?
                 .collect::<Result<Vec<_>, _>>()
@@ -785,21 +849,13 @@ pub mod persistence {
 
             let mut result = Vec::new();
             for (id_str, priority_u8, state_str, payload_str, resource_req_str) in items {
-                let id: TaskId = id_str
-                    .parse()
-                    .map_err(crate::error::persistence_err)?;
-                let priority = match priority_u8 {
-                    0 => super::Priority::Background,
-                    1 => super::Priority::Low,
-                    2 => super::Priority::Normal,
-                    3 => super::Priority::High,
-                    4 => super::Priority::Critical,
-                    _ => super::Priority::Normal,
-                };
-                let state: JobState = serde_json::from_str(&state_str)
-                    .map_err(crate::error::persistence_err)?;
-                let payload: T = serde_json::from_str(&payload_str)
-                    .map_err(crate::error::persistence_err)?;
+                let id: TaskId = id_str.parse().map_err(crate::error::persistence_err)?;
+                let priority = super::Priority::try_from(priority_u8)
+                    .unwrap_or_default();
+                let state: JobState =
+                    serde_json::from_str(&state_str).map_err(crate::error::persistence_err)?;
+                let payload: T =
+                    serde_json::from_str(&payload_str).map_err(crate::error::persistence_err)?;
                 let resource_req = resource_req_str
                     .as_deref()
                     .map(serde_json::from_str)
@@ -835,7 +891,7 @@ pub mod persistence {
         }
     }
 
-    impl super::ManagedQueue<serde_json::Value> {
+    impl<T: Send + Clone + serde::Serialize + 'static> super::ManagedQueue<T> {
         /// Create a managed queue with SQLite persistence.
         pub fn with_sqlite(
             config: super::ManagedQueueConfig,
@@ -849,6 +905,7 @@ pub mod persistence {
                 running_count: std::sync::atomic::AtomicUsize::new(0),
                 notify: tokio::sync::Notify::new(),
                 events_tx,
+                metrics: std::sync::Arc::new(crate::metrics::NoopMetrics),
                 backend: Some(backend),
             }
         }
@@ -958,9 +1015,7 @@ mod tests {
         let q = Arc::new(ConcurrentPriorityQueue::new());
         let q2 = q.clone();
 
-        let handle = tokio::spawn(async move {
-            q2.dequeue_wait().await.payload
-        });
+        let handle = tokio::spawn(async move { q2.dequeue_wait().await.payload });
 
         // Small delay to ensure the waiter is parked.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -981,7 +1036,8 @@ mod tests {
             let q2 = q.clone();
             handles.push(tokio::spawn(async move {
                 for j in 0..25 {
-                    q2.enqueue(QueueItem::new(Priority::Normal, i * 25 + j)).await;
+                    q2.enqueue(QueueItem::new(Priority::Normal, i * 25 + j))
+                        .await;
                 }
             }));
         }
@@ -1016,7 +1072,8 @@ mod tests {
     async fn managed_priority_ordering() {
         let q = ManagedQueue::new(ManagedQueueConfig::default());
         q.enqueue(Priority::Low, "low".to_string(), None).await;
-        q.enqueue(Priority::Critical, "crit".to_string(), None).await;
+        q.enqueue(Priority::Critical, "crit".to_string(), None)
+            .await;
         q.enqueue(Priority::Normal, "norm".to_string(), None).await;
 
         assert_eq!(q.dequeue_any().await.unwrap().payload, "crit");
@@ -1051,16 +1108,27 @@ mod tests {
         q.enqueue(
             Priority::Critical,
             "big-gpu".to_string(),
-            Some(ResourceReq { gpu_count: 4, vram_mb: 32000 }),
-        ).await;
+            Some(ResourceReq {
+                gpu_count: 4,
+                vram_mb: 32000,
+            }),
+        )
+        .await;
         q.enqueue(
             Priority::Normal,
             "small".to_string(),
-            Some(ResourceReq { gpu_count: 1, vram_mb: 8000 }),
-        ).await;
+            Some(ResourceReq {
+                gpu_count: 1,
+                vram_mb: 8000,
+            }),
+        )
+        .await;
 
         // Small pool: can only fit the small job despite big one being higher priority.
-        let pool = ResourcePool { gpu_count: 1, vram_mb: 8000 };
+        let pool = ResourcePool {
+            gpu_count: 1,
+            vram_mb: 8000,
+        };
         let item = q.dequeue(&pool).await.unwrap();
         assert_eq!(item.payload, "small");
         assert_eq!(q.queued_count().await, 1);
@@ -1089,7 +1157,9 @@ mod tests {
     #[tokio::test]
     async fn managed_cancel_queued() {
         let q = ManagedQueue::new(ManagedQueueConfig::default());
-        let id = q.enqueue(Priority::Normal, "cancel-me".to_string(), None).await;
+        let id = q
+            .enqueue(Priority::Normal, "cancel-me".to_string(), None)
+            .await;
 
         q.cancel(id).await.unwrap();
         assert_eq!(q.get_job(&id).unwrap().state, JobState::Cancelled);
@@ -1099,7 +1169,9 @@ mod tests {
     #[tokio::test]
     async fn managed_cancel_running() {
         let q = ManagedQueue::new(ManagedQueueConfig::default());
-        let id = q.enqueue(Priority::Normal, "cancel-me".to_string(), None).await;
+        let id = q
+            .enqueue(Priority::Normal, "cancel-me".to_string(), None)
+            .await;
         q.dequeue_any().await.unwrap();
 
         q.cancel(id).await.unwrap();
@@ -1110,7 +1182,9 @@ mod tests {
     #[tokio::test]
     async fn managed_fail() {
         let q = ManagedQueue::new(ManagedQueueConfig::default());
-        let id = q.enqueue(Priority::Normal, "fail-me".to_string(), None).await;
+        let id = q
+            .enqueue(Priority::Normal, "fail-me".to_string(), None)
+            .await;
         q.dequeue_any().await.unwrap();
 
         q.fail(id).unwrap();
@@ -1125,7 +1199,9 @@ mod tests {
             finished_ttl: Duration::from_millis(10),
         };
         let q = ManagedQueue::new(config);
-        let id = q.enqueue(Priority::Normal, "evict-me".to_string(), None).await;
+        let id = q
+            .enqueue(Priority::Normal, "evict-me".to_string(), None)
+            .await;
         q.dequeue_any().await.unwrap();
         q.complete(id).unwrap();
 
@@ -1162,7 +1238,9 @@ mod tests {
             ManagedQueueConfig::default(),
             backend.clone(),
         );
-        let _id = q.enqueue(Priority::High, serde_json::json!("test-payload"), None).await;
+        let _id = q
+            .enqueue(Priority::High, serde_json::json!("test-payload"), None)
+            .await;
 
         let loaded = backend.load_all::<serde_json::Value>().unwrap();
         assert_eq!(loaded.len(), 1);
@@ -1213,12 +1291,16 @@ mod tests {
         assert!(loaded.len() >= 2); // id2 (Queued) + id3 (Queued)
 
         // Verify priority round-trip.
-        let low_job = loaded.iter().find(|j| j.payload == serde_json::json!("low-job"));
+        let low_job = loaded
+            .iter()
+            .find(|j| j.payload == serde_json::json!("low-job"));
         assert!(low_job.is_some());
         assert_eq!(low_job.unwrap().priority, Priority::Low);
 
         // Verify resource_req round-trip.
-        let bg_job = loaded.iter().find(|j| j.payload == serde_json::json!("bg-job"));
+        let bg_job = loaded
+            .iter()
+            .find(|j| j.payload == serde_json::json!("bg-job"));
         assert!(bg_job.is_some());
         let req = bg_job.unwrap().resource_req.as_ref().unwrap();
         assert_eq!(req.gpu_count, 2);
@@ -1298,5 +1380,48 @@ mod tests {
     async fn concurrent_priority_queue_default() {
         let q: ConcurrentPriorityQueue<i32> = Default::default();
         assert!(q.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn managed_queue_with_metrics() {
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+        struct TestMetrics {
+            enqueued: AtomicU64,
+            dequeued: AtomicU64,
+            state_changes: AtomicU64,
+        }
+
+        impl crate::metrics::MajraMetrics for TestMetrics {
+            fn queue_enqueued(&self, _name: &str, _priority: u8) {
+                self.enqueued.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            fn queue_dequeued(&self, _name: &str, _priority: u8) {
+                self.dequeued.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            fn queue_state_changed(&self, _name: &str, _from: &str, _to: &str) {
+                self.state_changes.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+
+        let metrics = Arc::new(TestMetrics {
+            enqueued: AtomicU64::new(0),
+            dequeued: AtomicU64::new(0),
+            state_changes: AtomicU64::new(0),
+        });
+
+        let q = ManagedQueue::with_metrics(ManagedQueueConfig::default(), metrics.clone());
+
+        let id = q.enqueue(Priority::Normal, "test".to_string(), None).await;
+        assert_eq!(metrics.enqueued.load(AtomicOrdering::Relaxed), 1);
+
+        q.dequeue_any().await;
+        assert_eq!(metrics.dequeued.load(AtomicOrdering::Relaxed), 1);
+        // Queued→Running = 1 state change from dequeue
+        assert_eq!(metrics.state_changes.load(AtomicOrdering::Relaxed), 1);
+
+        q.complete(id).unwrap();
+        // Running→Completed = another state change
+        assert_eq!(metrics.state_changes.load(AtomicOrdering::Relaxed), 2);
     }
 }

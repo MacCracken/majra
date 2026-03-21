@@ -70,8 +70,13 @@ pub struct Relay {
 }
 
 impl Relay {
-    /// Create a relay for the given node with a custom channel capacity.
-    pub fn new(node_id: impl Into<NodeId>, capacity: usize) -> Self {
+    /// Create a relay for the given node with default capacity (256).
+    pub fn new(node_id: impl Into<NodeId>) -> Self {
+        Self::with_capacity(node_id, DEFAULT_CAPACITY)
+    }
+
+    /// Create a relay with a custom channel capacity.
+    pub fn with_capacity(node_id: impl Into<NodeId>, capacity: usize) -> Self {
         let (tx, _) = broadcast::channel(capacity);
         Self {
             node_id: node_id.into(),
@@ -84,9 +89,10 @@ impl Relay {
         }
     }
 
-    /// Create a relay with default capacity (256).
+    /// Backward-compatible alias for [`Relay::new`].
+    #[deprecated(note = "use Relay::new() instead")]
     pub fn with_defaults(node_id: impl Into<NodeId>) -> Self {
-        Self::new(node_id, DEFAULT_CAPACITY)
+        Self::new(node_id)
     }
 
     /// Send a message to a specific node. Returns the sequence number.
@@ -183,7 +189,7 @@ mod tests {
 
     #[test]
     fn send_increments_seq() {
-        let relay = Relay::with_defaults("node-1");
+        let relay = Relay::new("node-1");
         let s1 = relay.send("node-2", "test", serde_json::Value::Null);
         let s2 = relay.send("node-2", "test", serde_json::Value::Null);
         assert_eq!(s1, 1);
@@ -192,7 +198,7 @@ mod tests {
 
     #[test]
     fn dedup_drops_old_seq() {
-        let relay = Relay::with_defaults("node-1");
+        let relay = Relay::new("node-1");
 
         let msg = RelayMessage {
             seq: 5,
@@ -221,7 +227,7 @@ mod tests {
 
     #[test]
     fn skips_own_messages() {
-        let relay = Relay::with_defaults("node-1");
+        let relay = Relay::new("node-1");
         let msg = RelayMessage {
             seq: 1,
             from: "node-1".into(),
@@ -235,7 +241,7 @@ mod tests {
 
     #[test]
     fn skips_messages_for_other_nodes() {
-        let relay = Relay::with_defaults("node-1");
+        let relay = Relay::new("node-1");
         let msg = RelayMessage {
             seq: 1,
             from: "node-2".into(),
@@ -249,7 +255,7 @@ mod tests {
 
     #[test]
     fn broadcast_reaches_all() {
-        let relay = Relay::with_defaults("node-1");
+        let relay = Relay::new("node-1");
         let msg = RelayMessage {
             seq: 1,
             from: "node-2".into(),
@@ -267,7 +273,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let relay = Arc::new(Relay::with_defaults("node-1"));
+        let relay = Arc::new(Relay::new("node-1"));
         let mut handles = Vec::new();
 
         for sender_idx in 0..4 {

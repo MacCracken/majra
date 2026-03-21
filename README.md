@@ -123,7 +123,7 @@ assert_eq!(q.dequeue().unwrap().payload, "urgent-task");
 ```rust
 use majra::relay::Relay;
 
-let relay = Relay::with_defaults("node-1");
+let relay = Relay::new("node-1");
 let mut rx = relay.subscribe();
 
 relay.broadcast("announce", serde_json::json!({"joined": true}));

@@ -43,6 +43,16 @@ pub enum Status {
     Offline,
 }
 
+impl std::fmt::Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Online => write!(f, "online"),
+            Self::Suspect => write!(f, "suspect"),
+            Self::Offline => write!(f, "offline"),
+        }
+    }
+}
+
 /// Structured GPU telemetry data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuTelemetry {
@@ -430,7 +440,9 @@ impl ConcurrentHeartbeatTracker {
 
     /// Get a node's current state (cloned).
     pub fn get(&self, id: &str) -> Option<NodeState> {
-        self.nodes.get(id).map(|entry| entry.value().to_node_state())
+        self.nodes
+            .get(id)
+            .map(|entry| entry.value().to_node_state())
     }
 
     /// Get a node's GPU telemetry (cloned).
@@ -656,11 +668,7 @@ mod tests {
     #[test]
     fn register_with_telemetry() {
         let tracker = ConcurrentHeartbeatTracker::default();
-        tracker.register_with_telemetry(
-            "gpu-node",
-            serde_json::Value::Null,
-            vec![sample_gpu()],
-        );
+        tracker.register_with_telemetry("gpu-node", serde_json::Value::Null, vec![sample_gpu()]);
 
         let tel = tracker.get_gpu_telemetry("gpu-node").unwrap();
         assert_eq!(tel.len(), 1);

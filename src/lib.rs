@@ -30,6 +30,9 @@ pub mod error;
 pub mod metrics;
 pub(crate) mod util;
 
+#[cfg(feature = "logging")]
+pub mod logging;
+
 #[cfg(feature = "pubsub")]
 pub mod pubsub;
 

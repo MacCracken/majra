@@ -23,15 +23,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RateLimitStats` — `total_allowed`, `total_rejected`, `active_keys`, `total_evicted` counters
 - `stats()` method for runtime observability
 
-#### Observability
+#### Observability & logging
 - `metrics` module — `MajraMetrics` trait with no-op default (`NoopMetrics`), covering queue, pubsub, heartbeat, rate limiter, relay, and barrier operations
-- Structured `#[instrument]` tracing spans on `ManagedQueue` key methods (enqueue, dequeue, state transitions)
+- `ManagedQueue::with_metrics()` — accept custom `Arc<dyn MajraMetrics>` for enqueue/dequeue/state-change reporting
+- `logging` feature — structured tracing initialisation via `MAJRA_LOG` env var with per-module filtering
+- `info!`-level tracing on ManagedQueue lifecycle events (enqueue, dequeue, state transitions)
+- `debug!`-level tracing on heartbeat transitions, evictions, relay sends, rate limiter eviction
+- `trace!`-level tracing on per-message pubsub delivery and relay dedup
+- Structured `#[instrument]` spans on ManagedQueue enqueue, dequeue, and finish_job
 
 #### Distributed primitives
-- `AsyncBarrierSet` — barrier with `arrive_and_wait()` returning a `Future` that resolves on release
+- `AsyncBarrierSet` — barrier with `arrive_and_wait()` returning a `Future` that resolves on release, with `AtomicBool` release flag to prevent missed wakeups
 - `transport` module — `Transport` trait for pluggable relay connections (Unix socket, TCP, future gRPC)
 - `TransportFactory` trait — endpoint-based connection creation
 - `ConnectionPool` — multiplexed connection pool with per-endpoint reuse and automatic cleanup of disconnected transports
+
+#### Code quality
+- `#[non_exhaustive]` on all public enums (8 types)
+- `#[must_use]` on `PriorityQueue`, `ConcurrentPriorityQueue`, `RateLimiter`
+- `///` doc comments on every public item — `cargo doc -W missing_docs` passes
+- `Counter` and `evict_from_dashmap` utilities in `util` module to eliminate boilerplate
+- `barrier_status()` and `classify_status()` helpers to deduplicate release-check and status-classification logic
+- `persistence_err()` helper to replace 14 repeated `.map_err()` calls in SQLite module
+- `ConcurrentBarrierSet` consolidated as type alias for `AsyncBarrierSet`
+- `IpcClient` consolidated as type alias for `IpcConnection`
+
+#### Repository infrastructure
+- GitHub Actions CI (10-job pipeline: lint, test 3 platforms, MSRV, coverage, benchmarks, security audit, cargo-deny, semver check, docs)
+- GitHub Actions release workflow (CI gate → version check → crates.io publish → GitHub Release)
+- LICENSE (AGPL-3.0-only), CONTRIBUTING.md, SECURITY.md, CODE_OF_CONDUCT.md
+- Makefile with `make check` (fmt + clippy + test + audit)
+- `deny.toml` (license allowlist, advisory checks, source restrictions)
+- `codecov.yml` (80% project target, 75% patch)
+- `rust-toolchain.toml` (stable + rustfmt + clippy)
+- Fuzz targets (queue, pubsub, heartbeat) with libfuzzer
+- `supply-chain/` (cargo-vet config + audits)
+- `scripts/version-bump.sh` (atomic VERSION + Cargo.toml + Cargo.lock update)
+- Architecture overview, threat model, testing guide documentation
+- Integration tests (5 multi-module scenarios)
+- Benchmarks for all modules (25 benchmarks total)
+
+### Changed
+- `matches_pattern()` rewritten from recursive Vec-allocating to iterative zero-allocation with inline depth tracking
+- `ManagedQueue::dequeue()` restructured to release tiers lock before DashMap mutation, eliminating nested lock contention
+- `ManagedQueue::cancel()` drops DashMap guard before awaiting tiers lock, preventing cross-await lock holding
+- `ManagedQueue::dequeue()` only increments `running_count` and emits events when a job is actually found
+- `IPC write_frame` uses `u32::try_from` instead of `as u32` to prevent silent truncation on >4 GiB payloads
+- `BarrierRecord::forced` now correctly tracks whether `force()` was called via `was_forced` field
+- `RateLimiter::Bucket` merged redundant `last_refill`/`last_check` into single `last_access` field
+- `ConnectionPool::acquire()` drops lock before async connect to avoid blocking all pool access during I/O
+
+### Fixed
+- `AsyncBarrierSet::arrive_and_wait()` missed-wakeup race — added `AtomicBool` released flag checked in wait loop
+- `TypedPubSub::publish()` `delivered` counter no longer counts dropped messages under `DropNewest` policy
+- SQLite `persist()` no longer panics on `resource_req` serialisation failure (replaced `.unwrap()` with `.map_err()`)
+- Removed dead `From<rusqlite::Error>` impl that duplicated `persistence_err()` helper
+- SQLite `persist()` no longer stores meaningless `Instant::elapsed()` duration as `enqueued_at`
+- Integration tests properly feature-gated with `#[cfg(feature = "...")]` for `--no-default-features` compatibility
 
 ## [0.21.3] - 2026-03-21
 

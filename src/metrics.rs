@@ -147,9 +147,6 @@ mod tests {
         };
         m.queue_enqueued("test", 2);
         m.queue_enqueued("test", 3);
-        assert_eq!(
-            m.enqueued.load(std::sync::atomic::Ordering::Relaxed),
-            2
-        );
+        assert_eq!(m.enqueued.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 }

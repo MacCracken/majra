@@ -99,7 +99,8 @@ impl PubSub {
     /// Publish a message to a concrete topic.
     ///
     /// The message is delivered to every subscription whose pattern matches.
-    pub fn publish(&self, topic: &str, payload: serde_json::Value) {
+    /// Returns the number of subscriptions the message was delivered to.
+    pub fn publish(&self, topic: &str, payload: serde_json::Value) -> usize {
         let msg = TopicMessage {
             topic: topic.to_string(),
             payload,
@@ -116,6 +117,7 @@ impl PubSub {
 
         self.messages_published.inc();
         trace!(topic, delivered, "published");
+        delivered
     }
 
     /// Remove all subscriptions for a pattern.
@@ -241,7 +243,10 @@ impl<T: Clone + Send + Sync + 'static> TypedPubSub<T> {
         &self,
         pattern: &str,
         filter: Option<SubscriptionFilter<T>>,
-    ) -> (broadcast::Sender<TypedMessage<T>>, broadcast::Receiver<TypedMessage<T>>) {
+    ) -> (
+        broadcast::Sender<TypedMessage<T>>,
+        broadcast::Receiver<TypedMessage<T>>,
+    ) {
         let (tx, rx) = broadcast::channel(self.config.channel_capacity);
         let sub = TypedSubscription {
             sender: tx.clone(),
@@ -274,10 +279,7 @@ impl<T: Clone + Send + Sync + 'static> TypedPubSub<T> {
 
         // Store in replay buffer if enabled.
         if self.config.replay_capacity > 0 {
-            let mut buf = self
-                .replay_buffer
-                .entry(msg.topic.clone())
-                .or_default();
+            let mut buf = self.replay_buffer.entry(msg.topic.clone()).or_default();
             buf.push_back(msg.clone());
             while buf.len() > self.config.replay_capacity {
                 buf.pop_front();
@@ -350,12 +352,14 @@ impl<T: Clone + Send + Sync + 'static> Default for TypedPubSub<T> {
 // Also implement Serialize/Deserialize bridge for TypedMessage when T supports it.
 impl<T: Clone + Send + Sync + Serialize + 'static> TypedMessage<T> {
     /// Convert to an untyped `TopicMessage` by serializing the payload to JSON.
-    pub fn to_untyped(&self) -> TopicMessage {
-        TopicMessage {
+    ///
+    /// Returns `Err` if the payload cannot be serialized.
+    pub fn to_untyped(&self) -> Result<TopicMessage, serde_json::Error> {
+        Ok(TopicMessage {
             topic: self.topic.clone(),
-            payload: serde_json::to_value(&self.payload).unwrap_or_default(),
+            payload: serde_json::to_value(&self.payload)?,
             timestamp: self.timestamp,
-        }
+        })
     }
 }
 
@@ -392,7 +396,11 @@ pub fn matches_pattern(pattern: &str, topic: &str) -> bool {
                 // "#" matches remaining segments — but enforce depth limit.
                 // depth = segments matched so far. Add 1 for the current
                 // topic segment (if any) plus remaining topic segments.
-                let remaining = if top_seg.is_some() { 1 + top.count() } else { 0 };
+                let remaining = if top_seg.is_some() {
+                    1 + top.count()
+                } else {
+                    0
+                };
                 return depth + remaining < MAX_MATCH_DEPTH;
             }
             (Some("*"), Some(_)) => {
@@ -649,7 +657,7 @@ mod tests {
             },
             timestamp: Utc::now(),
         };
-        let untyped = msg.to_untyped();
+        let untyped = msg.to_untyped().unwrap();
         assert_eq!(untyped.payload["value"], 99);
 
         let back = TypedMessage::<TestEvent>::from_untyped(&untyped).unwrap();

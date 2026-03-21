@@ -213,7 +213,7 @@ fn rate_limiter_lifecycle() {
 fn relay_concurrent_dedup() {
     use majra::relay::{Relay, RelayMessage};
 
-    let relay = Arc::new(Relay::with_defaults("receiver"));
+    let relay = Arc::new(Relay::new("receiver"));
     let mut handles = Vec::new();
 
     for sender_idx in 0..4 {

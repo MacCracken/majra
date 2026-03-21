@@ -8,8 +8,9 @@
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use tracing::debug;
 
-use crate::util::{evict_from_dashmap, Counter};
+use crate::util::{Counter, evict_from_dashmap};
 
 /// State for a single key's bucket.
 struct Bucket {
@@ -96,11 +97,13 @@ impl RateLimiter {
     /// Returns the number of keys evicted.
     pub fn evict_stale(&self, max_idle: Duration) -> usize {
         let now = Instant::now();
-        let count =
-            evict_from_dashmap(&self.buckets, |_key, bucket| {
-                now.duration_since(bucket.last_access) >= max_idle
-            });
+        let count = evict_from_dashmap(&self.buckets, |_key, bucket| {
+            now.duration_since(bucket.last_access) >= max_idle
+        });
         self.total_evicted.add(count as u64);
+        if count > 0 {
+            debug!(count, "ratelimit: evicted stale keys");
+        }
         count
     }
 

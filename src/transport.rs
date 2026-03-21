@@ -80,13 +80,12 @@ impl ConnectionPool {
         if pool.len() >= self.max_per_endpoint {
             // Another task filled the pool while we were connecting.
             let _ = transport.close().await;
-            return pool
-                .last()
-                .cloned()
-                .ok_or_else(|| MajraError::CapacityExceeded(format!(
+            return pool.last().cloned().ok_or_else(|| {
+                MajraError::CapacityExceeded(format!(
                     "max connections ({}) reached for {endpoint}",
                     self.max_per_endpoint
-                )));
+                ))
+            });
         }
 
         pool.push(transport.clone());
