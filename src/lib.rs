@@ -28,6 +28,7 @@
 pub mod envelope;
 pub mod error;
 pub mod metrics;
+#[allow(dead_code)]
 pub(crate) mod util;
 
 #[cfg(feature = "logging")]
