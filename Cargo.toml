@@ -1,0 +1,49 @@
+[package]
+name = "majra"
+version = "0.21.0"
+edition = "2024"
+rust-version = "1.89"
+license = "AGPL-3.0-only"
+description = "Distributed queue & multiplex engine — pub/sub, priority queues, relay, IPC, heartbeat, and rate limiting for Rust"
+homepage = "https://github.com/MacCracken/majra"
+repository = "https://github.com/MacCracken/majra"
+readme = "README.md"
+documentation = "https://docs.rs/majra"
+keywords = ["queue", "pubsub", "relay", "ipc", "distributed"]
+categories = ["asynchronous", "concurrency", "network-programming"]
+exclude = [".claude/", "target/"]
+
+[features]
+default = ["pubsub", "queue", "relay", "heartbeat"]
+pubsub = []
+queue = []
+relay = []
+ipc = ["dep:tokio-util"]
+heartbeat = []
+ratelimit = []
+barrier = []
+full = ["pubsub", "queue", "relay", "ipc", "heartbeat", "ratelimit", "barrier"]
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+dashmap = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time", "net", "macros", "rt", "io-util"] }
+tokio-util = { version = "0.7", optional = true }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1"
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[[bench]]
+name = "pubsub"
+harness = false
+
+[[bench]]
+name = "queue"
+harness = false

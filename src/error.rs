@@ -1,0 +1,51 @@
+//! Shared error types for majra.
+
+use thiserror::Error;
+
+/// Top-level error type for majra operations.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum MajraError {
+    #[error("queue: {0}")]
+    Queue(String),
+
+    #[error("pubsub: {0}")]
+    PubSub(String),
+
+    #[error("relay: {0}")]
+    Relay(String),
+
+    #[error("ipc: {0}")]
+    Ipc(#[from] IpcError),
+
+    #[error("heartbeat: {0}")]
+    Heartbeat(String),
+
+    #[error("barrier: {0}")]
+    Barrier(String),
+
+    #[error("dag cycle detected: {0}")]
+    DagCycle(String),
+
+    #[error("capacity exceeded: {0}")]
+    CapacityExceeded(String),
+}
+
+/// IPC-specific errors.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum IpcError {
+    #[error("frame too large: {size} bytes (max {max})")]
+    FrameTooLarge { size: u32, max: u32 },
+
+    #[error("connection closed")]
+    ConnectionClosed,
+
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+pub type Result<T> = std::result::Result<T, MajraError>;
