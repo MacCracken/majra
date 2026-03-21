@@ -17,7 +17,6 @@
 //! ```
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::util::Counter;
@@ -71,7 +70,7 @@ pub struct TopicMessage {
 pub struct PubSub {
     subscriptions: DashMap<String, broadcast::Sender<TopicMessage>>,
     capacity: usize,
-    messages_published: AtomicUsize,
+    messages_published: Counter,
 }
 
 impl PubSub {
@@ -85,7 +84,7 @@ impl PubSub {
         Self {
             subscriptions: DashMap::new(),
             capacity,
-            messages_published: AtomicUsize::new(0),
+            messages_published: Counter::new(),
         }
     }
 
@@ -116,7 +115,7 @@ impl PubSub {
             }
         }
 
-        self.messages_published.fetch_add(1, Ordering::Relaxed);
+        self.messages_published.inc();
         trace!(topic, delivered, "published");
     }
 
@@ -131,8 +130,8 @@ impl PubSub {
     }
 
     /// Total messages published since creation.
-    pub fn messages_published(&self) -> usize {
-        self.messages_published.load(Ordering::Relaxed)
+    pub fn messages_published(&self) -> u64 {
+        self.messages_published.get()
     }
 }
 
@@ -297,20 +296,18 @@ impl<T: Clone + Send + Sync + 'static> TypedPubSub<T> {
 
                     match self.config.backpressure {
                         BackpressurePolicy::DropOldest => {
-                            // Default broadcast behaviour — oldest messages are dropped
-                            // when the channel is full.
                             let _ = sub.sender.send(msg.clone());
+                            delivered += 1;
                         }
                         BackpressurePolicy::DropNewest => {
-                            // Only send if there's capacity (receiver count > 0 and not full).
                             if sub.sender.len() < self.config.channel_capacity {
                                 let _ = sub.sender.send(msg.clone());
+                                delivered += 1;
                             } else {
                                 self.messages_dropped.inc();
                             }
                         }
                     }
-                    delivered += 1;
                 }
             }
         }
@@ -385,23 +382,24 @@ impl<T: Clone + Send + Sync + DeserializeOwned + 'static> TypedMessage<T> {
 /// - `*` matches exactly one segment
 /// - `#` matches zero or more trailing segments (must be last)
 pub fn matches_pattern(pattern: &str, topic: &str) -> bool {
-    let pat_segs: Vec<&str> = pattern.split('/').collect();
-    let top_segs: Vec<&str> = topic.split('/').collect();
-
-    if pat_segs.len() > MAX_MATCH_DEPTH || top_segs.len() > MAX_MATCH_DEPTH {
+    // Depth guard — count segments without allocating.
+    if pattern.split('/').count() > MAX_MATCH_DEPTH
+        || topic.split('/').count() > MAX_MATCH_DEPTH
+    {
         return false;
     }
 
-    matches_recursive(&pat_segs, &top_segs)
-}
+    let mut pat = pattern.split('/');
+    let mut top = topic.split('/');
 
-fn matches_recursive(pattern: &[&str], topic: &[&str]) -> bool {
-    match (pattern.first(), topic.first()) {
-        (None, None) => true,
-        (Some(&"#"), _) => true,
-        (Some(&"*"), Some(_)) => matches_recursive(&pattern[1..], &topic[1..]),
-        (Some(p), Some(t)) if p == t => matches_recursive(&pattern[1..], &topic[1..]),
-        _ => false,
+    loop {
+        match (pat.next(), top.next()) {
+            (None, None) => return true,
+            (Some("#"), _) => return true,
+            (Some("*"), Some(_)) => continue,
+            (Some(p), Some(t)) if p == t => continue,
+            _ => return false,
+        }
     }
 }
 
@@ -559,8 +557,6 @@ mod tests {
             replay_capacity: 3,
             ..Default::default()
         };
-        let hub = TypedPubSub::<TestEvent>::new();
-        // Need to create with config.
         let hub = TypedPubSub::<TestEvent>::with_config(config);
 
         // Publish before subscribing.

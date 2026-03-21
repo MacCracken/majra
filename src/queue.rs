@@ -448,10 +448,14 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
                 let id = tier.remove(idx).unwrap();
                 drop(tiers);
 
-                if let Some(mut job) = self.jobs.get_mut(&id) {
+                let result = if let Some(mut job) = self.jobs.get_mut(&id) {
                     job.state = JobState::Running;
                     job.started_at = Some(Instant::now());
-                }
+                    Some(job.clone())
+                } else {
+                    None
+                };
+
                 self.running_count.fetch_add(1, Ordering::Relaxed);
 
                 #[cfg(feature = "sqlite")]
@@ -466,7 +470,7 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
                     to: JobState::Running,
                 });
 
-                return self.jobs.get(&id).map(|j| j.value().clone());
+                return result;
             }
         }
 
@@ -623,14 +627,14 @@ pub mod persistence {
         /// Open or create a WAL-mode SQLite database at the given path.
         pub fn open(path: &std::path::Path) -> crate::error::Result<Self> {
             let conn = Connection::open(path)
-                .map_err(|e| crate::error::MajraError::Persistence(e.to_string()))?;
+                .map_err(crate::error::persistence_err)?;
             Self::init(conn)
         }
 
         /// Open an in-memory database (for testing).
         pub fn in_memory() -> crate::error::Result<Self> {
             let conn = Connection::open_in_memory()
-                .map_err(|e| crate::error::MajraError::Persistence(e.to_string()))?;
+                .map_err(crate::error::persistence_err)?;
             Self::init(conn)
         }
 
@@ -649,7 +653,7 @@ pub mod persistence {
                      finished_at INTEGER
                  );",
             )
-            .map_err(|e| crate::error::MajraError::Persistence(e.to_string()))?;
+            ?;
             Ok(Self {
                 conn: std::sync::Mutex::new(conn),
             })
@@ -659,13 +663,13 @@ pub mod persistence {
         pub fn persist<T: Serialize>(&self, item: &ManagedItem<T>) -> crate::error::Result<()> {
             let conn = self.conn.lock().unwrap();
             let payload = serde_json::to_string(&item.payload)
-                .map_err(|e| crate::error::MajraError::Persistence(e.to_string()))?;
+                .map_err(crate::error::persistence_err)?;
             let resource_req = item
                 .resource_req
                 .as_ref()
                 .map(|r| serde_json::to_string(r).unwrap());
             let state = serde_json::to_string(&item.state)
-                .map_err(|e| crate::error::MajraError::Persistence(e.to_string()))?;
+                .map_err(crate::error::persistence_err)?;
             conn.execute(
                 "INSERT OR REPLACE INTO managed_queue (id, priority, state, payload, resource_req, enqueued_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -678,7 +682,7 @@ pub mod persistence {
                     item.enqueued_at.map(|i| i.elapsed().as_secs() as i64),
                 ],
             )
-            .map_err(|e| crate::error::MajraError::Persistence(e.to_string()))?;
+            .map_err(crate::error::persistence_err)?;
             Ok(())
         }
 
@@ -690,12 +694,12 @@ pub mod persistence {
         ) -> crate::error::Result<()> {
             let conn = self.conn.lock().unwrap();
             let state_str = serde_json::to_string(&state)
-                .map_err(|e| crate::error::MajraError::Persistence(e.to_string()))?;
+                .map_err(crate::error::persistence_err)?;
             conn.execute(
                 "UPDATE managed_queue SET state = ?1 WHERE id = ?2",
                 rusqlite::params![state_str, id.to_string()],
             )
-            .map_err(|e| crate::error::MajraError::Persistence(e.to_string()))?;
+            .map_err(crate::error::persistence_err)?;
             Ok(())
         }
 
@@ -709,7 +713,7 @@ pub mod persistence {
                     "SELECT id, priority, state, payload, resource_req FROM managed_queue
                      WHERE state IN ('\"queued\"', '\"running\"')",
                 )
-                .map_err(|e| crate::error::MajraError::Persistence(e.to_string()))?;
+                .map_err(crate::error::persistence_err)?;
             let items = stmt
                 .query_map([], |row| {
                     let id_str: String = row.get(0)?;
@@ -719,15 +723,15 @@ pub mod persistence {
                     let resource_req_str: Option<String> = row.get(4)?;
                     Ok((id_str, priority_u8, state_str, payload_str, resource_req_str))
                 })
-                .map_err(|e| crate::error::MajraError::Persistence(e.to_string()))?
+                .map_err(crate::error::persistence_err)?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| crate::error::MajraError::Persistence(e.to_string()))?;
+                .map_err(crate::error::persistence_err)?;
 
             let mut result = Vec::new();
             for (id_str, priority_u8, state_str, payload_str, resource_req_str) in items {
                 let id: TaskId = id_str
                     .parse()
-                    .map_err(|e: uuid::Error| crate::error::MajraError::Persistence(e.to_string()))?;
+                    .map_err(crate::error::persistence_err)?;
                 let priority = match priority_u8 {
                     0 => super::Priority::Background,
                     1 => super::Priority::Low,
@@ -737,14 +741,14 @@ pub mod persistence {
                     _ => super::Priority::Normal,
                 };
                 let state: JobState = serde_json::from_str(&state_str)
-                    .map_err(|e| crate::error::MajraError::Persistence(e.to_string()))?;
+                    .map_err(crate::error::persistence_err)?;
                 let payload: T = serde_json::from_str(&payload_str)
-                    .map_err(|e| crate::error::MajraError::Persistence(e.to_string()))?;
+                    .map_err(crate::error::persistence_err)?;
                 let resource_req = resource_req_str
                     .as_deref()
                     .map(serde_json::from_str)
                     .transpose()
-                    .map_err(|e| crate::error::MajraError::Persistence(e.to_string()))?;
+                    .map_err(crate::error::persistence_err)?;
 
                 result.push(ManagedItem {
                     id,
@@ -769,7 +773,7 @@ pub mod persistence {
                     "DELETE FROM managed_queue WHERE id = ?1",
                     rusqlite::params![id.to_string()],
                 )
-                .map_err(|e| crate::error::MajraError::Persistence(e.to_string()))?;
+                .map_err(crate::error::persistence_err)?;
             }
             Ok(())
         }

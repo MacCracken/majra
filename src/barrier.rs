@@ -27,6 +27,7 @@ pub enum BarrierResult {
 struct BarrierState {
     expected: HashSet<String>,
     arrived: HashSet<String>,
+    was_forced: bool,
 }
 
 /// Manages multiple named barriers.
@@ -57,6 +58,7 @@ impl BarrierSet {
             BarrierState {
                 expected: participants,
                 arrived: HashSet::new(),
+                was_forced: false,
             },
         );
     }
@@ -90,6 +92,7 @@ impl BarrierSet {
 
         state.expected.remove(dead_participant);
         state.arrived.remove(dead_participant);
+        state.was_forced = true;
 
         if state.arrived.is_superset(&state.expected) {
             BarrierResult::Released
@@ -104,11 +107,10 @@ impl BarrierSet {
     /// Remove a completed barrier and return a record.
     pub fn complete(&mut self, barrier_name: &str) -> Option<BarrierRecord> {
         let state = self.barriers.remove(barrier_name)?;
-        let forced = !state.arrived.is_superset(&state.expected);
         Some(BarrierRecord {
             name: barrier_name.to_string(),
             participants: state.arrived.into_iter().collect(),
-            forced,
+            forced: state.was_forced,
         })
     }
 
@@ -140,13 +142,14 @@ struct AsyncBarrierState {
     expected: HashSet<String>,
     arrived: HashSet<String>,
     notify: Arc<Notify>,
+    was_forced: bool,
 }
 
-/// Thread-safe barrier set where `arrive()` returns a future that resolves
-/// when the barrier releases.
+/// Thread-safe barrier set with async support.
 ///
-/// Unlike [`ConcurrentBarrierSet`], callers can `.await` the barrier release
-/// instead of polling for `BarrierResult::Released`.
+/// Supports both sync `arrive()` (returns [`BarrierResult`]) and async
+/// `arrive_and_wait()` (blocks until the barrier releases).
+/// Also available as the type alias [`ConcurrentBarrierSet`].
 pub struct AsyncBarrierSet {
     barriers: DashMap<String, AsyncBarrierState>,
 }
@@ -166,6 +169,7 @@ impl AsyncBarrierSet {
                 expected: participants,
                 arrived: HashSet::new(),
                 notify: Arc::new(Notify::new()),
+                was_forced: false,
             },
         );
     }
@@ -228,6 +232,7 @@ impl AsyncBarrierSet {
 
         state.expected.remove(dead_participant);
         state.arrived.remove(dead_participant);
+        state.was_forced = true;
 
         if state.arrived.is_superset(&state.expected) {
             state.notify.notify_waiters();
@@ -243,11 +248,10 @@ impl AsyncBarrierSet {
     /// Remove a completed barrier and return a record.
     pub fn complete(&self, barrier_name: &str) -> Option<BarrierRecord> {
         let (_, state) = self.barriers.remove(barrier_name)?;
-        let forced = !state.arrived.is_superset(&state.expected);
         Some(BarrierRecord {
             name: barrier_name.to_string(),
             participants: state.arrived.into_iter().collect(),
-            forced,
+            forced: state.was_forced,
         })
     }
 

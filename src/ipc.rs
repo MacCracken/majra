@@ -35,11 +35,19 @@ impl IpcServer {
 }
 
 /// A bidirectional IPC connection.
+///
+/// Used for both server-accepted and client-initiated connections.
 pub struct IpcConnection {
     stream: UnixStream,
 }
 
 impl IpcConnection {
+    /// Connect to a Unix socket path (client-side).
+    pub async fn connect(path: &std::path::Path) -> Result<Self> {
+        let stream = UnixStream::connect(path).await?;
+        Ok(Self { stream })
+    }
+
     /// Send a JSON value as a length-prefixed frame.
     pub async fn send(&mut self, payload: &serde_json::Value) -> Result<()> {
         write_frame(&mut self.stream, payload).await
@@ -51,28 +59,8 @@ impl IpcConnection {
     }
 }
 
-/// An outbound IPC client.
-pub struct IpcClient {
-    stream: UnixStream,
-}
-
-impl IpcClient {
-    /// Connect to a Unix socket path.
-    pub async fn connect(path: &std::path::Path) -> Result<Self> {
-        let stream = UnixStream::connect(path).await?;
-        Ok(Self { stream })
-    }
-
-    /// Send a JSON value.
-    pub async fn send(&mut self, payload: &serde_json::Value) -> Result<()> {
-        write_frame(&mut self.stream, payload).await
-    }
-
-    /// Receive a JSON value.
-    pub async fn recv(&mut self) -> Result<serde_json::Value> {
-        read_frame(&mut self.stream).await
-    }
-}
+/// Backward-compatible alias — use [`IpcConnection`] directly.
+pub type IpcClient = IpcConnection;
 
 async fn write_frame(stream: &mut UnixStream, payload: &serde_json::Value) -> Result<()> {
     let data = serde_json::to_vec(payload)?;

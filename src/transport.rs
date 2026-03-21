@@ -60,21 +60,34 @@ impl ConnectionPool {
         let mut conns = self.connections.lock().await;
         let pool = conns.entry(endpoint.to_string()).or_default();
 
-        // Try to reuse an existing connected transport.
+        // Reuse an existing connected transport.
         pool.retain(|t| t.is_connected());
         if let Some(transport) = pool.last() {
             return Ok(transport.clone());
         }
 
-        // Create a new one.
-        if pool.len() >= self.max_per_endpoint {
-            return Err(MajraError::CapacityExceeded(format!(
-                "max connections ({}) reached for {endpoint}",
-                self.max_per_endpoint
-            )));
-        }
+        // No connected transports. Drop the lock before doing async I/O.
+        drop(conns);
 
         let transport: Arc<dyn Transport> = Arc::from(self.factory.connect(endpoint).await?);
+
+        // Re-acquire and insert.
+        let mut conns = self.connections.lock().await;
+        let pool = conns.entry(endpoint.to_string()).or_default();
+        pool.retain(|t| t.is_connected());
+
+        if pool.len() >= self.max_per_endpoint {
+            // Another task filled the pool while we were connecting.
+            let _ = transport.close().await;
+            return pool
+                .last()
+                .cloned()
+                .ok_or_else(|| MajraError::CapacityExceeded(format!(
+                    "max connections ({}) reached for {endpoint}",
+                    self.max_per_endpoint
+                )));
+        }
+
         pool.push(transport.clone());
         Ok(transport)
     }

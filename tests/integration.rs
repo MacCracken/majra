@@ -1,5 +1,7 @@
 //! Integration tests — multi-module scenarios simulating real consumer patterns.
 
+#![allow(unused_imports)]
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,6 +9,7 @@ use std::time::Duration;
 /// Simulates an Ifran-like training job lifecycle:
 /// ManagedQueue (job scheduling) + ConcurrentHeartbeatTracker (fleet health) +
 /// TypedPubSub (event broadcasting) + AsyncBarrierSet (distributed sync).
+#[cfg(all(feature = "queue", feature = "heartbeat", feature = "pubsub"))]
 #[tokio::test]
 async fn training_job_lifecycle() {
     use majra::heartbeat::{ConcurrentHeartbeatTracker, GpuTelemetry, HeartbeatConfig, Status};
@@ -106,6 +109,7 @@ async fn training_job_lifecycle() {
 
 /// Tests TypedPubSub + fleet heartbeat interaction:
 /// publish GPU events, subscribe with filters, verify delivery.
+#[cfg(feature = "pubsub")]
 #[tokio::test]
 async fn typed_pubsub_fleet_events() {
     use majra::pubsub::{TypedPubSub, TypedPubSubConfig};
@@ -147,6 +151,7 @@ async fn typed_pubsub_fleet_events() {
 }
 
 /// Tests async barrier with concurrent participants.
+#[cfg(feature = "barrier")]
 #[tokio::test]
 async fn async_barrier_multi_worker() {
     use majra::barrier::AsyncBarrierSet;
@@ -174,6 +179,7 @@ async fn async_barrier_multi_worker() {
 }
 
 /// Tests rate limiter stats and eviction.
+#[cfg(feature = "ratelimit")]
 #[test]
 fn rate_limiter_lifecycle() {
     use majra::ratelimit::RateLimiter;
@@ -202,6 +208,7 @@ fn rate_limiter_lifecycle() {
 }
 
 /// Tests relay dedup under concurrent senders.
+#[cfg(feature = "relay")]
 #[test]
 fn relay_concurrent_dedup() {
     use majra::relay::{Relay, RelayMessage};

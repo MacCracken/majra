@@ -54,3 +54,7 @@ harness = false
 [[bench]]
 name = "concurrent"
 harness = false
+
+[[example]]
+name = "managed_queue"
+required-features = ["queue", "ratelimit"]

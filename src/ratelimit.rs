@@ -14,8 +14,8 @@ use crate::util::{evict_from_dashmap, Counter};
 /// State for a single key's bucket.
 struct Bucket {
     tokens: f64,
-    last_refill: Instant,
-    last_check: Instant,
+    /// Last time this bucket was accessed (used for both refill and staleness eviction).
+    last_access: Instant,
 }
 
 /// Rate limiter usage statistics.
@@ -67,17 +67,14 @@ impl RateLimiter {
 
         let mut entry = self.buckets.entry(key.to_string()).or_insert(Bucket {
             tokens: burst,
-            last_refill: now,
-            last_check: now,
+            last_access: now,
         });
 
         let bucket = entry.value_mut();
 
-        // Refill based on elapsed time.
-        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        let elapsed = now.duration_since(bucket.last_access).as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * self.rate).min(burst);
-        bucket.last_refill = now;
-        bucket.last_check = now;
+        bucket.last_access = now;
 
         if bucket.tokens >= 1.0 {
             bucket.tokens -= 1.0;
@@ -101,7 +98,7 @@ impl RateLimiter {
         let now = Instant::now();
         let count =
             evict_from_dashmap(&self.buckets, |_key, bucket| {
-                now.duration_since(bucket.last_check) >= max_idle
+                now.duration_since(bucket.last_access) >= max_idle
             });
         self.total_evicted.add(count as u64);
         count
