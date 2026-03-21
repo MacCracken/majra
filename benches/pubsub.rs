@@ -20,14 +20,12 @@ fn bench_pattern_matching(c: &mut Criterion) {
 
     c.bench_function("matches_pattern deep (20 segments)", |b| {
         let topic = (0..20).map(|i| i.to_string()).collect::<Vec<_>>().join("/");
-        let pattern = format!("0/*/2/#");
+        let pattern = "0/*/2/#".to_string();
         b.iter(|| matches_pattern(&pattern, &topic))
     });
 }
 
 fn bench_untyped_pubsub(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-
     c.bench_function("pubsub_publish_10_subscribers", |b| {
         let hub = PubSub::new();
         let _receivers: Vec<_> = (0..10)

@@ -47,14 +47,17 @@ tokio = { version = "1", features = ["full", "test-util"] }
 [[bench]]
 name = "pubsub"
 harness = false
+required-features = ["pubsub"]
 
 [[bench]]
 name = "queue"
 harness = false
+required-features = ["queue"]
 
 [[bench]]
 name = "concurrent"
 harness = false
+required-features = ["queue", "heartbeat", "ratelimit", "relay", "barrier"]
 
 [[example]]
 name = "managed_queue"
