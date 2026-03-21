@@ -20,31 +20,82 @@ All items complete. See CHANGELOG.md for details.
 
 ---
 
-## Next — Ifran Integration Support
+## v0.22 — Consumer-Ready Core
 
-### Fleet & heartbeat enhancements
-- [ ] **GPU telemetry in heartbeat metadata** — allow heartbeat payloads to carry structured GPU stats (utilization %, memory, temperature) so Ifran can drop its custom telemetry polling loop
-- [ ] **Node eviction policies** — configurable auto-eviction of offline nodes after Nx offline_timeout (Ifran currently does 2x manually)
-- [ ] **Fleet stats aggregation** — aggregate GPU counts, total VRAM, online/suspect/offline counts across all tracked nodes
+Thread safety, queue power-ups, and heartbeat fleet support. After this release every module is safe for concurrent use and Ifran can migrate off its custom scheduler, telemetry loop, and eviction logic.
+
+### Thread safety (all modules)
+- [ ] `PriorityQueue` — concurrent wrapper (`Arc`-based or `DashMap`-backed tiers) so consumers stop wrapping in their own mutex
+- [ ] `HeartbeatTracker` — `DashMap` or `RwLock<HashMap>` backing
+- [ ] `BarrierSet` — `DashMap` or `RwLock<HashMap>` backing
+- [ ] `RateLimiter` — swap `std::sync::Mutex<HashMap>` for `DashMap`
+- [ ] `Relay.seen` — swap `std::sync::Mutex<HashMap>` for `DashMap`
+- [ ] Compile-time `Send + Sync` assertions on all public types
+- [ ] Concurrent-access benchmarks (multi-thread enqueue/dequeue, heartbeats, rate checks)
 
 ### Queue enhancements
-- [ ] **GPU-aware scheduling** — queue items carry resource requirements (GPU count, VRAM); dequeue only when resources are available. Ifran's training scheduler currently uses a simple FIFO and explicitly wants this
-- [ ] **Max concurrency enforcement** — built-in max-concurrent-running limit with automatic dequeue when slots free up
-- [ ] **Job lifecycle states** — Queued → Running → Completed/Failed/Cancelled state machine with TTL-based eviction of terminal jobs
-- [ ] **Persistent queue backing** — optional SQLite persistence for crash recovery (Ifran currently rolls its own)
+- [ ] **Resource-aware dequeue** — optional `ResourceReq { gpu_count: u32, vram_mb: u64 }` on `QueueItem`; dequeue only when resources are available (Ifran's training scheduler needs this)
+- [ ] **Max concurrency enforcement** — configurable max-running limit with automatic dequeue when slots free
+- [ ] **Job lifecycle states** — `Queued → Running → Completed / Failed / Cancelled` state machine with TTL-based eviction of terminal jobs
+- [ ] **Persistent queue backing** — optional `sqlite` feature, WAL mode, crash recovery (replaces Ifran's hand-rolled persistence)
+- [ ] **Queue events** — emit on enqueue/dequeue/state-change (wire into pubsub)
+
+### Heartbeat & fleet enhancements
+- [ ] **Structured GPU telemetry** — first-class `GpuTelemetry { utilization_pct, memory_used_mb, memory_total_mb, temperature_c }` alongside generic JSON metadata (Ifran drops its custom polling loop)
+- [ ] **Node eviction policies** — configurable auto-eviction after Nx `offline_timeout` with callback (Ifran currently does 2x manually)
+- [ ] **Fleet stats aggregation** — `FleetStats { total_nodes, online, suspect, offline, total_gpus, total_vram_mb, available_vram_mb }`
+- [ ] **Metadata update on heartbeat** — allow updating metadata on beat, not just on register
+
+---
+
+## v0.23 — Event System & Observability
+
+Typed pub/sub, smart rate limiting, and metrics hooks. After this release SecureYeoman can replace its EventDispatcher and sliding-window rate limiter; Ifran unifies its three broadcast channels.
 
 ### Pub/sub enhancements
-- [ ] **Typed event channels** — generic `PubSub<T: Serialize>` to replace Ifran's three separate `broadcast::channel<T>` buses (training events, GPU events, download progress)
-- [ ] **Backpressure policies** — configurable behavior when subscribers lag (drop oldest, drop newest, block)
-- [ ] **Event replay** — optional bounded replay buffer so late subscribers can catch up
+- [ ] **Typed event channels** — `PubSub<T: Serialize + DeserializeOwned + Clone + Send + Sync>` generic variant (replaces Ifran's three separate `broadcast::channel<T>` buses)
+- [ ] **Backpressure policies** — `BackpressurePolicy { DropOldest, DropNewest, Block }` configurable per subscription
+- [ ] **Event replay buffer** — optional bounded replay so late subscribers catch up
+- [ ] **Subscription filters** — predicate-based filtering beyond topic matching
 
 ### Rate limiting enhancements
-- [ ] **Automatic stale-key eviction** — periodic sweep of rate limiter keys with no recent activity (Ifran's per-IP DashMap currently grows unbounded)
-- [ ] **Rate limit stats** — expose rejection counts, active key count for observability
+- [ ] **Stale-key eviction** — periodic sweep or LRU eviction for keys with no recent activity (fixes Ifran's unbounded per-IP DashMap)
+- [ ] **Rate limit stats** — `RateLimitStats { total_allowed, total_rejected, active_keys, evicted_keys }`
 
-### Concurrency primitives
-- [ ] **Multiplexed connections** — connection pooling and multiplexing for distributed node communication
-- [ ] **Fleet queue** — distributed job queue across multiple nodes with work-stealing
+### Observability
+- [ ] **`MajraMetrics` trait** — default no-op impl; consumers wire to Prometheus/OpenTelemetry
+- [ ] **Structured tracing spans** — spans on all major operations across all modules
+
+### Distributed primitives
+- [ ] **Async barrier notification** — `arrive()` returns a `Future` that resolves when barrier releases
+- [ ] **Multiplexed connections** — connection pool for relay, reuse TCP connections across topics
+- [ ] **Relay transport trait** — pluggable transport (Unix socket, TCP, future gRPC)
+
+---
+
+## v1.0.0 — Stable Release
+
+API freeze, full coverage, proven by real consumers. No new features — just hardening, docs, and the integration proof.
+
+### Stability
+- [ ] All public API types are `Send + Sync`
+- [ ] `#[must_use]` and `#[non_exhaustive]` on all appropriate types
+- [ ] No `unsafe` code (or audited and documented)
+- [ ] Error handling audit — all error paths meaningful, no silent failures
+- [ ] API naming/ergonomics review
+
+### Testing & proof
+- [ ] ≥85% test coverage
+- [ ] Multi-module integration tests (simulated Ifran training loop: queue + heartbeat + pubsub)
+- [ ] At least 2 real consumers using each module (Ifran + SecureYeoman)
+- [ ] Benchmark suite for all modules
+- [ ] Fuzz targets for serialization paths
+
+### Documentation
+- [ ] docs.rs documentation with examples for every public item
+- [ ] Consumer migration guides (Ifran, SecureYeoman)
+- [ ] MSRV policy documented
+- [ ] SemVer guarantee: no breaking changes in 1.x
 
 ---
 
@@ -52,7 +103,8 @@ All items complete. See CHANGELOG.md for details.
 
 - [ ] **Redis-backed mode** — optional Redis backend for cross-process pub/sub and queues
 - [ ] **gRPC transport for relay** — relay messages over gRPC instead of raw TCP for firewall friendliness
-- [ ] **Metrics integration** — Prometheus counters/gauges for queue depth, pub/sub throughput, heartbeat states
+- [ ] **Prometheus metrics integration** — built-in counters/gauges (queue depth, pub/sub throughput, heartbeat states)
+- [ ] **Fleet queue** — distributed job queue across multiple nodes with work-stealing
 
 ---
 
