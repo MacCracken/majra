@@ -152,6 +152,7 @@ Majra unifies patterns from battle-tested implementations:
 | **SecureYeoman** | EventDispatcher, A2A heartbeat, sliding-window rate limiter, DAG workflow, swarm barriers (~3,200 lines) |
 | **AgnosAI** | Priority DAG scheduling, pub/sub wildcards, relay dedup, barrier sync |
 | **daimon** | Topic routing, fleet relay, IPC framing |
+| **stiva** | DagScheduler for compose service ordering, HeartbeatTracker for container health, ManagedQueue for container scheduling |
 
 ## License
 
