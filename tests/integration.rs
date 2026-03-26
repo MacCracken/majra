@@ -83,8 +83,8 @@ async fn training_job_lifecycle() {
     queue.fail(index_id).unwrap();
 
     assert_eq!(queue.running_count(), 0);
-    assert_eq!(queue.get_job(&train_id).unwrap().state, JobState::Completed);
-    assert_eq!(queue.get_job(&index_id).unwrap().state, JobState::Failed);
+    assert_eq!(queue.get(&train_id).unwrap().state, JobState::Completed);
+    assert_eq!(queue.get(&index_id).unwrap().state, JobState::Failed);
 
     // --- Verify events were emitted ---
     let mut event_count = 0;

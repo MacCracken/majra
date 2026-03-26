@@ -82,7 +82,9 @@ impl ConnectionPool {
 
         if pool.len() >= self.max_per_endpoint {
             // Another task filled the pool while we were connecting.
-            let _ = transport.close().await;
+            if let Err(e) = transport.close().await {
+                debug!(endpoint, error = %e, "transport: failed to close excess connection");
+            }
             return pool.last().cloned().ok_or_else(|| {
                 MajraError::CapacityExceeded(format!(
                     "max connections ({}) reached for {endpoint}",
@@ -101,7 +103,9 @@ impl ConnectionPool {
         if let Some(pool) = conns.remove(endpoint) {
             debug!(endpoint, count = pool.len(), "transport: closing endpoint");
             for transport in pool {
-                let _ = transport.close().await;
+                if let Err(e) = transport.close().await {
+                    debug!(endpoint, error = %e, "transport: close failed");
+                }
             }
         }
     }
@@ -111,9 +115,11 @@ impl ConnectionPool {
         let mut conns = self.connections.lock().await;
         let total: usize = conns.values().map(Vec::len).sum();
         debug!(total, "transport: closing all connections");
-        for (_, pool) in conns.drain() {
+        for (endpoint, pool) in conns.drain() {
             for transport in pool {
-                let _ = transport.close().await;
+                if let Err(e) = transport.close().await {
+                    debug!(%endpoint, error = %e, "transport: close failed");
+                }
             }
         }
     }

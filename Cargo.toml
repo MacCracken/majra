@@ -69,6 +69,10 @@ name = "dag"
 harness = false
 required-features = ["dag"]
 
+[[bench]]
+name = "live_io"
+harness = false
+
 [[example]]
 name = "managed_queue"
 required-features = ["queue", "ratelimit"]

@@ -90,12 +90,6 @@ impl Relay {
         }
     }
 
-    /// Backward-compatible alias for [`Relay::new`].
-    #[deprecated(note = "use Relay::new() instead")]
-    pub fn with_defaults(node_id: impl Into<NodeId>) -> Self {
-        Self::new(node_id)
-    }
-
     /// Send a message to a specific node. Returns the sequence number.
     pub fn send(
         &self,
@@ -114,10 +108,16 @@ impl Relay {
         };
 
         let is_broadcast = msg.to.is_empty();
-        let _ = self.tx.send(IncomingMessage {
-            message: msg,
-            is_broadcast,
-        });
+        if self
+            .tx
+            .send(IncomingMessage {
+                message: msg,
+                is_broadcast,
+            })
+            .is_err()
+        {
+            trace!(seq, "relay: no subscribers for sent message");
+        }
 
         self.messages_sent.inc();
         debug!(seq, "relay: sent");
@@ -165,7 +165,12 @@ impl Relay {
             is_broadcast,
         };
 
-        let _ = self.tx.send(incoming.clone());
+        if self.tx.send(incoming.clone()).is_err() {
+            trace!(
+                seq = incoming.message.seq,
+                "relay: no subscribers for received message"
+            );
+        }
         Some(incoming)
     }
 
@@ -323,12 +328,5 @@ mod tests {
         let msg = rx.try_recv().unwrap();
         assert_eq!(msg.message.seq, 1);
         assert_eq!(msg.message.topic, "test");
-    }
-
-    #[allow(deprecated)]
-    #[test]
-    fn with_defaults_backward_compat() {
-        let relay = Relay::with_defaults("node-1");
-        assert_eq!(relay.node_id(), "node-1");
     }
 }

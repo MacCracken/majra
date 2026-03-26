@@ -421,8 +421,9 @@ impl ConcurrentHeartbeatTracker {
                 .eviction_policy
                 .as_ref()
                 .and_then(|p| p.eviction_tx.as_ref())
+                && tx.send(id).is_err()
             {
-                let _ = tx.send(id);
+                debug!("heartbeat: eviction channel closed");
             }
         }
 

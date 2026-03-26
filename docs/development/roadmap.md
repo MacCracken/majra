@@ -11,17 +11,17 @@ Completed items are in [CHANGELOG.md](../../CHANGELOG.md).
 API freeze, full coverage, proven by real consumers.
 
 ### Stability
-- [ ] Error handling audit — all error paths meaningful, no silent failures
-- [ ] API naming/ergonomics review
+- [x] Error handling audit — all error paths meaningful, no silent failures
+- [x] API naming/ergonomics review
 
 ### Testing & proof
 - [ ] At least 2 real consumers using each module (Ifran + SecureYeoman)
-- [ ] Live I/O benchmarks (IPC over real Unix sockets, SQLite on real disk)
-- [ ] Load/soak testing (sustained throughput, latency percentiles, memory growth)
+- [x] Live I/O benchmarks (IPC over real Unix sockets, SQLite on real disk)
+- [x] Load/soak testing (sustained throughput, latency percentiles, memory growth)
 
 ### Documentation
-- [ ] Consumer migration guides (Ifran, SecureYeoman)
-- [ ] SemVer guarantee: no breaking changes in 1.x
+- [x] Consumer migration guides ([Ifran](../guides/migration-ifran.md), [SecureYeoman](../guides/migration-secureyeoman.md))
+- [x] SemVer guarantee: [no breaking changes in 1.x](semver.md)
 
 ---
 

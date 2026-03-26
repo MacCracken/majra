@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast};
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::error::MajraError;
@@ -224,10 +224,11 @@ impl DagScheduler {
             if let Some(neighbors) = adjacency.get(node) {
                 let mut next = Vec::new();
                 for &n in neighbors {
-                    let deg = in_degree.get_mut(n).unwrap();
-                    *deg -= 1;
-                    if *deg == 0 {
-                        next.push(n);
+                    if let Some(deg) = in_degree.get_mut(n) {
+                        *deg -= 1;
+                        if *deg == 0 {
+                            next.push(n);
+                        }
                     }
                 }
                 next.sort();
@@ -236,9 +237,15 @@ impl DagScheduler {
         }
 
         if order.len() != in_degree.len() {
-            return Err(MajraError::DagCycle(
-                "dependency graph contains a cycle".into(),
-            ));
+            let cycle_nodes: Vec<&str> = in_degree
+                .keys()
+                .filter(|k| !order.iter().any(|o| o == *k))
+                .copied()
+                .collect();
+            return Err(MajraError::DagCycle(format!(
+                "dependency graph contains a cycle involving: {}",
+                cycle_nodes.join(", ")
+            )));
         }
 
         Ok(order)
@@ -515,7 +522,9 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
 
         self.jobs.insert(id, item);
         self.tiers.lock().await[priority as usize].push_back(id);
-        let _ = self.events_tx.send(QueueEvent::Enqueued { id });
+        if self.events_tx.send(QueueEvent::Enqueued { id }).is_err() {
+            debug!(%id, "no event subscribers for enqueue");
+        }
         self.metrics.queue_enqueued("managed", priority as u8);
         info!(%id, ?priority, "job enqueued");
         self.notify.notify_one();
@@ -551,7 +560,9 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
                 });
 
                 if let Some(idx) = pos {
-                    found = Some(tier.remove(idx).unwrap());
+                    if let Some(id) = tier.remove(idx) {
+                        found = Some(id);
+                    }
                     break;
                 }
             }
@@ -575,12 +586,20 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
                 warn!(%id, error = %e, "sqlite: failed to update state to running");
             }
 
-            let _ = self.events_tx.send(QueueEvent::Dequeued { id });
-            let _ = self.events_tx.send(QueueEvent::StateChanged {
-                id,
-                from: JobState::Queued,
-                to: JobState::Running,
-            });
+            if self.events_tx.send(QueueEvent::Dequeued { id }).is_err() {
+                debug!(%id, "no event subscribers for dequeue");
+            }
+            if self
+                .events_tx
+                .send(QueueEvent::StateChanged {
+                    id,
+                    from: JobState::Queued,
+                    to: JobState::Running,
+                })
+                .is_err()
+            {
+                debug!(%id, "no event subscribers for state change");
+            }
             self.metrics
                 .queue_dequeued("managed", result.priority as u8);
             self.metrics
@@ -640,11 +659,17 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
             warn!(%id, error = %e, "sqlite: failed to update job state");
         }
 
-        let _ = self.events_tx.send(QueueEvent::StateChanged {
-            id,
-            from,
-            to: new_state,
-        });
+        if self
+            .events_tx
+            .send(QueueEvent::StateChanged {
+                id,
+                from,
+                to: new_state,
+            })
+            .is_err()
+        {
+            debug!(%id, "no event subscribers for state change");
+        }
 
         let from_str = from.to_string();
         let to_str = new_state.to_string();
@@ -685,7 +710,7 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
     }
 
     /// Get the current state of a job.
-    pub fn get_job(&self, id: &TaskId) -> Option<ManagedItem<T>> {
+    pub fn get(&self, id: &TaskId) -> Option<ManagedItem<T>> {
         self.jobs.get(id).map(|j| j.value().clone())
     }
 
@@ -1164,11 +1189,11 @@ mod tests {
 
         // Dequeue → Running.
         q.dequeue_any().await.unwrap();
-        assert_eq!(q.get_job(&id).unwrap().state, JobState::Running);
+        assert_eq!(q.get(&id).unwrap().state, JobState::Running);
 
         // Complete → Completed.
         q.complete(id).unwrap();
-        assert_eq!(q.get_job(&id).unwrap().state, JobState::Completed);
+        assert_eq!(q.get(&id).unwrap().state, JobState::Completed);
 
         // Can't complete again.
         assert!(q.complete(id).is_err());
@@ -1182,7 +1207,7 @@ mod tests {
             .await;
 
         q.cancel(id).await.unwrap();
-        assert_eq!(q.get_job(&id).unwrap().state, JobState::Cancelled);
+        assert_eq!(q.get(&id).unwrap().state, JobState::Cancelled);
         assert_eq!(q.queued_count().await, 0);
     }
 
@@ -1195,7 +1220,7 @@ mod tests {
         q.dequeue_any().await.unwrap();
 
         q.cancel(id).await.unwrap();
-        assert_eq!(q.get_job(&id).unwrap().state, JobState::Cancelled);
+        assert_eq!(q.get(&id).unwrap().state, JobState::Cancelled);
         assert_eq!(q.running_count(), 0);
     }
 
@@ -1208,7 +1233,7 @@ mod tests {
         q.dequeue_any().await.unwrap();
 
         q.fail(id).unwrap();
-        assert_eq!(q.get_job(&id).unwrap().state, JobState::Failed);
+        assert_eq!(q.get(&id).unwrap().state, JobState::Failed);
         assert_eq!(q.running_count(), 0);
     }
 

@@ -110,7 +110,13 @@ impl PubSub {
         let mut delivered = 0usize;
         for entry in self.subscriptions.iter() {
             if matches_pattern(entry.key(), topic) {
-                let _ = entry.value().send(msg.clone());
+                if entry.value().send(msg.clone()).is_err() {
+                    trace!(
+                        topic,
+                        pattern = entry.key().as_str(),
+                        "no active receivers for pattern"
+                    );
+                }
                 delivered += 1;
             }
         }
@@ -265,14 +271,23 @@ impl<T: Clone + Send + Sync + 'static> TypedPubSub<T> {
         for entry in self.replay_buffer.iter() {
             if matches_pattern(pattern, entry.key()) {
                 for msg in entry.value().iter() {
-                    let _ = tx.send(msg.clone());
+                    if tx.send(msg.clone()).is_err() {
+                        trace!(
+                            pattern,
+                            topic = msg.topic.as_str(),
+                            "replay: no active receivers"
+                        );
+                        return;
+                    }
                 }
             }
         }
     }
 
     /// Publish a typed message to a concrete topic.
-    pub fn publish(&self, topic: &str, payload: T) {
+    ///
+    /// Returns the number of subscriptions the message was delivered to.
+    pub fn publish(&self, topic: &str, payload: T) -> usize {
         let msg = TypedMessage {
             topic: topic.to_string(),
             payload,
@@ -288,7 +303,7 @@ impl<T: Clone + Send + Sync + 'static> TypedPubSub<T> {
             }
         }
 
-        let mut delivered = 0u64;
+        let mut delivered = 0usize;
         for entry in self.subscriptions.iter() {
             if matches_pattern(entry.key(), topic) {
                 for sub in entry.value().iter() {
@@ -299,12 +314,16 @@ impl<T: Clone + Send + Sync + 'static> TypedPubSub<T> {
 
                     match self.config.backpressure {
                         BackpressurePolicy::DropOldest => {
-                            let _ = sub.sender.send(msg.clone());
+                            if sub.sender.send(msg.clone()).is_err() {
+                                trace!(topic, "typed: no active receivers");
+                            }
                             delivered += 1;
                         }
                         BackpressurePolicy::DropNewest => {
                             if sub.sender.len() < self.config.channel_capacity {
-                                let _ = sub.sender.send(msg.clone());
+                                if sub.sender.send(msg.clone()).is_err() {
+                                    trace!(topic, "typed: no active receivers");
+                                }
                                 delivered += 1;
                             } else {
                                 self.messages_dropped.inc();
@@ -317,6 +336,7 @@ impl<T: Clone + Send + Sync + 'static> TypedPubSub<T> {
 
         self.messages_published.inc();
         trace!(topic, delivered, "typed: published");
+        delivered
     }
 
     /// Remove all subscriptions for a pattern.
@@ -370,9 +390,11 @@ impl<T: Clone + Send + Sync + Serialize + 'static> TypedMessage<T> {
 
 impl<T: Clone + Send + Sync + DeserializeOwned + 'static> TypedMessage<T> {
     /// Try to convert from an untyped `TopicMessage`.
-    pub fn from_untyped(msg: &TopicMessage) -> Option<Self> {
-        let payload: T = serde_json::from_value(msg.payload.clone()).ok()?;
-        Some(Self {
+    ///
+    /// Returns `Err` if the payload cannot be deserialized into `T`.
+    pub fn from_untyped(msg: &TopicMessage) -> Result<Self, serde_json::Error> {
+        let payload: T = serde_json::from_value(msg.payload.clone())?;
+        Ok(Self {
             topic: msg.topic.clone(),
             payload,
             timestamp: msg.timestamp,
@@ -667,7 +689,8 @@ mod tests {
         let untyped = msg.to_untyped().unwrap();
         assert_eq!(untyped.payload["value"], 99);
 
-        let back = TypedMessage::<TestEvent>::from_untyped(&untyped).unwrap();
+        let back = TypedMessage::<TestEvent>::from_untyped(&untyped)
+            .expect("deserialization should succeed");
         assert_eq!(back.payload.value, 99);
     }
 
@@ -750,6 +773,6 @@ mod tests {
             payload: serde_json::json!("not a TestEvent"),
             timestamp: Utc::now(),
         };
-        assert!(TypedMessage::<TestEvent>::from_untyped(&untyped).is_none());
+        assert!(TypedMessage::<TestEvent>::from_untyped(&untyped).is_err());
     }
 }

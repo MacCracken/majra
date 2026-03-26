@@ -44,8 +44,18 @@ pub fn init_with_level(default_level: &str) {
     use tracing_subscriber::fmt;
     use tracing_subscriber::prelude::*;
 
-    let filter =
-        EnvFilter::try_from_env("MAJRA_LOG").unwrap_or_else(|_| EnvFilter::new(default_level));
+    let filter = match EnvFilter::try_from_env("MAJRA_LOG") {
+        Ok(f) => f,
+        Err(e) => {
+            // Only warn if the var was set but invalid (not simply absent).
+            if std::env::var("MAJRA_LOG").is_ok() {
+                eprintln!(
+                    "majra: invalid MAJRA_LOG filter, falling back to '{default_level}': {e}"
+                );
+            }
+            EnvFilter::new(default_level)
+        }
+    };
 
     let _ = tracing_subscriber::registry()
         .with(fmt::layer().with_target(true).with_thread_ids(true))
