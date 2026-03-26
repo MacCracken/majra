@@ -29,18 +29,18 @@ API freeze, full coverage, proven by real consumers.
 
 ### QUIC Transport (Tier 1 — Network Evolution)
 
-- [ ] **QUIC relay backend** — `quinn`-based transport alongside TCP. Feature-gated: `quic = ["dep:quinn", "dep:rustls"]`
-- [ ] **Multiplexed streams** — ordered streams for pub/sub, RPC. Replaces single TCP connection per peer
-- [ ] **Unreliable datagrams** — fire-and-forget channel for real-time data (game state, sensor readings). Consumers: joshua multiplayer, edge sensor fleet
-- [ ] **0-RTT reconnect** — edge nodes resume without full handshake on network transitions
-- [ ] **Connection migration** — survive IP changes (WiFi → cellular, DHCP renewal)
-- [ ] TCP remains default. QUIC is opt-in, non-breaking
+- [x] **QUIC relay backend** — `QuicTransport`, `QuicTransportFactory`, `QuicListener` behind `quic` feature flag
+- [x] **Multiplexed streams** — each send/recv opens a new bi-directional QUIC stream (no HOL blocking)
+- [x] **Unreliable datagrams** — `send_datagram()` / `recv_datagram()` for fire-and-forget data
+- [x] **0-RTT reconnect** — quinn caches session tickets automatically for fast resume
+- [x] **Connection migration** — QUIC handles IP changes transparently at the protocol level
+- [x] TCP remains default. QUIC is opt-in via `quic` feature flag, non-breaking
 
 See [network-evolution.md](../../../../docs/development/network-evolution.md) in agnosticos for full architecture.
 
 ### Other Post-v1
 
-- [ ] **Redis-backed mode** — optional Redis backend for cross-process pub/sub and queues
+- [x] **Redis-backed mode** — `RedisPubSub` and `RedisQueue` behind `redis-backend` feature flag
 - [x] **Prometheus metrics exporter** — `PrometheusMetrics` behind `prometheus` feature flag with counters, gauges, and histograms
 - [x] **Fleet queue** — `FleetQueue<T>` with least-loaded routing, resource filtering, and work-stealing rebalance
 - [x] **TypedPubSub dead subscriber cleanup** — `cleanup_dead_subscribers()` on both `PubSub` and `TypedPubSub`

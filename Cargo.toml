@@ -26,8 +26,10 @@ dag = ["queue"]
 sqlite = ["dep:rusqlite"]
 logging = ["dep:tracing-subscriber"]
 fleet = ["queue", "heartbeat"]
+redis-backend = ["dep:redis", "dep:futures-util"]
+quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "relay"]
 prometheus = ["dep:prometheus"]
-full = ["pubsub", "queue", "relay", "ipc", "heartbeat", "ratelimit", "barrier", "dag", "sqlite", "logging", "prometheus", "fleet"]
+full = ["pubsub", "queue", "relay", "ipc", "heartbeat", "ratelimit", "barrier", "dag", "sqlite", "logging", "prometheus", "fleet", "redis-backend", "quic"]
 
 [dependencies]
 async-trait = "0.1"
@@ -42,6 +44,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], option
 uuid = { version = "1", features = ["v4", "serde"] }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 prometheus = { version = "0.13", optional = true }
+redis = { version = "0.27", features = ["tokio-comp", "aio"], optional = true }
+futures-util = { version = "0.3", optional = true }
+quinn = { version = "0.11", optional = true }
+rustls = { version = "0.23", features = ["ring"], default-features = false, optional = true }
+rcgen = { version = "0.13", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

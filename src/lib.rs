@@ -24,7 +24,9 @@
 //! | `barrier` | no | N-way barrier synchronisation with deadlock recovery |
 //! | `sqlite` | no | SQLite persistence for managed queue |
 //! | `fleet` | no | Distributed job queue with work-stealing |
+//! | `redis-backend` | no | Redis-backed cross-process pub/sub and queues |
 //! | `prometheus` | no | Built-in Prometheus metrics exporter |
+//! | `quic` | no | QUIC transport with multiplexed streams and datagrams |
 //! | `full` | — | Enables all features |
 
 pub mod envelope;
@@ -65,6 +67,12 @@ pub mod dag;
 
 #[cfg(feature = "fleet")]
 pub mod fleet;
+
+#[cfg(feature = "redis-backend")]
+pub mod redis_backend;
+
+#[cfg(feature = "quic")]
+pub mod quic;
 
 // ---------------------------------------------------------------------------
 // Compile-time Send + Sync assertions
