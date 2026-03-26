@@ -84,6 +84,30 @@ pub trait MajraMetrics: Send + Sync {
 
     /// A barrier was released.
     fn barrier_released(&self, _barrier_name: &str) {}
+
+    // --- Workflow DAG ---
+
+    /// A workflow run was started.
+    fn workflow_run_started(&self, _workflow_id: &str) {}
+
+    /// A workflow run completed successfully.
+    fn workflow_run_completed(&self, _workflow_id: &str, _duration_ms: u64) {}
+
+    /// A workflow run failed.
+    fn workflow_run_failed(&self, _workflow_id: &str, _duration_ms: u64) {}
+
+    /// A workflow step began executing.
+    fn workflow_step_started(&self, _workflow_id: &str, _step_id: &str) {}
+
+    /// A workflow step reached a terminal status.
+    fn workflow_step_finished(
+        &self,
+        _workflow_id: &str,
+        _step_id: &str,
+        _status: &str,
+        _duration_ms: u64,
+    ) {
+    }
 }
 
 /// No-op metrics implementation (default).

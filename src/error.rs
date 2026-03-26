@@ -50,6 +50,26 @@ pub enum MajraError {
     #[cfg(feature = "sqlite")]
     #[error("persistence: {0}")]
     Persistence(String),
+
+    /// Workflow definition validation error.
+    #[cfg(feature = "dag")]
+    #[error("workflow validation: {0}")]
+    WorkflowValidation(String),
+
+    /// Workflow step execution error.
+    #[cfg(feature = "dag")]
+    #[error("workflow step failed: {0}")]
+    WorkflowStepFailed(String),
+
+    /// Workflow run not found.
+    #[cfg(feature = "dag")]
+    #[error("workflow run not found: {0}")]
+    WorkflowRunNotFound(String),
+
+    /// Workflow storage error.
+    #[cfg(feature = "dag")]
+    #[error("workflow storage: {0}")]
+    WorkflowStorage(String),
 }
 
 /// IPC-specific errors.

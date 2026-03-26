@@ -14,6 +14,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### DAG workflow engine (`dag` feature)
+- `WorkflowEngine<S, E>` — tier-based DAG executor with parallel step scheduling, retry with exponential backoff, and 4 error policies (Fail/Continue/Skip/Fallback)
+- `TriggerMode` — `All` (AND) and `Any` (OR) join semantics for dependency resolution
+- `WorkflowStorage` trait — db-agnostic async storage for definitions, runs, and step runs
+- `StepExecutor` trait — consumer-defined step execution logic
+- `InMemoryWorkflowStorage` — DashMap-backed default storage (no external deps)
+- `SqliteWorkflowStorage` — SQLite-backed storage (behind `sqlite` feature)
+- `topological_sort_tiers()` — modified Kahn's algorithm returning parallelizable tiers with trigger-mode-aware in-degree
+- `WorkflowDefinition`, `WorkflowRun`, `StepRun` — full execution tracking types
+- `WorkflowContext` — step output accumulation for downstream reference
+- Validation: cycle detection (via `DagScheduler`), referential integrity for deps and fallbacks
+- Cooperative cancellation via `AtomicBool` per run
+- 22 unit tests (tier sort, validation, storage CRUD, engine execution, retry, error policies, context propagation)
+- 4 benchmarks (tier sort linear/wide, engine execute linear/diamond)
+
 #### Scaffold hardening (P-1)
 - `scripts/bench-history.sh` — benchmark runner that parses criterion output and appends results to `bench-history.csv`
 - `#[inline]` on ~20 hot-path accessors across all modules (Counter, matches_pattern, len/is_empty, is_terminal, satisfies, node_id, classify_status)

@@ -58,6 +58,9 @@ pub mod ratelimit;
 #[cfg(feature = "barrier")]
 pub mod barrier;
 
+#[cfg(feature = "dag")]
+pub mod dag;
+
 // ---------------------------------------------------------------------------
 // Compile-time Send + Sync assertions
 // ---------------------------------------------------------------------------
