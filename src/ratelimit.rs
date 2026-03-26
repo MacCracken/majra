@@ -121,6 +121,143 @@ impl RateLimiter {
             total_evicted: self.total_evicted.get(),
         }
     }
+
+    /// Shrink internal storage to reclaim memory from evicted entries.
+    ///
+    /// DashMap shards grow via power-of-2 doubling but never shrink
+    /// automatically. Call after a large eviction pass in long-running
+    /// processes to avoid heap fragmentation.
+    pub fn compact(&self) {
+        self.buckets.shrink_to_fit();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sliding window counter
+// ---------------------------------------------------------------------------
+
+/// Per-window request counter for the sliding window limiter.
+struct WindowCounter {
+    /// Requests in the previous full window.
+    prev_count: u64,
+    /// Requests in the current window.
+    curr_count: u64,
+    /// When the current window started.
+    window_start: Instant,
+}
+
+/// Per-key sliding-window rate limiter.
+///
+/// Uses the **approximate sliding window counter** algorithm: interpolates
+/// between the previous and current window based on elapsed time. This
+/// provides ~5% accuracy of an exact sliding window with O(1) memory and
+/// O(1) check time per key.
+///
+/// Use this when strict window accuracy matters (e.g., API quotas).
+/// For burst-tolerant rate limiting, prefer [`RateLimiter`] (token bucket).
+pub struct SlidingWindowLimiter {
+    windows: DashMap<String, WindowCounter>,
+    /// Maximum requests per window.
+    max_requests: u64,
+    /// Window duration.
+    window: Duration,
+    total_allowed: Counter,
+    total_rejected: Counter,
+}
+
+impl SlidingWindowLimiter {
+    /// Create a sliding-window rate limiter.
+    ///
+    /// - `max_requests`: maximum requests allowed per `window`
+    /// - `window`: duration of each window
+    pub fn new(max_requests: u64, window: Duration) -> Self {
+        Self {
+            windows: DashMap::new(),
+            max_requests,
+            window,
+            total_allowed: Counter::new(),
+            total_rejected: Counter::new(),
+        }
+    }
+
+    /// Check whether a request for `key` is allowed.
+    ///
+    /// Uses approximate sliding window: weighted sum of previous window
+    /// count and current window count based on elapsed fraction.
+    pub fn check(&self, key: &str) -> bool {
+        let now = Instant::now();
+        let mut entry = self
+            .windows
+            .entry(key.to_string())
+            .or_insert_with(|| WindowCounter {
+                prev_count: 0,
+                curr_count: 0,
+                window_start: now,
+            });
+
+        let elapsed = now.duration_since(entry.window_start);
+
+        // Advance windows if needed.
+        if elapsed >= self.window * 2 {
+            // Two or more windows have passed — both are stale.
+            entry.prev_count = 0;
+            entry.curr_count = 0;
+            entry.window_start = now;
+        } else if elapsed >= self.window {
+            // Current window becomes previous, start new current.
+            entry.prev_count = entry.curr_count;
+            entry.curr_count = 0;
+            entry.window_start += self.window;
+        }
+
+        // Weighted estimate: previous window contributes proportionally
+        // to the unexpired fraction.
+        let elapsed_in_current = now.duration_since(entry.window_start);
+        let weight = 1.0 - (elapsed_in_current.as_secs_f64() / self.window.as_secs_f64());
+        let estimate = (entry.prev_count as f64 * weight) + entry.curr_count as f64;
+
+        if estimate < self.max_requests as f64 {
+            entry.curr_count += 1;
+            drop(entry);
+            self.total_allowed.inc();
+            true
+        } else {
+            drop(entry);
+            self.total_rejected.inc();
+            false
+        }
+    }
+
+    /// Number of tracked keys.
+    #[inline]
+    pub fn key_count(&self) -> usize {
+        self.windows.len()
+    }
+
+    /// Evict keys that have been idle longer than `max_idle`.
+    pub fn evict_stale(&self, max_idle: Duration) -> usize {
+        let now = Instant::now();
+        crate::util::evict_from_dashmap(&self.windows, |_, v| {
+            now.duration_since(v.window_start) > max_idle
+        })
+    }
+
+    /// Total allowed requests since creation.
+    #[inline]
+    pub fn total_allowed(&self) -> u64 {
+        self.total_allowed.get()
+    }
+
+    /// Total rejected requests since creation.
+    #[inline]
+    pub fn total_rejected(&self) -> u64 {
+        self.total_rejected.get()
+    }
+
+    /// Shrink internal storage to reclaim memory.
+    pub fn compact(&self) {
+        self.windows.shrink_to_fit();
+    }
 }
 
 #[cfg(test)]
@@ -243,5 +380,46 @@ mod tests {
         let evicted = limiter.evict_stale(Duration::from_millis(10));
         assert_eq!(evicted, 3);
         assert_eq!(limiter.key_count(), 0);
+    }
+
+    // --- SlidingWindowLimiter ---
+
+    #[test]
+    fn sliding_window_allows_up_to_max() {
+        let limiter = SlidingWindowLimiter::new(3, Duration::from_secs(1));
+        assert!(limiter.check("a"));
+        assert!(limiter.check("a"));
+        assert!(limiter.check("a"));
+        assert!(!limiter.check("a"));
+    }
+
+    #[test]
+    fn sliding_window_separate_keys() {
+        let limiter = SlidingWindowLimiter::new(1, Duration::from_secs(1));
+        assert!(limiter.check("a"));
+        assert!(limiter.check("b"));
+        assert!(!limiter.check("a"));
+        assert!(!limiter.check("b"));
+    }
+
+    #[test]
+    fn sliding_window_stats() {
+        let limiter = SlidingWindowLimiter::new(2, Duration::from_secs(1));
+        let _ = limiter.check("a");
+        let _ = limiter.check("a");
+        let _ = limiter.check("a"); // rejected
+        assert_eq!(limiter.total_allowed(), 2);
+        assert_eq!(limiter.total_rejected(), 1);
+        assert_eq!(limiter.key_count(), 1);
+    }
+
+    #[test]
+    fn sliding_window_refills_after_window() {
+        let limiter = SlidingWindowLimiter::new(1, Duration::from_millis(20));
+        assert!(limiter.check("a"));
+        assert!(!limiter.check("a"));
+
+        std::thread::sleep(Duration::from_millis(45));
+        assert!(limiter.check("a"));
     }
 }

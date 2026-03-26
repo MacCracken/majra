@@ -366,6 +366,15 @@ impl Relay {
         &self.node_id
     }
 
+    /// Shrink the dedup table by rebuilding it, reclaiming memory from
+    /// removed entries. DashMap shards grow via power-of-2 doubling but
+    /// never shrink — call this periodically in long-running processes
+    /// with high key churn to avoid fragmentation.
+    pub fn compact_dedup(&self) {
+        self.seen.shrink_to_fit();
+        self.pending_requests.shrink_to_fit();
+    }
+
     /// Evict dedup entries that have been idle longer than `max_idle`.
     ///
     /// Call periodically to prevent unbounded growth of the dedup table in

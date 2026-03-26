@@ -6,11 +6,13 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use tokio::sync::Mutex;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::error::MajraError;
 use crate::relay::RelayMessage;
@@ -38,6 +40,92 @@ pub trait TransportFactory: Send + Sync + 'static {
     async fn connect(&self, endpoint: &str) -> Result<Box<dyn Transport>, MajraError>;
 }
 
+// ---------------------------------------------------------------------------
+// Circuit breaker
+// ---------------------------------------------------------------------------
+
+/// Circuit breaker state for a single endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CircuitState {
+    /// Normal operation — connections are allowed.
+    Closed,
+    /// Endpoint is failing — connections are rejected immediately.
+    Open,
+    /// Cooldown expired — one probe connection is allowed.
+    HalfOpen,
+}
+
+/// Per-endpoint circuit breaker configuration.
+#[derive(Debug, Clone)]
+pub struct CircuitBreakerConfig {
+    /// Number of consecutive failures before tripping to Open.
+    pub failure_threshold: usize,
+    /// Duration to stay Open before transitioning to HalfOpen.
+    pub cooldown: Duration,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 5,
+            cooldown: Duration::from_secs(30),
+        }
+    }
+}
+
+struct EndpointCircuit {
+    consecutive_failures: AtomicUsize,
+    tripped_at: Mutex<Option<Instant>>,
+    config: CircuitBreakerConfig,
+}
+
+impl EndpointCircuit {
+    fn new(config: CircuitBreakerConfig) -> Self {
+        Self {
+            consecutive_failures: AtomicUsize::new(0),
+            tripped_at: Mutex::new(None),
+            config,
+        }
+    }
+
+    async fn state(&self) -> CircuitState {
+        let failures = self.consecutive_failures.load(Ordering::Relaxed);
+        if failures < self.config.failure_threshold {
+            return CircuitState::Closed;
+        }
+        let guard = self.tripped_at.lock().await;
+        match *guard {
+            Some(tripped) if tripped.elapsed() >= self.config.cooldown => CircuitState::HalfOpen,
+            Some(_) => CircuitState::Open,
+            None => CircuitState::Closed,
+        }
+    }
+
+    fn record_success(&self) {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+    }
+
+    async fn record_failure(&self) {
+        let prev = self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+        if prev + 1 >= self.config.failure_threshold {
+            let mut guard = self.tripped_at.lock().await;
+            if guard.is_none() {
+                *guard = Some(Instant::now());
+            }
+        }
+    }
+
+    async fn reset(&self) {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+        *self.tripped_at.lock().await = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connection pool
+// ---------------------------------------------------------------------------
+
 /// A pooled transport entry with last-use tracking.
 struct PooledTransport {
     transport: Arc<dyn Transport>,
@@ -53,20 +141,69 @@ pub struct ConnectionPool {
     factory: Arc<dyn TransportFactory>,
     connections: Mutex<HashMap<String, Vec<PooledTransport>>>,
     max_per_endpoint: usize,
+    circuits: DashMap<String, Arc<EndpointCircuit>>,
+    circuit_config: CircuitBreakerConfig,
 }
 
 impl ConnectionPool {
     /// Create a new pool with the given factory and max connections per endpoint.
     pub fn new(factory: Arc<dyn TransportFactory>, max_per_endpoint: usize) -> Self {
+        Self::with_circuit_breaker(factory, max_per_endpoint, CircuitBreakerConfig::default())
+    }
+
+    /// Create a pool with custom circuit breaker configuration.
+    pub fn with_circuit_breaker(
+        factory: Arc<dyn TransportFactory>,
+        max_per_endpoint: usize,
+        circuit_config: CircuitBreakerConfig,
+    ) -> Self {
         Self {
             factory,
             connections: Mutex::new(HashMap::new()),
             max_per_endpoint,
+            circuits: DashMap::new(),
+            circuit_config,
         }
     }
 
+    fn get_circuit(&self, endpoint: &str) -> Arc<EndpointCircuit> {
+        self.circuits
+            .entry(endpoint.to_string())
+            .or_insert_with(|| Arc::new(EndpointCircuit::new(self.circuit_config.clone())))
+            .clone()
+    }
+
+    /// Get the circuit breaker state for an endpoint.
+    pub async fn circuit_state(&self, endpoint: &str) -> CircuitState {
+        self.get_circuit(endpoint).state().await
+    }
+
+    /// Reset the circuit breaker for an endpoint (force-close).
+    pub async fn reset_circuit(&self, endpoint: &str) {
+        self.get_circuit(endpoint).reset().await;
+    }
+
     /// Get or create a transport connection to the given endpoint.
+    ///
+    /// Respects the circuit breaker: returns `Err` immediately if the
+    /// endpoint's circuit is open. On connection failure, records the
+    /// failure for circuit breaker tracking.
     pub async fn acquire(&self, endpoint: &str) -> Result<Arc<dyn Transport>, MajraError> {
+        // Circuit breaker check.
+        let circuit = self.get_circuit(endpoint);
+        match circuit.state().await {
+            CircuitState::Open => {
+                warn!(endpoint, "transport: circuit open, rejecting connection");
+                return Err(MajraError::Relay(format!(
+                    "circuit breaker open for {endpoint}"
+                )));
+            }
+            CircuitState::HalfOpen => {
+                debug!(endpoint, "transport: circuit half-open, allowing probe");
+            }
+            CircuitState::Closed => {}
+        }
+
         let key = endpoint.to_string();
         let mut conns = self.connections.lock().await;
         let pool = conns.entry(key.clone()).or_default();
@@ -76,6 +213,7 @@ impl ConnectionPool {
         if let Some(pt) = pool.last_mut() {
             pt.last_used = Instant::now();
             trace!(endpoint, "transport: reusing connection");
+            circuit.record_success();
             return Ok(pt.transport.clone());
         }
 
@@ -83,7 +221,16 @@ impl ConnectionPool {
         drop(conns);
 
         debug!(endpoint, "transport: creating new connection");
-        let transport: Arc<dyn Transport> = Arc::from(self.factory.connect(endpoint).await?);
+        let transport: Arc<dyn Transport> = match self.factory.connect(endpoint).await {
+            Ok(t) => {
+                circuit.record_success();
+                Arc::from(t)
+            }
+            Err(e) => {
+                circuit.record_failure().await;
+                return Err(e);
+            }
+        };
 
         // Re-acquire and insert.
         let mut conns = self.connections.lock().await;

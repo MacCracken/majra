@@ -6,6 +6,8 @@ No open items.
 
 ## Engineering Backlog
 
+- Shared-memory IPC transport (30-40x faster than UDS; deferred — requires unsafe for mmap)
+
 ## Non-goals
 
 - **Application-level business logic** — majra provides primitives, consumers define semantics

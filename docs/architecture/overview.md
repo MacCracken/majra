@@ -57,6 +57,7 @@ ipc ─────────────────────────�
 5. **Lean** — minimal core deps (tokio, dashmap, serde, chrono, uuid, thiserror, tracing).
 6. **Eviction everywhere** — all collections have TTL/capacity-based eviction to prevent unbounded growth.
 7. **Multi-tenant ready** — `Namespace` module provides topic/key/node-ID scoping.
+8. **Fragmentation-aware** — `compact()` methods on Relay and RateLimiter reclaim DashMap dead capacity. For long-running processes with high key churn, use `tikv-jemallocator` to avoid glibc heap fragmentation.
 
 ## Concurrency Model
 

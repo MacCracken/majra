@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `EncryptedIpcConnection::rekey()` — key rotation API with nonce counter reset
+- `EncryptedIpcConnection::needs_rekey()` / `messages_sent()` — nonce exhaustion tracking (warns at 2^31, errors at 2^32)
+- `SlidingWindowLimiter` — approximate sliding-window rate limiter (~5% accuracy of exact, O(1) memory/time per key)
+- `WorkflowEngine::resume()` — durable workflow execution: reload step results from storage, skip completed steps, resume from interruption point
+- `ConnectionPool::with_circuit_breaker()` — per-endpoint circuit breaker (configurable failure threshold + cooldown)
+- `CircuitBreakerConfig`, `CircuitState` — circuit breaker types (Closed/Open/HalfOpen)
+- `ConnectionPool::circuit_state()` / `reset_circuit()` — circuit breaker introspection and manual reset
+- `Relay::compact_dedup()` — DashMap shrink-to-fit to reclaim dead capacity after eviction
+- `RateLimiter::compact()` / `SlidingWindowLimiter::compact()` — DashMap shrink-to-fit
+- `NamespacedMetrics` — per-tenant metrics partitioning via prefix delegation
+- Subscriber count warning at 40+ receivers per pattern (broadcast quadratic slowdown)
+- Cached Redis Lua script SHA for `RedisRateLimiter` (EVALSHA optimization)
+- 4 new `SlidingWindowLimiter` tests
+
+### Changed
+- `PostgresWorkflowStorage::connect_with_pool_size()` documents pool sizing formula (`cores * 2 + 1`, 10 MB/connection)
+- Architecture overview documents DashMap fragmentation mitigation and jemalloc recommendation
+
 ## [1.0.0] — 2026-03-26
 
 **First stable release.** API freeze. Full feature coverage across pub/sub, queues, relay, IPC, heartbeat, rate limiting, barriers, DAG workflows, fleet scheduling, and distributed backends.

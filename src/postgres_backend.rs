@@ -45,6 +45,10 @@ impl PostgresWorkflowStorage {
     }
 
     /// Connect with a custom connection pool size.
+    ///
+    /// **Sizing guideline**: `pool_size = (CPU_cores * 2) + 1`. Each PostgreSQL
+    /// connection uses ~10 MB of server memory. For N application instances
+    /// sharing a database, divide by N: `pool_size = (cores * 2 + 1) / N`.
     pub async fn connect_with_pool_size(
         connection_string: &str,
         max_pool_size: usize,
@@ -503,7 +507,10 @@ mod queue_backend {
             Ok(Self { pool })
         }
 
-        /// Connect and create a backend.
+        /// Connect and create a backend with default pool size (16).
+        ///
+        /// **Sizing guideline**: `pool_size = (CPU_cores * 2) + 1`. Each PostgreSQL
+        /// connection uses ~10 MB of server memory.
         pub async fn connect(connection_string: &str) -> crate::error::Result<Self> {
             let pg_config: tokio_postgres::Config = connection_string.parse().map_err(pg_err)?;
             let mgr_config = deadpool_postgres::ManagerConfig {

@@ -328,7 +328,34 @@ pub struct RedisRateLimiter {
     burst: usize,
     /// Key prefix in Redis.
     prefix: String,
+    /// Cached Lua script (SHA computed once, EVALSHA on every call).
+    script: redis::Script,
 }
+
+/// Lua script for atomic token-bucket check-and-decrement.
+const RATE_LIMIT_LUA: &str = r#"
+local key = KEYS[1]
+local rate = tonumber(ARGV[1])
+local burst = tonumber(ARGV[2])
+local now_ms = tonumber(ARGV[3])
+
+local tokens = tonumber(redis.call('HGET', key, 'tokens') or burst)
+local last_ms = tonumber(redis.call('HGET', key, 'last_ms') or now_ms)
+
+local elapsed_s = (now_ms - last_ms) / 1000.0
+tokens = math.min(tokens + elapsed_s * rate, burst)
+
+if tokens >= 1 then
+    tokens = tokens - 1
+    redis.call('HSET', key, 'tokens', tostring(tokens), 'last_ms', tostring(now_ms))
+    redis.call('EXPIRE', key, math.ceil(burst / rate) + 60)
+    return 1
+else
+    redis.call('HSET', key, 'tokens', tostring(tokens), 'last_ms', tostring(now_ms))
+    redis.call('EXPIRE', key, math.ceil(burst / rate) + 60)
+    return 0
+end
+"#;
 
 impl RedisRateLimiter {
     /// Create a distributed rate limiter.
@@ -342,6 +369,7 @@ impl RedisRateLimiter {
             rate,
             burst,
             prefix: prefix.into(),
+            script: redis::Script::new(RATE_LIMIT_LUA),
         }
     }
 
@@ -357,40 +385,9 @@ impl RedisRateLimiter {
             .await
             .map_err(|e| MajraError::Queue(e.to_string()))?;
 
-        // Lua script: atomic token bucket check-and-decrement.
-        // KEYS[1] = bucket key (hash with fields: tokens, last_ms)
-        // ARGV[1] = rate (tokens/sec)
-        // ARGV[2] = burst (max tokens)
-        // ARGV[3] = now_ms (current time in milliseconds)
-        // Returns: 1 if allowed, 0 if rejected
-        let script = redis::Script::new(
-            r#"
-            local key = KEYS[1]
-            local rate = tonumber(ARGV[1])
-            local burst = tonumber(ARGV[2])
-            local now_ms = tonumber(ARGV[3])
-
-            local tokens = tonumber(redis.call('HGET', key, 'tokens') or burst)
-            local last_ms = tonumber(redis.call('HGET', key, 'last_ms') or now_ms)
-
-            local elapsed_s = (now_ms - last_ms) / 1000.0
-            tokens = math.min(tokens + elapsed_s * rate, burst)
-
-            if tokens >= 1 then
-                tokens = tokens - 1
-                redis.call('HSET', key, 'tokens', tostring(tokens), 'last_ms', tostring(now_ms))
-                redis.call('EXPIRE', key, math.ceil(burst / rate) + 60)
-                return 1
-            else
-                redis.call('HSET', key, 'tokens', tostring(tokens), 'last_ms', tostring(now_ms))
-                redis.call('EXPIRE', key, math.ceil(burst / rate) + 60)
-                return 0
-            end
-            "#,
-        );
-
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let result: i32 = script
+        let result: i32 = self
+            .script
             .key(&redis_key)
             .arg(self.rate)
             .arg(self.burst)

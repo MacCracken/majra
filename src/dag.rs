@@ -956,6 +956,171 @@ impl<S: WorkflowStorage + 'static, E: StepExecutor + 'static> WorkflowEngine<S, 
             Err(MajraError::WorkflowRunNotFound(run_id.into()))
         }
     }
+
+    /// Resume a previously interrupted workflow run from storage.
+    ///
+    /// Loads the run and its step results from the storage backend,
+    /// reconstructs the `WorkflowContext`, and re-executes only the
+    /// steps that haven't completed yet. This provides crash recovery
+    /// (durable execution) when using a persistent backend (SQLite or
+    /// PostgreSQL).
+    ///
+    /// Returns `Err` if the run is not found, already completed, or
+    /// the definition cannot be located.
+    #[instrument(skip(self, definition), fields(run_id = %run_id))]
+    pub async fn resume(
+        &self,
+        run_id: &str,
+        definition: &WorkflowDefinition,
+    ) -> crate::error::Result<WorkflowRun> {
+        let mut run = self
+            .storage
+            .get_run(run_id)
+            .await?
+            .ok_or_else(|| MajraError::WorkflowRunNotFound(run_id.into()))?;
+
+        if matches!(
+            run.status,
+            WorkflowRunStatus::Completed | WorkflowRunStatus::Cancelled
+        ) {
+            return Ok(run);
+        }
+
+        Self::validate(definition)?;
+        let tiers = Self::topological_sort_tiers(&definition.steps)?;
+
+        // Reconstruct context from persisted step runs.
+        let step_runs = self.storage.get_step_runs_for_run(run_id).await?;
+        let mut ctx = WorkflowContext {
+            step_results: HashMap::new(),
+            input: run.input.clone().unwrap_or(serde_json::Value::Null),
+        };
+        let mut completed_steps: HashSet<String> = HashSet::new();
+        for sr in &step_runs {
+            if matches!(sr.status, StepRunStatus::Completed | StepRunStatus::Skipped) {
+                ctx.step_results.insert(
+                    sr.step_id.clone(),
+                    StepResult {
+                        output: sr.output.clone(),
+                        status: sr.status,
+                    },
+                );
+                completed_steps.insert(sr.step_id.clone());
+            }
+        }
+
+        info!(
+            %run_id,
+            completed = completed_steps.len(),
+            total = definition.steps.len(),
+            "resuming workflow run"
+        );
+
+        // Update run status to Running.
+        run.status = WorkflowRunStatus::Running;
+        self.storage.update_run(&run).await?;
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        self.cancelled
+            .insert(run_id.to_string(), cancel_flag.clone());
+
+        let step_map: HashMap<&str, &WorkflowStep> = definition
+            .steps
+            .iter()
+            .map(|s| (s.id.as_str(), s))
+            .collect();
+
+        let mut run_error: Option<String> = None;
+        let start_ms = chrono::Utc::now().timestamp_millis();
+
+        'tiers: for tier in &tiers {
+            if cancel_flag.load(Ordering::Acquire) {
+                run.status = WorkflowRunStatus::Cancelled;
+                run.completed_at = Some(chrono::Utc::now().timestamp_millis());
+                self.storage.update_run(&run).await?;
+                self.cancelled.remove(run_id);
+                return Ok(run);
+            }
+
+            // Skip tiers where all steps are already completed.
+            let pending: Vec<&String> = tier
+                .iter()
+                .filter(|id| !completed_steps.contains(id.as_str()))
+                .collect();
+            if pending.is_empty() {
+                continue;
+            }
+
+            for step_id in &pending {
+                let step = step_map[step_id.as_str()];
+
+                let executor = self.executor.clone();
+                let storage = self.storage.clone();
+                let metrics = self.metrics.clone();
+                let step_clone = step.clone();
+                let ctx_clone = ctx.clone();
+                let run_id_str = run_id.to_string();
+                let workflow_id = definition.id.clone();
+                let cancel = cancel_flag.clone();
+
+                let handle = tokio::spawn(async move {
+                    execute_step(
+                        executor.as_ref(),
+                        storage.as_ref(),
+                        &metrics,
+                        &step_clone,
+                        &ctx_clone,
+                        &run_id_str,
+                        &workflow_id,
+                        &cancel,
+                    )
+                    .await
+                });
+
+                match handle.await {
+                    Ok(Ok(result)) => {
+                        ctx.step_results.insert((*step_id).clone(), result);
+                    }
+                    Ok(Err(e)) => {
+                        run_error = Some(e.to_string());
+                        break 'tiers;
+                    }
+                    Err(join_err) => {
+                        run_error = Some(format!("step '{step_id}' panicked: {join_err}"));
+                        break 'tiers;
+                    }
+                }
+            }
+        }
+
+        let end_ms = chrono::Utc::now().timestamp_millis();
+        let duration_ms = (end_ms - start_ms) as u64;
+
+        if let Some(ref err) = run_error {
+            run.status = WorkflowRunStatus::Failed;
+            run.error = Some(err.clone());
+            self.metrics
+                .workflow_run_failed(&definition.id, duration_ms);
+        } else {
+            run.status = WorkflowRunStatus::Completed;
+            let mut output = serde_json::Map::new();
+            for (step_id, result) in &ctx.step_results {
+                if let Some(ref val) = result.output {
+                    output.insert(step_id.clone(), val.clone());
+                }
+            }
+            run.output = Some(serde_json::Value::Object(output));
+            self.metrics
+                .workflow_run_completed(&definition.id, duration_ms);
+        }
+
+        run.completed_at = Some(end_ms);
+        self.storage.update_run(&run).await?;
+        self.cancelled.remove(run_id);
+
+        info!(%run_id, status = %run.status, "workflow run resumed and finished");
+        Ok(run)
+    }
 }
 
 /// Execute a single step with retry and error policy handling.

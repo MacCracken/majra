@@ -37,6 +37,16 @@ const MAX_MATCH_DEPTH: usize = 32;
 /// Default number of publishes between automatic dead-subscriber cleanups.
 const DEFAULT_CLEANUP_INTERVAL: u64 = 1_000;
 
+/// Returns true if the pattern contains wildcard characters (`*` or `#`).
+#[inline]
+fn is_wildcard_pattern(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('#')
+}
+
+/// Subscriber count per pattern above which `tokio::sync::broadcast` send
+/// latency degrades quadratically. We emit a tracing warning at this threshold.
+const SUBSCRIBER_WARN_THRESHOLD: usize = 40;
+
 // ---------------------------------------------------------------------------
 // Backpressure policy
 // ---------------------------------------------------------------------------
@@ -285,8 +295,15 @@ struct TypedSubscription<T: Clone + Send + Sync + 'static> {
 ///
 /// Unlike [`PubSub`] which uses `serde_json::Value`, this variant is generic
 /// over the payload type `T`, giving compile-time type safety.
+///
+/// **Performance note**: `tokio::sync::broadcast` send latency degrades
+/// quadratically past ~40 subscribers per pattern. For high fan-out
+/// scenarios, consider fewer patterns with broader wildcards.
 pub struct TypedPubSub<T: Clone + Send + Sync + 'static> {
-    subscriptions: DashMap<String, Vec<TypedSubscription<T>>>,
+    /// Exact-topic subscriptions — O(1) direct lookup on publish. Fast path.
+    exact_subscriptions: DashMap<String, Vec<TypedSubscription<T>>>,
+    /// Wildcard-pattern subscriptions — iterated on publish. Slow path.
+    pattern_subscriptions: DashMap<String, Vec<TypedSubscription<T>>>,
     config: TypedPubSubConfig,
     messages_published: Counter,
     messages_dropped: Counter,
@@ -302,7 +319,8 @@ impl<T: Clone + Send + Sync + 'static> TypedPubSub<T> {
     /// Create a new typed hub with custom configuration.
     pub fn with_config(config: TypedPubSubConfig) -> Self {
         Self {
-            subscriptions: DashMap::new(),
+            exact_subscriptions: DashMap::new(),
+            pattern_subscriptions: DashMap::new(),
             messages_published: Counter::new(),
             messages_dropped: Counter::new(),
             replay_buffer: DashMap::new(),
@@ -363,10 +381,24 @@ impl<T: Clone + Send + Sync + 'static> TypedPubSub<T> {
             sender: tx.clone(),
             filter,
         };
-        self.subscriptions
-            .entry(pattern.to_string())
-            .or_default()
-            .push(sub);
+        let map = if is_wildcard_pattern(pattern) {
+            &self.pattern_subscriptions
+        } else {
+            &self.exact_subscriptions
+        };
+        let mut entry = map.entry(pattern.to_string()).or_default();
+        entry.push(sub);
+        let count = entry.len();
+        drop(entry);
+
+        if count == SUBSCRIBER_WARN_THRESHOLD {
+            tracing::warn!(
+                pattern,
+                count,
+                "pubsub: subscriber count per pattern exceeds {SUBSCRIBER_WARN_THRESHOLD} \
+                 — tokio::broadcast send latency may degrade quadratically"
+            );
+        }
         (tx, rx)
     }
 
@@ -420,10 +452,41 @@ impl<T: Clone + Send + Sync + 'static> TypedPubSub<T> {
         }
 
         let mut delivered = 0usize;
-        for entry in self.subscriptions.iter() {
+
+        // Fast path: exact-topic subscribers — O(1) DashMap lookup.
+        if let Some(subs) = self.exact_subscriptions.get(topic) {
+            for sub in subs.value().iter() {
+                    // Apply filter if present.
+                    if sub.filter.as_ref().is_some_and(|f| !f(&msg.payload)) {
+                        continue;
+                    }
+
+                    match self.config.backpressure {
+                        BackpressurePolicy::DropOldest => {
+                            if sub.sender.send(msg.clone()).is_err() {
+                                trace!(topic, "typed: no active receivers");
+                            }
+                            delivered += 1;
+                        }
+                        BackpressurePolicy::DropNewest => {
+                            if sub.sender.len() < self.config.channel_capacity {
+                                if sub.sender.send(msg.clone()).is_err() {
+                                    trace!(topic, "typed: no active receivers");
+                                }
+                                delivered += 1;
+                            } else {
+                                self.messages_dropped.inc();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Slow path: wildcard-pattern subscribers — iterate only patterns.
+        for entry in self.pattern_subscriptions.iter() {
             if matches_pattern(entry.key(), topic) {
                 for sub in entry.value().iter() {
-                    // Apply filter if present.
                     if sub.filter.as_ref().is_some_and(|f| !f(&msg.payload)) {
                         continue;
                     }
@@ -468,13 +531,14 @@ impl<T: Clone + Send + Sync + 'static> TypedPubSub<T> {
 
     /// Remove all subscriptions for a pattern.
     pub fn unsubscribe_all(&self, pattern: &str) {
-        self.subscriptions.remove(pattern);
+        self.exact_subscriptions.remove(pattern);
+        self.pattern_subscriptions.remove(pattern);
     }
 
-    /// Number of active subscription patterns.
+    /// Number of active subscription patterns (exact + wildcard).
     #[inline]
     pub fn pattern_count(&self) -> usize {
-        self.subscriptions.len()
+        self.exact_subscriptions.len() + self.pattern_subscriptions.len()
     }
 
     /// Total messages published since creation.
@@ -500,25 +564,22 @@ impl<T: Clone + Send + Sync + 'static> TypedPubSub<T> {
     /// every `cleanup_interval` publishes (configurable via [`TypedPubSubConfig`]).
     pub fn cleanup_dead_subscribers(&self) -> usize {
         let mut removed = 0usize;
-        let mut empty_patterns = Vec::new();
 
-        for mut entry in self.subscriptions.iter_mut() {
-            let before = entry.value().len();
-            entry
-                .value_mut()
-                .retain(|sub| sub.sender.receiver_count() > 0);
-            removed += before - entry.value().len();
-
-            if entry.value().is_empty() {
-                empty_patterns.push(entry.key().clone());
+        for map in [&self.exact_subscriptions, &self.pattern_subscriptions] {
+            let mut empty_patterns = Vec::new();
+            for mut entry in map.iter_mut() {
+                let before = entry.value().len();
+                entry
+                    .value_mut()
+                    .retain(|sub| sub.sender.receiver_count() > 0);
+                removed += before - entry.value().len();
+                if entry.value().is_empty() {
+                    empty_patterns.push(entry.key().clone());
+                }
             }
-        }
-
-        // Remove empty pattern entries outside the mutable iterator.
-        for pattern in &empty_patterns {
-            // Re-check under the entry lock to avoid racing with new subscribers.
-            self.subscriptions
-                .remove_if(pattern, |_, subs| subs.is_empty());
+            for pattern in &empty_patterns {
+                map.remove_if(pattern, |_, subs| subs.is_empty());
+            }
         }
 
         if removed > 0 {
@@ -529,8 +590,9 @@ impl<T: Clone + Send + Sync + 'static> TypedPubSub<T> {
 
     /// Number of individual subscriptions across all patterns.
     pub fn subscriber_count(&self) -> usize {
-        self.subscriptions
+        self.exact_subscriptions
             .iter()
+            .chain(self.pattern_subscriptions.iter())
             .map(|entry| entry.value().len())
             .sum()
     }

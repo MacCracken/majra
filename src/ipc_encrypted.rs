@@ -19,10 +19,16 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ring::aead::{self, AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
-use tracing::trace;
+use tracing::{trace, warn};
 
 use crate::error::IpcError;
 use crate::ipc::IpcConnection;
+
+/// Safe nonce limit for AES-256-GCM. The GCM internal counter is 32 bits,
+/// so after 2^32 encryptions with the same key, nonce uniqueness can no
+/// longer be guaranteed. We warn at 2^31 and refuse to encrypt past 2^32.
+const NONCE_WARN_THRESHOLD: u64 = 1 << 31; // ~2.1 billion
+const NONCE_HARD_LIMIT: u64 = 1 << 32; // ~4.3 billion
 
 /// AES-256-GCM encrypted wrapper around an [`IpcConnection`].
 ///
@@ -82,18 +88,33 @@ impl EncryptedIpcConnection {
         Self::new(conn, key)
     }
 
-    fn make_nonce(&self) -> [u8; 12] {
+    fn make_nonce(&self) -> Result<[u8; 12], IpcError> {
         let counter = self.send_counter.fetch_add(1, Ordering::Relaxed);
+
+        if counter >= NONCE_HARD_LIMIT {
+            return Err(IpcError::Io(std::io::Error::other(
+                "AES-GCM nonce limit reached (2^32 messages) — rotate key with rekey()",
+            )));
+        }
+        if counter == NONCE_WARN_THRESHOLD {
+            warn!(
+                counter,
+                "ipc-encrypted: approaching nonce limit (2^31 of 2^32) — rotate key soon"
+            );
+        }
+
         let mut nonce_bytes = [0u8; 12];
-        // Put counter in the last 8 bytes, first 4 are zero (direction marker space).
         nonce_bytes[4..12].copy_from_slice(&counter.to_be_bytes());
-        nonce_bytes
+        Ok(nonce_bytes)
     }
 
     /// Send an encrypted JSON frame.
+    ///
+    /// Returns `Err` if the nonce counter has been exhausted (2^32 messages).
+    /// Call [`rekey`](Self::rekey) to install a new key and reset the counter.
     pub async fn send(&mut self, payload: &serde_json::Value) -> Result<(), IpcError> {
         let plaintext = serde_json::to_vec(payload)?;
-        let nonce_bytes = self.make_nonce();
+        let nonce_bytes = self.make_nonce()?;
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
         let mut in_out = plaintext;
@@ -164,6 +185,46 @@ impl EncryptedIpcConnection {
         let value: serde_json::Value = serde_json::from_slice(plaintext)?;
         trace!(size = plaintext.len(), "ipc-encrypted: received");
         Ok(value)
+    }
+
+    /// Install a new encryption key and reset the nonce counter.
+    ///
+    /// Call this before the nonce limit is reached (2^32 messages). Both
+    /// endpoints must rekey simultaneously — coordinate via an unencrypted
+    /// control message or out-of-band signal.
+    pub fn rekey(&mut self, new_key: &[u8; 32]) -> Result<(), IpcError> {
+        let seal = UnboundKey::new(&AES_256_GCM, new_key).map_err(|_| {
+            IpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid AES-256-GCM key",
+            ))
+        })?;
+        let open = UnboundKey::new(&AES_256_GCM, new_key).map_err(|_| {
+            IpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid AES-256-GCM key",
+            ))
+        })?;
+        self.seal_key = LessSafeKey::new(seal);
+        self.open_key = LessSafeKey::new(open);
+        self.send_counter.store(0, Ordering::Relaxed);
+        trace!("ipc-encrypted: rekeyed, nonce counter reset");
+        Ok(())
+    }
+
+    /// Number of messages sent with the current key.
+    ///
+    /// When this approaches 2^32, call [`rekey`](Self::rekey).
+    #[inline]
+    pub fn messages_sent(&self) -> u64 {
+        self.send_counter.load(Ordering::Relaxed)
+    }
+
+    /// Whether the nonce counter is approaching exhaustion (past 2^31).
+    #[inline]
+    #[must_use]
+    pub fn needs_rekey(&self) -> bool {
+        self.send_counter.load(Ordering::Relaxed) >= NONCE_WARN_THRESHOLD
     }
 
     /// Get a reference to the underlying IPC connection.
