@@ -727,4 +727,29 @@ mod tests {
         assert_eq!(rx_star.recv().await.unwrap().payload.value, 1);
         assert_eq!(rx_hash.recv().await.unwrap().payload.value, 1);
     }
+
+    #[test]
+    fn pubsub_default_creates_hub() {
+        let hub = PubSub::default();
+        assert_eq!(hub.pattern_count(), 0);
+        assert_eq!(hub.messages_published(), 0);
+    }
+
+    #[test]
+    fn typed_pubsub_default_creates_hub() {
+        let hub = TypedPubSub::<TestEvent>::default();
+        assert_eq!(hub.pattern_count(), 0);
+        assert_eq!(hub.messages_published(), 0);
+        assert_eq!(hub.messages_dropped(), 0);
+    }
+
+    #[test]
+    fn typed_from_untyped_fails_on_wrong_type() {
+        let untyped = TopicMessage {
+            topic: "test".into(),
+            payload: serde_json::json!("not a TestEvent"),
+            timestamp: Utc::now(),
+        };
+        assert!(TypedMessage::<TestEvent>::from_untyped(&untyped).is_none());
+    }
 }

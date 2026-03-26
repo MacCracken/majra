@@ -59,6 +59,10 @@ name = "concurrent"
 harness = false
 required-features = ["queue", "heartbeat", "ratelimit", "relay", "barrier"]
 
+[[bench]]
+name = "ipc_envelope"
+harness = false
+
 [[example]]
 name = "managed_queue"
 required-features = ["queue", "ratelimit"]

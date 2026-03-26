@@ -306,4 +306,29 @@ mod tests {
         assert_eq!(stats.messages_received, 40);
         assert_eq!(stats.duplicates_dropped, 0);
     }
+
+    #[test]
+    fn broadcast_sends_and_counts() {
+        let relay = Relay::new("node-1");
+        let seq = relay.broadcast("announce", serde_json::json!({"event": "up"}));
+        assert_eq!(seq, 1);
+        assert_eq!(relay.stats().messages_sent, 1);
+    }
+
+    #[test]
+    fn subscribe_receives_sent_messages() {
+        let relay = Relay::new("node-1");
+        let mut rx = relay.subscribe();
+        relay.send("node-2", "test", serde_json::Value::Null);
+        let msg = rx.try_recv().unwrap();
+        assert_eq!(msg.message.seq, 1);
+        assert_eq!(msg.message.topic, "test");
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn with_defaults_backward_compat() {
+        let relay = Relay::with_defaults("node-1");
+        assert_eq!(relay.node_id(), "node-1");
+    }
 }

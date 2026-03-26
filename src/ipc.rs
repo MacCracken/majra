@@ -7,6 +7,7 @@
 //! - **Windows**: Uses named pipes (`\\.\pipe\majra-*`).
 
 use crate::error::IpcError;
+use tracing::{debug, trace};
 
 /// Maximum frame size (16 MiB).
 const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
@@ -151,12 +152,14 @@ impl IpcServer {
     /// named pipe name on Windows.
     pub fn bind(path: &std::path::Path) -> Result<Self> {
         let listener = platform::Listener::bind(path)?;
+        debug!(path = %path.display(), "ipc: server bound");
         Ok(Self { listener })
     }
 
     /// Accept the next incoming connection.
     pub async fn accept(&self) -> Result<IpcConnection> {
         let stream = self.listener.accept().await?;
+        debug!("ipc: connection accepted");
         Ok(IpcConnection { stream })
     }
 }
@@ -190,6 +193,7 @@ impl IpcConnection {
         }
         self.stream.write_all(&len.to_be_bytes()).await?;
         self.stream.write_all(&data).await?;
+        trace!(bytes = len, "ipc: frame sent");
         Ok(())
     }
 
@@ -199,6 +203,7 @@ impl IpcConnection {
         match self.stream.read_exact(&mut len_buf).await {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                trace!("ipc: connection closed by peer");
                 return Err(IpcError::ConnectionClosed);
             }
             Err(e) => return Err(e.into()),
@@ -213,6 +218,7 @@ impl IpcConnection {
         let mut buf = vec![0u8; len as usize];
         self.stream.read_exact(&mut buf).await?;
         let value = serde_json::from_slice(&buf)?;
+        trace!(bytes = len, "ipc: frame received");
         Ok(value)
     }
 }

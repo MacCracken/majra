@@ -545,4 +545,18 @@ mod tests {
         );
         assert_eq!(set.arrive("sync-1", "b"), BarrierResult::Released);
     }
+
+    #[test]
+    fn barrier_set_default() {
+        let set = BarrierSet::default();
+        assert!(set.is_empty());
+        assert_eq!(set.len(), 0);
+    }
+
+    #[test]
+    fn async_barrier_set_default() {
+        let set = AsyncBarrierSet::default();
+        assert!(set.is_empty());
+        assert_eq!(set.len(), 0);
+    }
 }

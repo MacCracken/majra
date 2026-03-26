@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
+use tracing::{debug, trace};
 
 use crate::error::MajraError;
 use crate::relay::RelayMessage;
@@ -64,12 +65,14 @@ impl ConnectionPool {
         // Reuse an existing connected transport.
         pool.retain(|t| t.is_connected());
         if let Some(transport) = pool.last() {
+            trace!(endpoint, "transport: reusing connection");
             return Ok(transport.clone());
         }
 
         // No connected transports. Drop the lock before doing async I/O.
         drop(conns);
 
+        debug!(endpoint, "transport: creating new connection");
         let transport: Arc<dyn Transport> = Arc::from(self.factory.connect(endpoint).await?);
 
         // Re-acquire and insert.
@@ -96,6 +99,7 @@ impl ConnectionPool {
     pub async fn close_endpoint(&self, endpoint: &str) {
         let mut conns = self.connections.lock().await;
         if let Some(pool) = conns.remove(endpoint) {
+            debug!(endpoint, count = pool.len(), "transport: closing endpoint");
             for transport in pool {
                 let _ = transport.close().await;
             }
@@ -105,6 +109,8 @@ impl ConnectionPool {
     /// Close all connections.
     pub async fn close_all(&self) {
         let mut conns = self.connections.lock().await;
+        let total: usize = conns.values().map(Vec::len).sum();
+        debug!(total, "transport: closing all connections");
         for (_, pool) in conns.drain() {
             for transport in pool {
                 let _ = transport.close().await;

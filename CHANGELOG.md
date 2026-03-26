@@ -14,6 +14,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Scaffold hardening (P-1)
+- `scripts/bench-history.sh` — benchmark runner that parses criterion output and appends results to `bench-history.csv`
+- `#[inline]` on ~20 hot-path accessors across all modules (Counter, matches_pattern, len/is_empty, is_terminal, satisfies, node_id, classify_status)
+- `#[must_use]` on `BarrierResult`, `matches_pattern()`, `DagScheduler::ready()`, `RelayStats`, `RateLimitStats`, `FleetStats`
+- Tracing instrumentation for IPC module (`debug!` on bind/accept, `trace!` on frame send/recv)
+- Tracing instrumentation for transport module (`debug!` on new connections and close, `trace!` on reuse)
+- Benchmark suite for envelope and IPC modules (`envelope_new`, `envelope_serialize_roundtrip`, `ipc_roundtrip_small_payload`, `ipc_roundtrip_large_payload`)
+- 8 new unit tests covering Default impls, deprecated compat, broadcast, subscribe, and error paths (barrier, relay, pubsub)
+
+### Changed
+- SQLite backend `.lock().unwrap()` replaced with `map_err` error propagation (4 call sites) — no more panics on poisoned mutex
+- Test coverage improved from 88% to 90%+ (133 tests total: 125 unit + 5 integration + 3 doc-tests)
+
+### Added
+
 #### Typed pub/sub (`TypedPubSub<T>`)
 - `TypedPubSub<T>` — generic, type-safe pub/sub hub replacing untyped `serde_json::Value` payloads
 - `TypedMessage<T>` — typed message with `to_untyped()` / `from_untyped()` conversion
