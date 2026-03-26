@@ -33,9 +33,7 @@ fn bench_ipc(c: &mut Criterion) {
     c.bench_function("ipc_roundtrip_small_payload", |b| {
         let path = std::env::temp_dir().join(format!("majra-bench-{}.sock", uuid::Uuid::new_v4()));
 
-        let server = rt.block_on(async {
-            majra::ipc::IpcServer::bind(&path).unwrap()
-        });
+        let server = rt.block_on(async { majra::ipc::IpcServer::bind(&path).unwrap() });
 
         // Spawn server echo loop.
         let path_clone = path.clone();
@@ -75,9 +73,7 @@ fn bench_ipc(c: &mut Criterion) {
     c.bench_function("ipc_roundtrip_large_payload", |b| {
         let path = std::env::temp_dir().join(format!("majra-bench-{}.sock", uuid::Uuid::new_v4()));
 
-        let server = rt.block_on(async {
-            majra::ipc::IpcServer::bind(&path).unwrap()
-        });
+        let server = rt.block_on(async { majra::ipc::IpcServer::bind(&path).unwrap() });
 
         let path_clone = path.clone();
         let server_handle = rt.spawn(async move {
