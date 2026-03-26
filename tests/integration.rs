@@ -94,7 +94,7 @@ async fn training_job_lifecycle() {
     assert!(event_count >= 6); // 2 enqueue + 2 dequeue + 2 state changes + 2 terminal
 
     // --- Heartbeat the GPU node ---
-    tracker.heartbeat_with_telemetry(
+    let _ = tracker.heartbeat_with_telemetry(
         "gpu-node-1",
         vec![GpuTelemetry {
             utilization_pct: 95.0,
@@ -188,8 +188,8 @@ fn rate_limiter_lifecycle() {
 
     // Exhaust burst for two keys.
     for _ in 0..5 {
-        limiter.check("client-a");
-        limiter.check("client-b");
+        let _ = limiter.check("client-a");
+        let _ = limiter.check("client-b");
     }
     // Next checks should be rejected.
     assert!(!limiter.check("client-a"));

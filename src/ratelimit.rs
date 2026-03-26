@@ -63,6 +63,7 @@ impl RateLimiter {
     }
 
     /// Check if a request for `key` is allowed. Consumes one token if yes.
+    #[must_use]
     pub fn check(&self, key: &str) -> bool {
         let now = Instant::now();
         let burst = self.burst as f64;
@@ -90,6 +91,7 @@ impl RateLimiter {
 
     /// Number of tracked keys.
     #[inline]
+    #[must_use]
     pub fn key_count(&self) -> usize {
         self.buckets.len()
     }
@@ -97,6 +99,7 @@ impl RateLimiter {
     /// Evict keys that have not been checked for at least `max_idle`.
     ///
     /// Returns the number of keys evicted.
+    #[must_use]
     pub fn evict_stale(&self, max_idle: Duration) -> usize {
         let now = Instant::now();
         let count = evict_from_dashmap(&self.buckets, |_key, bucket| {
@@ -155,8 +158,8 @@ mod tests {
     #[test]
     fn key_count() {
         let limiter = RateLimiter::new(1.0, 1);
-        limiter.check("a");
-        limiter.check("b");
+        let _ = limiter.check("a");
+        let _ = limiter.check("b");
         assert_eq!(limiter.key_count(), 2);
     }
 
@@ -190,9 +193,9 @@ mod tests {
     #[test]
     fn stats_tracking() {
         let limiter = RateLimiter::new(1.0, 2);
-        limiter.check("a"); // allowed
-        limiter.check("a"); // allowed
-        limiter.check("a"); // rejected
+        let _ = limiter.check("a"); // allowed
+        let _ = limiter.check("a"); // allowed
+        let _ = limiter.check("a"); // rejected
 
         let stats = limiter.stats();
         assert_eq!(stats.total_allowed, 2);
@@ -203,14 +206,14 @@ mod tests {
     #[test]
     fn evict_stale_keys() {
         let limiter = RateLimiter::new(1.0, 1);
-        limiter.check("fresh");
-        limiter.check("stale");
+        let _ = limiter.check("fresh");
+        let _ = limiter.check("stale");
 
         // Wait for stale to become idle.
         std::thread::sleep(Duration::from_millis(20));
 
         // Touch fresh again to keep it alive.
-        limiter.check("fresh");
+        let _ = limiter.check("fresh");
 
         let evicted = limiter.evict_stale(Duration::from_millis(15));
         assert_eq!(evicted, 1);
@@ -223,7 +226,7 @@ mod tests {
     #[test]
     fn evict_stale_no_keys() {
         let limiter = RateLimiter::new(1.0, 1);
-        limiter.check("a");
+        let _ = limiter.check("a");
         let evicted = limiter.evict_stale(Duration::from_secs(60));
         assert_eq!(evicted, 0);
     }
@@ -231,9 +234,9 @@ mod tests {
     #[test]
     fn evict_all_stale() {
         let limiter = RateLimiter::new(1.0, 1);
-        limiter.check("a");
-        limiter.check("b");
-        limiter.check("c");
+        let _ = limiter.check("a");
+        let _ = limiter.check("b");
+        let _ = limiter.check("c");
 
         std::thread::sleep(Duration::from_millis(15));
 

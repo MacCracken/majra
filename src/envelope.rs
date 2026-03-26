@@ -49,12 +49,14 @@ impl Envelope {
 
     /// Returns `true` if this is a broadcast message.
     #[inline]
+    #[must_use]
     pub fn is_broadcast(&self) -> bool {
         matches!(self.to, Target::Broadcast)
     }
 
     /// Returns `true` if this targets a topic.
     #[inline]
+    #[must_use]
     pub fn is_topic(&self) -> bool {
         matches!(self.to, Target::Topic(_))
     }

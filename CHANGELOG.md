@@ -7,22 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- `PostgresQueueBackend` — PostgreSQL persistence for `ManagedQueue` (mirrors `SqliteBackend` API)
-- `ManagedQueue::with_postgres()` constructor
-- `NamespacedMetrics` — per-tenant metrics partitioning via prefix delegation
-- Replay buffer fast-path for exact topic subscriptions (O(1) vs O(n) pattern scan)
-- `Relay::evict_stale_requests(timeout)` — TTL eviction for pending request-response correlations
-- Live Redis integration test (`redis_live_full_lifecycle`) covering pub/sub, queue, rate limiter, heartbeat
-- Live PostgreSQL integration test (`postgres_live_workflow_storage`) covering workflow CRUD
-- `benchmarks.md` — 3-point trend tracking
-- `docs/development/dependency-watch.md` — pinned versions and upgrade paths
-- Documentation Structure section in `CLAUDE.md`
-- Updated `README.md`, `SECURITY.md`, architecture overview, migration guides for v1.0.0
-
-### Changed
-- `PostgresWorkflowStorage::connect_with_pool_size()` — configurable pool size (was hardcoded to 16)
-
 ## [1.0.0] — 2026-03-26
 
 **First stable release.** API freeze. Full feature coverage across pub/sub, queues, relay, IPC, heartbeat, rate limiting, barriers, DAG workflows, fleet scheduling, and distributed backends.
@@ -49,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### PostgreSQL storage backend (`postgres` feature)
 - `PostgresWorkflowStorage` — `WorkflowStorage` impl backed by `deadpool-postgres` connection pool
+- `PostgresQueueBackend` — PostgreSQL persistence for `ManagedQueue` (mirrors `SqliteBackend` API)
+- `ManagedQueue::with_postgres()` constructor
 - Automatic table creation with `majra_` prefix
 - `connect()`, `connect_with_pool_size()`, and `from_pool()` constructors
 
@@ -89,6 +75,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Observability & logging
 - `metrics` module — `MajraMetrics` trait with no-op default and Prometheus implementation
+- `NamespacedMetrics` — per-tenant metrics partitioning via prefix delegation
 - `logging` feature — structured tracing via `MAJRA_LOG` env var
 - Structured `#[instrument]` spans on ManagedQueue operations
 
@@ -110,7 +97,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile, `deny.toml`, `codecov.yml`, `rust-toolchain.toml`
 - Fuzz targets (queue, pubsub, heartbeat)
 - `supply-chain/` (cargo-vet), `scripts/version-bump.sh`
-- 208 tests (unit + integration + doc-tests), 25+ benchmarks
+- `benchmarks.md` — 3-point trend tracking
+- `docs/development/dependency-watch.md` — pinned versions and upgrade paths
+- Live Redis integration test (`redis_live_full_lifecycle`) covering pub/sub, queue, rate limiter, heartbeat
+- Live PostgreSQL integration test (`postgres_live_workflow_storage`) covering workflow CRUD
+- 220 tests (unit + integration + doc-tests), 25+ benchmarks
 
 ### Changed
 - `matches_pattern()` rewritten to iterative zero-allocation with inline depth tracking
@@ -119,6 +110,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RateLimiter` internals swapped from `Mutex<HashMap>` to `DashMap`
 - `Relay` dedup map swapped to `DashMap`, stats to `AtomicU64`
 - `ConnectionPool::acquire()` drops lock before async connect
+- `PostgresWorkflowStorage::connect_with_pool_size()` — configurable pool size (was hardcoded to 16)
+- Replay buffer fast-path for exact topic subscriptions (O(1) vs O(n) pattern scan)
 
 ### Fixed
 - `AsyncBarrierSet::arrive_and_wait()` missed-wakeup race

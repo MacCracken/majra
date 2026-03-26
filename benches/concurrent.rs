@@ -120,7 +120,7 @@ fn bench_heartbeat(c: &mut Criterion) {
         }
         b.iter(|| {
             for i in 0..100 {
-                tracker.heartbeat(&format!("node-{i}"));
+                let _ = tracker.heartbeat(&format!("node-{i}"));
             }
             tracker.update_statuses();
         });
@@ -139,7 +139,7 @@ fn bench_heartbeat(c: &mut Criterion) {
         }];
         b.iter(|| {
             for i in 0..50 {
-                tracker.heartbeat_with_telemetry(&format!("gpu-{i}"), telemetry.clone());
+                let _ = tracker.heartbeat_with_telemetry(&format!("gpu-{i}"), telemetry.clone());
             }
         });
     });
@@ -169,7 +169,7 @@ fn bench_ratelimit(c: &mut Criterion) {
         let limiter = RateLimiter::new(1000.0, 100);
         b.iter(|| {
             for i in 0..1000 {
-                limiter.check(&format!("key-{}", i % 10));
+                let _ = limiter.check(&format!("key-{}", i % 10));
             }
         });
     });
@@ -178,7 +178,7 @@ fn bench_ratelimit(c: &mut Criterion) {
         let limiter = RateLimiter::new(100000.0, 10000);
         b.iter(|| {
             for _ in 0..1000 {
-                limiter.check("hot-key");
+                let _ = limiter.check("hot-key");
             }
         });
     });

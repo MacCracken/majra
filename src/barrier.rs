@@ -129,12 +129,14 @@ impl BarrierSet {
 
     /// Number of active barriers.
     #[inline]
+    #[must_use]
     pub fn len(&self) -> usize {
         self.barriers.len()
     }
 
     /// Returns `true` if there are no active barriers.
     #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.barriers.is_empty()
     }
@@ -299,12 +301,14 @@ impl AsyncBarrierSet {
 
     /// Number of active barriers.
     #[inline]
+    #[must_use]
     pub fn len(&self) -> usize {
         self.barriers.len()
     }
 
     /// Returns `true` if there are no active barriers.
     #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.barriers.is_empty()
     }

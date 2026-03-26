@@ -158,6 +158,7 @@ impl HeartbeatTracker {
     }
 
     /// Record a heartbeat from a node, resetting it to Online.
+    #[must_use]
     pub fn heartbeat(&mut self, id: &str) -> bool {
         if let Some(node) = self.nodes.get_mut(id) {
             node.status = Status::Online;
@@ -169,6 +170,7 @@ impl HeartbeatTracker {
     }
 
     /// Record a heartbeat and update metadata.
+    #[must_use]
     pub fn heartbeat_with_metadata(&mut self, id: &str, metadata: serde_json::Value) -> bool {
         if let Some(node) = self.nodes.get_mut(id) {
             node.status = Status::Online;
@@ -208,6 +210,7 @@ impl HeartbeatTracker {
     }
 
     /// List nodes filtered by status.
+    #[must_use]
     pub fn list_by_status(&self, status: Status) -> Vec<(&str, &NodeState)> {
         self.nodes
             .iter()
@@ -217,24 +220,28 @@ impl HeartbeatTracker {
     }
 
     /// List all online nodes.
+    #[must_use]
     pub fn online(&self) -> Vec<(&str, &NodeState)> {
         self.list_by_status(Status::Online)
     }
 
     /// Get a node's current state.
     #[inline]
+    #[must_use]
     pub fn get(&self, id: &str) -> Option<&NodeState> {
         self.nodes.get(id)
     }
 
     /// Total tracked nodes.
     #[inline]
+    #[must_use]
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
 
     /// Returns `true` if no nodes are being tracked.
     #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
@@ -332,6 +339,7 @@ impl ConcurrentHeartbeatTracker {
     }
 
     /// Record a heartbeat from a node, resetting it to Online.
+    #[must_use]
     pub fn heartbeat(&self, id: &str) -> bool {
         if let Some(mut node) = self.nodes.get_mut(id) {
             node.status = Status::Online;
@@ -344,6 +352,7 @@ impl ConcurrentHeartbeatTracker {
     }
 
     /// Record a heartbeat and update metadata.
+    #[must_use]
     pub fn heartbeat_with_metadata(&self, id: &str, metadata: serde_json::Value) -> bool {
         if let Some(mut node) = self.nodes.get_mut(id) {
             node.status = Status::Online;
@@ -357,6 +366,7 @@ impl ConcurrentHeartbeatTracker {
     }
 
     /// Record a heartbeat and update GPU telemetry.
+    #[must_use]
     pub fn heartbeat_with_telemetry(&self, id: &str, gpu_telemetry: Vec<GpuTelemetry>) -> bool {
         if let Some(mut node) = self.nodes.get_mut(id) {
             node.status = Status::Online;
@@ -431,6 +441,7 @@ impl ConcurrentHeartbeatTracker {
     }
 
     /// List nodes filtered by status (returns owned tuples).
+    #[must_use]
     pub fn list_by_status(&self, status: Status) -> Vec<(String, NodeState)> {
         self.nodes
             .iter()
@@ -440,11 +451,13 @@ impl ConcurrentHeartbeatTracker {
     }
 
     /// List all online nodes (returns owned tuples).
+    #[must_use]
     pub fn online(&self) -> Vec<(String, NodeState)> {
         self.list_by_status(Status::Online)
     }
 
     /// Get a node's current state (cloned).
+    #[must_use]
     pub fn get(&self, id: &str) -> Option<NodeState> {
         self.nodes
             .get(id)
@@ -452,6 +465,7 @@ impl ConcurrentHeartbeatTracker {
     }
 
     /// Get a node's GPU telemetry (cloned).
+    #[must_use]
     pub fn get_gpu_telemetry(&self, id: &str) -> Option<Vec<GpuTelemetry>> {
         self.nodes
             .get(id)
@@ -460,12 +474,14 @@ impl ConcurrentHeartbeatTracker {
 
     /// Total tracked nodes.
     #[inline]
+    #[must_use]
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
 
     /// Returns `true` if no nodes are being tracked.
     #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
@@ -548,7 +564,7 @@ mod tests {
         assert_eq!(changes[0], ("n1".to_string(), Status::Suspect));
 
         // Heartbeat resets to Online.
-        tracker.heartbeat("n1");
+        let _ = tracker.heartbeat("n1");
         assert_eq!(tracker.get("n1").unwrap().status, Status::Online);
     }
 
@@ -610,7 +626,7 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0], ("n1".to_string(), Status::Suspect));
 
-        tracker.heartbeat("n1");
+        let _ = tracker.heartbeat("n1");
         assert_eq!(tracker.get("n1").unwrap().status, Status::Online);
     }
 
@@ -649,7 +665,7 @@ mod tests {
             handles.push(thread::spawn(move || {
                 let id = format!("n-{i}");
                 for _ in 0..100 {
-                    t.heartbeat(&id);
+                    let _ = t.heartbeat(&id);
                 }
             }));
         }
@@ -742,7 +758,7 @@ mod tests {
 
         // Make n2 go suspect.
         std::thread::sleep(Duration::from_millis(80));
-        tracker.heartbeat("n1"); // keep n1 online
+        let _ = tracker.heartbeat("n1"); // keep n1 online
         tracker.update_statuses();
 
         let stats = tracker.fleet_stats();
@@ -795,7 +811,7 @@ mod tests {
         tracker.update_statuses(); // cycle 2
 
         // Heartbeat resets cycles.
-        tracker.heartbeat("n1");
+        let _ = tracker.heartbeat("n1");
         std::thread::sleep(Duration::from_millis(80));
         tracker.update_statuses(); // cycle 1 again (reset)
         assert_eq!(tracker.len(), 1); // not evicted

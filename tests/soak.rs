@@ -390,7 +390,7 @@ fn soak_heartbeat_contention() {
             for _ in 0..HEARTBEATS_PER_NODE {
                 for idx in node_start..node_end {
                     let s = Instant::now();
-                    tr.heartbeat(&format!("node-{idx}"));
+                    let _ = tr.heartbeat(&format!("node-{idx}"));
                     hist.record(s.elapsed());
                 }
             }
