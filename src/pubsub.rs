@@ -212,7 +212,7 @@ impl PubSub {
     /// Remove subscription patterns whose receivers have all been dropped.
     ///
     /// Returns the number of dead patterns removed. Also runs automatically
-    /// every [`DEFAULT_CLEANUP_INTERVAL`] publishes.
+    /// every 1,000 publishes (configurable via `set_cleanup_interval`).
     pub fn cleanup_dead_subscribers(&self) -> usize {
         let dead: Vec<String> = self
             .subscriptions
