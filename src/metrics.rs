@@ -531,13 +531,13 @@ mod tests {
             let families = registry.gather();
             let enqueued = families
                 .iter()
-                .find(|f| f.get_name() == "majra_queue_enqueued_total")
+                .find(|f| f.name() == "majra_queue_enqueued_total")
                 .expect("enqueued metric should exist");
 
             let total: f64 = enqueued
                 .get_metric()
                 .iter()
-                .map(|m| m.get_counter().get_value())
+                .map(|m| m.get_counter().value())
                 .sum();
             assert_eq!(total, 3.0);
         }
