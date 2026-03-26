@@ -15,7 +15,7 @@ API freeze, full coverage, proven by real consumers.
 - [ ] SecureYeoman: expand beyond pubsub + ratelimit to queue, heartbeat, dag
 - [ ] 90%+ test coverage across all features
 
-### Hardening (completed this session)
+### Hardening (done)
 - [x] Relay dedup TTL eviction (`evict_stale_dedup`)
 - [x] DAG `InMemoryWorkflowStorage` retention (`evict_older_than`, `max_runs`)
 - [x] Auto PubSub dead subscriber cleanup (periodic on publish)
@@ -23,38 +23,19 @@ API freeze, full coverage, proven by real consumers.
 - [x] ConnectionPool stale eviction (`evict_stale`)
 - [x] Bounded capacity limits (relay dedup, pubsub subscriptions, DAG runs)
 
----
+### Consumer-driven features (done)
+- [x] Multi-tenant scoping — `Namespace` module for topic/key/node-ID prefixing
+- [x] PostgreSQL storage backend — `postgres` feature with `PostgresWorkflowStorage`
+- [x] IPC encryption — `ipc-encrypted` feature with AES-256-GCM via `ring`
+- [x] WebSocket bridge for pubsub — `ws` feature with `WsBridge`
+- [x] Distributed rate limiting — `RedisRateLimiter` with atomic Lua script
+- [x] Fleet heartbeat for edge — `RedisHeartbeatTracker` with TTL-based keys
 
-## Post-1.0 — Consumer-Driven Features
-
-Features identified from SecureYeoman integration analysis. These require
-coordination with consumer teams and may ship incrementally.
-
-### Multi-tenant scoping
-- [ ] Namespace-keyed queue, pubsub, relay isolation
-- [ ] Per-tenant metrics partitioning
-- **Why**: SecureYeoman is multi-tenant; current primitives are process-global
-
-### PostgreSQL storage backend
-- [ ] `postgres` feature: `WorkflowStorage` impl for PostgreSQL
-- [ ] `postgres` feature: `ManagedQueue` persistence backend
-- **Why**: SecureYeoman standardised on PostgreSQL; SQLite is insufficient for production
-
-### IPC encryption layer
-- [ ] Optional AES-256-GCM or TLS envelope encryption for IPC frames
-- **Why**: SecureYeoman's desktop/capture IPC requires encrypted channels
-
-### WebSocket bridge for pubsub
-- [ ] `ws` feature: bridge in-process pubsub topics to WebSocket fan-out
-- **Why**: SecureYeoman has a separate WebSocket broadcast layer for dashboards; consolidating into majra pubsub removes duplication
-
-### Distributed rate limiting
-- [ ] Extend `redis-backend` to support distributed token-bucket rate limiting
-- **Why**: SecureYeoman falls back to Redis sliding-window when scaling; majra should own this
-
-### Fleet heartbeat for edge devices
-- [ ] Cross-instance heartbeat via `fleet` + `redis-backend`
-- **Why**: SecureYeoman Edge needs multi-instance health coordination
+### Remaining for 1.0
+- [ ] `ManagedQueue` PostgreSQL persistence backend (workflow storage done, queue storage pending)
+- [ ] Per-tenant metrics partitioning (namespace module provides the scoping, metrics integration pending)
+- [ ] Integration tests against live PostgreSQL and Redis
+- [ ] Migration guide for SecureYeoman consumers
 
 ---
 

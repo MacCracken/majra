@@ -27,11 +27,15 @@
 //! | `redis-backend` | no | Redis-backed cross-process pub/sub and queues |
 //! | `prometheus` | no | Built-in Prometheus metrics exporter |
 //! | `quic` | no | QUIC transport with multiplexed streams and datagrams |
+//! | `ipc-encrypted` | no | AES-256-GCM encrypted IPC channels |
+//! | `postgres` | no | PostgreSQL persistence for workflow storage |
+//! | `ws` | no | WebSocket bridge for pub/sub fan-out |
 //! | `full` | — | Enables all features |
 
 pub mod envelope;
 pub mod error;
 pub mod metrics;
+pub mod namespace;
 #[allow(dead_code)]
 pub(crate) mod util;
 
@@ -53,6 +57,9 @@ pub mod transport;
 #[cfg(feature = "ipc")]
 pub mod ipc;
 
+#[cfg(feature = "ipc-encrypted")]
+pub mod ipc_encrypted;
+
 #[cfg(feature = "heartbeat")]
 pub mod heartbeat;
 
@@ -70,6 +77,12 @@ pub mod fleet;
 
 #[cfg(feature = "redis-backend")]
 pub mod redis_backend;
+
+#[cfg(feature = "ws")]
+pub mod ws;
+
+#[cfg(all(feature = "postgres", feature = "dag"))]
+pub mod postgres_backend;
 
 #[cfg(feature = "quic")]
 pub mod quic;

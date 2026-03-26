@@ -309,6 +309,284 @@ impl RedisQueue {
 // Run with: cargo test --features redis-backend -- --ignored --nocapture
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Distributed Rate Limiter
+// ---------------------------------------------------------------------------
+
+/// Distributed token-bucket rate limiter backed by Redis.
+///
+/// Uses an atomic Lua script for check-and-decrement to avoid race conditions
+/// across multiple processes. Each key stores `{tokens, last_refill_ms}` as
+/// a Redis hash.
+///
+/// Compatible with the in-process [`crate::ratelimit::RateLimiter`] API style.
+pub struct RedisRateLimiter {
+    client: redis::Client,
+    /// Tokens per second.
+    rate: f64,
+    /// Maximum burst.
+    burst: usize,
+    /// Key prefix in Redis.
+    prefix: String,
+}
+
+impl RedisRateLimiter {
+    /// Create a distributed rate limiter.
+    ///
+    /// - `rate`: tokens per second
+    /// - `burst`: maximum token capacity
+    /// - `prefix`: Redis key prefix (e.g. `"majra:rl:"`)
+    pub fn new(client: redis::Client, rate: f64, burst: usize, prefix: impl Into<String>) -> Self {
+        Self {
+            client,
+            rate,
+            burst,
+            prefix: prefix.into(),
+        }
+    }
+
+    /// Check whether a request for `key` is allowed.
+    ///
+    /// Atomically refills tokens based on elapsed time and decrements if
+    /// allowed. Returns `true` if the request should proceed.
+    pub async fn check(&self, key: &str) -> crate::error::Result<bool> {
+        let redis_key = format!("{}{key}", self.prefix);
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| MajraError::Queue(e.to_string()))?;
+
+        // Lua script: atomic token bucket check-and-decrement.
+        // KEYS[1] = bucket key (hash with fields: tokens, last_ms)
+        // ARGV[1] = rate (tokens/sec)
+        // ARGV[2] = burst (max tokens)
+        // ARGV[3] = now_ms (current time in milliseconds)
+        // Returns: 1 if allowed, 0 if rejected
+        let script = redis::Script::new(
+            r#"
+            local key = KEYS[1]
+            local rate = tonumber(ARGV[1])
+            local burst = tonumber(ARGV[2])
+            local now_ms = tonumber(ARGV[3])
+
+            local tokens = tonumber(redis.call('HGET', key, 'tokens') or burst)
+            local last_ms = tonumber(redis.call('HGET', key, 'last_ms') or now_ms)
+
+            local elapsed_s = (now_ms - last_ms) / 1000.0
+            tokens = math.min(tokens + elapsed_s * rate, burst)
+
+            if tokens >= 1 then
+                tokens = tokens - 1
+                redis.call('HSET', key, 'tokens', tostring(tokens), 'last_ms', tostring(now_ms))
+                redis.call('EXPIRE', key, math.ceil(burst / rate) + 60)
+                return 1
+            else
+                redis.call('HSET', key, 'tokens', tostring(tokens), 'last_ms', tostring(now_ms))
+                redis.call('EXPIRE', key, math.ceil(burst / rate) + 60)
+                return 0
+            end
+            "#,
+        );
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let result: i32 = script
+            .key(&redis_key)
+            .arg(self.rate)
+            .arg(self.burst)
+            .arg(now_ms)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(|e| MajraError::Queue(e.to_string()))?;
+
+        trace!(key, allowed = result == 1, "redis-rl: check");
+        Ok(result == 1)
+    }
+
+    /// Get the configured rate.
+    #[inline]
+    pub fn rate(&self) -> f64 {
+        self.rate
+    }
+
+    /// Get the configured burst.
+    #[inline]
+    pub fn burst(&self) -> usize {
+        self.burst
+    }
+
+    /// Get the key prefix.
+    #[inline]
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Distributed Heartbeat Tracker
+// ---------------------------------------------------------------------------
+
+/// Distributed heartbeat tracker backed by Redis.
+///
+/// Each node registers with a TTL-based key. Heartbeats refresh the TTL.
+/// Status is derived from key presence: if the key exists, the node is
+/// considered online; expired keys indicate offline nodes.
+///
+/// This enables cross-instance health coordination for edge deployments
+/// where multiple majra processes need a shared view of fleet health.
+pub struct RedisHeartbeatTracker {
+    client: redis::Client,
+    /// Key prefix (e.g. `"majra:hb:"`).
+    prefix: String,
+    /// TTL for heartbeat keys in seconds.
+    ttl_secs: u64,
+}
+
+impl RedisHeartbeatTracker {
+    /// Create a distributed heartbeat tracker.
+    ///
+    /// - `prefix`: Redis key prefix
+    /// - `ttl_secs`: how long a heartbeat key survives without renewal
+    pub fn new(client: redis::Client, prefix: impl Into<String>, ttl_secs: u64) -> Self {
+        Self {
+            client,
+            prefix: prefix.into(),
+            ttl_secs,
+        }
+    }
+
+    /// Register a node with optional metadata. Sets the key with TTL.
+    pub async fn register(
+        &self,
+        node_id: &str,
+        metadata: &serde_json::Value,
+    ) -> crate::error::Result<()> {
+        let key = format!("{}{node_id}", self.prefix);
+        let value =
+            serde_json::to_string(metadata).map_err(|e| MajraError::Heartbeat(e.to_string()))?;
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| MajraError::Heartbeat(e.to_string()))?;
+        conn.set_ex::<_, _, ()>(&key, &value, self.ttl_secs)
+            .await
+            .map_err(|e| MajraError::Heartbeat(e.to_string()))?;
+        debug!(node_id, ttl = self.ttl_secs, "redis-hb: registered");
+        Ok(())
+    }
+
+    /// Send a heartbeat for a node, refreshing its TTL.
+    pub async fn heartbeat(
+        &self,
+        node_id: &str,
+        metadata: &serde_json::Value,
+    ) -> crate::error::Result<()> {
+        // Same as register — SET EX refreshes the key.
+        self.register(node_id, metadata).await
+    }
+
+    /// Check if a node is online (key exists and hasn't expired).
+    pub async fn is_online(&self, node_id: &str) -> crate::error::Result<bool> {
+        let key = format!("{}{node_id}", self.prefix);
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| MajraError::Heartbeat(e.to_string()))?;
+        let exists: bool = conn
+            .exists(&key)
+            .await
+            .map_err(|e| MajraError::Heartbeat(e.to_string()))?;
+        Ok(exists)
+    }
+
+    /// Get metadata for a node (returns `None` if offline/expired).
+    pub async fn get_metadata(
+        &self,
+        node_id: &str,
+    ) -> crate::error::Result<Option<serde_json::Value>> {
+        let key = format!("{}{node_id}", self.prefix);
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| MajraError::Heartbeat(e.to_string()))?;
+        let value: Option<String> = conn
+            .get(&key)
+            .await
+            .map_err(|e| MajraError::Heartbeat(e.to_string()))?;
+        match value {
+            Some(v) => {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&v).map_err(|e| MajraError::Heartbeat(e.to_string()))?;
+                Ok(Some(parsed))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// List all online nodes by scanning keys with the configured prefix.
+    ///
+    /// Returns `(node_id, metadata)` pairs.
+    pub async fn list_online(&self) -> crate::error::Result<Vec<(String, serde_json::Value)>> {
+        let pattern = format!("{}*", self.prefix);
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| MajraError::Heartbeat(e.to_string()))?;
+
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(&pattern)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| MajraError::Heartbeat(e.to_string()))?;
+
+        let mut result = Vec::with_capacity(keys.len());
+        for key in &keys {
+            let value: Option<String> = conn
+                .get(key)
+                .await
+                .map_err(|e| MajraError::Heartbeat(e.to_string()))?;
+            if let Some(v) = value {
+                let node_id = key.strip_prefix(&self.prefix).unwrap_or(key);
+                let metadata: serde_json::Value =
+                    serde_json::from_str(&v).map_err(|e| MajraError::Heartbeat(e.to_string()))?;
+                result.push((node_id.to_string(), metadata));
+            }
+        }
+        Ok(result)
+    }
+
+    /// Deregister a node by deleting its key.
+    pub async fn deregister(&self, node_id: &str) -> crate::error::Result<()> {
+        let key = format!("{}{node_id}", self.prefix);
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| MajraError::Heartbeat(e.to_string()))?;
+        conn.del::<_, ()>(&key)
+            .await
+            .map_err(|e| MajraError::Heartbeat(e.to_string()))?;
+        debug!(node_id, "redis-hb: deregistered");
+        Ok(())
+    }
+
+    /// Get the configured TTL in seconds.
+    #[inline]
+    pub fn ttl_secs(&self) -> u64 {
+        self.ttl_secs
+    }
+
+    /// Get the key prefix.
+    #[inline]
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,5 +688,22 @@ mod tests {
         let client = test_client();
         let q = RedisQueue::new(client, "majra:queue:jobs");
         assert_eq!(q.key(), "majra:queue:jobs");
+    }
+
+    #[test]
+    fn ratelimiter_config() {
+        let client = test_client();
+        let rl = RedisRateLimiter::new(client, 10.0, 100, "majra:rl:");
+        assert_eq!(rl.rate(), 10.0);
+        assert_eq!(rl.burst(), 100);
+        assert_eq!(rl.prefix(), "majra:rl:");
+    }
+
+    #[test]
+    fn heartbeat_tracker_config() {
+        let client = test_client();
+        let hb = RedisHeartbeatTracker::new(client, "majra:hb:", 30);
+        assert_eq!(hb.ttl_secs(), 30);
+        assert_eq!(hb.prefix(), "majra:hb:");
     }
 }

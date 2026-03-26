@@ -53,6 +53,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `PooledTransport` internal struct tracks last-use time for each pooled connection
 - 13 new tests covering dedup eviction, request-response, bounded capacity, auto-cleanup, pool stale eviction
 
+#### Multi-tenant scoping (`namespace` module)
+- `Namespace` — prefix-based tenant isolation for topics (`/`), keys (`:`), and node IDs
+- `topic()`, `key()`, `node_id()`, `pattern()`, `wildcard()` — scoped identifier builders
+- `strip_topic()`, `strip_key()` — reverse mapping to extract bare identifiers
+- Integration tests proving pub/sub and rate limiter isolation between tenants
+
+#### PostgreSQL storage backend (`postgres` feature)
+- `PostgresWorkflowStorage` — `WorkflowStorage` impl backed by `deadpool-postgres` connection pool
+- Automatic table creation (`majra_workflow_definitions`, `majra_workflow_runs`, `majra_workflow_step_runs`)
+- Full CRUD for definitions, runs, and step runs with ON CONFLICT upserts
+- `connect(connection_string)` and `from_pool(pool)` constructors
+
+#### IPC encryption (`ipc-encrypted` feature)
+- `EncryptedIpcConnection` — AES-256-GCM wrapper around `IpcConnection` using `ring`
+- Pre-shared 256-bit key, monotonic nonce counter per direction
+- `send()` / `recv()` encrypt/decrypt JSON payloads transparently
+- `connect()` and `bind_and_accept()` convenience constructors
+- Wire format: base64-encoded `[12-byte nonce][ciphertext + 16-byte GCM tag]`
+- Inline base64 encode/decode (no additional dependency)
+
+#### WebSocket bridge for pubsub (`ws` feature)
+- `WsBridge` — bridges `PubSub` topics to WebSocket clients via `tokio-tungstenite`
+- Clients subscribe by sending `{"subscribe": "pattern"}` JSON
+- Matching messages forwarded as JSON text frames with topic, payload, timestamp
+- `WsBridgeConfig` — configurable `max_connections` (default 1024)
+- `spawn()` for background server lifecycle
+
+#### Distributed rate limiting (`redis-backend` feature)
+- `RedisRateLimiter` — distributed token-bucket rate limiter via Redis
+- Atomic Lua script for check-and-decrement (no race conditions across processes)
+- Auto-expiring keys (TTL = burst/rate + 60s)
+- Compatible API style with in-process `RateLimiter`
+
+#### Distributed heartbeat tracker (`redis-backend` feature)
+- `RedisHeartbeatTracker` — cross-instance health coordination via Redis key TTLs
+- `register()`, `heartbeat()`, `is_online()`, `get_metadata()`, `list_online()`, `deregister()`
+- Automatic offline detection via Redis key expiry
+- Suitable for edge device fleet health monitoring
+
 ### Changed
 - SQLite backend `.lock().unwrap()` replaced with `map_err` error propagation (4 call sites) — no more panics on poisoned mutex
 - Test coverage improved from 88% to 90%+ (133 tests total: 125 unit + 5 integration + 3 doc-tests)
