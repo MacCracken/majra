@@ -83,7 +83,7 @@ pub struct Relay {
     next_seq: AtomicU64,
     seen: DashMap<NodeId, (u64, Instant)>,
     tx: broadcast::Sender<IncomingMessage>,
-    pending_requests: DashMap<String, oneshot::Sender<RelayMessage>>,
+    pending_requests: DashMap<String, (oneshot::Sender<RelayMessage>, Instant)>,
     max_dedup_entries: usize,
     messages_sent: Counter,
     messages_received: Counter,
@@ -180,7 +180,8 @@ impl Relay {
     ) -> (u64, oneshot::Receiver<RelayMessage>) {
         let correlation_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
-        self.pending_requests.insert(correlation_id.clone(), tx);
+        self.pending_requests
+            .insert(correlation_id.clone(), (tx, Instant::now()));
 
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let msg = RelayMessage {
@@ -257,6 +258,33 @@ impl Relay {
         self.pending_requests.len()
     }
 
+    /// Evict pending requests that have been waiting longer than `timeout`.
+    ///
+    /// Stale requests are dropped — their oneshot receivers will get
+    /// `RecvError`. Call periodically to prevent unbounded growth when
+    /// peers fail to reply.
+    ///
+    /// Returns the number of requests evicted.
+    pub fn evict_stale_requests(&self, timeout: Duration) -> usize {
+        let now = Instant::now();
+        let stale: Vec<String> = self
+            .pending_requests
+            .iter()
+            .filter(|entry| now.duration_since(entry.value().1) > timeout)
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        let count = stale.len();
+        for key in &stale {
+            self.pending_requests.remove(key);
+        }
+
+        if count > 0 {
+            debug!(count, "relay: evicted stale pending requests");
+        }
+        count
+    }
+
     /// Subscribe to inbound messages on this relay.
     pub fn subscribe(&self) -> broadcast::Receiver<IncomingMessage> {
         self.tx.subscribe()
@@ -309,7 +337,7 @@ impl Relay {
         // Resolve pending request-response correlation.
         if msg.is_reply
             && let Some(ref cid) = msg.correlation_id
-            && let Some((_, tx)) = self.pending_requests.remove(cid)
+            && let Some((_, (tx, _))) = self.pending_requests.remove(cid)
         {
             let _ = tx.send(msg.clone());
             trace!(

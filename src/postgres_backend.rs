@@ -37,13 +37,27 @@ pub struct PostgresWorkflowStorage {
 
 impl PostgresWorkflowStorage {
     /// Connect to PostgreSQL and create tables if they don't exist.
+    ///
+    /// Uses a default pool size of 16 connections. For custom pool sizing,
+    /// use [`from_pool`](Self::from_pool).
     pub async fn connect(connection_string: &str) -> crate::error::Result<Self> {
+        Self::connect_with_pool_size(connection_string, 16).await
+    }
+
+    /// Connect with a custom connection pool size.
+    pub async fn connect_with_pool_size(
+        connection_string: &str,
+        max_pool_size: usize,
+    ) -> crate::error::Result<Self> {
         let pg_config: tokio_postgres::Config = connection_string.parse().map_err(pg_err)?;
         let mgr_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         };
         let mgr = Manager::from_config(pg_config, NoTls, mgr_config);
-        let pool = Pool::builder(mgr).max_size(16).build().map_err(pg_err)?;
+        let pool = Pool::builder(mgr)
+            .max_size(max_pool_size)
+            .build()
+            .map_err(pg_err)?;
 
         let storage = Self { pool };
         storage.init_tables().await?;

@@ -5,12 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.22.3] — 2026-03-22
-
-### Changed
-- Version bump for stiva 0.22.3 ecosystem release
-
 ## [Unreleased]
+
+## [1.0.0] — 2026-03-26
+
+**First stable release.** API freeze. Full feature coverage across pub/sub, queues, relay, IPC, heartbeat, rate limiting, barriers, DAG workflows, fleet scheduling, and distributed backends.
 
 ### Added
 
@@ -19,211 +18,148 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TriggerMode` — `All` (AND) and `Any` (OR) join semantics for dependency resolution
 - `WorkflowStorage` trait — db-agnostic async storage for definitions, runs, and step runs
 - `StepExecutor` trait — consumer-defined step execution logic
-- `InMemoryWorkflowStorage` — DashMap-backed default storage (no external deps)
+- `InMemoryWorkflowStorage` — DashMap-backed default storage with retention policy (`evict_older_than`, `with_max_runs`)
 - `SqliteWorkflowStorage` — SQLite-backed storage (behind `sqlite` feature)
 - `topological_sort_tiers()` — modified Kahn's algorithm returning parallelizable tiers with trigger-mode-aware in-degree
 - `WorkflowDefinition`, `WorkflowRun`, `StepRun` — full execution tracking types
 - `WorkflowContext` — step output accumulation for downstream reference
-- Validation: cycle detection (via `DagScheduler`), referential integrity for deps and fallbacks
+- Validation: cycle detection, referential integrity for deps and fallbacks
 - Cooperative cancellation via `AtomicBool` per run
-- 22 unit tests (tier sort, validation, storage CRUD, engine execution, retry, error policies, context propagation)
-- 4 benchmarks (tier sort linear/wide, engine execute linear/diamond)
-
-#### Scaffold hardening (P-1)
-- `scripts/bench-history.sh` — benchmark runner that parses criterion output and appends results to `bench-history.csv`
-- `#[inline]` on ~20 hot-path accessors across all modules (Counter, matches_pattern, len/is_empty, is_terminal, satisfies, node_id, classify_status)
-- `#[must_use]` on `BarrierResult`, `matches_pattern()`, `DagScheduler::ready()`, `RelayStats`, `RateLimitStats`, `FleetStats`
-- Tracing instrumentation for IPC module (`debug!` on bind/accept, `trace!` on frame send/recv)
-- Tracing instrumentation for transport module (`debug!` on new connections and close, `trace!` on reuse)
-- Benchmark suite for envelope and IPC modules (`envelope_new`, `envelope_serialize_roundtrip`, `ipc_roundtrip_small_payload`, `ipc_roundtrip_large_payload`)
-- 8 new unit tests covering Default impls, deprecated compat, broadcast, subscribe, and error paths (barrier, relay, pubsub)
-
-#### Hardening & memory safety (P-1, SecureYeoman audit)
-- `Relay::evict_stale_dedup(max_idle)` — TTL-based eviction of the dedup table to prevent unbounded memory growth
-- `Relay::send_request()` / `Relay::reply()` — request-response correlation via UUID correlation IDs and oneshot channels for RPC patterns
-- `Relay::set_max_dedup_entries()` — configurable cap on dedup table size with automatic LRU eviction
-- `RelayMessage::correlation_id` and `is_reply` fields for request-response pairing
-- `RelayStats::dedup_evicted` and `dedup_table_size` fields for dedup observability
-- `InMemoryWorkflowStorage::evict_older_than(max_age)` — retention policy for terminal workflow runs and their step runs
-- `InMemoryWorkflowStorage::with_max_runs(max)` — bounded capacity with auto-eviction of oldest terminal run on insert
-- `InMemoryWorkflowStorage::run_count()` and `step_run_count()` for observability
-- `PubSub` and `TypedPubSub` automatic dead-subscriber cleanup on publish (configurable interval via `set_cleanup_interval` / `TypedPubSubConfig::cleanup_interval`)
-- `PubSub::try_subscribe()` and `TypedPubSub::try_subscribe()` — capacity-checked subscription with `max_subscriptions` limit
-- `ConnectionPool::evict_stale(max_idle)` — TTL-based eviction of idle transport connections with disconnect cleanup
-- `PooledTransport` internal struct tracks last-use time for each pooled connection
-- 13 new tests covering dedup eviction, request-response, bounded capacity, auto-cleanup, pool stale eviction
 
 #### Multi-tenant scoping (`namespace` module)
-- `Namespace` — prefix-based tenant isolation for topics (`/`), keys (`:`), and node IDs
+- `Namespace` — prefix-based tenant isolation for topics, keys, and node IDs
 - `topic()`, `key()`, `node_id()`, `pattern()`, `wildcard()` — scoped identifier builders
 - `strip_topic()`, `strip_key()` — reverse mapping to extract bare identifiers
-- Integration tests proving pub/sub and rate limiter isolation between tenants
 
 #### PostgreSQL storage backend (`postgres` feature)
 - `PostgresWorkflowStorage` — `WorkflowStorage` impl backed by `deadpool-postgres` connection pool
-- Automatic table creation (`majra_workflow_definitions`, `majra_workflow_runs`, `majra_workflow_step_runs`)
-- Full CRUD for definitions, runs, and step runs with ON CONFLICT upserts
-- `connect(connection_string)` and `from_pool(pool)` constructors
+- Automatic table creation with `majra_` prefix
+- `connect()`, `connect_with_pool_size()`, and `from_pool()` constructors
 
 #### IPC encryption (`ipc-encrypted` feature)
 - `EncryptedIpcConnection` — AES-256-GCM wrapper around `IpcConnection` using `ring`
 - Pre-shared 256-bit key, monotonic nonce counter per direction
 - `send()` / `recv()` encrypt/decrypt JSON payloads transparently
-- `connect()` and `bind_and_accept()` convenience constructors
-- Wire format: base64-encoded `[12-byte nonce][ciphertext + 16-byte GCM tag]`
-- Inline base64 encode/decode (no additional dependency)
 
 #### WebSocket bridge for pubsub (`ws` feature)
 - `WsBridge` — bridges `PubSub` topics to WebSocket clients via `tokio-tungstenite`
-- Clients subscribe by sending `{"subscribe": "pattern"}` JSON
-- Matching messages forwarded as JSON text frames with topic, payload, timestamp
+- Clients subscribe via `{"subscribe": "pattern"}` JSON handshake
 - `WsBridgeConfig` — configurable `max_connections` (default 1024)
-- `spawn()` for background server lifecycle
 
 #### Distributed rate limiting (`redis-backend` feature)
-- `RedisRateLimiter` — distributed token-bucket rate limiter via Redis
-- Atomic Lua script for check-and-decrement (no race conditions across processes)
-- Auto-expiring keys (TTL = burst/rate + 60s)
-- Compatible API style with in-process `RateLimiter`
+- `RedisRateLimiter` — distributed token-bucket rate limiter via atomic Redis Lua script
+- Auto-expiring keys, compatible API style with in-process `RateLimiter`
 
 #### Distributed heartbeat tracker (`redis-backend` feature)
 - `RedisHeartbeatTracker` — cross-instance health coordination via Redis key TTLs
 - `register()`, `heartbeat()`, `is_online()`, `get_metadata()`, `list_online()`, `deregister()`
-- Automatic offline detection via Redis key expiry
-- Suitable for edge device fleet health monitoring
-
-### Changed
-- SQLite backend `.lock().unwrap()` replaced with `map_err` error propagation (4 call sites) — no more panics on poisoned mutex
-- Test coverage improved from 88% to 90%+ (133 tests total: 125 unit + 5 integration + 3 doc-tests)
-
-### Added
 
 #### Typed pub/sub (`TypedPubSub<T>`)
-- `TypedPubSub<T>` — generic, type-safe pub/sub hub replacing untyped `serde_json::Value` payloads
-- `TypedMessage<T>` — typed message with `to_untyped()` / `from_untyped()` conversion
-- `BackpressurePolicy` — configurable per-hub: `DropOldest` (default) or `DropNewest`
-- `TypedPubSubConfig` — channel capacity, backpressure policy, replay buffer size
-- Event replay buffer — optional bounded replay so late subscribers catch up on missed messages
-- Subscription filters — `subscribe_filtered()` with predicate-based delivery filtering
-- `messages_dropped()` counter for backpressure observability
+- `TypedPubSub<T>` — generic, type-safe pub/sub hub with backpressure, replay, and filters
+- `BackpressurePolicy` — `DropOldest` (default) or `DropNewest`
+- Automatic dead-subscriber cleanup on publish (configurable interval)
+- `try_subscribe()` — capacity-checked subscription with `max_subscriptions` limit
 
 #### Rate limiter enhancements
-- `evict_stale(max_idle)` — periodic sweep of keys with no recent activity, returns eviction count
-- `RateLimitStats` — `total_allowed`, `total_rejected`, `active_keys`, `total_evicted` counters
-- `stats()` method for runtime observability
+- `evict_stale(max_idle)` — periodic sweep of idle keys
+- `RateLimitStats` — `total_allowed`, `total_rejected`, `active_keys`, `total_evicted`
+
+#### Relay enhancements
+- `send_request()` / `reply()` — request-response correlation via UUID and oneshot channels
+- `evict_stale_dedup(max_idle)` — TTL-based dedup table eviction
+- `evict_stale_requests(timeout)` — TTL-based pending request cleanup
+- `set_max_dedup_entries()` — configurable dedup table cap with LRU eviction
+- `RelayMessage::correlation_id` and `is_reply` fields
 
 #### Observability & logging
-- `metrics` module — `MajraMetrics` trait with no-op default (`NoopMetrics`), covering queue, pubsub, heartbeat, rate limiter, relay, and barrier operations
-- `ManagedQueue::with_metrics()` — accept custom `Arc<dyn MajraMetrics>` for enqueue/dequeue/state-change reporting
-- `logging` feature — structured tracing initialisation via `MAJRA_LOG` env var with per-module filtering
-- `info!`-level tracing on ManagedQueue lifecycle events (enqueue, dequeue, state transitions)
-- `debug!`-level tracing on heartbeat transitions, evictions, relay sends, rate limiter eviction
-- `trace!`-level tracing on per-message pubsub delivery and relay dedup
-- Structured `#[instrument]` spans on ManagedQueue enqueue, dequeue, and finish_job
+- `metrics` module — `MajraMetrics` trait with no-op default and Prometheus implementation
+- `logging` feature — structured tracing via `MAJRA_LOG` env var
+- Structured `#[instrument]` spans on ManagedQueue operations
 
 #### Distributed primitives
-- `AsyncBarrierSet` — barrier with `arrive_and_wait()` returning a `Future` that resolves on release, with `AtomicBool` release flag to prevent missed wakeups
-- `transport` module — `Transport` trait for pluggable relay connections (Unix socket, TCP, future gRPC)
-- `TransportFactory` trait — endpoint-based connection creation
-- `ConnectionPool` — multiplexed connection pool with per-endpoint reuse and automatic cleanup of disconnected transports
+- `AsyncBarrierSet` — async barrier with `arrive_and_wait()` and `AtomicBool` release flag
+- `transport` module — `Transport` trait, `TransportFactory`, `ConnectionPool` with stale eviction
+- `ConnectionPool::evict_stale(max_idle)` — TTL-based idle connection cleanup
 
 #### Code quality
-- `#[non_exhaustive]` on all public enums (8 types)
-- `#[must_use]` on `PriorityQueue`, `ConcurrentPriorityQueue`, `RateLimiter`
-- `///` doc comments on every public item — `cargo doc -W missing_docs` passes
-- `Counter` and `evict_from_dashmap` utilities in `util` module to eliminate boilerplate
-- `barrier_status()` and `classify_status()` helpers to deduplicate release-check and status-classification logic
-- `persistence_err()` helper to replace 14 repeated `.map_err()` calls in SQLite module
-- `ConcurrentBarrierSet` consolidated as type alias for `AsyncBarrierSet`
-- `IpcClient` consolidated as type alias for `IpcConnection`
+- `#[non_exhaustive]` on all public enums
+- `#[must_use]` on all pure return types
+- `#[inline]` on all hot-path accessors
+- `///` doc comments on every public item
+- `Counter` and `evict_from_dashmap` utilities
 
 #### Repository infrastructure
-- GitHub Actions CI (10-job pipeline: lint, test 3 platforms, MSRV, coverage, benchmarks, security audit, cargo-deny, semver check, docs)
-- GitHub Actions release workflow (CI gate → version check → crates.io publish → GitHub Release)
-- LICENSE (AGPL-3.0-only), CONTRIBUTING.md, SECURITY.md, CODE_OF_CONDUCT.md
-- Makefile with `make check` (fmt + clippy + test + audit)
-- `deny.toml` (license allowlist, advisory checks, source restrictions)
-- `codecov.yml` (80% project target, 75% patch)
-- `rust-toolchain.toml` (stable + rustfmt + clippy)
-- Fuzz targets (queue, pubsub, heartbeat) with libfuzzer
-- `supply-chain/` (cargo-vet config + audits)
-- `scripts/version-bump.sh` (atomic VERSION + Cargo.toml + Cargo.lock update)
-- Architecture overview, threat model, testing guide documentation
-- Integration tests (5 multi-module scenarios)
-- Benchmarks for all modules (25 benchmarks total)
+- GitHub Actions CI (10-job pipeline) and release workflow
+- LICENSE, CONTRIBUTING.md, SECURITY.md, CODE_OF_CONDUCT.md
+- Makefile, `deny.toml`, `codecov.yml`, `rust-toolchain.toml`
+- Fuzz targets (queue, pubsub, heartbeat)
+- `supply-chain/` (cargo-vet), `scripts/version-bump.sh`
+- 208 tests (unit + integration + doc-tests), 25+ benchmarks
 
 ### Changed
-- `matches_pattern()` rewritten from recursive Vec-allocating to iterative zero-allocation with inline depth tracking
-- `ManagedQueue::dequeue()` restructured to release tiers lock before DashMap mutation, eliminating nested lock contention
-- `ManagedQueue::cancel()` drops DashMap guard before awaiting tiers lock, preventing cross-await lock holding
-- `ManagedQueue::dequeue()` only increments `running_count` and emits events when a job is actually found
-- `IPC write_frame` uses `u32::try_from` instead of `as u32` to prevent silent truncation on >4 GiB payloads
-- `BarrierRecord::forced` now correctly tracks whether `force()` was called via `was_forced` field
-- `RateLimiter::Bucket` merged redundant `last_refill`/`last_check` into single `last_access` field
-- `ConnectionPool::acquire()` drops lock before async connect to avoid blocking all pool access during I/O
+- `matches_pattern()` rewritten to iterative zero-allocation with inline depth tracking
+- `ManagedQueue::dequeue()` releases tiers lock before DashMap mutation
+- `ManagedQueue::cancel()` drops DashMap guard before awaiting tiers lock
+- `RateLimiter` internals swapped from `Mutex<HashMap>` to `DashMap`
+- `Relay` dedup map swapped to `DashMap`, stats to `AtomicU64`
+- `ConnectionPool::acquire()` drops lock before async connect
 
 ### Fixed
-- `AsyncBarrierSet::arrive_and_wait()` missed-wakeup race — added `AtomicBool` released flag checked in wait loop
-- `TypedPubSub::publish()` `delivered` counter no longer counts dropped messages under `DropNewest` policy
-- SQLite `persist()` no longer panics on `resource_req` serialisation failure (replaced `.unwrap()` with `.map_err()`)
-- Removed dead `From<rusqlite::Error>` impl that duplicated `persistence_err()` helper
-- SQLite `persist()` no longer stores meaningless `Instant::elapsed()` duration as `enqueued_at`
-- Integration tests properly feature-gated with `#[cfg(feature = "...")]` for `--no-default-features` compatibility
+- `AsyncBarrierSet::arrive_and_wait()` missed-wakeup race
+- `TypedPubSub::publish()` delivered counter accuracy under `DropNewest`
+- SQLite `persist()` no longer panics on serialisation failure
+- IPC `write_frame` uses `u32::try_from` to prevent silent truncation
+
+## [0.22.3] — 2026-03-22
+
+### Changed
+- Version bump for stiva 0.22.3 ecosystem release
 
 ## [0.21.3] - 2026-03-21
 
 ### Added
 
 #### Thread safety
-- `ConcurrentPriorityQueue<T>` — async-aware wrapper with `Notify`-based blocking dequeue (`dequeue_wait`)
+- `ConcurrentPriorityQueue<T>` — async-aware wrapper with `Notify`-based blocking dequeue
 - `ConcurrentHeartbeatTracker` — `DashMap`-backed tracker with all `&self` methods
-- `ConcurrentBarrierSet` — `DashMap`-backed barrier manager with all `&self` methods
+- `ConcurrentBarrierSet` — `DashMap`-backed barrier manager
 - Compile-time `Send + Sync` assertions on all public types
-- Concurrent-access benchmarks (queue, managed queue, heartbeat, rate limiter)
 
 #### Managed queue (`ManagedQueue<T>`)
-- `ResourceReq` / `ResourcePool` — optional GPU-aware dequeue filtering (gpu_count, vram_mb)
-- `ManagedQueueConfig` — max concurrency enforcement with automatic slot release
-- `JobState` enum — `Queued → Running → Completed / Failed / Cancelled` state machine
-- `ManagedItem<T>` — lifecycle-tracked queue item with timestamps and resource requirements
-- `QueueEvent` — broadcast events on enqueue, dequeue, and state transitions
-- TTL-based eviction of terminal jobs via `evict_expired()`
-- `sqlite` feature — optional `SqliteBackend` persistence with WAL mode and crash recovery
+- `ResourceReq` / `ResourcePool` — GPU-aware dequeue filtering
+- `ManagedQueueConfig` — max concurrency enforcement
+- `JobState` enum — `Queued → Running → Completed / Failed / Cancelled`
+- `ManagedItem<T>` — lifecycle-tracked queue item
+- `QueueEvent` — broadcast events on state transitions
+- TTL-based eviction via `evict_expired()`
+- `sqlite` feature — `SqliteBackend` persistence with WAL mode
 
 #### Fleet & heartbeat
-- `GpuTelemetry` — structured GPU stats (utilization_pct, memory_used_mb, memory_total_mb, temperature_c)
-- `FleetStats` — aggregate node counts, GPU counts, and VRAM totals across fleet
-- `EvictionPolicy` — configurable auto-eviction after N offline cycles with mpsc notification channel
-- `register_with_telemetry()` — register nodes with initial GPU data
-- `heartbeat_with_telemetry()` — update GPU telemetry on heartbeat
-- `heartbeat_with_metadata()` — update metadata on heartbeat (both tracker variants)
-- `fleet_stats()` — one-call fleet-wide aggregation
-- `get_gpu_telemetry()` — retrieve a node's structured GPU data
+- `GpuTelemetry`, `FleetStats`, `EvictionPolicy`
+- `register_with_telemetry()`, `heartbeat_with_telemetry()`, `fleet_stats()`
 
 #### Error types
-- `MajraError::InvalidStateTransition` — for illegal job state transitions
-- `MajraError::ResourceUnavailable` — for resource constraint violations
-- `MajraError::Persistence` — for SQLite errors (behind `sqlite` feature)
+- `MajraError::InvalidStateTransition`, `ResourceUnavailable`, `Persistence`
 
 ### Changed
-- `RateLimiter` internals swapped from `std::sync::Mutex<HashMap>` to `DashMap` — same public API, better concurrent performance
-- `Relay` dedup map swapped from `std::sync::Mutex<HashMap>` to `DashMap`, stats counters from `Mutex<RelayStats>` to `AtomicU64` — same public API
-- `HeartbeatConfig` gains optional `eviction_policy` field (defaults to `None`, non-breaking)
+- `RateLimiter` and `Relay` internals to `DashMap` + `AtomicU64`
 
 ## [0.21.0] - 2026-03-21
 
 ### Added
-- `envelope` — Universal message envelope with Target routing (Node/Topic/Broadcast)
-- `pubsub` — Topic-based pub/sub with MQTT-style `*`/`#` wildcard matching
-- `queue` — Multi-tier priority queue (5 levels) with DAG dependency scheduling (Kahn's algorithm)
-- `relay` — Sequenced, deduplicated inter-node message relay with atomic counters
-- `ipc` — Length-prefixed framing (4-byte u32 + JSON) over Unix domain sockets
-- `heartbeat` — TTL-based node health tracking with Online → Suspect → Offline FSM
-- `ratelimit` — Per-key token bucket rate limiter with lazy refill
-- `barrier` — N-way barrier synchronisation with force/deadlock recovery
+- `envelope` — Universal message envelope with Target routing
+- `pubsub` — Topic-based pub/sub with MQTT-style wildcard matching
+- `queue` — Multi-tier priority queue with DAG dependency scheduling
+- `relay` — Sequenced, deduplicated inter-node message relay
+- `ipc` — Length-prefixed framing over Unix domain sockets
+- `heartbeat` — TTL-based health tracking with Online → Suspect → Offline FSM
+- `ratelimit` — Per-key token bucket rate limiter
+- `barrier` — N-way barrier synchronisation with deadlock recovery
 - `error` — Shared error types (MajraError, IpcError)
 - Feature-gated modules: default = pubsub + queue + relay + heartbeat
 
-[Unreleased]: https://github.com/MacCracken/majra/compare/v0.21.3...HEAD
+[Unreleased]: https://github.com/MacCracken/majra/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/MacCracken/majra/compare/v0.22.3...v1.0.0
+[0.22.3]: https://github.com/MacCracken/majra/compare/v0.21.3...v0.22.3
 [0.21.3]: https://github.com/MacCracken/majra/compare/v0.21.0...v0.21.3
 [0.21.0]: https://github.com/MacCracken/majra/releases/tag/v0.21.0

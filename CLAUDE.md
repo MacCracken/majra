@@ -7,7 +7,7 @@
 - **Type**: Flat library crate
 - **License**: AGPL-3.0-only
 - **MSRV**: 1.89
-- **Version**: SemVer 0.D.M pre-1.0
+- **Version**: SemVer 1.0.0 (stable)
 
 ## Consumers
 
@@ -54,6 +54,33 @@ daimon (agent messaging), AgnosAI (crew coordination), hoosh (inference routing)
 - **Vec arena over HashMap** — when indices are known, direct access beats hashing.
 - **Feature-gate optional deps** — consumers pull only what they need.
 - **tracing on all operations** — structured logging for audit trail.
+
+## Documentation Structure
+
+### Required root files
+- `README.md` — quick start, feature table, examples, architecture diagram
+- `CHANGELOG.md` — Keep a Changelog format, every release gets an entry
+- `CLAUDE.md` — development process instructions
+- `CONTRIBUTING.md` — PR process, code style, testing requirements
+- `SECURITY.md` — attack surface, supported versions, reporting process
+- `CODE_OF_CONDUCT.md` — Contributor Covenant v2.1
+- `LICENSE` — AGPL-3.0-only
+- `benchmarks.md` — 3-point trend tracking (baseline/previous/latest)
+
+### Required docs/
+- `architecture/overview.md` — module map, data flow, consumers, dependency stack
+- `development/roadmap.md` — completed items removed, backlog only
+- `development/dependency-watch.md` — pinned versions and upgrade paths
+
+### Earned docs/ (add when relevant)
+- `development/threat-model.md` — attack surface, known risks, mitigations
+- `guides/testing.md` — test categories, coverage, benchmark patterns
+- `guides/migration-*.md` — consumer migration guides
+
+### CHANGELOG Format
+- Keep a Changelog standard: Added / Changed / Fixed / Removed / Security / Performance
+- Every release gets an entry; `[Unreleased]` section at top
+- Performance claims must include benchmark numbers
 
 ## DO NOT
 - **Do not commit or push** — the user handles all git operations (commit, push, tag)

@@ -143,9 +143,12 @@ impl EncryptedIpcConnection {
         }
 
         let (nonce_bytes, ciphertext_and_tag) = frame.split_at(12);
-        let nonce = Nonce::assume_unique_for_key(
-            nonce_bytes.try_into().expect("nonce is exactly 12 bytes"),
-        );
+        let nonce_arr: [u8; 12] = nonce_bytes.try_into().map_err(|_| {
+            IpcError::Io(std::io::Error::other(
+                "internal error: nonce must be 12 bytes",
+            ))
+        })?;
+        let nonce = Nonce::assume_unique_for_key(nonce_arr);
 
         let mut in_out = ciphertext_and_tag.to_vec();
         let plaintext = self

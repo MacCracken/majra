@@ -429,8 +429,10 @@ impl InMemoryWorkflowStorage {
     ///
     /// Returns the number of runs evicted.
     pub fn evict_older_than(&self, max_age: Duration) -> usize {
-        let cutoff_ms = chrono::Utc::now().timestamp_millis()
-            - i64::try_from(max_age.as_millis()).unwrap_or(i64::MAX);
+        let max_age_ms = i64::try_from(max_age.as_millis()).unwrap_or(i64::MAX);
+        let cutoff_ms = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_sub(max_age_ms);
 
         let stale_run_ids: Vec<String> = self
             .runs

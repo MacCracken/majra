@@ -11,26 +11,32 @@ Majra provides shared messaging primitives for the [AGNOS](https://github.com/Ma
 | Module | Feature | Description |
 |--------|---------|-------------|
 | **pubsub** | `pubsub` | Topic-based pub/sub with MQTT-style `*`/`#` wildcard matching |
-| **pubsub** | `pubsub` | `TypedPubSub<T>` — generic, type-safe pub/sub with backpressure, replay, and filters |
+| **pubsub** | `pubsub` | `TypedPubSub<T>` — generic, type-safe pub/sub with backpressure, replay, filters, auto-cleanup |
 | **queue** | `queue` | Multi-tier priority queue (5 levels) with DAG dependency scheduling |
 | **queue** | `queue` | `ManagedQueue<T>` — resource-aware, lifecycle-tracked, concurrent job queue |
-| **relay** | `relay` | Sequenced, deduplicated inter-node message relay |
-| **transport** | `relay` | Pluggable transport trait + multiplexed connection pool |
+| **relay** | `relay` | Sequenced, deduplicated inter-node message relay with request-response correlation |
+| **transport** | `relay` | Pluggable transport trait + multiplexed connection pool with stale eviction |
 | **ipc** | `ipc` | Length-prefixed framing over Unix domain sockets |
-| **heartbeat** | `heartbeat` | TTL-based node health: Online → Suspect → Offline with GPU telemetry and fleet stats |
+| **ipc-encrypted** | `ipc-encrypted` | AES-256-GCM encrypted IPC channels via `ring` |
+| **heartbeat** | `heartbeat` | TTL-based node health: Online / Suspect / Offline with GPU telemetry and fleet stats |
 | **ratelimit** | `ratelimit` | Per-key token bucket rate limiter with stale-key eviction and stats |
 | **barrier** | `barrier` | N-way barrier sync with deadlock recovery + async `arrive_and_wait()` |
+| **dag** | `dag` | DAG-based workflow engine with tier scheduling, retry, error policies, pluggable storage |
+| **fleet** | `fleet` | Distributed job queue with work-stealing across nodes |
+| **namespace** | always | Multi-tenant scoping for topics, keys, and node IDs |
 | **metrics** | always | `MajraMetrics` trait — wire to Prometheus/OpenTelemetry |
+| **redis** | `redis-backend` | Cross-process pub/sub, queues, distributed rate limiter, distributed heartbeat |
+| **postgres** | `postgres` | PostgreSQL-backed workflow storage with connection pooling |
+| **ws** | `ws` | WebSocket bridge — fan out pub/sub topics to WebSocket clients |
+| **quic** | `quic` | QUIC transport with multiplexed streams and datagrams |
 
 Default features: `pubsub`, `queue`, `relay`, `heartbeat`.
-
-Optional: `ipc`, `ratelimit`, `barrier`, `sqlite` (persistent queue backing).
 
 ## Quick Start
 
 ```toml
 [dependencies]
-majra = "0.21"
+majra = "1.0"
 ```
 
 ### Typed Pub/Sub
@@ -74,10 +80,54 @@ if let Some(job) = queue.dequeue(&pool).await {
 }
 ```
 
+### Relay with Request-Response
+
+```rust
+use majra::relay::Relay;
+
+let relay = Relay::new("node-1");
+let mut sub = relay.subscribe();
+
+// Fire-and-forget broadcast.
+relay.broadcast("announce", serde_json::json!({"joined": true}));
+
+// Request-response (RPC pattern).
+let (seq, rx) = relay.send_request("node-2", "rpc/ping", serde_json::json!({}));
+// Await reply with timeout...
+```
+
+### Multi-Tenant Isolation
+
+```rust
+use majra::namespace::Namespace;
+use majra::pubsub::PubSub;
+
+let hub = PubSub::new();
+let ns_a = Namespace::new("tenant-a");
+let ns_b = Namespace::new("tenant-b");
+
+let mut rx_a = hub.subscribe(&ns_a.pattern("events/#"));
+hub.publish(&ns_a.topic("events/created"), serde_json::json!({"a": 1}));
+// Only tenant-a receives the message.
+```
+
+### Distributed Rate Limiting (Redis)
+
+```rust
+use majra::redis_backend::RedisRateLimiter;
+
+let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+let limiter = RedisRateLimiter::new(client, 100.0, 50, "myapp:rl:");
+
+if limiter.check("user:123").await? {
+    // Request allowed
+}
+```
+
 ### Fleet Heartbeat with GPU Telemetry
 
 ```rust
-use majra::heartbeat::{ConcurrentHeartbeatTracker, GpuTelemetry, HeartbeatConfig};
+use majra::heartbeat::{ConcurrentHeartbeatTracker, GpuTelemetry};
 
 let tracker = ConcurrentHeartbeatTracker::default();
 tracker.register_with_telemetry("gpu-node-1", serde_json::json!({}), vec![
@@ -90,69 +140,49 @@ tracker.register_with_telemetry("gpu-node-1", serde_json::json!({}), vec![
 ]);
 
 let stats = tracker.fleet_stats();
-println!("{} nodes, {} GPUs, {} MB VRAM available",
-    stats.total_nodes, stats.total_gpus, stats.available_vram_mb);
 ```
 
-### Async Barrier
+## Architecture
 
-```rust
-use majra::barrier::AsyncBarrierSet;
-
-let barriers = AsyncBarrierSet::new();
-barriers.create("training-sync", participants);
-
-// Each worker awaits the barrier — released when all arrive.
-barriers.arrive_and_wait("training-sync", "worker-0").await?;
-```
-
-### Priority Queue
-
-```rust
-use majra::queue::{PriorityQueue, QueueItem, Priority};
-
-let mut q = PriorityQueue::new();
-q.enqueue(QueueItem::new(Priority::Low, "background-task"));
-q.enqueue(QueueItem::new(Priority::Critical, "urgent-task"));
-
-assert_eq!(q.dequeue().unwrap().payload, "urgent-task");
-```
-
-### Message Relay
-
-```rust
-use majra::relay::Relay;
-
-let relay = Relay::new("node-1");
-let mut rx = relay.subscribe();
-
-relay.broadcast("announce", serde_json::json!({"joined": true}));
-```
-
-### Rate Limiter with Stats
-
-```rust
-use majra::ratelimit::RateLimiter;
-
-let limiter = RateLimiter::new(100.0, 50); // 100 req/s, burst 50
-limiter.check("client-ip");
-
-let stats = limiter.stats();
-// Evict idle keys to prevent unbounded memory growth.
-limiter.evict_stale(std::time::Duration::from_secs(300));
+```text
+majra
+├── pubsub          ── TypedPubSub<T>, PubSub, wildcard matching
+├── queue           ── PriorityQueue, ManagedQueue, DagScheduler
+├── relay           ── Relay (dedup, request-response), Transport, ConnectionPool
+├── heartbeat       ── ConcurrentHeartbeatTracker, GpuTelemetry, FleetStats
+├── ratelimit       ── RateLimiter (token bucket)
+├── barrier         ── AsyncBarrierSet
+├── dag             ── WorkflowEngine, WorkflowStorage (InMemory, SQLite, PostgreSQL)
+├── fleet           ── FleetQueue (work-stealing)
+├── ipc             ── IpcServer, IpcConnection
+├── ipc_encrypted   ── EncryptedIpcConnection (AES-256-GCM)
+├── namespace       ── Namespace (multi-tenant scoping)
+├── ws              ── WsBridge (WebSocket fan-out)
+├── redis_backend   ── RedisPubSub, RedisQueue, RedisRateLimiter, RedisHeartbeatTracker
+├── postgres_backend── PostgresWorkflowStorage
+├── metrics         ── MajraMetrics, PrometheusMetrics
+├── envelope        ── Envelope, Target
+└── error           ── MajraError, IpcError
 ```
 
 ## Ecosystem
 
-Majra unifies patterns from battle-tested implementations:
-
 | Consumer | What majra replaces |
 |----------|-------------------|
-| **Ifran** | Job scheduler (PriorityQueue), fleet heartbeat, rate limiting |
-| **SecureYeoman** | EventDispatcher, A2A heartbeat, sliding-window rate limiter, DAG workflow, swarm barriers (~3,200 lines) |
+| **Ifran** | Job scheduler, fleet heartbeat, rate limiting |
+| **SecureYeoman** | EventDispatcher, A2A heartbeat, rate limiter, DAG workflow, swarm barriers |
 | **AgnosAI** | Priority DAG scheduling, pub/sub wildcards, relay dedup, barrier sync |
 | **daimon** | Topic routing, fleet relay, IPC framing |
-| **stiva** | DagScheduler for compose service ordering, HeartbeatTracker for container health, ManagedQueue for container scheduling |
+| **stiva** | DagScheduler for compose ordering, HeartbeatTracker for container health |
+
+## Building
+
+```bash
+cargo build --all-features
+cargo test --all-features
+make check              # fmt + clippy + test + audit
+make bench              # criterion benchmarks with history
+```
 
 ## License
 

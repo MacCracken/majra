@@ -48,6 +48,7 @@ impl Namespace {
     /// Prefix a topic (for pub/sub and relay). Uses `/` delimiter.
     ///
     /// `events/created` → `tenant-42/events/created`
+    #[inline]
     #[must_use]
     pub fn topic(&self, topic: &str) -> String {
         format!("{}/{topic}", self.prefix)
@@ -56,6 +57,7 @@ impl Namespace {
     /// Prefix a key (for rate limiter, queue names). Uses `:` delimiter.
     ///
     /// `api_requests` → `tenant-42:api_requests`
+    #[inline]
     #[must_use]
     pub fn key(&self, key: &str) -> String {
         format!("{}:{key}", self.prefix)
@@ -64,6 +66,7 @@ impl Namespace {
     /// Prefix a node ID (for relay, fleet). Uses `:` delimiter.
     ///
     /// `gpu-node-1` → `tenant-42:gpu-node-1`
+    #[inline]
     #[must_use]
     pub fn node_id(&self, node_id: &str) -> String {
         format!("{}:{node_id}", self.prefix)
@@ -72,6 +75,7 @@ impl Namespace {
     /// Strip this namespace's prefix from a topic, returning the bare topic.
     ///
     /// Returns `None` if the topic does not belong to this namespace.
+    #[inline]
     #[must_use]
     pub fn strip_topic<'a>(&self, topic: &'a str) -> Option<&'a str> {
         topic
@@ -82,6 +86,7 @@ impl Namespace {
     /// Strip this namespace's prefix from a key.
     ///
     /// Returns `None` if the key does not belong to this namespace.
+    #[inline]
     #[must_use]
     pub fn strip_key<'a>(&self, key: &'a str) -> Option<&'a str> {
         key.strip_prefix(self.prefix.as_str())
@@ -91,6 +96,7 @@ impl Namespace {
     /// Build a subscription pattern scoped to this namespace.
     ///
     /// `events/*` → `tenant-42/events/*`
+    #[inline]
     #[must_use]
     pub fn pattern(&self, pattern: &str) -> String {
         format!("{}/{pattern}", self.prefix)
@@ -99,6 +105,7 @@ impl Namespace {
     /// Build a wildcard pattern matching all topics in this namespace.
     ///
     /// Returns `tenant-42/#` for MQTT-style matching.
+    #[inline]
     #[must_use]
     pub fn wildcard(&self) -> String {
         format!("{}/#", self.prefix)
