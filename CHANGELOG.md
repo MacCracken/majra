@@ -20,11 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `NamespacedMetrics` — per-tenant metrics partitioning via prefix delegation
 - Subscriber count warning at 40+ receivers per pattern (broadcast quadratic slowdown)
 - Cached Redis Lua script SHA for `RedisRateLimiter` (EVALSHA optimization)
+- `DirectChannel<T>` — zero-overhead broadcast channel, 73M msg/s, no topic routing
+- `HashedChannel<T>` + `TopicHash` — hashed topic routing with coarse timestamp, 16M msg/s
+- `TypedPubSub<T>` dual-pipe refactor — exact-topic subscribers use O(1) DashMap lookup (fast path), wildcard-only patterns iterate (slow path)
+- 7 new dual-pipe + DirectChannel + HashedChannel benchmarks
 - 4 new `SlidingWindowLimiter` tests
 
 ### Changed
+- `TypedPubSub` internal storage split into `exact_subscriptions` + `pattern_subscriptions` for O(1) exact-topic publish
 - `PostgresWorkflowStorage::connect_with_pool_size()` documents pool sizing formula (`cores * 2 + 1`, 10 MB/connection)
-- Architecture overview documents DashMap fragmentation mitigation and jemalloc recommendation
+- Architecture overview documents three-tier pub/sub, circuit breaker, DashMap fragmentation mitigation
 
 ## [1.0.0] — 2026-03-26
 

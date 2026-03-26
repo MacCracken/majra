@@ -20,6 +20,10 @@ backends. It is a pure Rust library with no C FFI and no `unsafe` code.
 | **Serialisation** | Untrusted `serde_json` payloads in envelopes, relay, IPC | Size limits on IPC frames (16 MiB max), no arbitrary code execution |
 | **Relay dedup** | Unbounded dedup table growth | TTL eviction + configurable max entries |
 | **Pending requests** | Unbounded correlation map growth | TTL eviction via `evict_stale_requests()` |
+| **Circuit breaker** | Cascading failure from endpoint outages | Configurable failure threshold + cooldown, half-open probe, manual reset |
+| **Sliding window approximation** | ~5% accuracy loss vs exact counting | Documented tradeoff; token bucket available for burst-tolerant use cases |
+| **Nonce exhaustion** | AES-GCM nonce reuse after 2^32 messages | Hard error at limit, warning at 2^31, `rekey()` API for key rotation |
+| **HashedChannel collisions** | Topic hash collision (u64) routes to wrong subscriber | Probability ~1 in 2^64; use TypedPubSub if collision-free routing required |
 
 ## Supported Versions
 

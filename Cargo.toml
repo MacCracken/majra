@@ -93,3 +93,7 @@ harness = false
 [[example]]
 name = "managed_queue"
 required-features = ["queue", "ratelimit"]
+
+[[example]]
+name = "pubsub_tiers"
+required-features = ["pubsub"]

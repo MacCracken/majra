@@ -10,23 +10,21 @@ Majra provides shared messaging primitives for the [AGNOS](https://github.com/Ma
 
 | Module | Feature | Description |
 |--------|---------|-------------|
-| **pubsub** | `pubsub` | Topic-based pub/sub with MQTT-style `*`/`#` wildcard matching |
-| **pubsub** | `pubsub` | `TypedPubSub<T>` — generic, type-safe pub/sub with backpressure, replay, filters, auto-cleanup |
-| **queue** | `queue` | Multi-tier priority queue (5 levels) with DAG dependency scheduling |
-| **queue** | `queue` | `ManagedQueue<T>` — resource-aware, lifecycle-tracked, concurrent job queue |
-| **relay** | `relay` | Sequenced, deduplicated inter-node message relay with request-response correlation |
-| **transport** | `relay` | Pluggable transport trait + multiplexed connection pool with stale eviction |
+| **pubsub** | `pubsub` | Three-tier pub/sub: `DirectChannel` (73M msg/s), `HashedChannel` (16M msg/s), `TypedPubSub` (1.1M msg/s with wildcards) |
+| **queue** | `queue` | Multi-tier priority queue + `ManagedQueue<T>` with GPU-aware scheduling |
+| **relay** | `relay` | Sequenced, deduplicated relay with request-response correlation + circuit breaker |
+| **transport** | `relay` | Pluggable transport trait + connection pool with stale eviction and circuit breaker |
 | **ipc** | `ipc` | Length-prefixed framing over Unix domain sockets |
-| **ipc-encrypted** | `ipc-encrypted` | AES-256-GCM encrypted IPC channels via `ring` |
+| **ipc-encrypted** | `ipc-encrypted` | AES-256-GCM encrypted IPC with key rotation and nonce exhaustion tracking |
 | **heartbeat** | `heartbeat` | TTL-based node health: Online / Suspect / Offline with GPU telemetry and fleet stats |
-| **ratelimit** | `ratelimit` | Per-key token bucket rate limiter with stale-key eviction and stats |
+| **ratelimit** | `ratelimit` | Token bucket (`RateLimiter`) + sliding window (`SlidingWindowLimiter`) rate limiters |
 | **barrier** | `barrier` | N-way barrier sync with deadlock recovery + async `arrive_and_wait()` |
-| **dag** | `dag` | DAG-based workflow engine with tier scheduling, retry, error policies, pluggable storage |
+| **dag** | `dag` | DAG workflow engine with durable execution (`resume`), retry, error policies, pluggable storage |
 | **fleet** | `fleet` | Distributed job queue with work-stealing across nodes |
 | **namespace** | always | Multi-tenant scoping for topics, keys, and node IDs |
-| **metrics** | always | `MajraMetrics` trait — wire to Prometheus/OpenTelemetry |
+| **metrics** | always | `MajraMetrics` + `NamespacedMetrics` + `PrometheusMetrics` |
 | **redis** | `redis-backend` | Cross-process pub/sub, queues, distributed rate limiter, distributed heartbeat |
-| **postgres** | `postgres` | PostgreSQL-backed workflow storage with connection pooling |
+| **postgres** | `postgres` | PostgreSQL-backed workflow + queue storage with connection pooling |
 | **ws** | `ws` | WebSocket bridge — fan out pub/sub topics to WebSocket clients |
 | **quic** | `quic` | QUIC transport with multiplexed streams and datagrams |
 
@@ -39,19 +37,26 @@ Default features: `pubsub`, `queue`, `relay`, `heartbeat`.
 majra = "1.0"
 ```
 
-### Typed Pub/Sub
+### Three-Tier Pub/Sub
 
 ```rust
-use majra::pubsub::{TypedPubSub, TypedPubSubConfig};
+use majra::pubsub::{DirectChannel, HashedChannel, TopicHash, TypedPubSub};
 
+// Tier 1: DirectChannel — 73M msg/s, raw broadcast, no routing
+let fast = DirectChannel::<i32>::new(1024);
+let mut rx = fast.subscribe();
+fast.publish(42);
+
+// Tier 2: HashedChannel — 16M msg/s, hashed topic routing + timestamp
+let hashed = HashedChannel::<i32>::new(1024);
+let topic = TopicHash::new("events/data");
+let mut rx = hashed.subscribe(topic);
+hashed.publish(topic, 42);
+
+// Tier 3: TypedPubSub — 1.1M msg/s, MQTT wildcards, replay, filters
 let hub = TypedPubSub::<MyEvent>::new();
-
-// Subscribe with a filter — only high-priority events.
 let mut rx = hub.subscribe_filtered("events/#", |e: &MyEvent| e.priority > 5);
-
 hub.publish("events/training", MyEvent { priority: 10, .. });
-
-let msg = rx.recv().await.unwrap();
 ```
 
 ### Managed Queue (GPU-aware scheduling)

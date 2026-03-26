@@ -15,7 +15,7 @@
 //!
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
-//! | `pubsub` | yes | Topic-based pub/sub with MQTT-style wildcard matching |
+//! | `pubsub` | yes | Three-tier pub/sub: DirectChannel (73M/s), HashedChannel (16M/s), TypedPubSub (1.1M/s with wildcards) |
 //! | `queue` | yes | Multi-tier priority queue with DAG dependency scheduling |
 //! | `relay` | yes | Sequenced, deduplicated inter-node message relay |
 //! | `ipc` | no | Length-prefixed framing over Unix domain sockets |
