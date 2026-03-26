@@ -116,6 +116,128 @@ pub struct NoopMetrics;
 impl MajraMetrics for NoopMetrics {}
 
 // ---------------------------------------------------------------------------
+// Namespaced metrics (multi-tenant)
+// ---------------------------------------------------------------------------
+
+/// Wraps a [`MajraMetrics`] implementation with a tenant namespace prefix.
+///
+/// All queue names, topics, and workflow IDs are prefixed with the namespace
+/// before being passed to the inner metrics backend. This provides per-tenant
+/// metric partitioning without requiring the backend to be tenant-aware.
+///
+/// # Example
+///
+/// ```rust
+/// use majra::metrics::{NamespacedMetrics, NoopMetrics};
+/// use std::sync::Arc;
+///
+/// let inner = Arc::new(NoopMetrics);
+/// let tenant_metrics = NamespacedMetrics::new("tenant-42", inner);
+/// // tenant_metrics.queue_enqueued("jobs", 3) → inner.queue_enqueued("tenant-42:jobs", 3)
+/// ```
+pub struct NamespacedMetrics {
+    prefix: String,
+    inner: std::sync::Arc<dyn MajraMetrics>,
+}
+
+impl NamespacedMetrics {
+    /// Create namespaced metrics with the given prefix.
+    pub fn new(prefix: impl Into<String>, inner: std::sync::Arc<dyn MajraMetrics>) -> Self {
+        Self {
+            prefix: prefix.into(),
+            inner,
+        }
+    }
+
+    #[inline]
+    fn ns(&self, name: &str) -> String {
+        format!("{}:{name}", self.prefix)
+    }
+}
+
+impl MajraMetrics for NamespacedMetrics {
+    fn queue_enqueued(&self, queue_name: &str, priority: u8) {
+        self.inner.queue_enqueued(&self.ns(queue_name), priority);
+    }
+    fn queue_dequeued(&self, queue_name: &str, priority: u8) {
+        self.inner.queue_dequeued(&self.ns(queue_name), priority);
+    }
+    fn queue_state_changed(&self, queue_name: &str, from: &str, to: &str) {
+        self.inner
+            .queue_state_changed(&self.ns(queue_name), from, to);
+    }
+    fn queue_depth(&self, queue_name: &str, depth: usize) {
+        self.inner.queue_depth(&self.ns(queue_name), depth);
+    }
+    fn queue_running(&self, queue_name: &str, count: usize) {
+        self.inner.queue_running(&self.ns(queue_name), count);
+    }
+    fn pubsub_published(&self, topic: &str, subscriber_count: usize) {
+        self.inner
+            .pubsub_published(&self.ns(topic), subscriber_count);
+    }
+    fn pubsub_dropped(&self, topic: &str) {
+        self.inner.pubsub_dropped(&self.ns(topic));
+    }
+    fn heartbeat_transition(&self, node_id: &str, from: &str, to: &str) {
+        self.inner.heartbeat_transition(&self.ns(node_id), from, to);
+    }
+    fn heartbeat_evicted(&self, node_id: &str) {
+        self.inner.heartbeat_evicted(&self.ns(node_id));
+    }
+    fn ratelimit_allowed(&self, key: &str) {
+        self.inner.ratelimit_allowed(&self.ns(key));
+    }
+    fn ratelimit_rejected(&self, key: &str) {
+        self.inner.ratelimit_rejected(&self.ns(key));
+    }
+    fn ratelimit_evicted(&self, count: usize) {
+        self.inner.ratelimit_evicted(count);
+    }
+    fn relay_sent(&self, from: &str, seq: u64) {
+        self.inner.relay_sent(&self.ns(from), seq);
+    }
+    fn relay_received(&self, from: &str, seq: u64) {
+        self.inner.relay_received(&self.ns(from), seq);
+    }
+    fn relay_duplicate_dropped(&self, from: &str, seq: u64) {
+        self.inner.relay_duplicate_dropped(&self.ns(from), seq);
+    }
+    fn barrier_arrived(&self, barrier_name: &str, arrived: usize, expected: usize) {
+        self.inner
+            .barrier_arrived(&self.ns(barrier_name), arrived, expected);
+    }
+    fn barrier_released(&self, barrier_name: &str) {
+        self.inner.barrier_released(&self.ns(barrier_name));
+    }
+    fn workflow_run_started(&self, workflow_id: &str) {
+        self.inner.workflow_run_started(&self.ns(workflow_id));
+    }
+    fn workflow_run_completed(&self, workflow_id: &str, duration_ms: u64) {
+        self.inner
+            .workflow_run_completed(&self.ns(workflow_id), duration_ms);
+    }
+    fn workflow_run_failed(&self, workflow_id: &str, duration_ms: u64) {
+        self.inner
+            .workflow_run_failed(&self.ns(workflow_id), duration_ms);
+    }
+    fn workflow_step_started(&self, workflow_id: &str, step_id: &str) {
+        self.inner
+            .workflow_step_started(&self.ns(workflow_id), step_id);
+    }
+    fn workflow_step_finished(
+        &self,
+        workflow_id: &str,
+        step_id: &str,
+        status: &str,
+        duration_ms: u64,
+    ) {
+        self.inner
+            .workflow_step_finished(&self.ns(workflow_id), step_id, status, duration_ms);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Prometheus implementation
 // ---------------------------------------------------------------------------
 

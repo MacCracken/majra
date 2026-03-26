@@ -114,7 +114,9 @@ let transitions = tracker.update_statuses();
 let stats = tracker.fleet_stats();
 ```
 
-## Step 4: Add SQLite persistence (optional)
+## Step 4: Add persistence
+
+### SQLite (single-node)
 
 ```rust
 use majra::queue::persistence::SqliteBackend;
@@ -123,9 +125,39 @@ let backend = Arc::new(SqliteBackend::open(Path::new("ifran-queue.db"))?);
 let queue = ManagedQueue::<IfranJob>::with_sqlite(config, backend);
 ```
 
+### PostgreSQL (multi-node)
+
+```rust
+use majra::postgres_backend::PostgresQueueBackend;
+
+let pg = Arc::new(PostgresQueueBackend::connect("postgresql://...").await?);
+let queue = ManagedQueue::<IfranJob>::with_postgres(config, pg);
+```
+
+## Step 5: Fleet scheduling (multi-node GPU clusters)
+
+For distributing jobs across GPU nodes with work-stealing:
+
+```rust
+use majra::fleet::{FleetQueue, FleetQueueConfig};
+use majra::queue::{ResourcePool, Priority, ResourceReq};
+
+let fleet = FleetQueue::new(FleetQueueConfig::default());
+
+// Register GPU nodes.
+fleet.register_node("gpu-0", ResourcePool { gpu_count: 4, vram_mb: 80_000 });
+fleet.register_node("gpu-1", ResourcePool { gpu_count: 2, vram_mb: 16_000 });
+
+// Submit — automatically routed to least-loaded node with sufficient resources.
+fleet.submit(Priority::High, job, Some(ResourceReq { gpu_count: 2, vram_mb: 32_000 }));
+
+// Periodic rebalancing — steal work from overloaded nodes.
+fleet.rebalance();
+```
+
 ## Cargo.toml
 
 ```toml
 [dependencies]
-majra = { version = "1", features = ["queue", "pubsub", "heartbeat", "sqlite"] }
+majra = { version = "1", features = ["queue", "pubsub", "heartbeat", "fleet", "postgres"] }
 ```

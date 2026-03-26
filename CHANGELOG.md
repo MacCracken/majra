@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `PostgresQueueBackend` — PostgreSQL persistence for `ManagedQueue` (mirrors `SqliteBackend` API)
+- `ManagedQueue::with_postgres()` constructor
+- `NamespacedMetrics` — per-tenant metrics partitioning via prefix delegation
+- Replay buffer fast-path for exact topic subscriptions (O(1) vs O(n) pattern scan)
+- `Relay::evict_stale_requests(timeout)` — TTL eviction for pending request-response correlations
+- Live Redis integration test (`redis_live_full_lifecycle`) covering pub/sub, queue, rate limiter, heartbeat
+- Live PostgreSQL integration test (`postgres_live_workflow_storage`) covering workflow CRUD
+- `benchmarks.md` — 3-point trend tracking
+- `docs/development/dependency-watch.md` — pinned versions and upgrade paths
+- Documentation Structure section in `CLAUDE.md`
+- Updated `README.md`, `SECURITY.md`, architecture overview, migration guides for v1.0.0
+
+### Changed
+- `PostgresWorkflowStorage::connect_with_pool_size()` — configurable pool size (was hardcoded to 16)
+
 ## [1.0.0] — 2026-03-26
 
 **First stable release.** API freeze. Full feature coverage across pub/sub, queues, relay, IPC, heartbeat, rate limiting, barriers, DAG workflows, fleet scheduling, and distributed backends.

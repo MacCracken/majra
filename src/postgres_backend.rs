@@ -432,6 +432,9 @@ fn parse_run_row(row: &tokio_postgres::Row) -> crate::error::Result<WorkflowRun>
     })
 }
 
+#[cfg(feature = "queue")]
+pub use queue_backend::PostgresQueueBackend;
+
 fn parse_step_run_row(row: &tokio_postgres::Row) -> crate::error::Result<StepRun> {
     let status_str: String = row.get(4);
     let input_json: Option<String> = row.get(5);
@@ -450,4 +453,180 @@ fn parse_step_run_row(row: &tokio_postgres::Row) -> crate::error::Result<StepRun
         completed_at: row.get(10),
         duration_ms: row.get(11),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Queue persistence backend
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "queue")]
+mod queue_backend {
+    use deadpool_postgres::Pool;
+    use serde::Serialize;
+    use serde::de::DeserializeOwned;
+    use tracing::debug;
+
+    use crate::queue::{JobState, ManagedItem, Priority, TaskId};
+
+    use super::pg_err;
+
+    /// PostgreSQL persistence backend for [`crate::queue::ManagedQueue`].
+    ///
+    /// Mirrors the [`crate::queue::persistence::SqliteBackend`] API but uses
+    /// async PostgreSQL queries via `deadpool-postgres`.
+    pub struct PostgresQueueBackend {
+        pool: Pool,
+    }
+
+    impl PostgresQueueBackend {
+        /// Create a backend from an existing connection pool.
+        ///
+        /// Creates the `majra_managed_queue` table if it doesn't exist.
+        pub async fn new(pool: Pool) -> crate::error::Result<Self> {
+            let client = pool.get().await.map_err(pg_err)?;
+            client
+                .batch_execute(
+                    "CREATE TABLE IF NOT EXISTS majra_managed_queue (
+                        id TEXT PRIMARY KEY,
+                        priority INTEGER NOT NULL,
+                        state TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        resource_req TEXT,
+                        enqueued_at BIGINT,
+                        started_at BIGINT,
+                        finished_at BIGINT
+                    );",
+                )
+                .await
+                .map_err(pg_err)?;
+            debug!("postgres: queue backend initialised");
+            Ok(Self { pool })
+        }
+
+        /// Connect and create a backend.
+        pub async fn connect(connection_string: &str) -> crate::error::Result<Self> {
+            let pg_config: tokio_postgres::Config = connection_string.parse().map_err(pg_err)?;
+            let mgr_config = deadpool_postgres::ManagerConfig {
+                recycling_method: deadpool_postgres::RecyclingMethod::Fast,
+            };
+            let mgr = deadpool_postgres::Manager::from_config(
+                pg_config,
+                tokio_postgres::NoTls,
+                mgr_config,
+            );
+            let pool = Pool::builder(mgr).max_size(16).build().map_err(pg_err)?;
+            Self::new(pool).await
+        }
+
+        /// Persist a queued item.
+        pub async fn persist<T: Serialize>(
+            &self,
+            item: &ManagedItem<T>,
+        ) -> crate::error::Result<()> {
+            let client = self.pool.get().await.map_err(pg_err)?;
+            let payload = serde_json::to_string(&item.payload).map_err(pg_err)?;
+            let resource_req = item
+                .resource_req
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(pg_err)?;
+            let state = serde_json::to_string(&item.state).map_err(pg_err)?;
+            client
+                .execute(
+                    "INSERT INTO majra_managed_queue (id, priority, state, payload, resource_req)
+                     VALUES ($1, $2, $3, $4, $5)
+                     ON CONFLICT (id) DO UPDATE SET
+                        state = EXCLUDED.state,
+                        payload = EXCLUDED.payload,
+                        resource_req = EXCLUDED.resource_req",
+                    &[
+                        &item.id.to_string(),
+                        &(item.priority as i32),
+                        &state,
+                        &payload,
+                        &resource_req,
+                    ],
+                )
+                .await
+                .map_err(pg_err)?;
+            Ok(())
+        }
+
+        /// Update the state of a persisted item.
+        pub async fn update_state(&self, id: TaskId, state: JobState) -> crate::error::Result<()> {
+            let client = self.pool.get().await.map_err(pg_err)?;
+            let state_str = serde_json::to_string(&state).map_err(pg_err)?;
+            client
+                .execute(
+                    "UPDATE majra_managed_queue SET state = $1 WHERE id = $2",
+                    &[&state_str, &id.to_string()],
+                )
+                .await
+                .map_err(pg_err)?;
+            Ok(())
+        }
+
+        /// Load all non-terminal items (crash recovery).
+        pub async fn load_all<T: DeserializeOwned>(
+            &self,
+        ) -> crate::error::Result<Vec<ManagedItem<T>>> {
+            let client = self.pool.get().await.map_err(pg_err)?;
+            let rows = client
+                .query(
+                    "SELECT id, priority, state, payload, resource_req
+                     FROM majra_managed_queue
+                     WHERE state IN ('\"queued\"', '\"running\"')",
+                    &[],
+                )
+                .await
+                .map_err(pg_err)?;
+
+            let mut result = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let id_str: String = row.get(0);
+                let priority_i32: i32 = row.get(1);
+                let state_str: String = row.get(2);
+                let payload_str: String = row.get(3);
+                let resource_req_str: Option<String> = row.get(4);
+
+                let id: TaskId = id_str.parse().map_err(pg_err)?;
+                let priority = Priority::try_from(priority_i32 as u8).unwrap_or_default();
+                let state: JobState = serde_json::from_str(&state_str).map_err(pg_err)?;
+                let payload: T = serde_json::from_str(&payload_str).map_err(pg_err)?;
+                let resource_req = resource_req_str
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(pg_err)?;
+
+                result.push(ManagedItem {
+                    id,
+                    priority,
+                    payload,
+                    resource_req,
+                    state,
+                    enqueued_at: None,
+                    started_at: None,
+                    finished_at: None,
+                });
+            }
+            Ok(result)
+        }
+
+        /// Delete evicted items.
+        pub async fn evict(&self, ids: &[TaskId]) -> crate::error::Result<()> {
+            let client = self.pool.get().await.map_err(pg_err)?;
+            for id in ids {
+                client
+                    .execute(
+                        "DELETE FROM majra_managed_queue WHERE id = $1",
+                        &[&id.to_string()],
+                    )
+                    .await
+                    .map_err(pg_err)?;
+            }
+            Ok(())
+        }
+    }
 }

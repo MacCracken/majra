@@ -371,6 +371,19 @@ impl<T: Clone + Send + Sync + 'static> TypedPubSub<T> {
     }
 
     fn replay_to(&self, tx: &broadcast::Sender<TypedMessage<T>>, pattern: &str) {
+        // Fast path: exact topic (no wildcards) — direct DashMap lookup.
+        if !pattern.contains('*') && !pattern.contains('#') {
+            if let Some(buf) = self.replay_buffer.get(pattern) {
+                for msg in buf.value().iter() {
+                    if tx.send(msg.clone()).is_err() {
+                        return;
+                    }
+                }
+            }
+            return;
+        }
+
+        // Slow path: wildcard pattern — scan all topics.
         for entry in self.replay_buffer.iter() {
             if matches_pattern(pattern, entry.key()) {
                 for msg in entry.value().iter() {

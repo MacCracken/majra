@@ -1,160 +1,163 @@
 # Migrating SecureYeoman to majra
 
-> SecureYeoman provides A2A (Agent-to-Agent) peer discovery, authentication,
-> and secure messaging. This guide covers replacing SecureYeoman's internal
-> relay, heartbeat, barrier, and IPC implementations with majra primitives.
+> SecureYeoman currently uses majra for **pub/sub** (event dispatcher) and
+> **rate limiting** (per-user, per-IP throttling) via NAPI bindings in `sy-napi`.
+> This guide covers expanding to the full majra feature set.
 
-## Modules to adopt
+## Current integration (via sy-napi)
 
-| SecureYeoman component | majra replacement | Feature flag |
-|-----------------------|-------------------|-------------|
-| Peer message relay | `Relay` | `relay` |
-| Peer health tracking | `ConcurrentHeartbeatTracker` | `heartbeat` |
-| Connection pooling | `ConnectionPool` | `relay` |
-| Sync barriers (multi-agent) | `AsyncBarrierSet` | `barrier` |
-| Local agent IPC | `IpcServer` / `IpcConnection` | `ipc` |
-| Per-peer rate limiting | `RateLimiter` | `ratelimit` |
+| SY component | majra feature | Status |
+|-------------|--------------|--------|
+| EventDispatcher | `pubsub` (TypedPubSub) | In production |
+| Rate limiter | `ratelimit` (token bucket) | In production |
 
-## Step 1: Replace the peer relay
+## Phase 1: Expand NAPI bindings (low risk)
 
-SecureYeoman's message forwarding becomes a `Relay`:
+### Add queue + heartbeat to sy-napi
 
-```rust
-use majra::relay::Relay;
-
-let relay = Relay::new("yeoman-node-1");
-
-// Send to a specific peer.
-let seq = relay.send("peer-abc", "auth/challenge", json!({
-    "nonce": "...",
-    "timestamp": Utc::now(),
-}));
-
-// Broadcast to all peers.
-relay.broadcast("discovery/announce", json!({
-    "capabilities": ["a2a-v2", "streaming"],
-}));
-
-// Process incoming messages (dedup built in).
-if let Some(incoming) = relay.receive(wire_msg) {
-    // Handle the deduplicated message.
-}
-
-// Subscribe to all relay traffic.
-let mut rx = relay.subscribe();
+```toml
+# crates/sy-napi/Cargo.toml
+majra = { path = "../../../majra", features = ["pubsub", "ratelimit", "queue", "heartbeat", "dag"] }
 ```
 
-### Key differences from SecureYeoman's internal relay
+### Replace setInterval heartbeat scheduling
 
-- Automatic dedup by sender + sequence number (no manual tracking)
-- Atomic sequence counters (no lock contention)
-- Built-in stats (`relay.stats()`) replace manual counters
-- `DashMap`-backed — lock-free concurrent access
-
-## Step 2: Replace peer health tracking
+SY's `HeartbeatManager` uses `setInterval` with custom interval tracking. Replace with majra:
 
 ```rust
+// In sy-napi/src/majra.rs — add heartbeat bindings
 use majra::heartbeat::{ConcurrentHeartbeatTracker, HeartbeatConfig, EvictionPolicy};
 
-let (eviction_tx, mut eviction_rx) = tokio::sync::mpsc::unbounded_channel();
 let tracker = ConcurrentHeartbeatTracker::new(HeartbeatConfig {
     suspect_after: Duration::from_secs(15),
     offline_after: Duration::from_secs(45),
     eviction_policy: Some(EvictionPolicy {
         offline_cycles: 3,
-        eviction_tx: Some(eviction_tx),
+        eviction_tx: Some(tx),
     }),
 });
-
-// Register authenticated peers.
-tracker.register("peer-abc", json!({
-    "public_key": "...",
-    "capabilities": ["a2a-v2"],
-}));
-
-// Periodic sweep.
-tracker.update_statuses();
-
-// Listen for evicted peers.
-while let Some(evicted_peer) = eviction_rx.recv().await {
-    // Remove from routing table, close connection, etc.
-}
 ```
 
-## Step 3: Replace connection pooling
+### Replace webhook retry polling with ManagedQueue
+
+SY polls `event_deliveries` table with `setInterval`. Replace with majra's priority queue:
 
 ```rust
-use majra::transport::{ConnectionPool, Transport, TransportFactory};
+use majra::queue::{ManagedQueue, ManagedQueueConfig, Priority};
 
-struct TlsTransportFactory { /* ... */ }
+let queue = ManagedQueue::new(ManagedQueueConfig {
+    max_concurrency: 10,
+    finished_ttl: Duration::from_secs(3600),
+});
+
+// Enqueue webhook delivery.
+queue.enqueue(Priority::Normal, webhook_payload, None).await;
+
+// Dequeue and deliver (no polling needed — use dequeue_wait).
+let job = queue.dequeue_wait().await;
+```
+
+## Phase 2: DAG workflow engine (medium risk)
+
+SY's `workflow-engine.ts` has a custom topological sort. Replace with majra's DAG engine:
+
+```rust
+use majra::dag::{WorkflowEngine, WorkflowEngineConfig, InMemoryWorkflowStorage, StepExecutor};
+
+// Implement StepExecutor for SY's step types.
+struct SyStepExecutor { /* agent, tool, webhook, swarm handlers */ }
 
 #[async_trait]
-impl TransportFactory for TlsTransportFactory {
-    async fn connect(&self, endpoint: &str) -> Result<Box<dyn Transport>, MajraError> {
-        // Establish TLS connection to peer.
+impl StepExecutor for SyStepExecutor {
+    async fn execute(&self, step: &WorkflowStep, ctx: &WorkflowContext) -> Result<Value, String> {
+        match step.config["type"].as_str() {
+            Some("agent") => execute_agent(step, ctx).await,
+            Some("webhook") => execute_webhook(step, ctx).await,
+            // ... 16+ step types
+        }
     }
 }
 
-let pool = ConnectionPool::new(Arc::new(TlsTransportFactory::new()), 4);
-
-// Acquire a connection (reuses existing if available).
-let transport = pool.acquire("peer-abc:8443").await?;
-transport.send(&relay_msg).await?;
+let engine = WorkflowEngine::new(
+    Arc::new(PostgresWorkflowStorage::connect(&pg_url).await?),
+    Arc::new(SyStepExecutor::new()),
+    WorkflowEngineConfig::default(),
+);
 ```
 
-## Step 4: Replace multi-agent sync barriers
+## Phase 3: Multi-tenant isolation
+
+SY is multi-tenant. Use `Namespace` to scope all operations:
 
 ```rust
-use majra::barrier::AsyncBarrierSet;
+use majra::namespace::Namespace;
 
-let barriers = AsyncBarrierSet::new();
+let ns = Namespace::new(&tenant_id);
 
-// Create a barrier for a multi-agent task.
-barriers.create("task-xyz", ["agent-1", "agent-2", "agent-3"].into());
+// Scoped pub/sub.
+hub.publish(&ns.topic("events/created"), payload);
+let mut rx = hub.subscribe(&ns.pattern("events/#"));
 
-// Each agent arrives and waits.
-barriers.arrive_and_wait("task-xyz", "agent-1").await?;
+// Scoped rate limiting.
+limiter.check(&ns.key("api_requests"));
 
-// If an agent dies, force-release the barrier.
-barriers.force("task-xyz", "dead-agent");
+// Scoped metrics.
+let metrics = NamespacedMetrics::new(&tenant_id, prometheus_metrics.clone());
 ```
 
-## Step 5: Replace local IPC
+## Phase 4: Relay for A2A delegation (higher risk)
+
+SY's A2A protocol uses custom encrypted envelopes. majra's relay provides:
 
 ```rust
-use majra::ipc::{IpcServer, IpcConnection};
+use majra::relay::Relay;
 
-// Server (yeoman daemon).
-let server = IpcServer::bind(Path::new("/run/yeoman/agent.sock"))?;
-let mut conn = server.accept().await?;
-let msg = conn.recv().await?;
-conn.send(&json!({"status": "ok"})).await?;
+let relay = Relay::new(&node_id);
 
-// Client (agent process).
-let mut client = IpcConnection::connect(Path::new("/run/yeoman/agent.sock")).await?;
-client.send(&json!({"action": "register"})).await?;
+// Request-response for delegation.
+let (seq, rx) = relay.send_request("target-node", "a2a/delegate", json!({
+    "task": "summarize",
+    "context": "...",
+}));
+
+// Await reply with timeout.
+let reply = tokio::time::timeout(Duration::from_secs(30), rx).await??;
 ```
 
-## Step 6: Add per-peer rate limiting
+For encrypted IPC (desktop/capture):
 
 ```rust
-use majra::ratelimit::RateLimiter;
+use majra::ipc_encrypted::EncryptedIpcConnection;
 
-let limiter = RateLimiter::new(100.0, 200); // 100 req/s, burst 200
-
-if limiter.check("peer-abc") {
-    // Process request.
-} else {
-    // Reject: rate limited.
-}
-
-// Periodic cleanup of idle peers.
-limiter.evict_stale(Duration::from_secs(300));
+let conn = EncryptedIpcConnection::connect(path, &shared_key).await?;
+conn.send(&json!({"command": "capture"})).await?;
 ```
 
-## Cargo.toml
+## Phase 5: Distributed backends
+
+When scaling beyond a single process:
+
+```rust
+// Distributed rate limiting via Redis.
+use majra::redis_backend::RedisRateLimiter;
+let rl = RedisRateLimiter::new(redis_client, 100.0, 50, "sy:rl:");
+
+// Distributed heartbeat for edge devices.
+use majra::redis_backend::RedisHeartbeatTracker;
+let hb = RedisHeartbeatTracker::new(redis_client, "sy:hb:", 30);
+
+// PostgreSQL workflow storage.
+use majra::postgres_backend::PostgresWorkflowStorage;
+let storage = PostgresWorkflowStorage::connect(&pg_url).await?;
+```
+
+## Cargo.toml (full integration)
 
 ```toml
 [dependencies]
-majra = { version = "1", features = ["relay", "heartbeat", "barrier", "ipc", "ratelimit"] }
+majra = { version = "1", features = [
+    "pubsub", "queue", "relay", "heartbeat", "ratelimit",
+    "dag", "barrier", "ipc-encrypted", "redis-backend", "postgres",
+    "prometheus", "logging"
+] }
 ```

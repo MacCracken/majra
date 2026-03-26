@@ -464,6 +464,8 @@ pub struct ManagedQueue<T: Send> {
     metrics: Arc<dyn MajraMetrics>,
     #[cfg(feature = "sqlite")]
     backend: Option<std::sync::Arc<persistence::SqliteBackend>>,
+    #[cfg(feature = "postgres")]
+    pg_backend: Option<std::sync::Arc<crate::postgres_backend::PostgresQueueBackend>>,
 }
 
 impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
@@ -485,6 +487,8 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
             metrics,
             #[cfg(feature = "sqlite")]
             backend: None,
+            #[cfg(feature = "postgres")]
+            pg_backend: None,
         }
     }
 
@@ -518,6 +522,13 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
             && let Err(e) = backend.persist(&item)
         {
             warn!(%id, error = %e, "sqlite: failed to persist job");
+        }
+
+        #[cfg(feature = "postgres")]
+        if let Some(ref pg) = self.pg_backend
+            && let Err(e) = pg.persist(&item).await
+        {
+            warn!(%id, error = %e, "postgres: failed to persist job");
         }
 
         self.jobs.insert(id, item);
@@ -584,6 +595,13 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
                 && let Err(e) = backend.update_state(id, JobState::Running)
             {
                 warn!(%id, error = %e, "sqlite: failed to update state to running");
+            }
+
+            #[cfg(feature = "postgres")]
+            if let Some(ref pg) = self.pg_backend
+                && let Err(e) = pg.update_state(id, JobState::Running).await
+            {
+                warn!(%id, error = %e, "postgres: failed to update state to running");
             }
 
             if self.events_tx.send(QueueEvent::Dequeued { id }).is_err() {
@@ -657,6 +675,16 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
             && let Err(e) = backend.update_state(id, new_state)
         {
             warn!(%id, error = %e, "sqlite: failed to update job state");
+        }
+
+        #[cfg(feature = "postgres")]
+        if let Some(ref pg) = self.pg_backend {
+            let pg = pg.clone();
+            tokio::spawn(async move {
+                if let Err(e) = pg.update_state(id, new_state).await {
+                    warn!(%id, error = %e, "postgres: failed to update job state");
+                }
+            });
         }
 
         if self
@@ -752,6 +780,17 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
             && let Err(e) = backend.evict(&to_remove)
         {
             warn!(error = %e, "sqlite: failed to evict expired jobs");
+        }
+
+        #[cfg(feature = "postgres")]
+        if let Some(ref pg) = self.pg_backend {
+            let pg = pg.clone();
+            let ids = to_remove.clone();
+            tokio::spawn(async move {
+                if let Err(e) = pg.evict(&ids).await {
+                    warn!(error = %e, "postgres: failed to evict expired jobs");
+                }
+            });
         }
 
         for id in &to_remove {
@@ -952,7 +991,32 @@ pub mod persistence {
                 events_tx,
                 metrics: std::sync::Arc::new(crate::metrics::NoopMetrics),
                 backend: Some(backend),
+                #[cfg(feature = "postgres")]
+                pg_backend: None,
             }
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
+    /// Create a managed queue with PostgreSQL persistence.
+    pub fn with_postgres(
+        config: ManagedQueueConfig,
+        backend: std::sync::Arc<crate::postgres_backend::PostgresQueueBackend>,
+    ) -> Self {
+        let (events_tx, _) = broadcast::channel(256);
+        Self {
+            tiers: tokio::sync::Mutex::new(Default::default()),
+            jobs: DashMap::new(),
+            config,
+            running_count: AtomicUsize::new(0),
+            notify: Notify::new(),
+            events_tx,
+            metrics: Arc::new(NoopMetrics),
+            #[cfg(feature = "sqlite")]
+            backend: None,
+            pg_backend: Some(backend),
         }
     }
 }

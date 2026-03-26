@@ -258,3 +258,141 @@ fn relay_concurrent_dedup() {
     assert_eq!(stats.messages_received, 40); // 4 senders * 10 unique
     assert_eq!(stats.duplicates_dropped, 40); // 4 senders * 10 replayed
 }
+
+// ---------------------------------------------------------------------------
+// Live Redis integration tests (require running Redis)
+// ---------------------------------------------------------------------------
+
+/// Redis pub/sub, queue, rate limiter, and heartbeat tracker end-to-end.
+///
+/// Run with: `cargo test --features redis-backend -- --ignored redis_live`
+#[cfg(feature = "redis-backend")]
+#[tokio::test]
+#[ignore]
+async fn redis_live_full_lifecycle() {
+    use majra::redis_backend::{RedisHeartbeatTracker, RedisPubSub, RedisQueue, RedisRateLimiter};
+
+    let client =
+        redis::Client::open("redis://127.0.0.1/").expect("Redis must be running for this test");
+
+    // --- Pub/Sub ---
+    let hub = RedisPubSub::new(client.clone(), "majra:test:live:");
+    let mut rx = hub.subscribe::<serde_json::Value>("events/*", 16).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await; // let subscriber connect
+    let delivered = hub
+        .publish("events/created", &serde_json::json!({"id": 1}))
+        .await
+        .unwrap();
+    if delivered > 0 {
+        let (topic, payload) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(topic.contains("events/created"));
+        assert_eq!(payload["id"], 1);
+    }
+
+    // --- Queue ---
+    let q = RedisQueue::new(client.clone(), "majra:test:live:queue");
+    q.clear().await.unwrap();
+    q.enqueue(5u8, &serde_json::json!({"task": "train"}))
+        .await
+        .unwrap();
+    q.enqueue(1u8, &serde_json::json!({"task": "index"}))
+        .await
+        .unwrap();
+    assert_eq!(q.len().await.unwrap(), 2);
+    let job: serde_json::Value = q.dequeue().await.unwrap().unwrap();
+    assert_eq!(job["task"], "train"); // highest priority first
+    q.clear().await.unwrap();
+
+    // --- Rate Limiter ---
+    let rl = RedisRateLimiter::new(client.clone(), 2.0, 2, "majra:test:live:rl:");
+    assert!(rl.check("user:1").await.unwrap());
+    assert!(rl.check("user:1").await.unwrap());
+    assert!(!rl.check("user:1").await.unwrap()); // burst exhausted
+
+    // --- Heartbeat ---
+    let hb = RedisHeartbeatTracker::new(client.clone(), "majra:test:live:hb:", 10);
+    hb.register("node-1", &serde_json::json!({"gpu": true}))
+        .await
+        .unwrap();
+    assert!(hb.is_online("node-1").await.unwrap());
+    let meta = hb.get_metadata("node-1").await.unwrap().unwrap();
+    assert_eq!(meta["gpu"], true);
+    let online = hb.list_online().await.unwrap();
+    assert!(online.iter().any(|(id, _)| id == "node-1"));
+    hb.deregister("node-1").await.unwrap();
+    assert!(!hb.is_online("node-1").await.unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// Live PostgreSQL integration tests (require running PostgreSQL)
+// ---------------------------------------------------------------------------
+
+/// PostgreSQL workflow storage and queue backend end-to-end.
+///
+/// Run with: `cargo test --features postgres,dag,queue -- --ignored postgres_live`
+///
+/// Expects `MAJRA_TEST_PG` env var with connection string, e.g.:
+/// `MAJRA_TEST_PG="postgresql://user:pass@localhost/majra_test"`
+#[cfg(all(feature = "postgres", feature = "dag"))]
+#[tokio::test]
+#[ignore]
+async fn postgres_live_workflow_storage() {
+    use majra::dag::{WorkflowDefinition, WorkflowRunStatus, WorkflowStep, WorkflowStorage};
+    use majra::postgres_backend::PostgresWorkflowStorage;
+
+    let conn_str = std::env::var("MAJRA_TEST_PG")
+        .unwrap_or_else(|_| "postgresql://postgres:postgres@localhost/majra_test".to_string());
+
+    let storage = Arc::new(
+        PostgresWorkflowStorage::connect(&conn_str)
+            .await
+            .expect("PostgreSQL must be running with the test database"),
+    );
+
+    // Create a simple workflow definition.
+    let def = WorkflowDefinition {
+        id: "test-wf-live".into(),
+        name: "Live Test Workflow".into(),
+        description: Some("Integration test".into()),
+        steps: vec![WorkflowStep {
+            id: "step-1".into(),
+            name: "Step One".into(),
+            depends_on: vec![],
+            trigger_mode: majra::dag::TriggerMode::All,
+            config: serde_json::json!({"action": "noop"}),
+            error_policy: majra::dag::ErrorPolicy::default(),
+            retry_policy: majra::dag::RetryPolicy::default(),
+        }],
+        enabled: true,
+        version: 1,
+        created_by: "test".into(),
+        created_at: chrono::Utc::now().timestamp_millis(),
+        updated_at: chrono::Utc::now().timestamp_millis(),
+    };
+
+    // CRUD definition.
+    storage.create_definition(&def).await.unwrap();
+    let loaded = storage
+        .get_definition("test-wf-live")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.name, "Live Test Workflow");
+    assert_eq!(loaded.steps.len(), 1);
+
+    let defs = storage.list_definitions(10, 0).await.unwrap();
+    assert!(defs.iter().any(|d| d.id == "test-wf-live"));
+
+    // Clean up.
+    assert!(storage.delete_definition("test-wf-live").await.unwrap());
+    assert!(
+        storage
+            .get_definition("test-wf-live")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

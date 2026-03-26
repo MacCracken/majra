@@ -10,15 +10,7 @@ Completed items are in [CHANGELOG.md](../../CHANGELOG.md).
 
 ### Consumer integration
 - [ ] SecureYeoman: expand NAPI bindings beyond pubsub + ratelimit to queue, heartbeat, dag
-- [ ] Ifran: integrate managed queue with GPU-aware scheduling
-- [ ] Integration tests against live PostgreSQL and Redis
-- [ ] Migration guide for SecureYeoman consumers
-
-### Remaining hardening
-- [ ] `ManagedQueue` PostgreSQL persistence backend
-- [ ] Per-tenant metrics partitioning (namespace scoping exists, metrics integration pending)
-- [ ] Prepared statement caching for PostgreSQL and SQLite backends
-- [ ] PubSub replay buffer indexing for efficient pattern-based replay
+- [ ] Ifran: integrate managed queue + fleet with GPU-aware scheduling
 
 ---
 
