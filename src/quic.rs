@@ -387,6 +387,8 @@ mod tests {
                 topic: "test".into(),
                 payload: serde_json::json!({"hello": "quic"}),
                 timestamp: Utc::now(),
+                correlation_id: None,
+                is_reply: false,
             };
             transport.send(&msg).await.unwrap();
             transport
@@ -492,6 +494,8 @@ mod tests {
                     topic: "multi".into(),
                     payload: serde_json::json!({"n": i}),
                     timestamp: Utc::now(),
+                    correlation_id: None,
+                    is_reply: false,
                 };
                 transport.send(&msg).await.unwrap();
             }

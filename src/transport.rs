@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
@@ -37,12 +38,20 @@ pub trait TransportFactory: Send + Sync + 'static {
     async fn connect(&self, endpoint: &str) -> Result<Box<dyn Transport>, MajraError>;
 }
 
+/// A pooled transport entry with last-use tracking.
+struct PooledTransport {
+    transport: Arc<dyn Transport>,
+    last_used: Instant,
+}
+
 /// Multiplexed connection pool for relay transports.
 ///
 /// Reuses connections to the same endpoint and supports concurrent access.
+/// Stale connections (idle beyond a configurable TTL) are evicted automatically
+/// on `acquire`, or on demand via [`ConnectionPool::evict_stale`].
 pub struct ConnectionPool {
     factory: Arc<dyn TransportFactory>,
-    connections: Mutex<HashMap<String, Vec<Arc<dyn Transport>>>>,
+    connections: Mutex<HashMap<String, Vec<PooledTransport>>>,
     max_per_endpoint: usize,
 }
 
@@ -63,10 +72,11 @@ impl ConnectionPool {
         let pool = conns.entry(key.clone()).or_default();
 
         // Reuse an existing connected transport.
-        pool.retain(|t| t.is_connected());
-        if let Some(transport) = pool.last() {
+        pool.retain(|pt| pt.transport.is_connected());
+        if let Some(pt) = pool.last_mut() {
+            pt.last_used = Instant::now();
             trace!(endpoint, "transport: reusing connection");
-            return Ok(transport.clone());
+            return Ok(pt.transport.clone());
         }
 
         // No connected transports. Drop the lock before doing async I/O.
@@ -78,14 +88,14 @@ impl ConnectionPool {
         // Re-acquire and insert.
         let mut conns = self.connections.lock().await;
         let pool = conns.entry(key).or_default();
-        pool.retain(|t| t.is_connected());
+        pool.retain(|pt| pt.transport.is_connected());
 
         if pool.len() >= self.max_per_endpoint {
             // Another task filled the pool while we were connecting.
             if let Err(e) = transport.close().await {
                 debug!(endpoint, error = %e, "transport: failed to close excess connection");
             }
-            return pool.last().cloned().ok_or_else(|| {
+            return pool.last().map(|pt| pt.transport.clone()).ok_or_else(|| {
                 MajraError::CapacityExceeded(format!(
                     "max connections ({}) reached for {endpoint}",
                     self.max_per_endpoint
@@ -93,7 +103,10 @@ impl ConnectionPool {
             });
         }
 
-        pool.push(transport.clone());
+        pool.push(PooledTransport {
+            transport: transport.clone(),
+            last_used: Instant::now(),
+        });
         Ok(transport)
     }
 
@@ -102,8 +115,8 @@ impl ConnectionPool {
         let mut conns = self.connections.lock().await;
         if let Some(pool) = conns.remove(endpoint) {
             debug!(endpoint, count = pool.len(), "transport: closing endpoint");
-            for transport in pool {
-                if let Err(e) = transport.close().await {
+            for pt in pool {
+                if let Err(e) = pt.transport.close().await {
                     debug!(endpoint, error = %e, "transport: close failed");
                 }
             }
@@ -116,12 +129,50 @@ impl ConnectionPool {
         let total: usize = conns.values().map(Vec::len).sum();
         debug!(total, "transport: closing all connections");
         for (endpoint, pool) in conns.drain() {
-            for transport in pool {
-                if let Err(e) = transport.close().await {
+            for pt in pool {
+                if let Err(e) = pt.transport.close().await {
                     debug!(%endpoint, error = %e, "transport: close failed");
                 }
             }
         }
+    }
+
+    /// Evict connections that have been idle longer than `max_idle`.
+    ///
+    /// Disconnected connections are also removed. Returns the number of
+    /// connections evicted.
+    pub async fn evict_stale(&self, max_idle: std::time::Duration) -> usize {
+        let now = Instant::now();
+        let mut conns = self.connections.lock().await;
+        let mut evicted = 0usize;
+
+        for (endpoint, pool) in conns.iter_mut() {
+            let before = pool.len();
+            let mut to_close = Vec::new();
+            pool.retain(|pt| {
+                if !pt.transport.is_connected() || now.duration_since(pt.last_used) > max_idle {
+                    to_close.push(pt.transport.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            let removed = before - pool.len();
+            if removed > 0 {
+                debug!(%endpoint, removed, "transport: evicted stale connections");
+            }
+            evicted += removed;
+
+            for transport in to_close {
+                if let Err(e) = transport.close().await {
+                    debug!(%endpoint, error = %e, "transport: close stale failed");
+                }
+            }
+        }
+
+        // Remove empty endpoint entries.
+        conns.retain(|_, pool| !pool.is_empty());
+        evicted
     }
 
     /// Number of endpoints with active connections.
@@ -248,6 +299,8 @@ mod tests {
             topic: "test".into(),
             payload: serde_json::Value::Null,
             timestamp: chrono::Utc::now(),
+            correlation_id: None,
+            is_reply: false,
         };
 
         transport.send(&msg).await.unwrap();
@@ -266,5 +319,42 @@ mod tests {
         let t2 = pool.acquire("node-1").await.unwrap();
         assert!(t2.is_connected());
         assert!(!Arc::ptr_eq(&t1, &t2));
+    }
+
+    #[tokio::test]
+    async fn pool_evict_stale_removes_idle_connections() {
+        let pool = ConnectionPool::new(Arc::new(MockFactory), 4);
+        pool.acquire("node-1").await.unwrap();
+        pool.acquire("node-2").await.unwrap();
+        assert_eq!(pool.connection_count().await, 2);
+
+        // Zero duration evicts everything.
+        let evicted = pool.evict_stale(std::time::Duration::ZERO).await;
+        assert_eq!(evicted, 2);
+        assert_eq!(pool.connection_count().await, 0);
+        assert_eq!(pool.endpoint_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn pool_evict_stale_keeps_fresh() {
+        let pool = ConnectionPool::new(Arc::new(MockFactory), 4);
+        pool.acquire("node-1").await.unwrap();
+
+        // Large TTL keeps everything.
+        let evicted = pool.evict_stale(std::time::Duration::from_secs(3600)).await;
+        assert_eq!(evicted, 0);
+        assert_eq!(pool.connection_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn pool_evict_stale_removes_disconnected() {
+        let pool = ConnectionPool::new(Arc::new(MockFactory), 4);
+        let t = pool.acquire("node-1").await.unwrap();
+        t.close().await.unwrap();
+
+        // Even with a huge TTL, disconnected connections are evicted.
+        let evicted = pool.evict_stale(std::time::Duration::from_secs(3600)).await;
+        assert_eq!(evicted, 1);
+        assert_eq!(pool.connection_count().await, 0);
     }
 }

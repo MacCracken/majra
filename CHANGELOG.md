@@ -38,6 +38,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Benchmark suite for envelope and IPC modules (`envelope_new`, `envelope_serialize_roundtrip`, `ipc_roundtrip_small_payload`, `ipc_roundtrip_large_payload`)
 - 8 new unit tests covering Default impls, deprecated compat, broadcast, subscribe, and error paths (barrier, relay, pubsub)
 
+#### Hardening & memory safety (P-1, SecureYeoman audit)
+- `Relay::evict_stale_dedup(max_idle)` — TTL-based eviction of the dedup table to prevent unbounded memory growth
+- `Relay::send_request()` / `Relay::reply()` — request-response correlation via UUID correlation IDs and oneshot channels for RPC patterns
+- `Relay::set_max_dedup_entries()` — configurable cap on dedup table size with automatic LRU eviction
+- `RelayMessage::correlation_id` and `is_reply` fields for request-response pairing
+- `RelayStats::dedup_evicted` and `dedup_table_size` fields for dedup observability
+- `InMemoryWorkflowStorage::evict_older_than(max_age)` — retention policy for terminal workflow runs and their step runs
+- `InMemoryWorkflowStorage::with_max_runs(max)` — bounded capacity with auto-eviction of oldest terminal run on insert
+- `InMemoryWorkflowStorage::run_count()` and `step_run_count()` for observability
+- `PubSub` and `TypedPubSub` automatic dead-subscriber cleanup on publish (configurable interval via `set_cleanup_interval` / `TypedPubSubConfig::cleanup_interval`)
+- `PubSub::try_subscribe()` and `TypedPubSub::try_subscribe()` — capacity-checked subscription with `max_subscriptions` limit
+- `ConnectionPool::evict_stale(max_idle)` — TTL-based eviction of idle transport connections with disconnect cleanup
+- `PooledTransport` internal struct tracks last-use time for each pooled connection
+- 13 new tests covering dedup eviction, request-response, bounded capacity, auto-cleanup, pool stale eviction
+
 ### Changed
 - SQLite backend `.lock().unwrap()` replaced with `map_err` error propagation (4 call sites) — no more panics on poisoned mutex
 - Test coverage improved from 88% to 90%+ (133 tests total: 125 unit + 5 integration + 3 doc-tests)

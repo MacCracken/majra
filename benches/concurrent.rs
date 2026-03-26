@@ -207,6 +207,8 @@ fn bench_relay(c: &mut Criterion) {
                     topic: "data".into(),
                     payload: serde_json::Value::Null,
                     timestamp: chrono::Utc::now(),
+                    correlation_id: None,
+                    is_reply: false,
                 };
                 relay.receive(msg);
             }

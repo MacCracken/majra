@@ -34,6 +34,9 @@ const CHANNEL_CAPACITY: usize = 256;
 /// Maximum topic hierarchy depth to prevent stack overflow in matching.
 const MAX_MATCH_DEPTH: usize = 32;
 
+/// Default number of publishes between automatic dead-subscriber cleanups.
+const DEFAULT_CLEANUP_INTERVAL: u64 = 1_000;
+
 // ---------------------------------------------------------------------------
 // Backpressure policy
 // ---------------------------------------------------------------------------
@@ -67,10 +70,16 @@ pub struct TopicMessage {
 ///
 /// Subscribers register wildcard patterns; publishers send to concrete topics.
 /// Delivery fans out to every pattern that matches the topic.
+///
+/// Dead subscribers (receivers that have been dropped) are cleaned up
+/// automatically every 1 000 publishes. Call [`PubSub::cleanup_dead_subscribers`]
+/// manually for immediate cleanup.
 pub struct PubSub {
     subscriptions: DashMap<String, broadcast::Sender<TopicMessage>>,
     capacity: usize,
     messages_published: Counter,
+    cleanup_interval: u64,
+    max_subscriptions: usize,
 }
 
 impl PubSub {
@@ -85,7 +94,23 @@ impl PubSub {
             subscriptions: DashMap::new(),
             capacity,
             messages_published: Counter::new(),
+            cleanup_interval: DEFAULT_CLEANUP_INTERVAL,
+            max_subscriptions: 0,
         }
+    }
+
+    /// Set the number of publishes between automatic dead-subscriber cleanups.
+    ///
+    /// Set to `0` to disable automatic cleanup entirely.
+    pub fn set_cleanup_interval(&mut self, interval: u64) {
+        self.cleanup_interval = interval;
+    }
+
+    /// Set the maximum number of subscription patterns allowed.
+    ///
+    /// Set to `0` (default) for unbounded.
+    pub fn set_max_subscriptions(&mut self, max: usize) {
+        self.max_subscriptions = max;
     }
 
     /// Subscribe to a topic pattern. Returns a receiver for matching messages.
@@ -94,6 +119,26 @@ impl PubSub {
             .entry(pattern.to_string())
             .or_insert_with(|| broadcast::channel(self.capacity).0)
             .subscribe()
+    }
+
+    /// Subscribe with capacity check. Returns `Err` if `max_subscriptions`
+    /// is set and the limit has been reached (existing patterns can always
+    /// add more receivers).
+    pub fn try_subscribe(
+        &self,
+        pattern: &str,
+    ) -> crate::error::Result<broadcast::Receiver<TopicMessage>> {
+        if self.max_subscriptions > 0
+            && !self.subscriptions.contains_key(pattern)
+            && self.subscriptions.len() >= self.max_subscriptions
+        {
+            return Err(crate::error::MajraError::CapacityExceeded(format!(
+                "max subscription patterns ({}) reached",
+                self.max_subscriptions
+            )));
+        }
+
+        Ok(self.subscribe(pattern))
     }
 
     /// Publish a message to a concrete topic.
@@ -123,6 +168,17 @@ impl PubSub {
 
         self.messages_published.inc();
         trace!(topic, delivered, "published");
+
+        // Periodic automatic cleanup.
+        if self.cleanup_interval > 0
+            && self
+                .messages_published
+                .get()
+                .is_multiple_of(self.cleanup_interval)
+        {
+            self.cleanup_dead_subscribers();
+        }
+
         delivered
     }
 
@@ -145,7 +201,8 @@ impl PubSub {
 
     /// Remove subscription patterns whose receivers have all been dropped.
     ///
-    /// Returns the number of dead patterns removed.
+    /// Returns the number of dead patterns removed. Also runs automatically
+    /// every [`DEFAULT_CLEANUP_INTERVAL`] publishes.
     pub fn cleanup_dead_subscribers(&self) -> usize {
         let dead: Vec<String> = self
             .subscriptions
@@ -197,6 +254,10 @@ pub struct TypedPubSubConfig {
     pub backpressure: BackpressurePolicy,
     /// Replay buffer capacity (0 = disabled).
     pub replay_capacity: usize,
+    /// Number of publishes between automatic dead-subscriber cleanups (0 = disabled).
+    pub cleanup_interval: u64,
+    /// Maximum number of subscription patterns allowed (0 = unbounded).
+    pub max_subscriptions: usize,
 }
 
 impl Default for TypedPubSubConfig {
@@ -205,6 +266,8 @@ impl Default for TypedPubSubConfig {
             channel_capacity: CHANNEL_CAPACITY,
             backpressure: BackpressurePolicy::DropOldest,
             replay_capacity: 0,
+            cleanup_interval: DEFAULT_CLEANUP_INTERVAL,
+            max_subscriptions: 0,
         }
     }
 }
@@ -257,6 +320,23 @@ impl<T: Clone + Send + Sync + 'static> TypedPubSub<T> {
         }
 
         rx
+    }
+
+    /// Subscribe with capacity check. Returns `Err` if `max_subscriptions`
+    /// is set and the limit has been reached.
+    pub fn try_subscribe(
+        &self,
+        pattern: &str,
+    ) -> crate::error::Result<broadcast::Receiver<TypedMessage<T>>> {
+        if self.config.max_subscriptions > 0
+            && self.subscriptions.len() >= self.config.max_subscriptions
+        {
+            return Err(crate::error::MajraError::CapacityExceeded(format!(
+                "max subscription patterns ({}) reached",
+                self.config.max_subscriptions
+            )));
+        }
+        Ok(self.subscribe(pattern))
     }
 
     /// Subscribe with a predicate filter. Only messages where `filter(&payload)`
@@ -359,6 +439,17 @@ impl<T: Clone + Send + Sync + 'static> TypedPubSub<T> {
 
         self.messages_published.inc();
         trace!(topic, delivered, "typed: published");
+
+        // Periodic automatic cleanup.
+        if self.config.cleanup_interval > 0
+            && self
+                .messages_published
+                .get()
+                .is_multiple_of(self.config.cleanup_interval)
+        {
+            self.cleanup_dead_subscribers();
+        }
+
         delivered
     }
 
@@ -392,9 +483,8 @@ impl<T: Clone + Send + Sync + 'static> TypedPubSub<T> {
 
     /// Remove subscriptions whose receivers have all been dropped.
     ///
-    /// Returns the number of dead subscriptions removed. Call periodically
-    /// (e.g. on a timer or after publish) to prevent unbounded growth of the
-    /// subscription map when subscribers disconnect without unsubscribing.
+    /// Returns the number of dead subscriptions removed. Also runs automatically
+    /// every `cleanup_interval` publishes (configurable via [`TypedPubSubConfig`]).
     pub fn cleanup_dead_subscribers(&self) -> usize {
         let mut removed = 0usize;
         let mut empty_patterns = Vec::new();
@@ -700,6 +790,7 @@ mod tests {
             channel_capacity: 2,
             backpressure: BackpressurePolicy::DropNewest,
             replay_capacity: 0,
+            ..Default::default()
         };
         let hub = TypedPubSub::<TestEvent>::with_config(config);
         let _rx = hub.subscribe("events/#");
@@ -892,6 +983,60 @@ mod tests {
         hub.cleanup_dead_subscribers();
         // Pattern "events/a" should be removed entirely.
         assert_eq!(hub.pattern_count(), 1);
+    }
+
+    #[test]
+    fn pubsub_auto_cleanup_on_publish() {
+        let mut hub = PubSub::new();
+        hub.set_cleanup_interval(5); // clean every 5 publishes
+
+        let rx = hub.subscribe("a/b");
+        drop(rx); // dead subscriber
+        assert_eq!(hub.pattern_count(), 1);
+
+        // Publish 4 times — no cleanup yet.
+        for _ in 0..4 {
+            hub.publish("a/b", serde_json::Value::Null);
+        }
+        assert_eq!(hub.pattern_count(), 1);
+
+        // 5th publish triggers cleanup.
+        hub.publish("a/b", serde_json::Value::Null);
+        assert_eq!(hub.pattern_count(), 0);
+    }
+
+    #[test]
+    fn typed_auto_cleanup_on_publish() {
+        let config = TypedPubSubConfig {
+            cleanup_interval: 3,
+            ..Default::default()
+        };
+        let hub = TypedPubSub::<TestEvent>::with_config(config);
+
+        let rx = hub.subscribe("events/#");
+        drop(rx);
+        assert_eq!(hub.pattern_count(), 1);
+
+        for i in 0..2 {
+            hub.publish(
+                "events/x",
+                TestEvent {
+                    kind: "x".into(),
+                    value: i,
+                },
+            );
+        }
+        assert_eq!(hub.pattern_count(), 1);
+
+        // 3rd publish triggers cleanup.
+        hub.publish(
+            "events/x",
+            TestEvent {
+                kind: "x".into(),
+                value: 3,
+            },
+        );
+        assert_eq!(hub.pattern_count(), 0);
     }
 
     #[test]

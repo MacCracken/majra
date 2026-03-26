@@ -383,17 +383,101 @@ pub trait StepExecutor: Send + Sync {
 /// In-memory workflow storage backed by [`DashMap`].
 ///
 /// Suitable for testing and single-process use. No persistence across restarts.
-#[derive(Debug, Default)]
+/// Set `max_runs` to cap the number of stored runs — once the limit is reached,
+/// the oldest terminal run is evicted automatically on `create_run`.
+#[derive(Debug)]
 pub struct InMemoryWorkflowStorage {
     definitions: DashMap<String, WorkflowDefinition>,
     runs: DashMap<String, WorkflowRun>,
     step_runs: DashMap<String, StepRun>,
+    /// Maximum number of run records to keep (0 = unbounded).
+    max_runs: usize,
+}
+
+impl Default for InMemoryWorkflowStorage {
+    fn default() -> Self {
+        Self {
+            definitions: DashMap::new(),
+            runs: DashMap::new(),
+            step_runs: DashMap::new(),
+            max_runs: 0,
+        }
+    }
 }
 
 impl InMemoryWorkflowStorage {
     /// Create a new empty in-memory storage.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create with a maximum number of stored runs.
+    ///
+    /// When the limit is reached, the oldest terminal (completed/failed/cancelled)
+    /// run is evicted on each new `create_run`. Set to `0` for unbounded.
+    pub fn with_max_runs(max_runs: usize) -> Self {
+        Self {
+            max_runs,
+            ..Default::default()
+        }
+    }
+
+    /// Evict completed and failed workflow runs older than `max_age`.
+    ///
+    /// Also removes associated step runs. Only terminal runs
+    /// (`Completed`, `Failed`, `Cancelled`) are eligible for eviction.
+    ///
+    /// Returns the number of runs evicted.
+    pub fn evict_older_than(&self, max_age: Duration) -> usize {
+        let cutoff_ms = chrono::Utc::now().timestamp_millis()
+            - i64::try_from(max_age.as_millis()).unwrap_or(i64::MAX);
+
+        let stale_run_ids: Vec<String> = self
+            .runs
+            .iter()
+            .filter(|entry| {
+                let run = entry.value();
+                matches!(
+                    run.status,
+                    WorkflowRunStatus::Completed
+                        | WorkflowRunStatus::Failed
+                        | WorkflowRunStatus::Cancelled
+                ) && run.completed_at.is_some_and(|t| t < cutoff_ms)
+            })
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        let count = stale_run_ids.len();
+        for run_id in &stale_run_ids {
+            self.runs.remove(run_id);
+            // Remove associated step runs.
+            let step_ids: Vec<String> = self
+                .step_runs
+                .iter()
+                .filter(|e| e.value().run_id == *run_id)
+                .map(|e| e.key().clone())
+                .collect();
+            for step_id in &step_ids {
+                self.step_runs.remove(step_id);
+            }
+        }
+
+        if count > 0 {
+            tracing::debug!(count, "dag: evicted old workflow runs");
+        }
+        count
+    }
+
+    /// Number of workflow runs currently stored.
+    #[inline]
+    pub fn run_count(&self) -> usize {
+        self.runs.len()
+    }
+
+    /// Number of step run records currently stored.
+    #[inline]
+    pub fn step_run_count(&self) -> usize {
+        self.step_runs.len()
     }
 }
 
@@ -428,6 +512,36 @@ impl WorkflowStorage for InMemoryWorkflowStorage {
     }
 
     async fn create_run(&self, run: &WorkflowRun) -> crate::error::Result<()> {
+        // Auto-evict oldest terminal run if at capacity.
+        if self.max_runs > 0 && self.runs.len() >= self.max_runs {
+            let oldest = self
+                .runs
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e.value().status,
+                        WorkflowRunStatus::Completed
+                            | WorkflowRunStatus::Failed
+                            | WorkflowRunStatus::Cancelled
+                    )
+                })
+                .min_by_key(|e| e.value().completed_at.unwrap_or(i64::MAX))
+                .map(|e| e.key().clone());
+            if let Some(old_id) = oldest {
+                // Remove associated step runs.
+                let step_ids: Vec<String> = self
+                    .step_runs
+                    .iter()
+                    .filter(|e| e.value().run_id == old_id)
+                    .map(|e| e.key().clone())
+                    .collect();
+                for sid in &step_ids {
+                    self.step_runs.remove(sid);
+                }
+                self.runs.remove(&old_id);
+                tracing::debug!(evicted = %old_id, "dag: evicted oldest run (capacity)");
+            }
+        }
         self.runs.insert(run.id.clone(), run.clone());
         Ok(())
     }
@@ -1973,6 +2087,91 @@ mod tests {
 
         let output = run.output.unwrap();
         assert_eq!(output["b"]["upstream"], 42);
+    }
+
+    // --- InMemoryWorkflowStorage retention ---
+
+    #[tokio::test]
+    async fn in_memory_evict_older_than() {
+        let storage = InMemoryWorkflowStorage::new();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
+        // Insert a completed run with an old completed_at.
+        let old_run = WorkflowRun {
+            id: "old-run".into(),
+            workflow_id: "wf-1".into(),
+            workflow_name: "test".into(),
+            status: WorkflowRunStatus::Completed,
+            input: None,
+            output: None,
+            error: None,
+            triggered_by: "test".into(),
+            created_at: now_ms - 7_200_000,
+            started_at: Some(now_ms - 7_200_000),
+            completed_at: Some(now_ms - 7_200_000), // 2 hours ago
+        };
+        storage.create_run(&old_run).await.unwrap();
+
+        // Insert associated step run.
+        let sr = StepRun {
+            id: "old-step".into(),
+            run_id: "old-run".into(),
+            step_id: "a".into(),
+            step_name: "a".into(),
+            status: StepRunStatus::Completed,
+            input: None,
+            output: None,
+            error: None,
+            attempt: 1,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+        };
+        storage.create_step_run(&sr).await.unwrap();
+
+        // Insert a recent run.
+        let new_run = WorkflowRun {
+            id: "new-run".into(),
+            workflow_id: "wf-1".into(),
+            workflow_name: "test".into(),
+            status: WorkflowRunStatus::Completed,
+            input: None,
+            output: None,
+            error: None,
+            triggered_by: "test".into(),
+            created_at: now_ms,
+            started_at: Some(now_ms),
+            completed_at: Some(now_ms),
+        };
+        storage.create_run(&new_run).await.unwrap();
+
+        // Insert a running run (should not be evicted regardless of age).
+        let running_run = WorkflowRun {
+            id: "running-run".into(),
+            workflow_id: "wf-1".into(),
+            workflow_name: "test".into(),
+            status: WorkflowRunStatus::Running,
+            input: None,
+            output: None,
+            error: None,
+            triggered_by: "test".into(),
+            created_at: now_ms - 7_200_000,
+            started_at: Some(now_ms - 7_200_000),
+            completed_at: None,
+        };
+        storage.create_run(&running_run).await.unwrap();
+
+        assert_eq!(storage.run_count(), 3);
+        assert_eq!(storage.step_run_count(), 1);
+
+        // Evict runs older than 1 hour.
+        let evicted = storage.evict_older_than(Duration::from_secs(3600));
+        assert_eq!(evicted, 1); // only old_run
+        assert_eq!(storage.run_count(), 2);
+        assert_eq!(storage.step_run_count(), 0); // step run cleaned up
+        assert!(storage.get_run("new-run").await.unwrap().is_some());
+        assert!(storage.get_run("running-run").await.unwrap().is_some());
+        assert!(storage.get_run("old-run").await.unwrap().is_none());
     }
 
     // --- SQLite storage tests ---

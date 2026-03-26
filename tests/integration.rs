@@ -228,6 +228,8 @@ fn relay_concurrent_dedup() {
                     topic: "data".into(),
                     payload: serde_json::Value::Null,
                     timestamp: chrono::Utc::now(),
+                    correlation_id: None,
+                    is_reply: false,
                 };
                 r.receive(msg);
             }
@@ -240,6 +242,8 @@ fn relay_concurrent_dedup() {
                     topic: "data".into(),
                     payload: serde_json::Value::Null,
                     timestamp: chrono::Utc::now(),
+                    correlation_id: None,
+                    is_reply: false,
                 };
                 r.receive(msg);
             }

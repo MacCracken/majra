@@ -454,6 +454,8 @@ fn soak_relay_dedup() {
                         topic: "soak".into(),
                         payload: serde_json::Value::Null,
                         timestamp: chrono::Utc::now(),
+                        correlation_id: None,
+                        is_reply: false,
                     };
                     let s = Instant::now();
                     let _ = r.receive(msg);
