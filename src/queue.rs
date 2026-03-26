@@ -128,11 +128,13 @@ impl<T> PriorityQueue<T> {
     }
 
     /// Total items across all tiers.
+    #[inline]
     pub fn len(&self) -> usize {
         self.tiers.iter().map(VecDeque::len).sum()
     }
 
     /// Returns `true` if all tiers are empty.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.tiers.iter().all(VecDeque::is_empty)
     }
@@ -174,6 +176,7 @@ impl DagScheduler {
     }
 
     /// Return node keys whose dependencies have all been completed.
+    #[must_use]
     pub fn ready(&self, completed: &HashSet<String>) -> Vec<String> {
         let mut ready = Vec::new();
         for (node, deps) in &self.dependencies {
@@ -330,6 +333,7 @@ pub struct ResourcePool {
 
 impl ResourcePool {
     /// Check whether the pool can satisfy the given requirements.
+    #[inline]
     pub fn satisfies(&self, req: &ResourceReq) -> bool {
         self.gpu_count >= req.gpu_count && self.vram_mb >= req.vram_mb
     }
@@ -366,6 +370,7 @@ impl std::fmt::Display for JobState {
 
 impl JobState {
     /// Whether this is a terminal state.
+    #[inline]
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
@@ -641,9 +646,11 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
             to: new_state,
         });
 
+        let from_str = from.to_string();
+        let to_str = new_state.to_string();
         self.metrics
-            .queue_state_changed("managed", &from.to_string(), &new_state.to_string());
-        info!(%id, %from, to = %new_state, "job state changed");
+            .queue_state_changed("managed", &from_str, &to_str);
+        info!(%id, from = %from_str, to = %to_str, "job state changed");
 
         Ok(())
     }
@@ -683,11 +690,13 @@ impl<T: Send + Clone + Serialize + 'static> ManagedQueue<T> {
     }
 
     /// Number of currently running jobs.
+    #[inline]
     pub fn running_count(&self) -> usize {
         self.running_count.load(Ordering::Relaxed)
     }
 
     /// Number of tracked jobs (all states).
+    #[inline]
     pub fn job_count(&self) -> usize {
         self.jobs.len()
     }
@@ -781,7 +790,10 @@ pub mod persistence {
 
         /// Persist a queued item.
         pub fn persist<T: Serialize>(&self, item: &ManagedItem<T>) -> crate::error::Result<()> {
-            let conn = self.conn.lock().unwrap();
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| crate::error::persistence_err(format!("mutex poisoned: {e}")))?;
             let payload =
                 serde_json::to_string(&item.payload).map_err(crate::error::persistence_err)?;
             let resource_req = item
@@ -809,7 +821,10 @@ pub mod persistence {
 
         /// Update the state of a persisted item.
         pub fn update_state(&self, id: TaskId, state: JobState) -> crate::error::Result<()> {
-            let conn = self.conn.lock().unwrap();
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| crate::error::persistence_err(format!("mutex poisoned: {e}")))?;
             let state_str = serde_json::to_string(&state).map_err(crate::error::persistence_err)?;
             conn.execute(
                 "UPDATE managed_queue SET state = ?1 WHERE id = ?2",
@@ -821,7 +836,10 @@ pub mod persistence {
 
         /// Load all non-terminal items (crash recovery).
         pub fn load_all<T: DeserializeOwned>(&self) -> crate::error::Result<Vec<ManagedItem<T>>> {
-            let conn = self.conn.lock().unwrap();
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| crate::error::persistence_err(format!("mutex poisoned: {e}")))?;
             let mut stmt = conn
                 .prepare(
                     "SELECT id, priority, state, payload, resource_req FROM managed_queue
@@ -878,7 +896,10 @@ pub mod persistence {
 
         /// Delete evicted items.
         pub fn evict(&self, ids: &[TaskId]) -> crate::error::Result<()> {
-            let conn = self.conn.lock().unwrap();
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| crate::error::persistence_err(format!("mutex poisoned: {e}")))?;
             for id in ids {
                 conn.execute(
                     "DELETE FROM managed_queue WHERE id = ?1",

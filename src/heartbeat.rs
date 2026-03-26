@@ -17,6 +17,7 @@ use tracing::debug;
 const DEFAULT_SUSPECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Classify a node's status based on time since last heartbeat.
+#[inline]
 fn classify_status(elapsed: Duration, config: &HeartbeatConfig) -> Status {
     if elapsed >= config.offline_after {
         Status::Offline
@@ -68,6 +69,7 @@ pub struct GpuTelemetry {
 
 /// Aggregated fleet statistics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[must_use]
 pub struct FleetStats {
     /// Total number of tracked nodes across all statuses.
     pub total_nodes: usize,
@@ -220,16 +222,19 @@ impl HeartbeatTracker {
     }
 
     /// Get a node's current state.
+    #[inline]
     pub fn get(&self, id: &str) -> Option<&NodeState> {
         self.nodes.get(id)
     }
 
     /// Total tracked nodes.
+    #[inline]
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
 
     /// Returns `true` if no nodes are being tracked.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
@@ -453,11 +458,13 @@ impl ConcurrentHeartbeatTracker {
     }
 
     /// Total tracked nodes.
+    #[inline]
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
 
     /// Returns `true` if no nodes are being tracked.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }

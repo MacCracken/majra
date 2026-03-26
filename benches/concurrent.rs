@@ -223,7 +223,7 @@ fn bench_barrier(c: &mut Criterion) {
             let participants: HashSet<String> = (0..10).map(|i| format!("p-{i}")).collect();
             set.create("sync", participants);
             for i in 0..10 {
-                set.arrive("sync", &format!("p-{i}"));
+                let _ = set.arrive("sync", &format!("p-{i}"));
             }
         });
     });
@@ -236,7 +236,7 @@ fn bench_barrier(c: &mut Criterion) {
                 let participants: HashSet<String> = (0..4).map(|i| format!("w-{i}")).collect();
                 set.create(&name, participants);
                 for i in 0..4 {
-                    set.arrive(&name, &format!("w-{i}"));
+                    let _ = set.arrive(&name, &format!("w-{i}"));
                 }
                 set.complete(&name);
             }

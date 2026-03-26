@@ -126,11 +126,13 @@ impl PubSub {
     }
 
     /// Number of active subscription patterns.
+    #[inline]
     pub fn pattern_count(&self) -> usize {
         self.subscriptions.len()
     }
 
     /// Total messages published since creation.
+    #[inline]
     pub fn messages_published(&self) -> u64 {
         self.messages_published.get()
     }
@@ -323,16 +325,19 @@ impl<T: Clone + Send + Sync + 'static> TypedPubSub<T> {
     }
 
     /// Number of active subscription patterns.
+    #[inline]
     pub fn pattern_count(&self) -> usize {
         self.subscriptions.len()
     }
 
     /// Total messages published since creation.
+    #[inline]
     pub fn messages_published(&self) -> u64 {
         self.messages_published.get()
     }
 
     /// Total messages dropped due to backpressure (DropNewest policy only).
+    #[inline]
     pub fn messages_dropped(&self) -> u64 {
         self.messages_dropped.get()
     }
@@ -384,6 +389,8 @@ impl<T: Clone + Send + Sync + DeserializeOwned + 'static> TypedMessage<T> {
 /// Segment separator is `/`. Wildcards:
 /// - `*` matches exactly one segment
 /// - `#` matches zero or more trailing segments (must be last)
+#[inline]
+#[must_use]
 pub fn matches_pattern(pattern: &str, topic: &str) -> bool {
     let mut pat = pattern.split('/');
     let mut top = topic.split('/');

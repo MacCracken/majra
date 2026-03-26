@@ -16,16 +16,19 @@ impl Counter {
     }
 
     /// Increment by one.
+    #[inline]
     pub fn inc(&self) {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Increment by `n`.
+    #[inline]
     pub fn add(&self, n: u64) {
         self.0.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Read the current value.
+    #[inline]
     pub fn get(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }

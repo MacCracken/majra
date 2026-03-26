@@ -21,6 +21,7 @@ struct Bucket {
 
 /// Rate limiter usage statistics.
 #[derive(Debug, Clone, Default)]
+#[must_use]
 pub struct RateLimitStats {
     /// Total number of allowed requests.
     pub total_allowed: u64,
@@ -88,6 +89,7 @@ impl RateLimiter {
     }
 
     /// Number of tracked keys.
+    #[inline]
     pub fn key_count(&self) -> usize {
         self.buckets.len()
     }

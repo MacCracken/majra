@@ -14,6 +14,7 @@ use tokio::sync::Notify;
 /// Result of arriving at a barrier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
+#[must_use]
 pub enum BarrierResult {
     /// Still waiting for more participants.
     Waiting {
@@ -127,11 +128,13 @@ impl BarrierSet {
     }
 
     /// Number of active barriers.
+    #[inline]
     pub fn len(&self) -> usize {
         self.barriers.len()
     }
 
     /// Returns `true` if there are no active barriers.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.barriers.is_empty()
     }
@@ -295,11 +298,13 @@ impl AsyncBarrierSet {
     }
 
     /// Number of active barriers.
+    #[inline]
     pub fn len(&self) -> usize {
         self.barriers.len()
     }
 
     /// Returns `true` if there are no active barriers.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.barriers.is_empty()
     }
@@ -354,7 +359,7 @@ mod tests {
         let mut set = BarrierSet::new();
         set.create("sync-1", participants(&["a", "b"]));
 
-        set.arrive("sync-1", "a");
+        let _ = set.arrive("sync-1", "a");
         // b is dead — force it out.
         assert_eq!(set.force("sync-1", "b"), BarrierResult::Released);
     }
@@ -364,8 +369,8 @@ mod tests {
         let mut set = BarrierSet::new();
         set.create("sync-1", participants(&["a", "b"]));
 
-        set.arrive("sync-1", "a");
-        set.arrive("sync-1", "a");
+        let _ = set.arrive("sync-1", "a");
+        let _ = set.arrive("sync-1", "a");
         assert_eq!(
             set.arrive("sync-1", "a"),
             BarrierResult::Waiting {
@@ -379,7 +384,7 @@ mod tests {
     fn complete_removes_barrier() {
         let mut set = BarrierSet::new();
         set.create("sync-1", participants(&["a"]));
-        set.arrive("sync-1", "a");
+        let _ = set.arrive("sync-1", "a");
 
         let record = set.complete("sync-1").unwrap();
         assert_eq!(record.name, "sync-1");
@@ -422,7 +427,7 @@ mod tests {
         let set = ConcurrentBarrierSet::new();
         set.create("sync-1", participants(&["a", "b"]));
 
-        set.arrive("sync-1", "a");
+        let _ = set.arrive("sync-1", "a");
         assert_eq!(set.force("sync-1", "b"), BarrierResult::Released);
     }
 
@@ -430,7 +435,7 @@ mod tests {
     fn concurrent_complete() {
         let set = ConcurrentBarrierSet::new();
         set.create("sync-1", participants(&["a"]));
-        set.arrive("sync-1", "a");
+        let _ = set.arrive("sync-1", "a");
 
         let record = set.complete("sync-1").unwrap();
         assert_eq!(record.name, "sync-1");
@@ -496,7 +501,7 @@ mod tests {
 
         // Small delay before second participant arrives.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        set.arrive("sync-1", "b");
+        let _ = set.arrive("sync-1", "b");
 
         // Waiter should now be released.
         waiter.await.unwrap();
@@ -521,7 +526,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         // Force remove b — should release the barrier.
-        set.force("sync-1", "b");
+        let _ = set.force("sync-1", "b");
 
         waiter.await.unwrap();
     }

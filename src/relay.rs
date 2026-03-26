@@ -47,6 +47,7 @@ pub struct IncomingMessage {
 
 /// Relay statistics.
 #[derive(Debug, Clone, Default)]
+#[must_use]
 pub struct RelayStats {
     /// Total number of messages sent from this node.
     pub messages_sent: u64,
@@ -169,6 +170,7 @@ impl Relay {
     }
 
     /// This relay's node ID.
+    #[inline]
     pub fn node_id(&self) -> &str {
         &self.node_id
     }
