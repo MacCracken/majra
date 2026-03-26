@@ -1,3 +1,4 @@
+#![allow(unused_imports, dead_code)]
 //! Load and soak tests for majra primitives.
 //!
 //! These tests run sustained workloads and report latency percentiles and

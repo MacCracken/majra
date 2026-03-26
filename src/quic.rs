@@ -36,8 +36,8 @@ use crate::transport::{Transport, TransportFactory};
 /// Generate a self-signed TLS certificate and key for testing/development.
 ///
 /// For production, supply your own [`rustls::ServerConfig`] and
-/// [`rustls::ClientConfig`] via [`QuicListener::with_server_config`] and
-/// [`QuicTransportFactory::with_client_config`].
+/// [`rustls::ClientConfig`] via [`QuicListener::bind`] and
+/// [`QuicTransportFactory::new`].
 pub fn self_signed_tls() -> Result<(rustls::ServerConfig, rustls::ClientConfig), MajraError> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
         .map_err(|e| MajraError::Relay(format!("cert generation: {e}")))?;
@@ -72,7 +72,7 @@ pub fn self_signed_tls() -> Result<(rustls::ServerConfig, rustls::ClientConfig),
 /// A QUIC connection implementing the [`Transport`] trait.
 ///
 /// Each `send()` opens a new bi-directional stream (multiplexed, no HOL blocking).
-/// Also supports fire-and-forget datagrams via [`send_datagram`].
+/// Also supports fire-and-forget datagrams via [`QuicTransport::send_datagram`].
 pub struct QuicTransport {
     connection: quinn::Connection,
     /// Buffered receive stream for `recv()` calls.
