@@ -23,6 +23,8 @@
 //! | `ratelimit` | no | Per-key token bucket rate limiter |
 //! | `barrier` | no | N-way barrier synchronisation with deadlock recovery |
 //! | `sqlite` | no | SQLite persistence for managed queue |
+//! | `fleet` | no | Distributed job queue with work-stealing |
+//! | `prometheus` | no | Built-in Prometheus metrics exporter |
 //! | `full` | — | Enables all features |
 
 pub mod envelope;
@@ -60,6 +62,9 @@ pub mod barrier;
 
 #[cfg(feature = "dag")]
 pub mod dag;
+
+#[cfg(feature = "fleet")]
+pub mod fleet;
 
 // ---------------------------------------------------------------------------
 // Compile-time Send + Sync assertions
@@ -100,5 +105,9 @@ mod sync_assertions {
         // Barrier
         #[cfg(feature = "barrier")]
         _assert_send_sync::<super::barrier::AsyncBarrierSet>();
+
+        // Fleet
+        #[cfg(feature = "fleet")]
+        _assert_send_sync::<super::fleet::FleetQueue<String>>();
     }
 }

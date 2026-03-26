@@ -41,9 +41,9 @@ See [network-evolution.md](../../../../docs/development/network-evolution.md) in
 ### Other Post-v1
 
 - [ ] **Redis-backed mode** — optional Redis backend for cross-process pub/sub and queues
-- [ ] **Prometheus metrics exporter** — built-in `MajraMetrics` implementation with counters/gauges (queue depth, pub/sub throughput, heartbeat states)
-- [ ] **Fleet queue** — distributed job queue across multiple nodes with work-stealing
-- [ ] **TypedPubSub dead subscriber cleanup** — GC sweep of dropped receivers during publish
+- [x] **Prometheus metrics exporter** — `PrometheusMetrics` behind `prometheus` feature flag with counters, gauges, and histograms
+- [x] **Fleet queue** — `FleetQueue<T>` with least-loaded routing, resource filtering, and work-stealing rebalance
+- [x] **TypedPubSub dead subscriber cleanup** — `cleanup_dead_subscribers()` on both `PubSub` and `TypedPubSub`
 
 ---
 

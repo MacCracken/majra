@@ -142,6 +142,29 @@ impl PubSub {
     pub fn messages_published(&self) -> u64 {
         self.messages_published.get()
     }
+
+    /// Remove subscription patterns whose receivers have all been dropped.
+    ///
+    /// Returns the number of dead patterns removed.
+    pub fn cleanup_dead_subscribers(&self) -> usize {
+        let dead: Vec<String> = self
+            .subscriptions
+            .iter()
+            .filter(|entry| entry.value().receiver_count() == 0)
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        let count = dead.len();
+        for pattern in &dead {
+            self.subscriptions
+                .remove_if(pattern, |_, tx| tx.receiver_count() == 0);
+        }
+
+        if count > 0 {
+            trace!(count, "pubsub: cleaned up dead patterns");
+        }
+        count
+    }
 }
 
 impl Default for PubSub {
@@ -365,6 +388,48 @@ impl<T: Clone + Send + Sync + 'static> TypedPubSub<T> {
     /// Clear the replay buffer for all topics.
     pub fn clear_replay(&self) {
         self.replay_buffer.clear();
+    }
+
+    /// Remove subscriptions whose receivers have all been dropped.
+    ///
+    /// Returns the number of dead subscriptions removed. Call periodically
+    /// (e.g. on a timer or after publish) to prevent unbounded growth of the
+    /// subscription map when subscribers disconnect without unsubscribing.
+    pub fn cleanup_dead_subscribers(&self) -> usize {
+        let mut removed = 0usize;
+        let mut empty_patterns = Vec::new();
+
+        for mut entry in self.subscriptions.iter_mut() {
+            let before = entry.value().len();
+            entry
+                .value_mut()
+                .retain(|sub| sub.sender.receiver_count() > 0);
+            removed += before - entry.value().len();
+
+            if entry.value().is_empty() {
+                empty_patterns.push(entry.key().clone());
+            }
+        }
+
+        // Remove empty pattern entries outside the mutable iterator.
+        for pattern in &empty_patterns {
+            // Re-check under the entry lock to avoid racing with new subscribers.
+            self.subscriptions
+                .remove_if(pattern, |_, subs| subs.is_empty());
+        }
+
+        if removed > 0 {
+            trace!(removed, "typed: cleaned up dead subscribers");
+        }
+        removed
+    }
+
+    /// Number of individual subscriptions across all patterns.
+    pub fn subscriber_count(&self) -> usize {
+        self.subscriptions
+            .iter()
+            .map(|entry| entry.value().len())
+            .sum()
     }
 }
 
@@ -774,5 +839,74 @@ mod tests {
             timestamp: Utc::now(),
         };
         assert!(TypedMessage::<TestEvent>::from_untyped(&untyped).is_err());
+    }
+
+    // --- Dead subscriber cleanup ---
+
+    #[test]
+    fn pubsub_cleanup_dead_subscribers() {
+        let hub = PubSub::new();
+        let rx1 = hub.subscribe("a/b");
+        let _rx2 = hub.subscribe("c/d");
+        assert_eq!(hub.pattern_count(), 2);
+
+        // Drop rx1 — its pattern should be cleaned up.
+        drop(rx1);
+        let removed = hub.cleanup_dead_subscribers();
+        assert_eq!(removed, 1);
+        assert_eq!(hub.pattern_count(), 1);
+    }
+
+    #[test]
+    fn pubsub_cleanup_no_dead() {
+        let hub = PubSub::new();
+        let _rx = hub.subscribe("a/b");
+        assert_eq!(hub.cleanup_dead_subscribers(), 0);
+        assert_eq!(hub.pattern_count(), 1);
+    }
+
+    #[test]
+    fn typed_cleanup_dead_subscribers() {
+        let hub = TypedPubSub::<TestEvent>::new();
+        let rx1 = hub.subscribe("events/a");
+        let _rx2 = hub.subscribe("events/b");
+        let rx3 = hub.subscribe_filtered("events/#", |e: &TestEvent| e.value > 10);
+        assert_eq!(hub.subscriber_count(), 3);
+
+        // Drop two subscribers.
+        drop(rx1);
+        drop(rx3);
+        let removed = hub.cleanup_dead_subscribers();
+        assert_eq!(removed, 2);
+        assert_eq!(hub.subscriber_count(), 1);
+    }
+
+    #[test]
+    fn typed_cleanup_removes_empty_patterns() {
+        let hub = TypedPubSub::<TestEvent>::new();
+        let rx1 = hub.subscribe("events/a");
+        let _rx2 = hub.subscribe("events/b");
+        assert_eq!(hub.pattern_count(), 2);
+
+        drop(rx1);
+        hub.cleanup_dead_subscribers();
+        // Pattern "events/a" should be removed entirely.
+        assert_eq!(hub.pattern_count(), 1);
+    }
+
+    #[test]
+    fn typed_cleanup_partial_pattern() {
+        let hub = TypedPubSub::<TestEvent>::new();
+        let rx1 = hub.subscribe("events/#");
+        let _rx2 = hub.subscribe("events/#"); // Same pattern, different subscriber.
+        assert_eq!(hub.subscriber_count(), 2);
+        assert_eq!(hub.pattern_count(), 1);
+
+        drop(rx1);
+        let removed = hub.cleanup_dead_subscribers();
+        assert_eq!(removed, 1);
+        // Pattern still exists because rx2 is alive.
+        assert_eq!(hub.pattern_count(), 1);
+        assert_eq!(hub.subscriber_count(), 1);
     }
 }

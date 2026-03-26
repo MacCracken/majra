@@ -25,7 +25,9 @@ barrier = []
 dag = ["queue"]
 sqlite = ["dep:rusqlite"]
 logging = ["dep:tracing-subscriber"]
-full = ["pubsub", "queue", "relay", "ipc", "heartbeat", "ratelimit", "barrier", "dag", "sqlite", "logging"]
+fleet = ["queue", "heartbeat"]
+prometheus = ["dep:prometheus"]
+full = ["pubsub", "queue", "relay", "ipc", "heartbeat", "ratelimit", "barrier", "dag", "sqlite", "logging", "prometheus", "fleet"]
 
 [dependencies]
 async-trait = "0.1"
@@ -39,6 +41,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
 uuid = { version = "1", features = ["v4", "serde"] }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+prometheus = { version = "0.13", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
