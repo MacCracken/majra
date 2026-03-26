@@ -27,8 +27,20 @@ API freeze, full coverage, proven by real consumers.
 
 ## Post-v1
 
+### QUIC Transport (Tier 1 — Network Evolution)
+
+- [ ] **QUIC relay backend** — `quinn`-based transport alongside TCP. Feature-gated: `quic = ["dep:quinn", "dep:rustls"]`
+- [ ] **Multiplexed streams** — ordered streams for pub/sub, RPC. Replaces single TCP connection per peer
+- [ ] **Unreliable datagrams** — fire-and-forget channel for real-time data (game state, sensor readings). Consumers: joshua multiplayer, edge sensor fleet
+- [ ] **0-RTT reconnect** — edge nodes resume without full handshake on network transitions
+- [ ] **Connection migration** — survive IP changes (WiFi → cellular, DHCP renewal)
+- [ ] TCP remains default. QUIC is opt-in, non-breaking
+
+See [network-evolution.md](../../../../docs/development/network-evolution.md) in agnosticos for full architecture.
+
+### Other Post-v1
+
 - [ ] **Redis-backed mode** — optional Redis backend for cross-process pub/sub and queues
-- [ ] **gRPC transport for relay** — relay messages over gRPC instead of raw TCP for firewall friendliness
 - [ ] **Prometheus metrics exporter** — built-in `MajraMetrics` implementation with counters/gauges (queue depth, pub/sub throughput, heartbeat states)
 - [ ] **Fleet queue** — distributed job queue across multiple nodes with work-stealing
 - [ ] **TypedPubSub dead subscriber cleanup** — GC sweep of dropped receivers during publish
