@@ -18,6 +18,7 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "Unicode-DFS-2016",
+    "Zlib",
     "AGPL-3.0-only",
     "CDLA-Permissive-2.0",
 ]
