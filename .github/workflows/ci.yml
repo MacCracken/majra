@@ -154,10 +154,24 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
 
+  version:
+    name: Version Consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify VERSION matches Cargo.toml
+        run: |
+          FILE_VERSION=$(cat VERSION | tr -d '[:space:]')
+          CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          if [ "$FILE_VERSION" != "$CARGO_VERSION" ]; then
+            echo "ERROR: VERSION ($FILE_VERSION) != Cargo.toml ($CARGO_VERSION)"
+            exit 1
+          fi
+          echo "Versions match: $FILE_VERSION"
+
   semver:
     name: SemVer Check
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
         with:
