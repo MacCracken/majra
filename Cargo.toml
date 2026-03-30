@@ -1,6 +1,6 @@
 [package]
 name = "majra"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 rust-version = "1.89"
 license = "AGPL-3.0-only"
@@ -29,7 +29,7 @@ logging = ["dep:tracing-subscriber"]
 fleet = ["queue", "heartbeat"]
 postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
 redis-backend = ["dep:redis", "dep:futures-util"]
-ws = ["pubsub", "dep:tokio-tungstenite"]
+ws = ["pubsub", "dep:tokio-tungstenite", "dep:futures-util"]
 quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "relay"]
 prometheus = ["dep:prometheus"]
 full = ["pubsub", "queue", "relay", "ipc", "ipc-encrypted", "heartbeat", "ratelimit", "barrier", "dag", "sqlite", "logging", "prometheus", "fleet", "redis-backend", "quic", "postgres", "ws"]
