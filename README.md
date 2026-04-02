@@ -191,4 +191,4 @@ make bench              # criterion benchmarks with history
 
 ## License
 
-AGPL-3.0-only
+GPL-3.0-only

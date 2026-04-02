@@ -5,7 +5,7 @@
 **Majra** (Arabic: channel/waterway) — Distributed queue and multiplex engine — pub/sub, queues, relay, IPC, heartbeat, rate limiting
 
 - **Type**: Flat library crate
-- **License**: AGPL-3.0-only
+- **License**: GPL-3.0-only
 - **MSRV**: 1.89
 - **Version**: SemVer 1.0.0 (stable)
 
