@@ -64,7 +64,7 @@ daimon (agent messaging), AgnosAI (crew coordination), hoosh (inference routing)
 - `CONTRIBUTING.md` — PR process, code style, testing requirements
 - `SECURITY.md` — attack surface, supported versions, reporting process
 - `CODE_OF_CONDUCT.md` — Contributor Covenant v2.1
-- `LICENSE` — AGPL-3.0-only
+- `LICENSE` — GPL-3.0-only
 - `benchmarks.md` — 3-point trend tracking (baseline/previous/latest)
 
 ### Required docs/

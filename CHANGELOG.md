@@ -5,21 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [1.0.4]
+
+### Changed
+- **License changed from AGPL-3.0-only to GPL-3.0-only** — updated `Cargo.toml`, `deny.toml`, `README.md`, `CONTRIBUTING.md`, `CLAUDE.md`, and `LICENSE` file
+- **Dependencies updated** — 25 packages bumped to latest compatible versions (ICU 2.1→2.2, wasm-bindgen 0.2.115→0.2.117, libc 0.2.183→0.2.184, and others)
+
 ## [1.0.3]
 
 ### Fixed
 - **`ws` feature missing `futures-util` dependency** — `ws` feature used `futures_util::{SinkExt, StreamExt}` but did not gate `dep:futures-util`, causing compilation failure when `ws` was enabled without `redis-backend` (which happened to bring `futures-util` in under `full`)
-
----
 
 ## [1.0.2]
 
 ### Changed
 - **`redis` dependency upgraded from 0.27 to 1.x** — aligns with redis crate stable 1.0 release. No API changes required; `get_multiplexed_async_connection()`, `AsyncCommands`, `Script::invoke_async()` remain compatible. Consumers pinned to `redis 0.27` via majra can now use `redis 1.x` directly without version conflicts.
 
----
-
-## [Unreleased]
+## [1.0.1]
 
 ### Added
 - `EncryptedIpcConnection::rekey()` — key rotation API with nonce counter reset
@@ -205,7 +209,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `error` — Shared error types (MajraError, IpcError)
 - Feature-gated modules: default = pubsub + queue + relay + heartbeat
 
-[Unreleased]: https://github.com/MacCracken/majra/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/MacCracken/majra/compare/v1.0.4...HEAD
+[1.0.4]: https://github.com/MacCracken/majra/compare/v1.0.3...v1.0.4
+[1.0.3]: https://github.com/MacCracken/majra/compare/v1.0.2...v1.0.3
+[1.0.2]: https://github.com/MacCracken/majra/compare/v1.0.1...v1.0.2
+[1.0.1]: https://github.com/MacCracken/majra/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/MacCracken/majra/compare/v0.22.3...v1.0.0
 [0.22.3]: https://github.com/MacCracken/majra/compare/v0.21.3...v0.22.3
 [0.21.3]: https://github.com/MacCracken/majra/compare/v0.21.0...v0.21.3
