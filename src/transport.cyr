@@ -1,0 +1,111 @@
+# majra/transport — transport vtable + connection pool + circuit breaker
+#
+# Replaces Rust's Transport trait, TransportFactory trait, ConnectionPool,
+# and CircuitBreaker with function-pointer vtables.
+
+# Transport vtable (32 bytes):
+#   offset  0: send_fn(self, data, len)
+#   offset  8: recv_fn(self, buf, buf_len)
+#   offset 16: is_connected_fn(self)
+#   offset 24: close_fn(self)
+
+fn transport_send(vt, self_ptr, data, len) {
+    return fncall2(load64(vt), self_ptr, data);
+}
+
+fn transport_recv(vt, self_ptr, buf, buf_len) {
+    return fncall2(load64(vt + 8), self_ptr, buf);
+}
+
+fn transport_is_connected(vt, self_ptr) {
+    return fncall1(load64(vt + 16), self_ptr);
+}
+
+fn transport_close(vt, self_ptr) {
+    return fncall1(load64(vt + 24), self_ptr);
+}
+
+# Circuit breaker states
+enum CircuitState {
+    CIRCUIT_CLOSED = 0;
+    CIRCUIT_OPEN = 1;
+    CIRCUIT_HALF_OPEN = 2;
+}
+
+# CircuitBreaker struct (32 bytes):
+#   offset  0: consecutive_failures (i64)
+#   offset  8: tripped_at_ns (i64)
+#   offset 16: failure_threshold (i64)
+#   offset 24: cooldown_ns (i64)
+
+fn circuit_breaker_new(failure_threshold, cooldown_ns) {
+    var cb = fl_alloc(32);
+    store64(cb, 0);
+    store64(cb + 8, 0);
+    store64(cb + 16, failure_threshold);
+    store64(cb + 24, cooldown_ns);
+    return cb;
+}
+
+fn circuit_state(cb) {
+    var failures = load64(cb);
+    var threshold = load64(cb + 16);
+    if (failures < threshold) { return CIRCUIT_CLOSED; }
+    var elapsed = time_now_ns() - load64(cb + 8);
+    if (elapsed >= load64(cb + 24)) { return CIRCUIT_HALF_OPEN; }
+    return CIRCUIT_OPEN;
+}
+
+fn circuit_record_success(cb) {
+    store64(cb, 0);
+    store64(cb + 8, 0);
+}
+
+fn circuit_record_failure(cb) {
+    store64(cb, load64(cb) + 1);
+    if (load64(cb) >= load64(cb + 16)) {
+        store64(cb + 8, time_now_ns());
+    }
+}
+
+fn circuit_reset(cb) {
+    store64(cb, 0);
+    store64(cb + 8, 0);
+}
+
+# ConnectionPool struct (24 bytes):
+#   offset  0: connections (i64) — hashmap: endpoint_str -> vec of transport ptrs
+#   offset  8: circuit_breakers (i64) — hashmap: endpoint_str -> CircuitBreaker ptr
+#   offset 16: mutex (i64)
+
+fn conn_pool_new() {
+    var p = fl_alloc(24);
+    store64(p, map_new());
+    store64(p + 8, map_new());
+    store64(p + 16, mutex_new());
+    return p;
+}
+
+fn conn_pool_with_circuit_breaker(pool, endpoint, threshold, cooldown_ns) {
+    var cb = circuit_breaker_new(threshold, cooldown_ns);
+    var mtx = load64(pool + 16);
+    mutex_lock(mtx);
+    map_set(load64(pool + 8), endpoint, cb);
+    mutex_unlock(mtx);
+}
+
+fn conn_pool_circuit_state(pool, endpoint) {
+    var cbs = load64(pool + 8);
+    var cb = map_get(cbs, endpoint);
+    if (cb == 0) { return CIRCUIT_CLOSED; }
+    return circuit_state(cb);
+}
+
+fn conn_pool_reset_circuit(pool, endpoint) {
+    var cb = map_get(load64(pool + 8), endpoint);
+    if (cb != 0) { circuit_reset(cb); }
+}
+
+fn conn_pool_endpoint_count(pool) {
+    return map_count(load64(pool));
+}

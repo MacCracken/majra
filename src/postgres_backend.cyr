@@ -1,0 +1,298 @@
+# majra/postgres_backend — PostgreSQL wire protocol for workflow storage
+#
+# Implements the PostgreSQL frontend/backend protocol (v3) over TCP.
+# Supports startup, simple query, and parameterized query.
+#
+# Wire format:
+#   Frontend -> Backend: [1B type][4B length][payload]
+#   Backend -> Frontend: [1B type][4B length][payload]
+#   Startup message has no type byte: [4B length][4B protocol][params...]
+
+# --- PostgreSQL Wire Protocol Constants ---
+
+# Message types (frontend -> backend)
+var PG_MSG_QUERY = 81;
+var PG_MSG_TERMINATE = 88;
+var PG_MSG_PASSWORD = 112;
+
+# Message types (backend -> frontend)
+var PG_MSG_AUTH = 82;
+var PG_MSG_READY = 90;
+var PG_MSG_ROW_DESC = 84;
+var PG_MSG_DATA_ROW = 68;
+var PG_MSG_CMD_COMPLETE = 67;
+var PG_MSG_ERROR = 69;
+var PG_MSG_NOTICE = 78;
+
+# Auth types
+var PG_AUTH_OK = 0;
+var PG_AUTH_CLEARTEXT = 3;
+
+# --- Connection ---
+
+# PgConn struct (16 bytes):
+#   offset 0: fd (i64)
+#   offset 8: ready (i64) — 1 if ready for query
+
+fn _pg_write_be32(buf, offset, val) {
+    store8(buf + offset, (val >> 24) & 0xFF);
+    store8(buf + offset + 1, (val >> 16) & 0xFF);
+    store8(buf + offset + 2, (val >> 8) & 0xFF);
+    store8(buf + offset + 3, val & 0xFF);
+}
+
+fn _pg_read_be32(buf, offset) {
+    return (load8(buf+offset) << 24) | (load8(buf+offset+1) << 16) | (load8(buf+offset+2) << 8) | load8(buf+offset+3);
+}
+
+fn _pg_read_be16(buf, offset) {
+    return (load8(buf+offset) << 8) | load8(buf+offset+1);
+}
+
+# Globals for PG startup to avoid local clobbering
+var _pg_fd_g = 0;
+var _pg_user_g = 0;
+var _pg_db_g = 0;
+var _pg_pw_g = 0;
+
+# Send startup message: protocol version 3.0, user, database
+fn _pg_startup() {
+    var user = _pg_user_g;
+    var database = _pg_db_g;
+    var fd = _pg_fd_g;
+    var user_len = strlen(user);
+    var db_len = strlen(database);
+    # [4B len][4B protocol][user\0name\0database\0name\0\0]
+    var payload_len = 4 + 5 + user_len + 1 + 9 + db_len + 1 + 1;
+    var msg_len = 4 + payload_len;
+    var msg = fl_alloc(msg_len);
+    _pg_write_be32(msg, 0, msg_len);
+    _pg_write_be32(msg, 4, 196608);
+    var pos = 8;
+    memcpy(msg + pos, "user", 4); pos = pos + 4; store8(msg + pos, 0); pos = pos + 1;
+    memcpy(msg + pos, user, user_len); pos = pos + user_len; store8(msg + pos, 0); pos = pos + 1;
+    memcpy(msg + pos, "database", 8); pos = pos + 8; store8(msg + pos, 0); pos = pos + 1;
+    memcpy(msg + pos, database, db_len); pos = pos + db_len; store8(msg + pos, 0); pos = pos + 1;
+    store8(msg + pos, 0);
+    syscall(SYS_WRITE, fd, msg, msg_len);
+}
+
+# Read a single backend message. Returns {type, data_ptr, data_len} or 0.
+fn _pg_read_msg(fd) {
+    var hdr[2];
+    var n = syscall(SYS_READ, fd, &hdr, 5);
+    if (n < 5) { return 0; }
+    var msg_type = load8(&hdr);
+    var msg_len = _pg_read_be32(&hdr, 1);
+    var data_len = msg_len - 4;
+    var data = 0;
+    if (data_len > 0) {
+        data = fl_alloc(data_len + 1);
+        var total = 0;
+        while (total < data_len) {
+            var r = syscall(SYS_READ, fd, data + total, data_len - total);
+            if (r <= 0) { return 0; }
+            total = total + r;
+        }
+        store8(data + data_len, 0);
+    }
+    var result = fl_alloc(24);
+    store64(result, msg_type);
+    store64(result + 8, data);
+    store64(result + 16, data_len);
+    return result;
+}
+
+# Send a simple query
+fn _pg_send_query(fd, sql) {
+    var sql_len = strlen(sql);
+    var msg_len = 4 + sql_len + 1;
+    var msg = fl_alloc(1 + msg_len);
+    store8(msg, PG_MSG_QUERY);
+    _pg_write_be32(msg, 1, msg_len);
+    memcpy(msg + 5, sql, sql_len);
+    store8(msg + 5 + sql_len, 0);
+    syscall(SYS_WRITE, fd, msg, 1 + msg_len);
+}
+
+# Send password message (cleartext)
+fn _pg_send_password(fd, password) {
+    var pw_len = strlen(password);
+    var msg_len = 4 + pw_len + 1;
+    var msg = fl_alloc(1 + msg_len);
+    store8(msg, PG_MSG_PASSWORD);
+    _pg_write_be32(msg, 1, msg_len);
+    memcpy(msg + 5, password, pw_len);
+    store8(msg + 5 + pw_len, 0);
+    syscall(SYS_WRITE, fd, msg, 1 + msg_len);
+}
+
+# Send terminate message
+fn _pg_terminate(fd) {
+    var msg[2];
+    store8(&msg, PG_MSG_TERMINATE);
+    _pg_write_be32(&msg, 1, 4);
+    syscall(SYS_WRITE, fd, &msg, 5);
+}
+
+# Connect to PostgreSQL. Returns PgConn or 0.
+fn pg_connect(host, port, user, database, password) {
+    _pg_fd_g = syscall(41, AF_INET, SOCK_STREAM, 0);
+    if (_pg_fd_g < 0) { return 0; }
+    var sa = sockaddr_in(INADDR_LOOPBACK(), port);
+    if (syscall(42, _pg_fd_g, sa, 16) < 0) {
+        syscall(SYS_CLOSE, _pg_fd_g);
+        return 0;
+    }
+    _pg_user_g = user;
+    _pg_db_g = database;
+    _pg_pw_g = password;
+
+    _pg_startup();
+    var fd = _pg_fd_g;
+
+    # Read auth response
+    var msg = _pg_read_msg(fd);
+    if (msg == 0) { syscall(SYS_CLOSE, fd); return 0; }
+
+    var msg_type = load64(msg);
+    if (msg_type == PG_MSG_AUTH) {
+        var auth_type = _pg_read_be32(load64(msg + 8), 0);
+        if (auth_type == PG_AUTH_CLEARTEXT) {
+            _pg_send_password(fd, _pg_pw_g);
+            # Read AuthenticationOk
+            msg = _pg_read_msg(fd);
+            if (msg == 0) { syscall(SYS_CLOSE, fd); return 0; }
+        }
+        if (auth_type != PG_AUTH_OK && _pg_read_be32(load64(msg + 8), 0) != PG_AUTH_OK) {
+            syscall(SYS_CLOSE, fd);
+            return 0;
+        }
+    }
+
+    # Read until ReadyForQuery
+    while (1) {
+        msg = _pg_read_msg(fd);
+        if (msg == 0) { break; }
+        if (load64(msg) == PG_MSG_READY) { break; }
+    }
+
+    var conn = fl_alloc(16);
+    store64(conn, fd);
+    store64(conn + 8, 1);
+    return conn;
+}
+
+fn pg_close(conn) {
+    _pg_terminate(load64(conn));
+    syscall(SYS_CLOSE, load64(conn));
+}
+
+# Execute a SQL query. Returns vec of rows, where each row is a vec of column values (C strings).
+fn pg_query(conn, sql) {
+    var fd = load64(conn);
+    _pg_send_query(fd, sql);
+
+    var rows = vec_new();
+    var num_cols = 0;
+
+    while (1) {
+        var msg = _pg_read_msg(fd);
+        if (msg == 0) { break; }
+        var mtype = load64(msg);
+
+        if (mtype == PG_MSG_ROW_DESC) {
+            # Parse field count
+            num_cols = _pg_read_be16(load64(msg + 8), 0);
+        }
+        elif (mtype == PG_MSG_DATA_ROW) {
+            var data = load64(msg + 8);
+            var col_count = _pg_read_be16(data, 0);
+            var row = vec_new();
+            var pos = 2;
+            var ci = 0;
+            while (ci < col_count) {
+                var col_len = _pg_read_be32(data, pos);
+                pos = pos + 4;
+                if (col_len < 0) {
+                    # NULL value
+                    vec_push(row, 0);
+                } else {
+                    var val = fl_alloc(col_len + 1);
+                    memcpy(val, data + pos, col_len);
+                    store8(val + col_len, 0);
+                    vec_push(row, val);
+                    pos = pos + col_len;
+                }
+                ci = ci + 1;
+            }
+            vec_push(rows, row);
+        }
+        elif (mtype == PG_MSG_CMD_COMPLETE) {
+            # Command completed
+        }
+        elif (mtype == PG_MSG_ERROR) {
+            # Error response
+            break;
+        }
+        elif (mtype == PG_MSG_READY) {
+            break;
+        }
+    }
+
+    return rows;
+}
+
+# Execute a SQL statement (no result rows expected).
+fn pg_exec(conn, sql) {
+    pg_query(conn, sql);
+}
+
+# --- Workflow Storage over PostgreSQL ---
+
+# Initialize tables for workflow storage.
+fn pg_init_workflow_tables(conn) {
+    pg_exec(conn, "CREATE TABLE IF NOT EXISTS majra_workflow_definitions (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT, steps_json TEXT NOT NULL DEFAULT '[]', enabled BOOLEAN NOT NULL DEFAULT TRUE, version INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL DEFAULT 'system', created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL)");
+    pg_exec(conn, "CREATE TABLE IF NOT EXISTS majra_workflow_runs (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, workflow_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', input_json TEXT, output_json TEXT, error TEXT, triggered_by TEXT NOT NULL DEFAULT 'manual', created_at BIGINT NOT NULL, started_at BIGINT, completed_at BIGINT)");
+    pg_exec(conn, "CREATE TABLE IF NOT EXISTS majra_workflow_step_runs (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, step_id TEXT NOT NULL, step_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', input_json TEXT, output_json TEXT, error TEXT, attempt INTEGER NOT NULL DEFAULT 1, started_at BIGINT, completed_at BIGINT, duration_ms BIGINT)");
+    pg_exec(conn, "CREATE INDEX IF NOT EXISTS idx_majra_wf_runs_workflow ON majra_workflow_runs(workflow_id)");
+    pg_exec(conn, "CREATE INDEX IF NOT EXISTS idx_majra_wf_step_runs_run ON majra_workflow_step_runs(run_id)");
+}
+
+# Save a workflow definition (upsert).
+fn pg_save_workflow_def(conn, def_id, name, steps_json) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "INSERT INTO majra_workflow_definitions (id, name, steps_json, created_at, updated_at) VALUES ('");
+    str_builder_add_cstr(sb, def_id);
+    str_builder_add_cstr(sb, "', '");
+    str_builder_add_cstr(sb, name);
+    str_builder_add_cstr(sb, "', '");
+    str_builder_add_cstr(sb, steps_json);
+    var now = time_now_ns() / 1000000;
+    str_builder_add_cstr(sb, "', ");
+    str_builder_add_int(sb, now);
+    str_builder_add_cstr(sb, ", ");
+    str_builder_add_int(sb, now);
+    str_builder_add_cstr(sb, ") ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, steps_json = EXCLUDED.steps_json, updated_at = EXCLUDED.updated_at");
+    pg_exec(conn, str_data(str_builder_build(sb)));
+}
+
+# Get a workflow definition by ID. Returns first row or 0.
+fn pg_get_workflow_def(conn, def_id) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "SELECT id, name, steps_json FROM majra_workflow_definitions WHERE id = '");
+    str_builder_add_cstr(sb, def_id);
+    str_builder_add_cstr(sb, "'");
+    var rows = pg_query(conn, str_data(str_builder_build(sb)));
+    if (vec_len(rows) == 0) { return 0; }
+    return vec_get(rows, 0);
+}
+
+# Delete a workflow definition.
+fn pg_delete_workflow_def(conn, def_id) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "DELETE FROM majra_workflow_definitions WHERE id = '");
+    str_builder_add_cstr(sb, def_id);
+    str_builder_add_cstr(sb, "'");
+    pg_exec(conn, str_data(str_builder_build(sb)));
+}

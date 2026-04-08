@@ -1,0 +1,82 @@
+# majra/envelope — universal message envelope
+#
+# Every message flowing through pub/sub, relay, or IPC shares this structure.
+
+# Target kinds
+enum TargetKind {
+    TARGET_NODE = 0;
+    TARGET_TOPIC = 1;
+    TARGET_BROADCAST = 2;
+}
+
+# Envelope struct layout (56 bytes, 7 fields):
+#   offset  0: id_hi     (i64) — upper 64 bits of UUID
+#   offset  8: id_lo     (i64) — lower 64 bits of UUID
+#   offset 16: from      (i64) — Str pointer (sender ID)
+#   offset 24: to_kind   (i64) — TargetKind enum value
+#   offset 32: to_name   (i64) — Str pointer (node/topic name, 0 for broadcast)
+#   offset 40: payload   (i64) — pointer to payload data (Str or json)
+#   offset 48: timestamp (i64) — nanoseconds since CLOCK_MONOTONIC
+
+var SYS_CLOCK_GETTIME = 228;
+var SYS_GETRANDOM = 318;
+
+# Get current monotonic time in nanoseconds.
+fn time_now_ns() {
+    var ts[2];
+    syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, &ts);
+    return load64(&ts) * 1000000000 + load64(&ts + 8);
+}
+
+# Generate a pseudo-UUID (128 random bits) using getrandom syscall.
+# Returns two values: hi in rax, lo via rethi().
+fn uuid_generate() {
+    var buf[2];
+    syscall(SYS_GETRANDOM, &buf, 16, 0);
+    var hi = load64(&buf);
+    var lo = load64(&buf + 8);
+    # Set version 4 (bits 48-51 of hi) and variant 1 (bits 62-63 of lo)
+    hi = (hi & 0xFFFFFFFFFFFF0FFF) | 0x0000000000004000;
+    lo = (lo & 0x3FFFFFFFFFFFFFFF) | 0x8000000000000000;
+    ret2(hi, lo);
+}
+
+# Create a new envelope.
+# from_str: Str pointer for sender ID
+# to_kind: TargetKind enum value
+# to_name: Str pointer for target name (0 for broadcast)
+# payload: pointer to payload data
+fn envelope_new(from_str, to_kind, to_name, payload) {
+    var e = fl_alloc(56);
+    var hi = uuid_generate();
+    var lo = rethi();
+    store64(e, hi);
+    store64(e + 8, lo);
+    store64(e + 16, from_str);
+    store64(e + 24, to_kind);
+    store64(e + 32, to_name);
+    store64(e + 40, payload);
+    store64(e + 48, time_now_ns());
+    return e;
+}
+
+# Accessors
+fn envelope_id_hi(e)    { return load64(e); }
+fn envelope_id_lo(e)    { return load64(e + 8); }
+fn envelope_from(e)     { return load64(e + 16); }
+fn envelope_to_kind(e)  { return load64(e + 24); }
+fn envelope_to_name(e)  { return load64(e + 32); }
+fn envelope_payload(e)  { return load64(e + 40); }
+fn envelope_timestamp(e){ return load64(e + 48); }
+
+fn envelope_is_broadcast(e) {
+    return load64(e + 24) == TARGET_BROADCAST;
+}
+
+fn envelope_is_topic(e) {
+    return load64(e + 24) == TARGET_TOPIC;
+}
+
+fn envelope_is_node(e) {
+    return load64(e + 24) == TARGET_NODE;
+}

@@ -1,0 +1,296 @@
+# majra/ws — WebSocket bridge for pub/sub fan-out
+#
+# Implements WebSocket protocol (RFC 6455) over TCP:
+#   - HTTP/1.1 upgrade handshake with SHA-1 + base64
+#   - Frame parsing (text, binary, ping/pong, close)
+#   - Bridge to in-process pub/sub
+#
+# Protocol:
+#   1. Client connects via TCP
+#   2. HTTP upgrade handshake (requires SHA-1 of key + magic GUID)
+#   3. Client sends {"subscribe": "pattern"}
+#   4. Server forwards matching pub/sub messages as JSON text frames
+
+# --- SHA-1 Implementation (RFC 3174) ---
+# Required for WebSocket handshake: SHA1(client_key + magic_guid)
+
+var _sha1_h0 = 0x67452301;
+var _sha1_h1 = 0xEFCDAB89;
+var _sha1_h2 = 0x98BADCFE;
+var _sha1_h3 = 0x10325476;
+var _sha1_h4 = 0xC3D2E1F0;
+
+fn _sha1_rotl32(x, n) {
+    x = x & 0xFFFFFFFF;
+    return ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF;
+}
+
+# SHA-1 hash of data[0..len]. Returns ptr to 20-byte digest.
+fn sha1(data, len) {
+    var h0 = _sha1_h0;
+    var h1 = _sha1_h1;
+    var h2 = _sha1_h2;
+    var h3 = _sha1_h3;
+    var h4 = _sha1_h4;
+
+    # Pad message: append 0x80, zeros, then 64-bit BE length
+    var padded_len = ((len + 9 + 63) / 64) * 64;
+    var padded = fl_alloc(padded_len);
+    memset(padded, 0, padded_len);
+    memcpy(padded, data, len);
+    store8(padded + len, 0x80);
+    # Store original length in bits as 64-bit BE at end
+    var bit_len = len * 8;
+    store8(padded + padded_len - 8, (bit_len >> 56) & 0xFF);
+    store8(padded + padded_len - 7, (bit_len >> 48) & 0xFF);
+    store8(padded + padded_len - 6, (bit_len >> 40) & 0xFF);
+    store8(padded + padded_len - 5, (bit_len >> 32) & 0xFF);
+    store8(padded + padded_len - 4, (bit_len >> 24) & 0xFF);
+    store8(padded + padded_len - 3, (bit_len >> 16) & 0xFF);
+    store8(padded + padded_len - 2, (bit_len >> 8) & 0xFF);
+    store8(padded + padded_len - 1, bit_len & 0xFF);
+
+    # Process each 64-byte block
+    var w[80];
+    var block = 0;
+    while (block < padded_len) {
+        # Prepare message schedule
+        var wi = 0;
+        while (wi < 16) {
+            var off = block + wi * 4;
+            store64(&w + wi * 8, (load8(padded+off) << 24) | (load8(padded+off+1) << 16) | (load8(padded+off+2) << 8) | load8(padded+off+3));
+            wi = wi + 1;
+        }
+        while (wi < 80) {
+            var xor_val = load64(&w + (wi-3)*8) ^ load64(&w + (wi-8)*8) ^ load64(&w + (wi-14)*8) ^ load64(&w + (wi-16)*8);
+            store64(&w + wi * 8, _sha1_rotl32(xor_val, 1));
+            wi = wi + 1;
+        }
+
+        var a = h0;
+        var b = h1;
+        var c = h2;
+        var d = h3;
+        var e = h4;
+
+        var ri = 0;
+        while (ri < 80) {
+            var f = 0;
+            var k = 0;
+            if (ri < 20) {
+                f = (b & c) | ((b ^ 0xFFFFFFFF) & d);
+                k = 0x5A827999;
+            } elif (ri < 40) {
+                f = b ^ c ^ d;
+                k = 0x6ED9EBA1;
+            } elif (ri < 60) {
+                f = (b & c) | (b & d) | (c & d);
+                k = 0x8F1BBCDC;
+            } else {
+                f = b ^ c ^ d;
+                k = 0xCA62C1D6;
+            }
+            f = f & 0xFFFFFFFF;
+            var temp = (_sha1_rotl32(a, 5) + f + e + k + load64(&w + ri*8)) & 0xFFFFFFFF;
+            e = d;
+            d = c;
+            c = _sha1_rotl32(b, 30);
+            b = a;
+            a = temp;
+            ri = ri + 1;
+        }
+
+        h0 = (h0 + a) & 0xFFFFFFFF;
+        h1 = (h1 + b) & 0xFFFFFFFF;
+        h2 = (h2 + c) & 0xFFFFFFFF;
+        h3 = (h3 + d) & 0xFFFFFFFF;
+        h4 = (h4 + e) & 0xFFFFFFFF;
+        block = block + 64;
+    }
+
+    # Output 20-byte digest in big-endian
+    var digest = fl_alloc(20);
+    store8(digest, (h0>>24)&0xFF); store8(digest+1, (h0>>16)&0xFF); store8(digest+2, (h0>>8)&0xFF); store8(digest+3, h0&0xFF);
+    store8(digest+4, (h1>>24)&0xFF); store8(digest+5, (h1>>16)&0xFF); store8(digest+6, (h1>>8)&0xFF); store8(digest+7, h1&0xFF);
+    store8(digest+8, (h2>>24)&0xFF); store8(digest+9, (h2>>16)&0xFF); store8(digest+10, (h2>>8)&0xFF); store8(digest+11, h2&0xFF);
+    store8(digest+12, (h3>>24)&0xFF); store8(digest+13, (h3>>16)&0xFF); store8(digest+14, (h3>>8)&0xFF); store8(digest+15, h3&0xFF);
+    store8(digest+16, (h4>>24)&0xFF); store8(digest+17, (h4>>16)&0xFF); store8(digest+18, (h4>>8)&0xFF); store8(digest+19, h4&0xFF);
+    return digest;
+}
+
+# --- WebSocket Constants ---
+var WS_MAGIC_GUID = "258EAFA5-E914-47DA-95CA-5AB5DC11BE85";
+
+# WebSocket opcodes
+enum WsOpcode {
+    WS_TEXT = 1;
+    WS_BINARY = 2;
+    WS_CLOSE = 8;
+    WS_PING = 9;
+    WS_PONG = 10;
+}
+
+# --- WebSocket Handshake ---
+
+# Compute Sec-WebSocket-Accept value from client key.
+fn _ws_accept_key(client_key) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, client_key);
+    str_builder_add_cstr(sb, WS_MAGIC_GUID);
+    var combined = str_builder_build(sb);
+    var digest = sha1(str_data(combined), str_len(combined));
+    return base64_encode(digest, 20);
+}
+
+# --- WebSocket Frame ---
+
+# Send a text frame (unmasked, server->client).
+fn ws_send_text(fd, data, len) {
+    if (len < 126) {
+        var hdr[1];
+        store8(&hdr, 0x81);
+        store8(&hdr + 1, len);
+        syscall(SYS_WRITE, fd, &hdr, 2);
+    } elif (len < 65536) {
+        var hdr[2];
+        store8(&hdr, 0x81);
+        store8(&hdr + 1, 126);
+        store8(&hdr + 2, (len >> 8) & 0xFF);
+        store8(&hdr + 3, len & 0xFF);
+        syscall(SYS_WRITE, fd, &hdr, 4);
+    }
+    syscall(SYS_WRITE, fd, data, len);
+}
+
+# Read a WebSocket frame. Returns {opcode, payload_ptr, payload_len} or 0.
+fn ws_recv_frame(fd) {
+    var hdr[2];
+    var n = syscall(SYS_READ, fd, &hdr, 2);
+    if (n < 2) { return 0; }
+
+    var opcode = load8(&hdr) & 0x0F;
+    var masked = (load8(&hdr + 1) >> 7) & 1;
+    var payload_len = load8(&hdr + 1) & 0x7F;
+
+    if (payload_len == 126) {
+        var ext[1];
+        syscall(SYS_READ, fd, &ext, 2);
+        payload_len = (load8(&ext) << 8) | load8(&ext + 1);
+    }
+
+    # Read mask key (4 bytes) if masked
+    var mask[1];
+    if (masked == 1) {
+        syscall(SYS_READ, fd, &mask, 4);
+    }
+
+    # Read payload
+    var payload = fl_alloc(payload_len + 1);
+    var total = 0;
+    while (total < payload_len) {
+        var r = syscall(SYS_READ, fd, payload + total, payload_len - total);
+        if (r <= 0) { return 0; }
+        total = total + r;
+    }
+
+    # Unmask
+    if (masked == 1) {
+        var mi = 0;
+        while (mi < payload_len) {
+            store8(payload + mi, load8(payload + mi) ^ load8(&mask + (mi & 3)));
+            mi = mi + 1;
+        }
+    }
+    store8(payload + payload_len, 0);
+
+    var frame = fl_alloc(24);
+    store64(frame, opcode);
+    store64(frame + 8, payload);
+    store64(frame + 16, payload_len);
+    return frame;
+}
+
+# Send a close frame.
+fn ws_send_close(fd) {
+    var hdr[1];
+    store8(&hdr, 0x88);
+    store8(&hdr + 1, 0);
+    syscall(SYS_WRITE, fd, &hdr, 2);
+}
+
+# Send a pong frame.
+fn ws_send_pong(fd, data, len) {
+    var hdr[1];
+    store8(&hdr, 0x8A);
+    store8(&hdr + 1, len);
+    syscall(SYS_WRITE, fd, &hdr, 2);
+    if (len > 0) {
+        syscall(SYS_WRITE, fd, data, len);
+    }
+}
+
+# --- WebSocket Server ---
+
+# WsBridge struct (16 bytes):
+#   offset 0: pubsub (i64) — PubSub hub ptr
+#   offset 8: max_connections (i64)
+
+fn ws_bridge_new(pubsub_hub, max_connections) {
+    var b = fl_alloc(16);
+    store64(b, pubsub_hub);
+    store64(b + 8, max_connections);
+    return b;
+}
+
+# Accept a WebSocket upgrade from a raw TCP connection.
+# Reads HTTP headers, extracts Sec-WebSocket-Key, sends 101 response.
+# Returns 1 on success, 0 on failure.
+fn _ws_accept_upgrade(fd) {
+    # Read HTTP request (up to 4KB)
+    var buf = fl_alloc(4096);
+    var total = 0;
+    # Read until we see \r\n\r\n
+    while (total < 4090) {
+        var n = syscall(SYS_READ, fd, buf + total, 1);
+        if (n <= 0) { return 0; }
+        total = total + 1;
+        if (total >= 4 && load8(buf+total-4) == 13 && load8(buf+total-3) == 10 && load8(buf+total-2) == 13 && load8(buf+total-1) == 10) {
+            break;
+        }
+    }
+    store8(buf + total, 0);
+
+    # Find Sec-WebSocket-Key header
+    var key_header = "Sec-WebSocket-Key: ";
+    var key_pos = 0;
+    var i = 0;
+    while (i < total) {
+        if (memeq(buf + i, key_header, 19) == 1) {
+            key_pos = i + 19;
+            break;
+        }
+        i = i + 1;
+    }
+    if (key_pos == 0) { return 0; }
+
+    # Extract key value (until \r\n)
+    var key_end = key_pos;
+    while (key_end < total && load8(buf + key_end) != 13) {
+        key_end = key_end + 1;
+    }
+    var client_key = fl_alloc(key_end - key_pos + 1);
+    memcpy(client_key, buf + key_pos, key_end - key_pos);
+    store8(client_key + key_end - key_pos, 0);
+
+    # Compute accept key
+    var accept_key = _ws_accept_key(client_key);
+
+    # Send 101 Switching Protocols
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ");
+    str_builder_add_cstr(sb, accept_key);
+    str_builder_add_cstr(sb, "\r\n\r\n");
+    var resp = str_builder_build(sb);
+    syscall(SYS_WRITE, fd, str_data(resp), str_len(resp));
+    return 1;
+}

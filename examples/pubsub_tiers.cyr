@@ -1,0 +1,106 @@
+# Example: Three-tier pub/sub demonstration
+#
+# Demonstrates three pub/sub tiers with increasing sophistication:
+#   1. DirectChannel  — raw broadcast, no topics
+#   2. HashedChannel  — hashed topic routing
+#   3. PubSub         — MQTT-style wildcards, filters, patterns
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/freelist.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/hashmap.cyr"
+include "lib/syscalls.cyr"
+include "lib/tagged.cyr"
+include "lib/fnptr.cyr"
+include "lib/thread.cyr"
+include "lib/bench.cyr"
+
+include "src/error.cyr"
+include "src/counter.cyr"
+include "src/pubsub.cyr"
+
+# --- Filter: only high utilization events ---
+fn _high_util_filter(payload) {
+    if (payload > 80) { return 1; }
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    fl_init();
+
+    println("=== Pub/Sub Tiers Example ===");
+
+    # === Tier 1: DirectChannel ===
+    println("");
+    println("--- Tier 1: DirectChannel (zero-overhead broadcast) ---");
+    var dc = direct_channel_new(10000);
+
+    var b1 = bench_new("direct_channel");
+    var i = 0;
+    bench_batch_start(b1);
+    while (i < 10000) {
+        direct_channel_send(dc, i);
+        i = i + 1;
+    }
+    bench_batch_stop(b1, 10000);
+    bench_report(b1);
+
+    # === Tier 2: HashedChannel ===
+    println("");
+    println("--- Tier 2: HashedChannel (hashed topic routing) ---");
+    var hc = hashed_channel_new();
+    var ch_temp = hashed_channel_subscribe(hc, "sensors/temp");
+    var ch_humid = hashed_channel_subscribe(hc, "sensors/humidity");
+
+    hashed_channel_send(hc, "sensors/temp", 22);
+    hashed_channel_send(hc, "sensors/humidity", 65);
+    hashed_channel_send(hc, "sensors/temp", 23);
+
+    println("Temp readings:");
+    print_num(chan_recv(ch_temp)); println(" C");
+    print_num(chan_recv(ch_temp)); println(" C");
+    println("Humidity:");
+    print_num(chan_recv(ch_humid)); println(" %");
+
+    # === Tier 3: PubSub with wildcards ===
+    println("");
+    println("--- Tier 3: PubSub (MQTT wildcards + filters) ---");
+    var ps = pubsub_new();
+
+    # Exact subscriber
+    var ch_exact = pubsub_subscribe(ps, "events/gpu/util");
+
+    # Wildcard subscriber
+    var ch_wild = pubsub_subscribe_pattern(ps, "events/#");
+
+    # Filtered subscriber (only high utilization)
+    var ch_filtered = pubsub_subscribe_filtered(ps, "events/gpu/util", &_high_util_filter);
+
+    # Publish events
+    pubsub_publish(ps, "events/gpu/util", 45);
+    pubsub_publish(ps, "events/gpu/util", 92);
+    pubsub_publish(ps, "events/cpu/load", 78);
+
+    println("Exact subscriber got:");
+    print_num(chan_recv(ch_exact)); println(" (45)");
+    print_num(chan_recv(ch_exact)); println(" (92)");
+
+    println("Wildcard subscriber got 3 messages (gpu/util x2 + cpu/load)");
+
+    println("Filtered subscriber (>80% only) got:");
+    print_num(chan_recv(ch_filtered)); println(" (92)");
+
+    println("");
+    println("Total published: ");
+    print_num(pubsub_total_published(ps));
+    println("");
+
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

@@ -1,0 +1,247 @@
+# majra/pubsub — pub/sub with MQTT-style wildcard matching
+#
+# Three tiers:
+#   DirectChannel — single MPSC channel, no routing
+#   HashedChannel — hashed topic routing, O(1) lookup
+#   PubSub — topic/pattern matching with wildcards
+
+# --- MQTT pattern matching ---
+# Supports + (single level) and # (multi-level) wildcards.
+# Topics are / delimited.
+
+fn matches_pattern(topic, pattern) {
+    var td = topic;
+    var tlen = strlen(topic);
+    var pd = pattern;
+    var plen = strlen(pattern);
+    var ti = 0;
+    var pi = 0;
+
+    while (pi < plen) {
+        var pc = load8(pd + pi);
+
+        if (pc == 35) {
+            # '#' matches everything remaining
+            return 1;
+        }
+
+        if (pc == 43) {
+            # '+' matches one level (up to next /)
+            while (ti < tlen) {
+                if (load8(td + ti) == 47) { break; }
+                ti = ti + 1;
+            }
+            pi = pi + 1;
+            # Skip matching / in both
+            if (pi < plen && ti < tlen) {
+                if (load8(pd + pi) == 47 && load8(td + ti) == 47) {
+                    pi = pi + 1;
+                    ti = ti + 1;
+                }
+            }
+            continue;
+        }
+
+        if (ti >= tlen) { return 0; }
+        if (pc != load8(td + ti)) { return 0; }
+        pi = pi + 1;
+        ti = ti + 1;
+    }
+
+    return ti >= tlen;
+}
+
+# --- Subscriber ---
+# A subscriber has a channel and an optional filter function pointer.
+# Subscriber struct (16 bytes):
+#   offset 0: chan (i64) — MPSC channel ptr
+#   offset 8: filter_fn (i64) — function ptr or 0
+
+fn _sub_new(chan, filter_fn) {
+    var s = fl_alloc(16);
+    store64(s, chan);
+    store64(s + 8, filter_fn);
+    return s;
+}
+
+# --- PubSub Hub ---
+# PubSub struct (32 bytes):
+#   offset  0: exact_subs (i64) — hashmap: topic_str -> vec of subscriber ptrs
+#   offset  8: pattern_subs (i64) — hashmap: pattern_str -> vec of subscriber ptrs
+#   offset 16: mutex (i64)
+#   offset 24: total_published (i64) — counter ptr
+
+fn pubsub_new() {
+    var ps = fl_alloc(32);
+    store64(ps, map_new());
+    store64(ps + 8, map_new());
+    store64(ps + 16, mutex_new());
+    store64(ps + 24, counter_new());
+    return ps;
+}
+
+# Subscribe to an exact topic. Returns a channel to recv from.
+fn pubsub_subscribe(ps, topic) {
+    var ch = chan_new(64);
+    var sub = _sub_new(ch, 0);
+    var mtx = load64(ps + 16);
+    mutex_lock(mtx);
+    var exact = load64(ps);
+    var subs = map_get(exact, topic);
+    if (subs == 0) {
+        subs = vec_new();
+        map_set(exact, topic, subs);
+    }
+    vec_push(subs, sub);
+    mutex_unlock(mtx);
+    return ch;
+}
+
+# Subscribe to a wildcard pattern. Returns a channel to recv from.
+fn pubsub_subscribe_pattern(ps, pattern) {
+    var ch = chan_new(64);
+    var sub = _sub_new(ch, 0);
+    var mtx = load64(ps + 16);
+    mutex_lock(mtx);
+    var patterns = load64(ps + 8);
+    var subs = map_get(patterns, pattern);
+    if (subs == 0) {
+        subs = vec_new();
+        map_set(patterns, pattern, subs);
+    }
+    vec_push(subs, sub);
+    mutex_unlock(mtx);
+    return ch;
+}
+
+# Subscribe with a filter function. filter_fn(payload) should return 1 to accept.
+fn pubsub_subscribe_filtered(ps, topic, filter_fn) {
+    var ch = chan_new(64);
+    var sub = _sub_new(ch, filter_fn);
+    var mtx = load64(ps + 16);
+    mutex_lock(mtx);
+    var exact = load64(ps);
+    var subs = map_get(exact, topic);
+    if (subs == 0) {
+        subs = vec_new();
+        map_set(exact, topic, subs);
+    }
+    vec_push(subs, sub);
+    mutex_unlock(mtx);
+    return ch;
+}
+
+# Publish to a topic. Delivers to exact and pattern subscribers.
+# Returns number of subscribers delivered to.
+fn pubsub_publish(ps, topic, payload) {
+    var mtx = load64(ps + 16);
+    mutex_lock(mtx);
+    var delivered = 0;
+
+    # Exact subscribers
+    var exact = load64(ps);
+    var subs = map_get(exact, topic);
+    if (subs != 0) {
+        var i = 0;
+        var len = vec_len(subs);
+        while (i < len) {
+            var sub = vec_get(subs, i);
+            var filter = load64(sub + 8);
+            if (filter == 0 || fncall1(filter, payload) == 1) {
+                chan_send(load64(sub), payload);
+                delivered = delivered + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    # Pattern subscribers
+    var patterns = load64(ps + 8);
+    var pat_keys = map_keys(patterns);
+    var j = 0;
+    var plen = vec_len(pat_keys);
+    while (j < plen) {
+        var pat = vec_get(pat_keys, j);
+        if (matches_pattern(topic, pat) == 1) {
+            var psubs = map_get(patterns, pat);
+            if (psubs != 0) {
+                var k = 0;
+                var klen = vec_len(psubs);
+                while (k < klen) {
+                    var sub = vec_get(psubs, k);
+                    var filter = load64(sub + 8);
+                    if (filter == 0 || fncall1(filter, payload) == 1) {
+                        chan_send(load64(sub), payload);
+                        delivered = delivered + 1;
+                    }
+                    k = k + 1;
+                }
+            }
+        }
+        j = j + 1;
+    }
+
+    mutex_unlock(mtx);
+    counter_inc(load64(ps + 24));
+    return delivered;
+}
+
+fn pubsub_total_published(ps) {
+    return counter_get(load64(ps + 24));
+}
+
+# --- DirectChannel ---
+# Zero-overhead point-to-point channel (no topic routing).
+# Just a thin wrapper around an MPSC channel.
+
+fn direct_channel_new(capacity) {
+    return chan_new(capacity);
+}
+
+fn direct_channel_send(ch, payload) {
+    return chan_send(ch, payload);
+}
+
+fn direct_channel_recv(ch) {
+    return chan_recv(ch);
+}
+
+# --- HashedChannel ---
+# Sharded by topic hash. O(1) lookup.
+# HashedChannel struct (16 bytes):
+#   offset 0: channels (i64) — hashmap: topic_str -> channel ptr
+#   offset 8: mutex (i64)
+
+fn hashed_channel_new() {
+    var hc = fl_alloc(16);
+    store64(hc, map_new());
+    store64(hc + 8, mutex_new());
+    return hc;
+}
+
+# Get or create channel for a topic.
+fn _hc_get_or_create(hc, topic) {
+    var chans = load64(hc);
+    var ch = map_get(chans, topic);
+    if (ch == 0) {
+        ch = chan_new(64);
+        map_set(chans, topic, ch);
+    }
+    return ch;
+}
+
+fn hashed_channel_send(hc, topic, payload) {
+    var mtx = load64(hc + 8);
+    mutex_lock(mtx);
+    var ch = _hc_get_or_create(hc, topic);
+    chan_send(ch, payload);
+    mutex_unlock(mtx);
+}
+
+fn hashed_channel_subscribe(hc, topic) {
+    var mtx = load64(hc + 8);
+    mutex_lock(mtx);
+    var ch = _hc_get_or_create(hc, topic);
+    mutex_unlock(mtx);
+    return ch;
+}

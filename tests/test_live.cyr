@@ -1,0 +1,307 @@
+# majra — live integration tests (requires running Redis + PostgreSQL)
+#
+# Redis:    localhost:6379
+# Postgres: localhost:5432 user=postgres password=majra db=majra
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/freelist.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/hashmap.cyr"
+include "lib/syscalls.cyr"
+include "lib/tagged.cyr"
+include "lib/fnptr.cyr"
+include "lib/thread.cyr"
+include "lib/assert.cyr"
+include "lib/net.cyr"
+
+include "src/error.cyr"
+include "src/counter.cyr"
+include "src/envelope.cyr"
+include "src/namespace.cyr"
+include "src/ipc.cyr"
+include "src/redis_backend.cyr"
+include "src/postgres_backend.cyr"
+
+# =============================================================================
+# Redis Live Tests
+# =============================================================================
+
+fn test_redis_ping() {
+    var rc = redis_connect_default();
+    assert(rc != 0, "redis connected");
+
+    var reply = redis_ping(rc);
+    assert(reply != 0, "redis ping reply");
+    assert(str_eq(reply, str_from("PONG")) == 1, "redis PONG");
+
+    redis_close(rc);
+    println("  redis_ping: ok");
+}
+
+fn test_redis_set_get() {
+    var rc = redis_connect_default();
+    redis_set_prefix(rc, "majra:test:");
+
+    redis_set(rc, "k1", "hello");
+    var v = redis_get(rc, "k1");
+    assert(v != 0, "redis get k1");
+    assert(str_eq(v, str_from("hello")) == 1, "redis k1 = hello");
+
+    # Overwrite
+    redis_set(rc, "k1", "world");
+    v = redis_get(rc, "k1");
+    assert(str_eq(v, str_from("world")) == 1, "redis k1 = world");
+
+    # Get nonexistent
+    var v2 = redis_get(rc, "nonexistent");
+    assert(v2 == 0, "redis get nonexistent = nil");
+
+    # Delete
+    redis_del(rc, "k1");
+    var v3 = redis_get(rc, "k1");
+    assert(v3 == 0, "redis k1 deleted");
+
+    # Exists
+    redis_set(rc, "exists-test", "1");
+    var ex = redis_exists(rc, "exists-test");
+    assert_eq(ex, 1, "redis exists 1");
+    redis_del(rc, "exists-test");
+    ex = redis_exists(rc, "exists-test");
+    assert_eq(ex, 0, "redis exists 0");
+
+    # Cleanup
+    redis_del(rc, "k1");
+    redis_close(rc);
+    println("  redis_set_get: ok");
+}
+
+fn test_redis_setex() {
+    var rc = redis_connect_default();
+    redis_set_prefix(rc, "majra:test:");
+
+    redis_setex(rc, "ttl-key", "expires", 2);
+    var v = redis_get(rc, "ttl-key");
+    assert(v != 0, "redis ttl-key exists");
+    assert(str_eq(v, str_from("expires")) == 1, "redis ttl-key value");
+
+    # Key should exist now, will expire in 2s (don't wait)
+    redis_del(rc, "ttl-key");
+    redis_close(rc);
+    println("  redis_setex: ok");
+}
+
+fn test_redis_sorted_set() {
+    var rc = redis_connect_default();
+    redis_set_prefix(rc, "majra:test:");
+
+    # ZADD with priority scores (lower score = higher priority)
+    redis_zadd(rc, "queue:jobs", "job-normal", 0 - 2);
+    redis_zadd(rc, "queue:jobs", "job-critical", 0 - 4);
+    redis_zadd(rc, "queue:jobs", "job-background", 0);
+
+    # ZCARD
+    var count = redis_zcard(rc, "queue:jobs");
+    assert_eq(count, 3, "redis zcard 3");
+
+    # ZPOPMIN should return highest priority (lowest score = -4)
+    var popped = redis_zpopmin(rc, "queue:jobs");
+    assert(popped != 0, "redis zpopmin result");
+    # popped is a vec of [member, score] pairs
+    # First element should be "job-critical"
+
+    # ZCARD after pop
+    count = redis_zcard(rc, "queue:jobs");
+    assert_eq(count, 2, "redis zcard after pop");
+
+    # Cleanup
+    redis_del(rc, "queue:jobs");
+    redis_close(rc);
+    println("  redis_sorted_set: ok");
+}
+
+fn test_redis_hash() {
+    var rc = redis_connect_default();
+    redis_set_prefix(rc, "majra:test:");
+
+    redis_hset(rc, "rl:key1", "tokens", "10");
+    redis_hset(rc, "rl:key1", "last_ms", "1000");
+
+    var tokens = redis_hget(rc, "rl:key1", "tokens");
+    assert(tokens != 0, "redis hget tokens");
+    assert(str_eq(tokens, str_from("10")) == 1, "redis tokens = 10");
+
+    var last = redis_hget(rc, "rl:key1", "last_ms");
+    assert(str_eq(last, str_from("1000")) == 1, "redis last_ms = 1000");
+
+    # Cleanup
+    redis_del(rc, "rl:key1");
+    redis_close(rc);
+    println("  redis_hash: ok");
+}
+
+fn test_redis_publish() {
+    var rc = redis_connect_default();
+    redis_set_prefix(rc, "majra:test:");
+
+    # Publish without subscribers returns 0
+    var receivers = redis_publish(rc, "events/test", "hello");
+    assert_eq(receivers, 0, "redis pub 0 receivers");
+
+    redis_close(rc);
+    println("  redis_publish: ok");
+}
+
+fn test_redis_keys() {
+    var rc = redis_connect_default();
+    redis_set_prefix(rc, "majra:test:hb:");
+
+    redis_set(rc, "node-1", "online");
+    redis_set(rc, "node-2", "online");
+    redis_set(rc, "node-3", "online");
+
+    var keys = redis_keys(rc, "*");
+    assert(keys != 0, "redis keys result");
+
+    # Cleanup
+    redis_del(rc, "node-1");
+    redis_del(rc, "node-2");
+    redis_del(rc, "node-3");
+    redis_close(rc);
+    println("  redis_keys: ok");
+}
+
+# =============================================================================
+# PostgreSQL Live Tests
+# =============================================================================
+
+fn test_pg_connect() {
+    var conn = pg_connect("127.0.0.1", 5432, "postgres", "majra", "majra");
+    assert(conn != 0, "pg connected");
+    pg_close(conn);
+    println("  pg_connect: ok");
+}
+
+fn test_pg_simple_query() {
+    var conn = pg_connect("127.0.0.1", 5432, "postgres", "majra", "majra");
+
+    var rows = pg_query(conn, "SELECT 1 AS num, 'hello' AS greeting");
+    assert(vec_len(rows) > 0, "pg query returned rows");
+
+    var row = vec_get(rows, 0);
+    var col1 = vec_get(row, 0);
+    assert(streq(col1, "1") == 1, "pg col1 = 1");
+    var col2 = vec_get(row, 1);
+    assert(streq(col2, "hello") == 1, "pg col2 = hello");
+
+    pg_close(conn);
+    println("  pg_simple_query: ok");
+}
+
+fn test_pg_create_table() {
+    var conn = pg_connect("127.0.0.1", 5432, "postgres", "majra", "majra");
+
+    pg_exec(conn, "DROP TABLE IF EXISTS majra_test_table");
+    pg_exec(conn, "CREATE TABLE majra_test_table (id TEXT PRIMARY KEY, value TEXT)");
+
+    pg_exec(conn, "INSERT INTO majra_test_table (id, value) VALUES ('k1', 'v1')");
+    pg_exec(conn, "INSERT INTO majra_test_table (id, value) VALUES ('k2', 'v2')");
+
+    var rows = pg_query(conn, "SELECT id, value FROM majra_test_table ORDER BY id");
+    assert_eq(vec_len(rows), 2, "pg 2 rows");
+
+    var r1 = vec_get(rows, 0);
+    assert(streq(vec_get(r1, 0), "k1") == 1, "pg row1 id = k1");
+    assert(streq(vec_get(r1, 1), "v1") == 1, "pg row1 value = v1");
+
+    var r2 = vec_get(rows, 1);
+    assert(streq(vec_get(r2, 0), "k2") == 1, "pg row2 id = k2");
+
+    # Update
+    pg_exec(conn, "UPDATE majra_test_table SET value = 'updated' WHERE id = 'k1'");
+    rows = pg_query(conn, "SELECT value FROM majra_test_table WHERE id = 'k1'");
+    assert(streq(vec_get(vec_get(rows, 0), 0), "updated") == 1, "pg updated");
+
+    # Delete
+    pg_exec(conn, "DELETE FROM majra_test_table WHERE id = 'k2'");
+    rows = pg_query(conn, "SELECT id FROM majra_test_table");
+    assert_eq(vec_len(rows), 1, "pg 1 row after delete");
+
+    # Cleanup
+    pg_exec(conn, "DROP TABLE majra_test_table");
+    pg_close(conn);
+    println("  pg_create_table: ok");
+}
+
+fn test_pg_workflow_storage() {
+    var conn = pg_connect("127.0.0.1", 5432, "postgres", "majra", "majra");
+
+    # Initialize workflow tables
+    pg_init_workflow_tables(conn);
+
+    # Save a workflow definition
+    pg_save_workflow_def(conn, "wf-live-1", "live test workflow", "[]");
+
+    # Get it back
+    var row = pg_get_workflow_def(conn, "wf-live-1");
+    assert(row != 0, "pg wf def exists");
+    assert(streq(vec_get(row, 0), "wf-live-1") == 1, "pg wf id");
+    assert(streq(vec_get(row, 1), "live test workflow") == 1, "pg wf name");
+
+    # Get nonexistent
+    var miss = pg_get_workflow_def(conn, "nonexistent");
+    assert(miss == 0, "pg wf miss");
+
+    # Update (upsert)
+    pg_save_workflow_def(conn, "wf-live-1", "updated name", "[{\"id\":\"s1\"}]");
+    row = pg_get_workflow_def(conn, "wf-live-1");
+    assert(streq(vec_get(row, 1), "updated name") == 1, "pg wf updated name");
+
+    # Delete
+    pg_delete_workflow_def(conn, "wf-live-1");
+    miss = pg_get_workflow_def(conn, "wf-live-1");
+    assert(miss == 0, "pg wf deleted");
+
+    # Cleanup tables
+    pg_exec(conn, "DROP TABLE IF EXISTS majra_workflow_step_runs");
+    pg_exec(conn, "DROP TABLE IF EXISTS majra_workflow_runs");
+    pg_exec(conn, "DROP TABLE IF EXISTS majra_workflow_definitions");
+
+    pg_close(conn);
+    println("  pg_workflow_storage: ok");
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+
+fn main() {
+    alloc_init();
+    fl_init();
+
+    println("=== majra live integration tests ===");
+    println("  (requires Redis on :6379 and PostgreSQL on :5432)");
+    println("");
+
+    # Redis tests
+    test_redis_ping();
+    test_redis_set_get();
+    test_redis_setex();
+    test_redis_sorted_set();
+    test_redis_hash();
+    test_redis_publish();
+    test_redis_keys();
+
+    # PostgreSQL tests
+    test_pg_connect();
+    test_pg_simple_query();
+    test_pg_create_table();
+    test_pg_workflow_storage();
+
+    return assert_summary();
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

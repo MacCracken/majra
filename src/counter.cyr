@@ -1,0 +1,57 @@
+# majra/counter — mutex-protected counter and map eviction helper
+#
+# Replaces Rust's AtomicU64 Counter and evict_from_dashmap utility.
+
+# Counter struct layout (16 bytes):
+#   offset 0: value (i64)
+#   offset 8: mutex ptr (i64)
+
+fn counter_new() {
+    var c = fl_alloc(16);
+    store64(c, 0);
+    store64(c + 8, mutex_new());
+    return c;
+}
+
+fn counter_inc(c) {
+    var m = load64(c + 8);
+    mutex_lock(m);
+    store64(c, load64(c) + 1);
+    mutex_unlock(m);
+}
+
+fn counter_add(c, n) {
+    var m = load64(c + 8);
+    mutex_lock(m);
+    store64(c, load64(c) + n);
+    mutex_unlock(m);
+}
+
+fn counter_get(c) {
+    return load64(c);
+}
+
+# Evict entries from a hashmap where predicate_fn(key, value) returns 1.
+# Two-pass: collect keys to evict, then remove them.
+# Returns number of entries evicted.
+fn map_evict(m, predicate_fn) {
+    var keys_to_remove = vec_new();
+    var keys = map_keys(m);
+    var i = 0;
+    var len = vec_len(keys);
+    while (i < len) {
+        var k = vec_get(keys, i);
+        var v = map_get(m, k);
+        if (fncall2(predicate_fn, k, v) == 1) {
+            vec_push(keys_to_remove, k);
+        }
+        i = i + 1;
+    }
+    var evicted = vec_len(keys_to_remove);
+    i = 0;
+    while (i < evicted) {
+        map_delete(m, vec_get(keys_to_remove, i));
+        i = i + 1;
+    }
+    return evicted;
+}

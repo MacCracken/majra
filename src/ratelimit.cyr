@@ -1,0 +1,228 @@
+# majra/ratelimit — per-key token bucket rate limiter
+#
+# Lazy refill: tokens replenished on each check() based on elapsed time.
+# No background tasks required. Uses fixed-point math (x1000 scaling).
+#
+# Also provides a sliding-window rate limiter variant.
+
+# --- Token Bucket Rate Limiter ---
+
+# Bucket struct layout (16 bytes):
+#   offset 0: tokens_x1000 (i64) — tokens * 1000
+#   offset 8: last_access_ns (i64) — nanoseconds from CLOCK_MONOTONIC
+
+# RateLimiter struct layout (48 bytes):
+#   offset  0: rate_x1000    (i64) — tokens per second * 1000
+#   offset  8: burst_x1000   (i64) — max tokens * 1000
+#   offset 16: buckets       (i64) — hashmap ptr (string -> bucket ptr)
+#   offset 24: mutex         (i64) — mutex ptr for thread safety
+#   offset 32: total_allowed (i64) — counter ptr
+#   offset 40: total_rejected(i64) — counter ptr
+
+fn ratelimit_new(rate_x1000, burst) {
+    var rl = fl_alloc(48);
+    store64(rl, rate_x1000);
+    store64(rl + 8, burst * 1000);
+    store64(rl + 16, map_new());
+    store64(rl + 24, mutex_new());
+    store64(rl + 32, counter_new());
+    store64(rl + 40, counter_new());
+    return rl;
+}
+
+# Check if a request for key is allowed. Consumes one token if yes.
+# Returns 1 (allowed) or 0 (rejected).
+fn ratelimit_check(rl, key) {
+    var now = time_now_ns();
+    var rate_x1000 = load64(rl);
+    var burst_x1000 = load64(rl + 8);
+    var buckets = load64(rl + 16);
+    var mtx = load64(rl + 24);
+
+    mutex_lock(mtx);
+
+    var bucket_ptr = map_get(buckets, key);
+    if (bucket_ptr == 0) {
+        # New key: start with full burst
+        bucket_ptr = fl_alloc(16);
+        store64(bucket_ptr, burst_x1000);
+        store64(bucket_ptr + 8, now);
+        map_set(buckets, key, bucket_ptr);
+    }
+
+    # Refill tokens based on elapsed time
+    var last_ns = load64(bucket_ptr + 8);
+    var elapsed_ns = now - last_ns;
+    var tokens = load64(bucket_ptr);
+
+    # refill = elapsed_ns * rate_x1000 / 1_000_000_000
+    # To avoid overflow: split into seconds and remainder
+    var elapsed_sec = elapsed_ns / 1000000000;
+    var elapsed_rem = elapsed_ns - elapsed_sec * 1000000000;
+    var refill = elapsed_sec * rate_x1000 + elapsed_rem * rate_x1000 / 1000000000;
+
+    tokens = tokens + refill;
+    if (tokens > burst_x1000) {
+        tokens = burst_x1000;
+    }
+    store64(bucket_ptr + 8, now);
+
+    var result = 0;
+    if (tokens >= 1000) {
+        tokens = tokens - 1000;
+        result = 1;
+        counter_inc(load64(rl + 32));
+    } else {
+        counter_inc(load64(rl + 40));
+    }
+    store64(bucket_ptr, tokens);
+
+    mutex_unlock(mtx);
+    return result;
+}
+
+# Number of tracked keys.
+fn ratelimit_key_count(rl) {
+    return map_count(load64(rl + 16));
+}
+
+# Evict keys idle longer than max_idle_ns.
+# Returns number of keys evicted.
+fn ratelimit_evict_stale(rl, max_idle_ns) {
+    var now = time_now_ns();
+    var buckets = load64(rl + 16);
+    var mtx = load64(rl + 24);
+
+    mutex_lock(mtx);
+
+    var keys = map_keys(buckets);
+    var to_remove = vec_new();
+    var i = 0;
+    var len = vec_len(keys);
+    while (i < len) {
+        var k = vec_get(keys, i);
+        var bucket_ptr = map_get(buckets, k);
+        var last_ns = load64(bucket_ptr + 8);
+        if (now - last_ns >= max_idle_ns) {
+            vec_push(to_remove, k);
+        }
+        i = i + 1;
+    }
+
+    var evicted = vec_len(to_remove);
+    i = 0;
+    while (i < evicted) {
+        map_delete(buckets, vec_get(to_remove, i));
+        i = i + 1;
+    }
+
+    mutex_unlock(mtx);
+    return evicted;
+}
+
+# Get stats: returns ptr to RateLimitStats struct (32 bytes)
+#   offset  0: total_allowed
+#   offset  8: total_rejected
+#   offset 16: active_keys
+#   offset 24: total_evicted (unused for now, always 0)
+fn ratelimit_stats(rl) {
+    var s = fl_alloc(32);
+    store64(s, counter_get(load64(rl + 32)));
+    store64(s + 8, counter_get(load64(rl + 40)));
+    store64(s + 16, map_count(load64(rl + 16)));
+    store64(s + 24, 0);
+    return s;
+}
+
+# --- Sliding Window Rate Limiter ---
+
+# WindowCounter struct (24 bytes):
+#   offset  0: prev_count (i64)
+#   offset  8: curr_count (i64)
+#   offset 16: window_start_ns (i64)
+
+# SlidingWindowLimiter struct (40 bytes):
+#   offset  0: windows       (i64) — hashmap ptr
+#   offset  8: max_requests  (i64)
+#   offset 16: window_ns     (i64) — window duration in nanoseconds
+#   offset 24: mutex         (i64)
+#   offset 32: total_allowed (i64) — counter ptr
+#   offset 40: total_rejected(i64) — counter ptr
+
+fn sliding_window_new(max_requests, window_ns) {
+    var sw = fl_alloc(48);
+    store64(sw, map_new());
+    store64(sw + 8, max_requests);
+    store64(sw + 16, window_ns);
+    store64(sw + 24, mutex_new());
+    store64(sw + 32, counter_new());
+    store64(sw + 40, counter_new());
+    return sw;
+}
+
+fn sliding_window_check(sw, key) {
+    var now = time_now_ns();
+    var windows = load64(sw);
+    var max_req = load64(sw + 8);
+    var window_ns = load64(sw + 16);
+    var mtx = load64(sw + 24);
+
+    mutex_lock(mtx);
+
+    var wc_ptr = map_get(windows, key);
+    if (wc_ptr == 0) {
+        wc_ptr = fl_alloc(24);
+        store64(wc_ptr, 0);
+        store64(wc_ptr + 8, 0);
+        store64(wc_ptr + 16, now);
+        map_set(windows, key, wc_ptr);
+    }
+
+    var elapsed = now - load64(wc_ptr + 16);
+
+    # Advance windows if needed
+    if (elapsed >= window_ns * 2) {
+        store64(wc_ptr, 0);
+        store64(wc_ptr + 8, 0);
+        store64(wc_ptr + 16, now);
+    } elif (elapsed >= window_ns) {
+        store64(wc_ptr, load64(wc_ptr + 8));
+        store64(wc_ptr + 8, 0);
+        store64(wc_ptr + 16, load64(wc_ptr + 16) + window_ns);
+    }
+
+    # Weighted estimate using integer approximation
+    # weight = 1.0 - elapsed_in_current / window_ns
+    # estimate = prev_count * weight + curr_count
+    # Using x1000 scaling:
+    var elapsed_in_current = now - load64(wc_ptr + 16);
+    var weight_x1000 = 1000 - elapsed_in_current * 1000 / window_ns;
+    if (weight_x1000 < 0) { weight_x1000 = 0; }
+    var prev = load64(wc_ptr);
+    var curr = load64(wc_ptr + 8);
+    var estimate_x1000 = prev * weight_x1000 + curr * 1000;
+
+    var result = 0;
+    if (estimate_x1000 < max_req * 1000) {
+        store64(wc_ptr + 8, curr + 1);
+        result = 1;
+        counter_inc(load64(sw + 32));
+    } else {
+        counter_inc(load64(sw + 40));
+    }
+
+    mutex_unlock(mtx);
+    return result;
+}
+
+fn sliding_window_key_count(sw) {
+    return map_count(load64(sw));
+}
+
+fn sliding_window_total_allowed(sw) {
+    return counter_get(load64(sw + 32));
+}
+
+fn sliding_window_total_rejected(sw) {
+    return counter_get(load64(sw + 40));
+}

@@ -1,0 +1,162 @@
+# majra/metrics — observability hooks via function pointer vtable
+#
+# Replaces Rust's MajraMetrics trait with a 22-slot vtable struct.
+# Each slot is a function pointer; noop_metrics() fills all slots with a no-op.
+#
+# Vtable layout (22 * 8 = 176 bytes):
+#   offset   0: queue_enqueued(name, priority)
+#   offset   8: queue_dequeued(name, priority)
+#   offset  16: queue_state_changed(name, from, to)      [3 args - use global]
+#   offset  24: queue_depth(name, depth)
+#   offset  32: queue_running(name, count)
+#   offset  40: pubsub_published(topic, subscriber_count)
+#   offset  48: pubsub_dropped(topic)
+#   offset  56: heartbeat_transition(node_id, from, to)   [3 args - use global]
+#   offset  64: heartbeat_evicted(node_id)
+#   offset  72: ratelimit_allowed(key)
+#   offset  80: ratelimit_rejected(key)
+#   offset  88: ratelimit_evicted(count)
+#   offset  96: relay_sent(from, seq)
+#   offset 104: relay_received(from, seq)
+#   offset 112: relay_duplicate_dropped(from, seq)
+#   offset 120: barrier_arrived(name, arrived, expected)   [3 args - use global]
+#   offset 128: barrier_released(name)
+#   offset 136: workflow_run_started(workflow_id)
+#   offset 144: workflow_run_completed(workflow_id, duration_ms)
+#   offset 152: workflow_run_failed(workflow_id, duration_ms)
+#   offset 160: workflow_step_started(workflow_id, step_id)
+#   offset 168: workflow_step_finished(workflow_id, step_id) [extra args via global]
+
+var METRICS_VTABLE_SIZE = 176;
+
+# No-op function for default vtable slots (1-arg and 2-arg versions both just return 0)
+fn _metrics_noop(a, b) { return 0; }
+
+# Create a no-op metrics vtable.
+fn noop_metrics() {
+    var vt = fl_alloc(METRICS_VTABLE_SIZE);
+    var i = 0;
+    while (i < 22) {
+        store64(vt + i * 8, &_metrics_noop);
+        i = i + 1;
+    }
+    return vt;
+}
+
+# --- Metrics dispatch helpers ---
+# For 2-arg methods, call directly via fncall2.
+# For 3+ arg methods, store extras in globals before calling.
+
+var _metrics_arg3 = 0;
+var _metrics_arg4 = 0;
+
+fn metrics_queue_enqueued(vt, name, priority) {
+    fncall2(load64(vt), name, priority);
+}
+
+fn metrics_queue_dequeued(vt, name, priority) {
+    fncall2(load64(vt + 8), name, priority);
+}
+
+fn metrics_queue_state_changed(vt, name, from, to) {
+    _metrics_arg3 = to;
+    fncall2(load64(vt + 16), name, from);
+}
+
+fn metrics_queue_depth(vt, name, depth) {
+    fncall2(load64(vt + 24), name, depth);
+}
+
+fn metrics_queue_running(vt, name, count) {
+    fncall2(load64(vt + 32), name, count);
+}
+
+fn metrics_pubsub_published(vt, topic, sub_count) {
+    fncall2(load64(vt + 40), topic, sub_count);
+}
+
+fn metrics_pubsub_dropped(vt, topic) {
+    fncall2(load64(vt + 48), topic, 0);
+}
+
+fn metrics_heartbeat_transition(vt, node_id, from, to) {
+    _metrics_arg3 = to;
+    fncall2(load64(vt + 56), node_id, from);
+}
+
+fn metrics_heartbeat_evicted(vt, node_id) {
+    fncall2(load64(vt + 64), node_id, 0);
+}
+
+fn metrics_ratelimit_allowed(vt, key) {
+    fncall2(load64(vt + 72), key, 0);
+}
+
+fn metrics_ratelimit_rejected(vt, key) {
+    fncall2(load64(vt + 80), key, 0);
+}
+
+fn metrics_ratelimit_evicted(vt, count) {
+    fncall2(load64(vt + 88), count, 0);
+}
+
+fn metrics_relay_sent(vt, from, seq) {
+    fncall2(load64(vt + 96), from, seq);
+}
+
+fn metrics_relay_received(vt, from, seq) {
+    fncall2(load64(vt + 104), from, seq);
+}
+
+fn metrics_relay_duplicate_dropped(vt, from, seq) {
+    fncall2(load64(vt + 112), from, seq);
+}
+
+fn metrics_barrier_arrived(vt, name, arrived, expected) {
+    _metrics_arg3 = expected;
+    fncall2(load64(vt + 120), name, arrived);
+}
+
+fn metrics_barrier_released(vt, name) {
+    fncall2(load64(vt + 128), name, 0);
+}
+
+fn metrics_workflow_run_started(vt, workflow_id) {
+    fncall2(load64(vt + 136), workflow_id, 0);
+}
+
+fn metrics_workflow_run_completed(vt, workflow_id, duration_ms) {
+    fncall2(load64(vt + 144), workflow_id, duration_ms);
+}
+
+fn metrics_workflow_run_failed(vt, workflow_id, duration_ms) {
+    fncall2(load64(vt + 152), workflow_id, duration_ms);
+}
+
+fn metrics_workflow_step_started(vt, workflow_id, step_id) {
+    fncall2(load64(vt + 160), workflow_id, step_id);
+}
+
+fn metrics_workflow_step_finished(vt, workflow_id, step_id, status, duration_ms) {
+    _metrics_arg3 = status;
+    _metrics_arg4 = duration_ms;
+    fncall2(load64(vt + 168), workflow_id, step_id);
+}
+
+# --- Counting metrics (for testing) ---
+# A simple metrics impl that counts queue_enqueued calls.
+# Stores count at a known global.
+
+var _counting_metrics_enqueued = 0;
+
+fn _counting_queue_enqueued(name, priority) {
+    _counting_metrics_enqueued = _counting_metrics_enqueued + 1;
+    return 0;
+}
+
+fn counting_metrics() {
+    var vt = noop_metrics();
+    _counting_metrics_enqueued = 0;
+    store64(vt, &_counting_queue_enqueued);
+    return vt;
+}

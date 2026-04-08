@@ -1,0 +1,93 @@
+# majra/error — error codes and result helpers
+#
+# Replaces Rust's MajraError enum + IpcError enum.
+# Uses integer error codes. Detail messages stored in a global buffer.
+
+# --- MajraError codes ---
+enum MajraErr {
+    ERR_NONE = 0;
+    ERR_QUEUE = 1;
+    ERR_PUBSUB = 2;
+    ERR_RELAY = 3;
+    ERR_IPC = 4;
+    ERR_HEARTBEAT = 5;
+    ERR_BARRIER = 6;
+    ERR_DAG_CYCLE = 7;
+    ERR_CAPACITY = 8;
+    ERR_INVALID_STATE = 9;
+    ERR_RESOURCE_UNAVAIL = 10;
+    ERR_PERSISTENCE = 11;
+    ERR_WORKFLOW_VALIDATION = 12;
+    ERR_WORKFLOW_STEP = 13;
+    ERR_WORKFLOW_NOT_FOUND = 14;
+    ERR_WORKFLOW_STORAGE = 15;
+}
+
+# --- IpcError codes ---
+enum IpcErr {
+    ERR_IPC_FRAME_TOO_LARGE = 100;
+    ERR_IPC_CONN_CLOSED = 101;
+    ERR_IPC_IO = 102;
+    ERR_IPC_JSON = 103;
+}
+
+# --- Error message buffer ---
+# Stores the detail string for the most recent error.
+var _err_msg_buf[64];
+var _err_msg_len = 0;
+
+# Set the error detail message (copies up to 504 bytes).
+fn set_err_msg(msg) {
+    var len = str_len(msg);
+    if (len > 504) {
+        len = 504;
+    }
+    var src = str_data(msg);
+    var i = 0;
+    while (i < len) {
+        store8(&_err_msg_buf + i, load8(src + i));
+        i = i + 1;
+    }
+    _err_msg_len = len;
+}
+
+# Get the current error message as a Str.
+fn get_err_msg() {
+    return str_new(&_err_msg_buf, _err_msg_len);
+}
+
+# Clear the error message.
+fn clear_err_msg() {
+    _err_msg_len = 0;
+}
+
+# Create a majra error result with a message.
+fn majra_err(code, msg) {
+    set_err_msg(msg);
+    return Err(code);
+}
+
+# Print an error code name for debugging.
+fn err_name(code) {
+    if (code == ERR_NONE) { return "ok"; }
+    if (code == ERR_QUEUE) { return "queue"; }
+    if (code == ERR_PUBSUB) { return "pubsub"; }
+    if (code == ERR_RELAY) { return "relay"; }
+    if (code == ERR_IPC) { return "ipc"; }
+    if (code == ERR_HEARTBEAT) { return "heartbeat"; }
+    if (code == ERR_BARRIER) { return "barrier"; }
+    if (code == ERR_DAG_CYCLE) { return "dag_cycle"; }
+    if (code == ERR_CAPACITY) { return "capacity"; }
+    if (code == ERR_INVALID_STATE) { return "invalid_state"; }
+    if (code == ERR_RESOURCE_UNAVAIL) { return "resource_unavail"; }
+    if (code == ERR_PERSISTENCE) { return "persistence"; }
+    if (code == ERR_WORKFLOW_VALIDATION) { return "workflow_validation"; }
+    if (code == ERR_WORKFLOW_STEP) { return "workflow_step"; }
+    if (code == ERR_WORKFLOW_NOT_FOUND) { return "workflow_not_found"; }
+    if (code == ERR_WORKFLOW_STORAGE) { return "workflow_storage"; }
+    if (code == ERR_IPC_FRAME_TOO_LARGE) { return "ipc_frame_too_large"; }
+    if (code == ERR_IPC_CONN_CLOSED) { return "ipc_conn_closed"; }
+    if (code == ERR_IPC_IO) { return "ipc_io"; }
+    if (code == ERR_IPC_JSON) { return "ipc_json"; }
+    return "unknown";
+}

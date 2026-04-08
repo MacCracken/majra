@@ -1,0 +1,288 @@
+# majra/relay — sequenced, deduplicated inter-node message relay
+#
+# Each node gets a sequence counter. Receivers track the last seen
+# sequence per sender, dropping duplicates and out-of-order messages.
+
+# RelayMessage struct (64 bytes, 8 fields):
+#   offset  0: seq (i64)
+#   offset  8: from_str (i64) — Str ptr
+#   offset 16: to_str (i64) — Str ptr (0 or empty = broadcast)
+#   offset 24: topic_str (i64) — Str ptr
+#   offset 32: payload (i64) — ptr to payload data
+#   offset 40: timestamp_ns (i64)
+#   offset 48: correlation_id (i64) — Str ptr or 0
+#   offset 56: is_reply (i64) — 0 or 1
+
+fn relay_msg_new(seq, from, to, topic, payload) {
+    var m = fl_alloc(64);
+    store64(m, seq);
+    store64(m + 8, from);
+    store64(m + 16, to);
+    store64(m + 24, topic);
+    store64(m + 32, payload);
+    store64(m + 40, time_now_ns());
+    store64(m + 48, 0);
+    store64(m + 56, 0);
+    return m;
+}
+
+# DedupEntry struct (16 bytes):
+#   offset 0: last_seq (i64)
+#   offset 8: last_seen_ns (i64)
+
+# Relay struct (64 bytes):
+#   offset  0: node_id (i64) — Str ptr
+#   offset  8: next_seq (i64)
+#   offset 16: seen (i64) — hashmap: node_id_str -> DedupEntry ptr
+#   offset 24: subscribers (i64) — vec of channel ptrs
+#   offset 32: pending_requests (i64) — hashmap: correlation_id -> channel ptr
+#   offset 40: mutex (i64)
+#   offset 48: messages_sent (i64) — counter ptr
+#   offset 56: messages_received (i64) — counter ptr
+# Relay struct extended offsets (use inline constants since global vars
+# may not work correctly in address arithmetic)
+
+fn relay_new(node_id) {
+    var r = fl_alloc(88);
+    store64(r, node_id);
+    store64(r + 8, 1);
+    store64(r + 16, map_new());
+    store64(r + 24, vec_new());
+    store64(r + 32, map_new());
+    store64(r + 40, mutex_new());
+    store64(r + 48, counter_new());
+    store64(r + 56, counter_new());
+    store64(r + 64, counter_new());
+    store64(r + 72, counter_new());
+    store64(r + 80, 0);
+    return r;
+}
+
+fn relay_set_max_dedup(r, max) {
+    store64(r + 80, max);
+}
+
+fn relay_node_id(r) {
+    return load64(r);
+}
+
+# Send a message to a specific node. Returns sequence number.
+fn relay_send(r, to, topic, payload) {
+    var mtx = load64(r + 40);
+    mutex_lock(mtx);
+    var seq = load64(r + 8);
+    store64(r + 8, seq + 1);
+    mutex_unlock(mtx);
+
+    var msg = relay_msg_new(seq, load64(r), to, topic, payload);
+
+    # Broadcast to all subscribers
+    var subs = load64(r + 24);
+    var i = 0;
+    var len = vec_len(subs);
+    while (i < len) {
+        chan_send(vec_get(subs, i), msg);
+        i = i + 1;
+    }
+
+    counter_inc(load64(r + 48));
+    return seq;
+}
+
+# Broadcast to all nodes.
+fn relay_broadcast(r, topic, payload) {
+    return relay_send(r, 0, topic, payload);
+}
+
+# Subscribe to inbound messages. Returns a channel.
+fn relay_subscribe(r) {
+    var ch = chan_new(256);
+    var mtx = load64(r + 40);
+    mutex_lock(mtx);
+    vec_push(load64(r + 24), ch);
+    mutex_unlock(mtx);
+    return ch;
+}
+
+# Globals for dedup entry creation (avoids local variable clobbering)
+var _dedup_map = 0;
+var _dedup_key = 0;
+var _dedup_seq = 0;
+
+var _dedup_called = 0;
+var _dedup_keylen = 0;
+
+var _dedup_entry = 0;
+
+fn _relay_alloc_dedup_entry() {
+    _dedup_called = _dedup_called + 1;
+    _dedup_keylen = strlen(_dedup_key);
+    _dedup_entry = fl_alloc(16);
+    store64(_dedup_entry, _dedup_seq);
+    store64(_dedup_entry + 8, time_now_ns());
+    map_set(_dedup_map, _dedup_key, _dedup_entry);
+}
+
+# Check dedup for incoming message. Returns 1 if duplicate (should drop), 0 if new.
+fn _relay_check_dedup(r, msg) {
+    # Read everything we need BEFORE any function calls
+    var sender = load64(msg + 8);
+    var seq = load64(msg);
+    var seen = load64(r + 16);
+
+    # Save to globals before map_get clobbers locals
+    _dedup_map = seen;
+    _dedup_key = sender;
+    _dedup_seq = seq;
+
+    var entry = map_get(seen, sender);
+    if (entry != 0) {
+        if (_dedup_seq <= load64(entry)) {
+            return 1;
+        }
+        store64(entry, _dedup_seq);
+        store64(entry + 8, time_now_ns());
+        return 0;
+    }
+    # New sender
+    _relay_alloc_dedup_entry();
+    return 0;
+}
+
+# Globals to preserve relay_receive args across function calls
+var _recv_r = 0;
+var _recv_msg = 0;
+
+fn _recv_skip_own() {
+    var from = load64(_recv_msg + 8);
+    var nid = load64(_recv_r);
+    if (from != 0 && nid != 0 && streq(from, nid) == 1) { return 1; }
+    return 0;
+}
+
+fn _recv_check_target() {
+    var to = load64(_recv_msg + 16);
+    var nid = load64(_recv_r);
+    if (to == 0 || strlen(to) == 0) { return 1; }
+    if (streq(to, nid) == 1) { return 0; }
+    return 2;
+}
+
+# Process an incoming message. Returns the message if it passes dedup, or 0.
+fn relay_receive(r, msg) {
+    _recv_r = r;
+    _recv_msg = msg;
+
+    if (_recv_skip_own() == 1) { return 0; }
+
+    var target_check = _recv_check_target();
+    if (target_check == 2) { return 0; }
+    var is_broadcast = target_check;
+
+    # Dedup check
+    _dedup_map = load64(_recv_r + 16);
+    _dedup_key = load64(_recv_msg + 8);
+    _dedup_seq = load64(_recv_msg);
+
+    var entry = map_get(_dedup_map, _dedup_key);
+    if (entry != 0) {
+        if (_dedup_seq <= load64(entry)) {
+            counter_inc(load64(_recv_r + 64));
+            return 0;
+        }
+        store64(entry, _dedup_seq);
+        store64(entry + 8, time_now_ns());
+    } else {
+        _relay_alloc_dedup_entry();
+    }
+
+    # Enforce dedup table size limit
+    var max_dedup = load64(_recv_r + 80);
+    var seen = load64(_recv_r + 16);
+    if (max_dedup > 0 && map_count(seen) > max_dedup) {
+        # Evict oldest entry
+        var keys = map_keys(seen);
+        var oldest_key = 0;
+        var oldest_time = 0;
+        var i = 0;
+        var len = vec_len(keys);
+        while (i < len) {
+            var k = vec_get(keys, i);
+            var e = map_get(seen, k);
+            var t = load64(e + 8);
+            if (oldest_key == 0 || t < oldest_time) {
+                oldest_key = k;
+                oldest_time = t;
+            }
+            i = i + 1;
+        }
+        if (oldest_key != 0) {
+            map_delete(seen, oldest_key);
+            counter_inc(load64(r + 72));
+        }
+    }
+
+    counter_inc(load64(_recv_r + 56));
+
+    # Broadcast to subscribers
+    var subs = load64(_recv_r + 24);
+    var i = 0;
+    var len = vec_len(subs);
+    while (i < len) {
+        chan_send(vec_get(subs, i), _recv_msg);
+        i = i + 1;
+    }
+
+    return _recv_msg;
+}
+
+fn relay_dedup_table_size(r) {
+    return map_count(load64(r + 16));
+}
+
+# Evict dedup entries idle longer than max_idle_ns. Returns count.
+fn relay_evict_stale_dedup(r, max_idle_ns) {
+    var now = time_now_ns();
+    var mtx = load64(r + 40);
+    mutex_lock(mtx);
+    var seen = load64(r + 16);
+    var keys = map_keys(seen);
+    var to_remove = vec_new();
+    var i = 0;
+    var len = vec_len(keys);
+    while (i < len) {
+        var k = vec_get(keys, i);
+        var e = map_get(seen, k);
+        if (now - load64(e + 8) > max_idle_ns) {
+            vec_push(to_remove, k);
+        }
+        i = i + 1;
+    }
+    var count = vec_len(to_remove);
+    i = 0;
+    while (i < count) {
+        map_delete(seen, vec_get(to_remove, i));
+        i = i + 1;
+    }
+    if (count > 0) {
+        counter_add(load64(r + 72), count);
+    }
+    mutex_unlock(mtx);
+    return count;
+}
+
+# RelayStats struct (40 bytes):
+#   offset  0: messages_sent
+#   offset  8: messages_received
+#   offset 16: duplicates_dropped
+#   offset 24: dedup_evicted
+#   offset 32: dedup_table_size
+fn relay_stats(r) {
+    var s = fl_alloc(40);
+    store64(s, counter_get(load64(r + 48)));
+    store64(s + 8, counter_get(load64(r + 56)));
+    store64(s + 16, counter_get(load64(r + 64)));
+    store64(s + 24, counter_get(load64(r + 72)));
+    store64(s + 32, map_count(load64(r + 16)));
+    return s;
+}

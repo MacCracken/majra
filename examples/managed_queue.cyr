@@ -1,0 +1,90 @@
+# Example: GPU-aware job scheduling with ManagedQueue
+#
+# Demonstrates:
+#   - Priority queue with 5 tiers
+#   - Max concurrency enforcement
+#   - Job lifecycle (enqueue -> dequeue -> complete/fail)
+#   - Metrics integration
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/freelist.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/hashmap.cyr"
+include "lib/syscalls.cyr"
+include "lib/tagged.cyr"
+include "lib/fnptr.cyr"
+include "lib/thread.cyr"
+
+include "src/error.cyr"
+include "src/counter.cyr"
+include "src/envelope.cyr"
+include "src/metrics.cyr"
+include "src/queue.cyr"
+
+fn main() {
+    alloc_init();
+    fl_init();
+
+    println("=== Managed Queue Example ===");
+
+    # Create a queue with max 2 concurrent jobs
+    var mq = mq_new("gpu-training", 2);
+    var metrics = counting_metrics();
+    mq_with_metrics(mq, metrics);
+
+    # Enqueue training jobs
+    println("Enqueueing jobs...");
+    var j_critical = mq_enqueue(mq, PRIORITY_CRITICAL, 1);
+    var j_high = mq_enqueue(mq, PRIORITY_HIGH, 2);
+    var j_normal = mq_enqueue(mq, PRIORITY_NORMAL, 3);
+    var j_low = mq_enqueue(mq, PRIORITY_LOW, 4);
+
+    print_num(mq_queued_count(mq));
+    println(" jobs queued");
+
+    # Process jobs
+    println("Processing...");
+    var d1 = mq_dequeue(mq);
+    print_num(queue_item_payload(d1));
+    println(" dequeued (should be 1 = critical)");
+
+    var d2 = mq_dequeue(mq);
+    print_num(queue_item_payload(d2));
+    println(" dequeued (should be 2 = high)");
+
+    # At max concurrency - next dequeue returns 0
+    var d3 = mq_dequeue(mq);
+    if (d3 == 0) {
+        println("Blocked: max concurrency reached (2)");
+    }
+
+    # Complete first job
+    mq_complete(mq, d1);
+    println("Job 1 completed");
+
+    # Now we can dequeue more
+    d3 = mq_dequeue(mq);
+    print_num(queue_item_payload(d3));
+    println(" dequeued (should be 3 = normal)");
+
+    # Fail a job
+    mq_fail(mq, d2);
+    println("Job 2 failed");
+
+    # Complete remaining
+    mq_complete(mq, d3);
+
+    println("---");
+    print_num(mq_total_completed(mq));
+    println(" jobs completed");
+    print_num(mq_job_count(mq));
+    println(" total jobs tracked");
+
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

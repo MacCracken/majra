@@ -1,0 +1,172 @@
+# majra/fleet — distributed job queue with work-stealing
+#
+# Wraps ManagedQueue to provide per-node job assignment and rebalancing.
+
+# FleetQueueConfig struct (24 bytes):
+#   offset  0: steal_threshold (i64) — min items before stealing from a node
+#   offset  8: max_steal_batch (i64) — max items to steal per rebalance
+#   offset 16: max_concurrent (i64) — per-node concurrency limit
+
+fn fleet_config_new(steal_threshold, max_steal_batch, max_concurrent) {
+    var cfg = fl_alloc(24);
+    store64(cfg, steal_threshold);
+    store64(cfg + 8, max_steal_batch);
+    store64(cfg + 16, max_concurrent);
+    return cfg;
+}
+
+# FleetQueue struct (24 bytes):
+#   offset  0: nodes (i64) — hashmap: node_id_str -> ManagedQueue ptr
+#   offset  8: config (i64) — FleetQueueConfig ptr
+#   offset 16: mutex (i64)
+
+fn fleet_new(config) {
+    var fq = fl_alloc(24);
+    store64(fq, map_new());
+    store64(fq + 8, config);
+    store64(fq + 16, mutex_new());
+    return fq;
+}
+
+# Register a node. Creates a per-node ManagedQueue.
+fn fleet_register_node(fq, node_id) {
+    var cfg = load64(fq + 8);
+    var max_c = load64(cfg + 16);
+    var mq = mq_new(node_id, max_c);
+    var mtx = load64(fq + 16);
+    mutex_lock(mtx);
+    map_set(load64(fq), node_id, mq);
+    mutex_unlock(mtx);
+}
+
+# Deregister a node.
+fn fleet_deregister_node(fq, node_id) {
+    var mtx = load64(fq + 16);
+    mutex_lock(mtx);
+    map_delete(load64(fq), node_id);
+    mutex_unlock(mtx);
+}
+
+# Get the ManagedQueue for a node.
+fn fleet_node_queue(fq, node_id) {
+    return map_get(load64(fq), node_id);
+}
+
+# Select the least-loaded node. Returns node_id string or 0.
+fn _fleet_select_node(fq) {
+    var nodes = load64(fq);
+    var keys = map_keys(nodes);
+    var best_id = 0;
+    var best_load = 999999999;
+    var i = 0;
+    var len = vec_len(keys);
+    while (i < len) {
+        var nid = vec_get(keys, i);
+        var mq = map_get(nodes, nid);
+        var load = mq_queued_count(mq) + mq_running_count(mq);
+        if (load < best_load) {
+            best_load = load;
+            best_id = nid;
+        }
+        i = i + 1;
+    }
+    return best_id;
+}
+
+# Submit a job to the least-loaded node. Returns the QueueItem or 0.
+fn fleet_submit(fq, priority, payload) {
+    var mtx = load64(fq + 16);
+    mutex_lock(mtx);
+    var node_id = _fleet_select_node(fq);
+    if (node_id == 0) {
+        mutex_unlock(mtx);
+        return 0;
+    }
+    var mq = map_get(load64(fq), node_id);
+    mutex_unlock(mtx);
+    return mq_enqueue(mq, priority, payload);
+}
+
+# Rebalance: steal from overloaded nodes and assign to underloaded.
+# Returns number of jobs stolen.
+fn fleet_rebalance(fq) {
+    var cfg = load64(fq + 8);
+    var threshold = load64(cfg);
+    var max_batch = load64(cfg + 8);
+    var mtx = load64(fq + 16);
+    mutex_lock(mtx);
+
+    var nodes = load64(fq);
+    var keys = map_keys(nodes);
+    var len = vec_len(keys);
+    var stolen = 0;
+
+    # Find overloaded and underloaded nodes
+    var i = 0;
+    while (i < len) {
+        var nid = vec_get(keys, i);
+        var mq = map_get(nodes, nid);
+        var queued = mq_queued_count(mq);
+
+        if (queued > threshold) {
+            # This node is overloaded — try to steal
+            var to_steal = queued - threshold;
+            if (to_steal > max_batch) { to_steal = max_batch; }
+
+            # Find underloaded target
+            var j = 0;
+            while (j < len && to_steal > 0) {
+                if (j != i) {
+                    var tid = vec_get(keys, j);
+                    var tmq = map_get(nodes, tid);
+                    var tqueued = mq_queued_count(tmq);
+                    if (tqueued < threshold) {
+                        var item = mq_dequeue(mq);
+                        if (item != 0) {
+                            mq_enqueue(tmq, queue_item_priority(item), queue_item_payload(item));
+                            stolen = stolen + 1;
+                            to_steal = to_steal - 1;
+                        }
+                    }
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    mutex_unlock(mtx);
+    return stolen;
+}
+
+fn fleet_node_count(fq) {
+    return map_count(load64(fq));
+}
+
+# FleetQueueStats struct (32 bytes):
+#   offset  0: total_nodes
+#   offset  8: total_queued
+#   offset 16: total_running
+#   offset 24: total_completed
+fn fleet_stats(fq) {
+    var s = fl_alloc(32);
+    var nodes = load64(fq);
+    var keys = map_keys(nodes);
+    var total_q = 0;
+    var total_r = 0;
+    var total_c = 0;
+    var i = 0;
+    var len = vec_len(keys);
+    while (i < len) {
+        var mq = map_get(nodes, vec_get(keys, i));
+        total_q = total_q + mq_queued_count(mq);
+        total_r = total_r + mq_running_count(mq);
+        total_c = total_c + mq_total_completed(mq);
+        i = i + 1;
+    }
+    store64(s, len);
+    store64(s + 8, total_q);
+    store64(s + 16, total_r);
+    store64(s + 24, total_c);
+    return s;
+}

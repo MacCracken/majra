@@ -1,0 +1,311 @@
+# majra/redis_backend — Redis RESP protocol over TCP
+#
+# Implements RESP (REdis Serialization Protocol) for cross-process
+# pub/sub, priority queues, rate limiting, and heartbeat tracking.
+#
+# Wire format: RESP2 over TCP.
+#   Simple string: +OK\r\n
+#   Error:         -ERR msg\r\n
+#   Integer:       :42\r\n
+#   Bulk string:   $5\r\nhello\r\n
+#   Array:         *2\r\n$3\r\nGET\r\n$3\r\nkey\r\n
+
+# --- RESP Protocol ---
+# Note: Cyrius does not support \r escape. We use raw bytes 13,10 for CR LF.
+
+# Append CRLF (bytes 13, 10) to a string builder.
+fn _sb_crlf(sb) {
+    var crlf = alloc(2);
+    store8(crlf, 13);
+    store8(crlf + 1, 10);
+    str_builder_add(sb, str_new(crlf, 2));
+}
+
+# Send a RESP command array over a TCP socket.
+# cmd is a vec of C strings (command + arguments).
+# Returns 0 on success, -1 on failure.
+fn _resp_send_cmd(fd, cmd) {
+    var sb = str_builder_new();
+    # Array header
+    str_builder_add_cstr(sb, "*");
+    str_builder_add_int(sb, vec_len(cmd));
+    _sb_crlf(sb);
+    # Each element as bulk string
+    var i = 0;
+    var len = vec_len(cmd);
+    while (i < len) {
+        var arg = vec_get(cmd, i);
+        var alen = strlen(arg);
+        str_builder_add_cstr(sb, "$");
+        str_builder_add_int(sb, alen);
+        _sb_crlf(sb);
+        str_builder_add_cstr(sb, arg);
+        _sb_crlf(sb);
+        i = i + 1;
+    }
+    var msg = str_builder_build(sb);
+    var w = syscall(SYS_WRITE, fd, str_data(msg), str_len(msg));
+    if (w < 0) { return 0 - 1; }
+    return 0;
+}
+
+# Read a line from the socket (up to \r\n). Returns Str or 0.
+var _resp_buf[512];
+fn _resp_read_line(fd) {
+    var pos = 0;
+    while (pos < 4088) {
+        var n = syscall(SYS_READ, fd, &_resp_buf + pos, 1);
+        if (n <= 0) { return 0; }
+        if (pos > 0 && load8(&_resp_buf + pos - 1) == 13 && load8(&_resp_buf + pos) == 10) {
+            return str_new(&_resp_buf, pos - 1);
+        }
+        pos = pos + 1;
+    }
+    return 0;
+}
+
+# Read a RESP reply. Returns:
+#   For simple strings/errors: Str
+#   For integers: the integer value
+#   For bulk strings: Str or 0 (nil)
+#   For arrays: vec of reply values
+fn _resp_read_reply(fd) {
+    var line = _resp_read_line(fd);
+    if (line == 0) { return 0; }
+    var data = str_data(line);
+    var type_byte = load8(data);
+
+    if (type_byte == 43) {
+        # +simple string
+        return str_new(data + 1, str_len(line) - 1);
+    }
+    if (type_byte == 45) {
+        # -error
+        return str_new(data + 1, str_len(line) - 1);
+    }
+    if (type_byte == 58) {
+        # :integer
+        return str_to_int(str_new(data + 1, str_len(line) - 1));
+    }
+    if (type_byte == 36) {
+        # $bulk string
+        var blen = str_to_int(str_new(data + 1, str_len(line) - 1));
+        if (blen < 0) { return 0; }
+        var buf = fl_alloc(blen + 2);
+        var total = 0;
+        while (total < blen + 2) {
+            var n = syscall(SYS_READ, fd, buf + total, blen + 2 - total);
+            if (n <= 0) { return 0; }
+            total = total + n;
+        }
+        return str_new(buf, blen);
+    }
+    if (type_byte == 42) {
+        # *array
+        var count = str_to_int(str_new(data + 1, str_len(line) - 1));
+        if (count < 0) { return 0; }
+        var arr = vec_new();
+        var j = 0;
+        while (j < count) {
+            vec_push(arr, _resp_read_reply(fd));
+            j = j + 1;
+        }
+        return arr;
+    }
+    return 0;
+}
+
+# --- Redis Connection ---
+
+# RedisConn struct (16 bytes):
+#   offset 0: fd (i64)
+#   offset 8: prefix (i64) — C string for key namespacing
+
+fn redis_connect(host, port) {
+    var fd = syscall(41, AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { return 0; }
+    var sa = sockaddr_in(INADDR_LOOPBACK(), port);
+    var ret = syscall(42, fd, sa, 16);
+    if (ret < 0) {
+        syscall(SYS_CLOSE, fd);
+        return 0;
+    }
+    var rc = fl_alloc(16);
+    store64(rc, fd);
+    store64(rc + 8, "");
+    return rc;
+}
+
+fn redis_connect_default() {
+    return redis_connect("127.0.0.1", 6379);
+}
+
+fn redis_set_prefix(rc, prefix) {
+    store64(rc + 8, prefix);
+}
+
+fn redis_close(rc) {
+    syscall(SYS_CLOSE, load64(rc));
+}
+
+# Build prefixed key
+fn _redis_pkey(rc, key) {
+    var prefix = load64(rc + 8);
+    if (strlen(prefix) == 0) { return key; }
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, prefix);
+    str_builder_add_cstr(sb, key);
+    return str_data(str_builder_build(sb));
+}
+
+# --- Basic Commands ---
+
+fn redis_set(rc, key, value) {
+    var cmd = vec_new();
+    vec_push(cmd, "SET");
+    vec_push(cmd, _redis_pkey(rc, key));
+    vec_push(cmd, value);
+    _resp_send_cmd(load64(rc), cmd);
+    return _resp_read_reply(load64(rc));
+}
+
+fn redis_get(rc, key) {
+    var cmd = vec_new();
+    vec_push(cmd, "GET");
+    vec_push(cmd, _redis_pkey(rc, key));
+    _resp_send_cmd(load64(rc), cmd);
+    return _resp_read_reply(load64(rc));
+}
+
+fn redis_del(rc, key) {
+    var cmd = vec_new();
+    vec_push(cmd, "DEL");
+    vec_push(cmd, _redis_pkey(rc, key));
+    _resp_send_cmd(load64(rc), cmd);
+    return _resp_read_reply(load64(rc));
+}
+
+fn redis_exists(rc, key) {
+    var cmd = vec_new();
+    vec_push(cmd, "EXISTS");
+    vec_push(cmd, _redis_pkey(rc, key));
+    _resp_send_cmd(load64(rc), cmd);
+    return _resp_read_reply(load64(rc));
+}
+
+# SET with EX (expire in seconds)
+fn redis_setex(rc, key, value, ttl_secs) {
+    var cmd = vec_new();
+    vec_push(cmd, "SET");
+    vec_push(cmd, _redis_pkey(rc, key));
+    vec_push(cmd, value);
+    vec_push(cmd, "EX");
+    var ttl_str = str_data(str_from_int(ttl_secs));
+    vec_push(cmd, ttl_str);
+    _resp_send_cmd(load64(rc), cmd);
+    return _resp_read_reply(load64(rc));
+}
+
+# --- Sorted Set (Queue) ---
+
+fn redis_zadd(rc, key, member, score) {
+    var cmd = vec_new();
+    vec_push(cmd, "ZADD");
+    vec_push(cmd, _redis_pkey(rc, key));
+    vec_push(cmd, str_data(str_from_int(score)));
+    vec_push(cmd, member);
+    _resp_send_cmd(load64(rc), cmd);
+    return _resp_read_reply(load64(rc));
+}
+
+fn redis_zpopmin(rc, key) {
+    var cmd = vec_new();
+    vec_push(cmd, "ZPOPMIN");
+    vec_push(cmd, _redis_pkey(rc, key));
+    vec_push(cmd, "1");
+    _resp_send_cmd(load64(rc), cmd);
+    return _resp_read_reply(load64(rc));
+}
+
+fn redis_zcard(rc, key) {
+    var cmd = vec_new();
+    vec_push(cmd, "ZCARD");
+    vec_push(cmd, _redis_pkey(rc, key));
+    _resp_send_cmd(load64(rc), cmd);
+    return _resp_read_reply(load64(rc));
+}
+
+# --- Pub/Sub (publish only — subscribe requires dedicated connection) ---
+
+fn redis_publish(rc, channel, message) {
+    var cmd = vec_new();
+    vec_push(cmd, "PUBLISH");
+    vec_push(cmd, _redis_pkey(rc, channel));
+    vec_push(cmd, message);
+    _resp_send_cmd(load64(rc), cmd);
+    return _resp_read_reply(load64(rc));
+}
+
+# --- Hash (for rate limiter) ---
+
+fn redis_hset(rc, key, field, value) {
+    var cmd = vec_new();
+    vec_push(cmd, "HSET");
+    vec_push(cmd, _redis_pkey(rc, key));
+    vec_push(cmd, field);
+    vec_push(cmd, value);
+    _resp_send_cmd(load64(rc), cmd);
+    return _resp_read_reply(load64(rc));
+}
+
+fn redis_hget(rc, key, field) {
+    var cmd = vec_new();
+    vec_push(cmd, "HGET");
+    vec_push(cmd, _redis_pkey(rc, key));
+    vec_push(cmd, field);
+    _resp_send_cmd(load64(rc), cmd);
+    return _resp_read_reply(load64(rc));
+}
+
+fn redis_expire(rc, key, seconds) {
+    var cmd = vec_new();
+    vec_push(cmd, "EXPIRE");
+    vec_push(cmd, _redis_pkey(rc, key));
+    vec_push(cmd, str_data(str_from_int(seconds)));
+    _resp_send_cmd(load64(rc), cmd);
+    return _resp_read_reply(load64(rc));
+}
+
+# --- KEYS (for heartbeat list_online) ---
+
+fn redis_keys(rc, pattern) {
+    var cmd = vec_new();
+    vec_push(cmd, "KEYS");
+    vec_push(cmd, _redis_pkey(rc, pattern));
+    _resp_send_cmd(load64(rc), cmd);
+    return _resp_read_reply(load64(rc));
+}
+
+# --- EVAL (for rate limiter Lua script) ---
+
+fn redis_eval(rc, script, num_keys, key, arg1, arg2, arg3) {
+    var cmd = vec_new();
+    vec_push(cmd, "EVAL");
+    vec_push(cmd, script);
+    vec_push(cmd, str_data(str_from_int(num_keys)));
+    vec_push(cmd, _redis_pkey(rc, key));
+    vec_push(cmd, arg1);
+    vec_push(cmd, arg2);
+    vec_push(cmd, arg3);
+    _resp_send_cmd(load64(rc), cmd);
+    return _resp_read_reply(load64(rc));
+}
+
+# --- PING (connection test) ---
+
+fn redis_ping(rc) {
+    var cmd = vec_new();
+    vec_push(cmd, "PING");
+    _resp_send_cmd(load64(rc), cmd);
+    return _resp_read_reply(load64(rc));
+}

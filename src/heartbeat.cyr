@@ -1,0 +1,481 @@
+# majra/heartbeat — TTL-based node health tracking
+#
+# Tracks last-seen timestamps per node and transitions through:
+# Online -> Suspect (after suspect timeout) -> Offline (after offline timeout)
+
+# Node health status
+enum NodeStatus {
+    STATUS_ONLINE = 0;
+    STATUS_SUSPECT = 1;
+    STATUS_OFFLINE = 2;
+}
+
+# Default timeouts in nanoseconds
+var DEFAULT_SUSPECT_NS = 30000000000;
+var DEFAULT_OFFLINE_NS = 90000000000;
+
+# HeartbeatConfig struct (24 bytes):
+#   offset  0: suspect_after_ns (i64)
+#   offset  8: offline_after_ns (i64)
+#   offset 16: eviction_cycles  (i64) — 0 = no eviction
+
+fn heartbeat_config_default() {
+    var cfg = fl_alloc(24);
+    store64(cfg, DEFAULT_SUSPECT_NS);
+    store64(cfg + 8, DEFAULT_OFFLINE_NS);
+    store64(cfg + 16, 0);
+    return cfg;
+}
+
+fn heartbeat_config_new(suspect_ns, offline_ns, eviction_cycles) {
+    var cfg = fl_alloc(24);
+    store64(cfg, suspect_ns);
+    store64(cfg + 8, offline_ns);
+    store64(cfg + 16, eviction_cycles);
+    return cfg;
+}
+
+# Classify status based on elapsed time
+fn _classify_status(elapsed_ns, cfg) {
+    if (elapsed_ns >= load64(cfg + 8)) {
+        return STATUS_OFFLINE;
+    }
+    if (elapsed_ns >= load64(cfg)) {
+        return STATUS_SUSPECT;
+    }
+    return STATUS_ONLINE;
+}
+
+fn status_name(s) {
+    if (s == STATUS_ONLINE) { return "online"; }
+    if (s == STATUS_SUSPECT) { return "suspect"; }
+    if (s == STATUS_OFFLINE) { return "offline"; }
+    return "unknown";
+}
+
+# NodeState struct (40 bytes):
+#   offset  0: status (i64)
+#   offset  8: last_seen_ns (i64)
+#   offset 16: metadata (i64) — arbitrary payload pointer
+#   offset 24: gpu_telemetry (i64) — vec of GpuTelemetry ptrs, or 0
+#   offset 32: offline_cycles (i64)
+
+fn _node_state_new(metadata) {
+    var ns = fl_alloc(40);
+    store64(ns, STATUS_ONLINE);
+    store64(ns + 8, time_now_ns());
+    store64(ns + 16, metadata);
+    store64(ns + 24, 0);
+    store64(ns + 32, 0);
+    return ns;
+}
+
+# GpuTelemetry struct (32 bytes):
+#   offset  0: util_pct_x100 (i64) — utilization % * 100
+#   offset  8: mem_used_mb (i64)
+#   offset 16: mem_total_mb (i64)
+#   offset 24: temp_c_x100 (i64) — temperature * 100, or -1 if unavailable
+
+fn gpu_telemetry_new(util_x100, mem_used, mem_total, temp_x100) {
+    var g = fl_alloc(32);
+    store64(g, util_x100);
+    store64(g + 8, mem_used);
+    store64(g + 16, mem_total);
+    store64(g + 24, temp_x100);
+    return g;
+}
+
+# FleetStats struct (56 bytes):
+#   offset  0: total_nodes
+#   offset  8: online
+#   offset 16: suspect
+#   offset 24: offline
+#   offset 32: total_gpus
+#   offset 40: total_vram_mb
+#   offset 48: available_vram_mb
+
+# --- HeartbeatTracker (single-threaded, for use within one thread) ---
+
+# HeartbeatTracker struct (16 bytes):
+#   offset 0: nodes (i64) — hashmap: string -> NodeState ptr
+#   offset 8: config (i64) — HeartbeatConfig ptr
+
+fn hb_tracker_new(cfg) {
+    var ht = fl_alloc(16);
+    store64(ht, map_new());
+    store64(ht + 8, cfg);
+    return ht;
+}
+
+fn hb_register(ht, id, metadata) {
+    var nodes = load64(ht);
+    var ns = _node_state_new(metadata);
+    map_set(nodes, id, ns);
+}
+
+fn hb_heartbeat(ht, id) {
+    var nodes = load64(ht);
+    var ns = map_get(nodes, id);
+    if (ns == 0) { return 0; }
+    store64(ns, STATUS_ONLINE);
+    store64(ns + 8, time_now_ns());
+    store64(ns + 32, 0);
+    return 1;
+}
+
+fn hb_heartbeat_with_metadata(ht, id, metadata) {
+    var nodes = load64(ht);
+    var ns = map_get(nodes, id);
+    if (ns == 0) { return 0; }
+    store64(ns, STATUS_ONLINE);
+    store64(ns + 8, time_now_ns());
+    store64(ns + 16, metadata);
+    store64(ns + 32, 0);
+    return 1;
+}
+
+fn hb_deregister(ht, id) {
+    var nodes = load64(ht);
+    return map_delete(nodes, id);
+}
+
+# Sweep all nodes, return vec of (id_str, new_status) pairs for transitions.
+# Each pair is stored as a 16-byte struct: { id_ptr, status }.
+fn hb_update_statuses(ht) {
+    var nodes = load64(ht);
+    var cfg = load64(ht + 8);
+    var now = time_now_ns();
+    var transitions = vec_new();
+
+    var keys = map_keys(nodes);
+    var i = 0;
+    var len = vec_len(keys);
+    while (i < len) {
+        var id = vec_get(keys, i);
+        var ns = map_get(nodes, id);
+        var elapsed = now - load64(ns + 8);
+        var prev = load64(ns);
+        var new_status = _classify_status(elapsed, cfg);
+
+        if (new_status == STATUS_OFFLINE) {
+            store64(ns + 32, load64(ns + 32) + 1);
+        } else {
+            store64(ns + 32, 0);
+        }
+
+        if (new_status != prev) {
+            store64(ns, new_status);
+            # Store transition as pair: push id then status
+            var pair = fl_alloc(16);
+            store64(pair, id);
+            store64(pair + 8, new_status);
+            vec_push(transitions, pair);
+        }
+        i = i + 1;
+    }
+
+    # Handle eviction
+    var eviction_cycles = load64(cfg + 16);
+    if (eviction_cycles > 0) {
+        var to_evict = vec_new();
+        keys = map_keys(nodes);
+        i = 0;
+        len = vec_len(keys);
+        while (i < len) {
+            var id = vec_get(keys, i);
+            var ns = map_get(nodes, id);
+            if (load64(ns + 32) >= eviction_cycles) {
+                vec_push(to_evict, id);
+            }
+            i = i + 1;
+        }
+        i = 0;
+        len = vec_len(to_evict);
+        while (i < len) {
+            map_delete(nodes, vec_get(to_evict, i));
+            i = i + 1;
+        }
+    }
+
+    return transitions;
+}
+
+fn hb_get(ht, id) {
+    return map_get(load64(ht), id);
+}
+
+fn hb_len(ht) {
+    return map_count(load64(ht));
+}
+
+fn hb_is_empty(ht) {
+    return map_count(load64(ht)) == 0;
+}
+
+# List nodes by status — returns vec of id string pointers
+fn hb_list_by_status(ht, status) {
+    var nodes = load64(ht);
+    var result = vec_new();
+    var keys = map_keys(nodes);
+    var i = 0;
+    var len = vec_len(keys);
+    while (i < len) {
+        var id = vec_get(keys, i);
+        var ns = map_get(nodes, id);
+        if (load64(ns) == status) {
+            vec_push(result, id);
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+fn hb_online(ht) {
+    return hb_list_by_status(ht, STATUS_ONLINE);
+}
+
+# --- ConcurrentHeartbeatTracker (thread-safe wrapper) ---
+
+# Same struct layout as HeartbeatTracker but adds a mutex at offset 16.
+# ConcurrentHeartbeatTracker struct (24 bytes):
+#   offset  0: nodes (i64) — hashmap
+#   offset  8: config (i64) — HeartbeatConfig ptr
+#   offset 16: mutex (i64)
+
+fn chb_tracker_new(cfg) {
+    var cht = fl_alloc(24);
+    store64(cht, map_new());
+    store64(cht + 8, cfg);
+    store64(cht + 16, mutex_new());
+    return cht;
+}
+
+fn chb_register(cht, id, metadata) {
+    var mtx = load64(cht + 16);
+    mutex_lock(mtx);
+    var ns = _node_state_new(metadata);
+    map_set(load64(cht), id, ns);
+    mutex_unlock(mtx);
+}
+
+fn chb_register_with_telemetry(cht, id, metadata, gpu_vec) {
+    var mtx = load64(cht + 16);
+    mutex_lock(mtx);
+    var ns = _node_state_new(metadata);
+    store64(ns + 24, gpu_vec);
+    map_set(load64(cht), id, ns);
+    mutex_unlock(mtx);
+}
+
+fn chb_heartbeat(cht, id) {
+    var mtx = load64(cht + 16);
+    mutex_lock(mtx);
+    var ns = map_get(load64(cht), id);
+    if (ns == 0) {
+        mutex_unlock(mtx);
+        return 0;
+    }
+    store64(ns, STATUS_ONLINE);
+    store64(ns + 8, time_now_ns());
+    store64(ns + 32, 0);
+    mutex_unlock(mtx);
+    return 1;
+}
+
+fn chb_heartbeat_with_metadata(cht, id, metadata) {
+    var mtx = load64(cht + 16);
+    mutex_lock(mtx);
+    var ns = map_get(load64(cht), id);
+    if (ns == 0) {
+        mutex_unlock(mtx);
+        return 0;
+    }
+    store64(ns, STATUS_ONLINE);
+    store64(ns + 8, time_now_ns());
+    store64(ns + 16, metadata);
+    store64(ns + 32, 0);
+    mutex_unlock(mtx);
+    return 1;
+}
+
+fn chb_heartbeat_with_telemetry(cht, id, gpu_vec) {
+    var mtx = load64(cht + 16);
+    mutex_lock(mtx);
+    var ns = map_get(load64(cht), id);
+    if (ns == 0) {
+        mutex_unlock(mtx);
+        return 0;
+    }
+    store64(ns, STATUS_ONLINE);
+    store64(ns + 8, time_now_ns());
+    store64(ns + 24, gpu_vec);
+    store64(ns + 32, 0);
+    mutex_unlock(mtx);
+    return 1;
+}
+
+fn chb_deregister(cht, id) {
+    var mtx = load64(cht + 16);
+    mutex_lock(mtx);
+    var r = map_delete(load64(cht), id);
+    mutex_unlock(mtx);
+    return r;
+}
+
+fn chb_update_statuses(cht) {
+    var mtx = load64(cht + 16);
+    mutex_lock(mtx);
+    # Reuse the single-threaded logic by constructing a temp tracker view
+    var nodes = load64(cht);
+    var cfg = load64(cht + 8);
+    var now = time_now_ns();
+    var transitions = vec_new();
+
+    var keys = map_keys(nodes);
+    var i = 0;
+    var len = vec_len(keys);
+    while (i < len) {
+        var id = vec_get(keys, i);
+        var ns = map_get(nodes, id);
+        var elapsed = now - load64(ns + 8);
+        var prev = load64(ns);
+        var new_status = _classify_status(elapsed, cfg);
+
+        if (new_status == STATUS_OFFLINE) {
+            store64(ns + 32, load64(ns + 32) + 1);
+        } else {
+            store64(ns + 32, 0);
+        }
+
+        if (new_status != prev) {
+            store64(ns, new_status);
+            var pair = fl_alloc(16);
+            store64(pair, id);
+            store64(pair + 8, new_status);
+            vec_push(transitions, pair);
+        }
+        i = i + 1;
+    }
+
+    # Handle eviction
+    var eviction_cycles = load64(cfg + 16);
+    if (eviction_cycles > 0) {
+        var to_evict = vec_new();
+        keys = map_keys(nodes);
+        i = 0;
+        len = vec_len(keys);
+        while (i < len) {
+            var id = vec_get(keys, i);
+            var ns = map_get(nodes, id);
+            if (load64(ns + 32) >= eviction_cycles) {
+                vec_push(to_evict, id);
+            }
+            i = i + 1;
+        }
+        i = 0;
+        len = vec_len(to_evict);
+        while (i < len) {
+            map_delete(nodes, vec_get(to_evict, i));
+            i = i + 1;
+        }
+    }
+
+    mutex_unlock(mtx);
+    return transitions;
+}
+
+fn chb_get(cht, id) {
+    var mtx = load64(cht + 16);
+    mutex_lock(mtx);
+    var ns = map_get(load64(cht), id);
+    mutex_unlock(mtx);
+    return ns;
+}
+
+fn chb_get_gpu_telemetry(cht, id) {
+    var mtx = load64(cht + 16);
+    mutex_lock(mtx);
+    var ns = map_get(load64(cht), id);
+    var result = 0;
+    if (ns != 0) {
+        result = load64(ns + 24);
+    }
+    mutex_unlock(mtx);
+    return result;
+}
+
+fn chb_len(cht) {
+    return map_count(load64(cht));
+}
+
+fn chb_is_empty(cht) {
+    return map_count(load64(cht)) == 0;
+}
+
+fn chb_list_by_status(cht, status) {
+    var mtx = load64(cht + 16);
+    mutex_lock(mtx);
+    var nodes = load64(cht);
+    var result = vec_new();
+    var keys = map_keys(nodes);
+    var i = 0;
+    var len = vec_len(keys);
+    while (i < len) {
+        var id = vec_get(keys, i);
+        var ns = map_get(nodes, id);
+        if (load64(ns) == status) {
+            vec_push(result, id);
+        }
+        i = i + 1;
+    }
+    mutex_unlock(mtx);
+    return result;
+}
+
+fn chb_online(cht) {
+    return chb_list_by_status(cht, STATUS_ONLINE);
+}
+
+# Fleet stats aggregation
+fn chb_fleet_stats(cht) {
+    var mtx = load64(cht + 16);
+    mutex_lock(mtx);
+    var nodes = load64(cht);
+    var s = fl_alloc(56);
+    # Zero-init
+    var j = 0;
+    while (j < 7) { store64(s + j * 8, 0); j = j + 1; }
+
+    var keys = map_keys(nodes);
+    var i = 0;
+    var len = vec_len(keys);
+    while (i < len) {
+        var id = vec_get(keys, i);
+        var ns = map_get(nodes, id);
+        store64(s, load64(s) + 1);
+        var st = load64(ns);
+        if (st == STATUS_ONLINE) { store64(s + 8, load64(s + 8) + 1); }
+        elif (st == STATUS_SUSPECT) { store64(s + 16, load64(s + 16) + 1); }
+        elif (st == STATUS_OFFLINE) { store64(s + 24, load64(s + 24) + 1); }
+
+        var gpu_vec = load64(ns + 24);
+        if (gpu_vec != 0) {
+            var g = 0;
+            var glen = vec_len(gpu_vec);
+            while (g < glen) {
+                var gp = vec_get(gpu_vec, g);
+                store64(s + 32, load64(s + 32) + 1);
+                var total_mb = load64(gp + 16);
+                var used_mb = load64(gp + 8);
+                store64(s + 40, load64(s + 40) + total_mb);
+                var avail = total_mb - used_mb;
+                if (avail < 0) { avail = 0; }
+                store64(s + 48, load64(s + 48) + avail);
+                g = g + 1;
+            }
+        }
+        i = i + 1;
+    }
+    mutex_unlock(mtx);
+    return s;
+}

@@ -1,0 +1,252 @@
+# majra — benchmarks (inline timing to avoid function pointer clobbering)
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/freelist.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/hashmap.cyr"
+include "lib/syscalls.cyr"
+include "lib/tagged.cyr"
+include "lib/fnptr.cyr"
+include "lib/thread.cyr"
+include "lib/bench.cyr"
+
+include "src/error.cyr"
+include "src/counter.cyr"
+include "src/envelope.cyr"
+include "src/namespace.cyr"
+include "src/metrics.cyr"
+include "src/ratelimit.cyr"
+include "src/heartbeat.cyr"
+include "src/queue.cyr"
+include "src/pubsub.cyr"
+include "src/relay.cyr"
+include "src/barrier.cyr"
+include "src/transport.cyr"
+
+fn main() {
+    alloc_init();
+    fl_init();
+
+    var benches = vec_new();
+    var N = 10000;
+    var i = 0;
+
+    # --- Envelope ---
+    var b = bench_new("envelope_new");
+    bench_batch_start(b);
+    i = 0;
+    while (i < N) {
+        envelope_new("node-1", TARGET_TOPIC, "events/test", 42);
+        i = i + 1;
+    }
+    bench_batch_stop(b, N);
+    vec_push(benches, b);
+
+    # --- PriorityQueue enqueue ---
+    var pq = pq_new();
+    b = bench_new("pq_enqueue");
+    bench_batch_start(b);
+    i = 0;
+    while (i < N) {
+        pq_enqueue(pq, queue_item_new(PRIORITY_NORMAL, i));
+        i = i + 1;
+    }
+    bench_batch_stop(b, N);
+    vec_push(benches, b);
+
+    # --- PriorityQueue dequeue ---
+    b = bench_new("pq_dequeue");
+    bench_batch_start(b);
+    i = 0;
+    while (i < N) {
+        pq_dequeue(pq);
+        i = i + 1;
+    }
+    bench_batch_stop(b, N);
+    vec_push(benches, b);
+
+    # --- Pattern matching ---
+    b = bench_new("pattern_exact");
+    bench_batch_start(b);
+    i = 0;
+    while (i < N) {
+        matches_pattern("events/node/created", "events/node/created");
+        i = i + 1;
+    }
+    bench_batch_stop(b, N);
+    vec_push(benches, b);
+
+    b = bench_new("pattern_wildcard_+");
+    bench_batch_start(b);
+    i = 0;
+    while (i < N) {
+        matches_pattern("events/node/created", "events/+/created");
+        i = i + 1;
+    }
+    bench_batch_stop(b, N);
+    vec_push(benches, b);
+
+    b = bench_new("pattern_wildcard_#");
+    bench_batch_start(b);
+    i = 0;
+    while (i < N) {
+        matches_pattern("events/node/created", "events/#");
+        i = i + 1;
+    }
+    bench_batch_stop(b, N);
+    vec_push(benches, b);
+
+    b = bench_new("pattern_no_match");
+    bench_batch_start(b);
+    i = 0;
+    while (i < N) {
+        matches_pattern("events/node/created", "logs/node/error");
+        i = i + 1;
+    }
+    bench_batch_stop(b, N);
+    vec_push(benches, b);
+
+    # --- PubSub publish (no subscribers = no blocking) ---
+    var ps = pubsub_new();
+    b = bench_new("pubsub_publish_nosub");
+    bench_batch_start(b);
+    i = 0;
+    while (i < N) {
+        pubsub_publish(ps, "events/test", i);
+        i = i + 1;
+    }
+    bench_batch_stop(b, N);
+    vec_push(benches, b);
+
+    # --- PubSub publish with 1 subscriber (drain between batches) ---
+    var ps2 = pubsub_new();
+    var ps2_ch = pubsub_subscribe(ps2, "events/test");
+    b = bench_new("pubsub_1sub_publish");
+    bench_batch_start(b);
+    i = 0;
+    while (i < 60) {
+        pubsub_publish(ps2, "events/test", i);
+        chan_recv(ps2_ch);
+        i = i + 1;
+    }
+    bench_batch_stop(b, 60);
+    vec_push(benches, b);
+
+    # --- DirectChannel send (large buffer) ---
+    var dc = direct_channel_new(N);
+    b = bench_new("direct_channel_send");
+    bench_batch_start(b);
+    i = 0;
+    while (i < N) {
+        direct_channel_send(dc, i);
+        i = i + 1;
+    }
+    bench_batch_stop(b, N);
+    vec_push(benches, b);
+
+    # --- Heartbeat ---
+    var cht = chb_tracker_new(heartbeat_config_default());
+    i = 0;
+    while (i < 100) {
+        var gpus = vec_new();
+        vec_push(gpus, gpu_telemetry_new(5000, 4000, 8000, 6000));
+        chb_register_with_telemetry(cht, str_data(str_from_int(i)), 0, gpus);
+        i = i + 1;
+    }
+    b = bench_new("heartbeat_100nodes");
+    bench_batch_start(b);
+    i = 0;
+    while (i < 1000) {
+        chb_heartbeat(cht, "0");
+        i = i + 1;
+    }
+    bench_batch_stop(b, 1000);
+    vec_push(benches, b);
+
+    b = bench_new("fleet_stats_100");
+    bench_batch_start(b);
+    i = 0;
+    while (i < 100) {
+        chb_fleet_stats(cht);
+        i = i + 1;
+    }
+    bench_batch_stop(b, 100);
+    vec_push(benches, b);
+
+    # --- RateLimit ---
+    var rl = ratelimit_new(1000000000, 1000000);
+    b = bench_new("ratelimit_check");
+    bench_batch_start(b);
+    i = 0;
+    while (i < N) {
+        ratelimit_check(rl, "key-0");
+        i = i + 1;
+    }
+    bench_batch_stop(b, N);
+    vec_push(benches, b);
+
+    # --- Relay send ---
+    var relay = relay_new("bench-node");
+    b = bench_new("relay_send");
+    bench_batch_start(b);
+    i = 0;
+    while (i < 1000) {
+        relay_send(relay, "node-2", "test", 0);
+        i = i + 1;
+    }
+    bench_batch_stop(b, 1000);
+    vec_push(benches, b);
+
+    # --- Barrier ---
+    b = bench_new("barrier_cycle");
+    bench_batch_start(b);
+    i = 0;
+    while (i < 1000) {
+        var bs = barrier_set_new();
+        var parts = vec_new();
+        vec_push(parts, "a"); vec_push(parts, "b"); vec_push(parts, "c"); vec_push(parts, "d");
+        barrier_create(bs, "sync", parts);
+        barrier_arrive(bs, "sync", "a");
+        barrier_arrive(bs, "sync", "b");
+        barrier_arrive(bs, "sync", "c");
+        barrier_arrive(bs, "sync", "d");
+        i = i + 1;
+    }
+    bench_batch_stop(b, 1000);
+    vec_push(benches, b);
+
+    # --- Circuit breaker ---
+    var cb = circuit_breaker_new(5, 1000000000);
+    b = bench_new("circuit_state");
+    bench_batch_start(b);
+    i = 0;
+    while (i < N) {
+        circuit_state(cb);
+        i = i + 1;
+    }
+    bench_batch_stop(b, N);
+    vec_push(benches, b);
+
+    # --- Counter ---
+    var ctr = counter_new();
+    b = bench_new("counter_inc");
+    bench_batch_start(b);
+    i = 0;
+    while (i < N) {
+        counter_inc(ctr);
+        i = i + 1;
+    }
+    bench_batch_stop(b, N);
+    vec_push(benches, b);
+
+    # --- Report ---
+    bench_report_all(benches);
+
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

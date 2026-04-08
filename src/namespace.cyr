@@ -1,0 +1,108 @@
+# majra/namespace — tenant-scoped identifier prefixing
+#
+# Provides namespace-prefixed access to pub/sub, relay, and rate limiting
+# so multiple tenants can share a single process without cross-contamination.
+#
+# Topics:   {prefix}/{topic}
+# Keys:     {prefix}:{key}
+# Node IDs: {prefix}:{node_id}
+
+# Namespace is just a Str pointer to the prefix string.
+# All functions take the prefix Str as their first argument.
+
+# Create a new namespace from a C string.
+fn namespace_new(prefix_cstr) {
+    return str_from(prefix_cstr);
+}
+
+# Get the prefix Str.
+fn namespace_prefix(ns) {
+    return ns;
+}
+
+# Prefix a topic with / delimiter.
+fn namespace_topic(ns, topic_cstr) {
+    var sb = str_builder_new();
+    str_builder_add(sb, ns);
+    str_builder_add_cstr(sb, "/");
+    str_builder_add_cstr(sb, topic_cstr);
+    return str_builder_build(sb);
+}
+
+# Prefix a key with : delimiter.
+fn namespace_key(ns, key_cstr) {
+    var sb = str_builder_new();
+    str_builder_add(sb, ns);
+    str_builder_add_cstr(sb, ":");
+    str_builder_add_cstr(sb, key_cstr);
+    return str_builder_build(sb);
+}
+
+# Prefix a node ID with : delimiter.
+fn namespace_node_id(ns, node_id_cstr) {
+    return namespace_key(ns, node_id_cstr);
+}
+
+# Prefix a subscription pattern with / delimiter.
+fn namespace_pattern(ns, pattern_cstr) {
+    return namespace_topic(ns, pattern_cstr);
+}
+
+# Build wildcard pattern: {prefix}/#
+fn namespace_wildcard(ns) {
+    var sb = str_builder_new();
+    str_builder_add(sb, ns);
+    str_builder_add_cstr(sb, "/#");
+    return str_builder_build(sb);
+}
+
+# Strip namespace prefix from a topic (/ delimiter).
+# Returns the bare topic as a Str, or 0 if topic doesn't belong to this namespace.
+fn namespace_strip_topic(ns, topic) {
+    var prefix_len = str_len(ns);
+    var topic_len = str_len(topic);
+    # Must be longer than prefix + "/"
+    if (topic_len <= prefix_len + 1) {
+        return 0;
+    }
+    # Check prefix matches
+    var pd = str_data(ns);
+    var td = str_data(topic);
+    var i = 0;
+    while (i < prefix_len) {
+        if (load8(pd + i) != load8(td + i)) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    # Check delimiter is /
+    if (load8(td + prefix_len) != 47) {
+        return 0;
+    }
+    # Return the rest after prefix/
+    return str_new(td + prefix_len + 1, topic_len - prefix_len - 1);
+}
+
+# Strip namespace prefix from a key (: delimiter).
+# Returns the bare key as a Str, or 0 if key doesn't belong to this namespace.
+fn namespace_strip_key(ns, key) {
+    var prefix_len = str_len(ns);
+    var key_len = str_len(key);
+    if (key_len <= prefix_len + 1) {
+        return 0;
+    }
+    var pd = str_data(ns);
+    var kd = str_data(key);
+    var i = 0;
+    while (i < prefix_len) {
+        if (load8(pd + i) != load8(kd + i)) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    # Check delimiter is :
+    if (load8(kd + prefix_len) != 58) {
+        return 0;
+    }
+    return str_new(kd + prefix_len + 1, key_len - prefix_len - 1);
+}

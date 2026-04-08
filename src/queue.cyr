@@ -1,0 +1,330 @@
+# majra/queue — multi-tier priority queue with managed lifecycle
+#
+# Replaces Rust's PriorityQueue<T>, ConcurrentPriorityQueue<T>, ManagedQueue<T>.
+# All payloads are i64 (pointers to user-allocated data).
+
+# Priority levels
+enum Priority {
+    PRIORITY_CRITICAL = 0;
+    PRIORITY_HIGH = 1;
+    PRIORITY_NORMAL = 2;
+    PRIORITY_LOW = 3;
+    PRIORITY_BACKGROUND = 4;
+}
+
+var NUM_PRIORITIES = 5;
+
+# Job states
+enum JobState {
+    JOB_QUEUED = 0;
+    JOB_RUNNING = 1;
+    JOB_COMPLETED = 2;
+    JOB_FAILED = 3;
+    JOB_CANCELLED = 4;
+}
+
+fn job_state_name(s) {
+    if (s == JOB_QUEUED) { return "queued"; }
+    if (s == JOB_RUNNING) { return "running"; }
+    if (s == JOB_COMPLETED) { return "completed"; }
+    if (s == JOB_FAILED) { return "failed"; }
+    if (s == JOB_CANCELLED) { return "cancelled"; }
+    return "unknown";
+}
+
+# QueueItem struct (40 bytes):
+#   offset  0: id_hi (i64)
+#   offset  8: id_lo (i64)
+#   offset 16: priority (i64)
+#   offset 24: payload (i64) — pointer to user data
+#   offset 32: job_key (i64) — Str ptr for ManagedQueue lookup (or 0)
+
+fn queue_item_new(priority, payload) {
+    var item = fl_alloc(40);
+    var hi = uuid_generate();
+    var lo = rethi();
+    store64(item, hi);
+    store64(item + 8, lo);
+    store64(item + 16, priority);
+    store64(item + 24, payload);
+    store64(item + 32, 0);
+    return item;
+}
+
+fn queue_item_id_hi(item) { return load64(item); }
+fn queue_item_id_lo(item) { return load64(item + 8); }
+fn queue_item_priority(item) { return load64(item + 16); }
+fn queue_item_payload(item) { return load64(item + 24); }
+fn queue_item_key(item) { return load64(item + 32); }
+
+# --- PriorityQueue ---
+# 5 vecs (one per priority level) + total count
+# PriorityQueue struct (48 bytes):
+#   offset  0-39: tiers[5] — vec ptrs (i64 each)
+#   offset 40: total (i64)
+
+fn pq_new() {
+    var pq = fl_alloc(48);
+    var i = 0;
+    while (i < NUM_PRIORITIES) {
+        store64(pq + i * 8, vec_new());
+        i = i + 1;
+    }
+    store64(pq + 40, 0);
+    return pq;
+}
+
+fn pq_enqueue(pq, item) {
+    var pri = load64(item + 16);
+    if (pri >= NUM_PRIORITIES) { pri = PRIORITY_NORMAL; }
+    var tier = load64(pq + pri * 8);
+    vec_push(tier, item);
+    store64(pq + 40, load64(pq + 40) + 1);
+}
+
+# Dequeue highest priority item. Returns item ptr or 0.
+fn pq_dequeue(pq) {
+    var i = 0;
+    while (i < NUM_PRIORITIES) {
+        var tier = load64(pq + i * 8);
+        if (vec_len(tier) > 0) {
+            var item = vec_get(tier, 0);
+            vec_remove(tier, 0);
+            store64(pq + 40, load64(pq + 40) - 1);
+            return item;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn pq_len(pq) { return load64(pq + 40); }
+fn pq_is_empty(pq) { return load64(pq + 40) == 0; }
+
+# --- ConcurrentPriorityQueue ---
+# Wraps PriorityQueue with mutex + futex for blocking dequeue.
+# ConcurrentPQ struct (32 bytes):
+#   offset  0: pq (i64)
+#   offset  8: mutex (i64)
+#   offset 16: waiters_flag (i64) — address for futex wait/wake
+#   offset 24: total_enqueued (i64) — counter ptr
+
+fn cpq_new() {
+    var cpq = fl_alloc(32);
+    store64(cpq, pq_new());
+    store64(cpq + 8, mutex_new());
+    store64(cpq + 16, 0);
+    store64(cpq + 24, counter_new());
+    return cpq;
+}
+
+fn cpq_enqueue(cpq, item) {
+    var mtx = load64(cpq + 8);
+    mutex_lock(mtx);
+    pq_enqueue(load64(cpq), item);
+    counter_inc(load64(cpq + 24));
+    # Wake one waiter
+    store64(cpq + 16, load64(cpq + 16) + 1);
+    mutex_unlock(mtx);
+    syscall(SYS_FUTEX, cpq + 16, FUTEX_WAKE, 1, 0, 0, 0);
+}
+
+fn cpq_dequeue(cpq) {
+    var mtx = load64(cpq + 8);
+    mutex_lock(mtx);
+    var item = pq_dequeue(load64(cpq));
+    mutex_unlock(mtx);
+    return item;
+}
+
+# Blocking dequeue — waits until an item is available.
+fn cpq_dequeue_wait(cpq) {
+    while (1) {
+        var mtx = load64(cpq + 8);
+        mutex_lock(mtx);
+        var item = pq_dequeue(load64(cpq));
+        if (item != 0) {
+            mutex_unlock(mtx);
+            return item;
+        }
+        var val = load64(cpq + 16);
+        mutex_unlock(mtx);
+        # Wait for enqueue notification
+        syscall(SYS_FUTEX, cpq + 16, FUTEX_WAIT, val, 0, 0, 0);
+    }
+}
+
+fn cpq_len(cpq) {
+    return pq_len(load64(cpq));
+}
+
+# --- ManagedQueue ---
+# Job lifecycle: Queued -> Running -> Completed/Failed/Cancelled
+#
+# ManagedItem struct (72 bytes):
+#   offset  0: id_hi
+#   offset  8: id_lo
+#   offset 16: priority
+#   offset 24: payload
+#   offset 32: state (JobState)
+#   offset 40: enqueued_at_ns
+#   offset 48: started_at_ns
+#   offset 56: finished_at_ns
+#   offset 64: max_concurrent (i64) — 0 = unlimited
+
+# ManagedQueue struct (64 bytes):
+#   offset  0: cpq (i64) — ConcurrentPriorityQueue ptr
+#   offset  8: jobs (i64) — hashmap: id_str -> ManagedItem ptr
+#   offset 16: mutex (i64)
+#   offset 24: name (i64) — Str ptr
+#   offset 32: running_count (i64)
+#   offset 40: max_concurrent (i64) — 0 = unlimited
+#   offset 48: metrics (i64) — metrics vtable ptr (or 0)
+#   offset 56: total_completed (i64) — counter ptr
+
+fn mq_new(name, max_concurrent) {
+    var mq = fl_alloc(64);
+    store64(mq, cpq_new());
+    store64(mq + 8, map_new());
+    store64(mq + 16, mutex_new());
+    store64(mq + 24, name);
+    store64(mq + 32, 0);
+    store64(mq + 40, max_concurrent);
+    store64(mq + 48, 0);
+    store64(mq + 56, counter_new());
+    return mq;
+}
+
+fn mq_with_metrics(mq, metrics_vt) {
+    store64(mq + 48, metrics_vt);
+}
+
+# Sequential job ID counter for stable map keys.
+var _mq_next_job_id = 1;
+
+fn _next_job_key() {
+    var id = _mq_next_job_id;
+    _mq_next_job_id = _mq_next_job_id + 1;
+    return str_from_int(id);
+}
+
+fn mq_enqueue(mq, priority, payload) {
+    var item = queue_item_new(priority, payload);
+    var key = _next_job_key();
+    store64(item + 32, key);
+
+    # Create managed item
+    var mi = fl_alloc(72);
+    store64(mi, load64(item));
+    store64(mi + 8, load64(item + 8));
+    store64(mi + 16, priority);
+    store64(mi + 24, payload);
+    store64(mi + 32, JOB_QUEUED);
+    store64(mi + 40, time_now_ns());
+    store64(mi + 48, 0);
+    store64(mi + 56, 0);
+    store64(mi + 64, 0);
+
+    var mtx = load64(mq + 16);
+    mutex_lock(mtx);
+    map_set(load64(mq + 8), key, mi);
+    mutex_unlock(mtx);
+
+    cpq_enqueue(load64(mq), item);
+
+    var vt = load64(mq + 48);
+    if (vt != 0) {
+        metrics_queue_enqueued(vt, load64(mq + 24), priority);
+    }
+
+    return item;
+}
+
+# Dequeue next job and mark it Running.
+fn mq_dequeue(mq) {
+    var mtx = load64(mq + 16);
+    var max_c = load64(mq + 40);
+
+    # Check concurrency limit
+    if (max_c > 0) {
+        mutex_lock(mtx);
+        if (load64(mq + 32) >= max_c) {
+            mutex_unlock(mtx);
+            return 0;
+        }
+        mutex_unlock(mtx);
+    }
+
+    var item = cpq_dequeue(load64(mq));
+    if (item == 0) { return 0; }
+
+    var key = load64(item + 32);
+
+    mutex_lock(mtx);
+    var mi = map_get(load64(mq + 8), key);
+    if (mi != 0) {
+        store64(mi + 32, JOB_RUNNING);
+        store64(mi + 48, time_now_ns());
+        store64(mq + 32, load64(mq + 32) + 1);
+    }
+    mutex_unlock(mtx);
+
+    var vt = load64(mq + 48);
+    if (vt != 0) {
+        metrics_queue_dequeued(vt, load64(mq + 24), load64(item + 16));
+    }
+
+    return item;
+}
+
+# Mark a job as completed.
+fn mq_complete(mq, item) {
+    var key = load64(item + 32);
+    var mtx = load64(mq + 16);
+
+    mutex_lock(mtx);
+    var mi = map_get(load64(mq + 8), key);
+    if (mi != 0) {
+        store64(mi + 32, JOB_COMPLETED);
+        store64(mi + 56, time_now_ns());
+        store64(mq + 32, load64(mq + 32) - 1);
+        counter_inc(load64(mq + 56));
+    }
+    mutex_unlock(mtx);
+}
+
+# Mark a job as failed.
+fn mq_fail(mq, item) {
+    var key = load64(item + 32);
+    var mtx = load64(mq + 16);
+
+    mutex_lock(mtx);
+    var mi = map_get(load64(mq + 8), key);
+    if (mi != 0) {
+        store64(mi + 32, JOB_FAILED);
+        store64(mi + 56, time_now_ns());
+        store64(mq + 32, load64(mq + 32) - 1);
+    }
+    mutex_unlock(mtx);
+}
+
+# Cancel a queued job (only from QUEUED state).
+fn mq_cancel(mq, item) {
+    var key = load64(item + 32);
+    var mtx = load64(mq + 16);
+
+    mutex_lock(mtx);
+    var mi = map_get(load64(mq + 8), key);
+    if (mi != 0) {
+        if (load64(mi + 32) == JOB_QUEUED) {
+            store64(mi + 32, JOB_CANCELLED);
+            store64(mi + 56, time_now_ns());
+        }
+    }
+    mutex_unlock(mtx);
+}
+
+fn mq_queued_count(mq) { return cpq_len(load64(mq)); }
+fn mq_running_count(mq) { return load64(mq + 32); }
+fn mq_total_completed(mq) { return counter_get(load64(mq + 56)); }
+fn mq_job_count(mq) { return map_count(load64(mq + 8)); }

@@ -1,6 +1,11 @@
-# Build artifacts
+# Cyrius build output
+/build/
+
+# Rust build artifacts (archived source)
 /target/
+rust-old/target/
 Cargo.lock
+rust-old/Cargo.lock
 
 # Editor / IDE
 *.swp
@@ -41,3 +46,7 @@ supply-chain/.cache/
 # Environment / secrets
 .env
 .env.*
+
+# Temporary test files
+/tmp/
+*.tmp

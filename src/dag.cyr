@@ -1,0 +1,318 @@
+# majra/dag — DAG workflow engine with parallel step scheduling
+#
+# Replaces Rust's WorkflowEngine, WorkflowDefinition, WorkflowRun, etc.
+# Uses thread_create/join for parallel step execution within tiers.
+
+# Workflow step status
+enum StepStatus {
+    STEP_PENDING = 0;
+    STEP_RUNNING = 1;
+    STEP_COMPLETED = 2;
+    STEP_FAILED = 3;
+    STEP_SKIPPED = 4;
+}
+
+# Workflow run status
+enum RunStatus {
+    RUN_PENDING = 0;
+    RUN_RUNNING = 1;
+    RUN_COMPLETED = 2;
+    RUN_FAILED = 3;
+    RUN_CANCELLED = 4;
+}
+
+# Error policies
+enum ErrorPolicy {
+    POLICY_FAIL = 0;
+    POLICY_CONTINUE = 1;
+    POLICY_SKIP = 2;
+}
+
+# Trigger modes
+enum TriggerMode {
+    TRIGGER_ALL = 0;
+    TRIGGER_ANY = 1;
+}
+
+# WorkflowStep struct (48 bytes):
+#   offset  0: id (i64) — C string
+#   offset  8: name (i64) — C string
+#   offset 16: depends_on (i64) — vec of step id strings
+#   offset 24: trigger_mode (i64) — TRIGGER_ALL or TRIGGER_ANY
+#   offset 32: error_policy (i64)
+#   offset 40: retry_max (i64)
+
+fn workflow_step_new(id, name) {
+    var s = fl_alloc(48);
+    store64(s, id);
+    store64(s + 8, name);
+    store64(s + 16, vec_new());
+    store64(s + 24, TRIGGER_ALL);
+    store64(s + 32, POLICY_FAIL);
+    store64(s + 40, 0);
+    return s;
+}
+
+fn step_add_dep(step, dep_id) {
+    vec_push(load64(step + 16), dep_id);
+}
+
+fn step_set_retry(step, max_retries) {
+    store64(step + 40, max_retries);
+}
+
+fn step_set_error_policy(step, policy) {
+    store64(step + 32, policy);
+}
+
+fn step_set_trigger_mode(step, mode) {
+    store64(step + 24, mode);
+}
+
+# WorkflowDefinition struct (32 bytes):
+#   offset  0: id (i64) — C string
+#   offset  8: name (i64) — C string
+#   offset 16: steps (i64) — vec of WorkflowStep ptrs
+#   offset 24: enabled (i64) — 0 or 1
+
+fn workflow_def_new(id, name) {
+    var d = fl_alloc(32);
+    store64(d, id);
+    store64(d + 8, name);
+    store64(d + 16, vec_new());
+    store64(d + 24, 1);
+    return d;
+}
+
+fn workflow_def_add_step(def, step) {
+    vec_push(load64(def + 16), step);
+}
+
+# StepResult struct (24 bytes):
+#   offset  0: status (i64)
+#   offset  8: output (i64) — arbitrary result data
+#   offset 16: error_msg (i64) — C string or 0
+
+fn step_result_new(status, output, error_msg) {
+    var sr = fl_alloc(24);
+    store64(sr, status);
+    store64(sr + 8, output);
+    store64(sr + 16, error_msg);
+    return sr;
+}
+
+# StepExecutor vtable (8 bytes):
+#   offset 0: execute_fn(step_ptr, context_ptr) -> StepResult ptr
+
+# WorkflowContext struct (16 bytes):
+#   offset  0: step_results (i64) — hashmap: step_id -> StepResult ptr
+#   offset  8: input (i64) — workflow input data
+
+fn workflow_context_new(input) {
+    var ctx = fl_alloc(16);
+    store64(ctx, map_new());
+    store64(ctx + 8, input);
+    return ctx;
+}
+
+fn context_get_step_result(ctx, step_id) {
+    return map_get(load64(ctx), step_id);
+}
+
+fn context_set_step_result(ctx, step_id, result) {
+    map_set(load64(ctx), step_id, result);
+}
+
+# Check if a step's dependencies are satisfied.
+fn _deps_satisfied(step, ctx) {
+    var deps = load64(step + 16);
+    var mode = load64(step + 24);
+    var dep_count = vec_len(deps);
+    if (dep_count == 0) { return 1; }
+
+    var satisfied = 0;
+    var i = 0;
+    while (i < dep_count) {
+        var dep_id = vec_get(deps, i);
+        var result = context_get_step_result(ctx, dep_id);
+        if (result != 0 && load64(result) == STEP_COMPLETED) {
+            satisfied = satisfied + 1;
+        }
+        i = i + 1;
+    }
+
+    if (mode == TRIGGER_ALL) {
+        return satisfied == dep_count;
+    }
+    # TRIGGER_ANY
+    return satisfied > 0;
+}
+
+# Topological sort into tiers (Kahn's algorithm).
+# Returns a vec of vecs (each inner vec is a tier of step pointers).
+fn _compute_tiers(def) {
+    var steps = load64(def + 16);
+    var num_steps = vec_len(steps);
+    var tiers = vec_new();
+
+    # Build in-degree map: step_id -> count of dependencies
+    var in_degree = map_new();
+    var i = 0;
+    while (i < num_steps) {
+        var s = vec_get(steps, i);
+        var sid = load64(s);
+        map_set(in_degree, sid, vec_len(load64(s + 16)));
+        i = i + 1;
+    }
+
+    # Iteratively collect steps with 0 in-degree
+    var remaining = num_steps;
+    while (remaining > 0) {
+        var tier = vec_new();
+        i = 0;
+        while (i < num_steps) {
+            var s = vec_get(steps, i);
+            var sid = load64(s);
+            if (map_get(in_degree, sid) == 0) {
+                vec_push(tier, s);
+                map_set(in_degree, sid, 0 - 1);
+            }
+            i = i + 1;
+        }
+        if (vec_len(tier) == 0) {
+            break;
+        }
+        # Reduce in-degree for dependents
+        var j = 0;
+        var tlen = vec_len(tier);
+        while (j < tlen) {
+            var done_step = vec_get(tier, j);
+            var done_id = load64(done_step);
+            # For each step, check if it depends on done_id
+            i = 0;
+            while (i < num_steps) {
+                var s = vec_get(steps, i);
+                var deps = load64(s + 16);
+                var k = 0;
+                var dlen = vec_len(deps);
+                while (k < dlen) {
+                    if (streq(vec_get(deps, k), done_id) == 1) {
+                        var sid = load64(s);
+                        var cur = map_get(in_degree, sid);
+                        if (cur > 0) {
+                            map_set(in_degree, sid, cur - 1);
+                        }
+                    }
+                    k = k + 1;
+                }
+                i = i + 1;
+            }
+            j = j + 1;
+        }
+        remaining = remaining - vec_len(tier);
+        vec_push(tiers, tier);
+    }
+
+    return tiers;
+}
+
+# Execute a workflow definition with a given executor function and input.
+# executor_fn(step_ptr, ctx_ptr) -> StepResult ptr
+# Returns: RUN_COMPLETED or RUN_FAILED
+fn workflow_execute(def, executor_fn, input) {
+    var ctx = workflow_context_new(input);
+    var tiers = _compute_tiers(def);
+    var num_tiers = vec_len(tiers);
+    var final_status = RUN_COMPLETED;
+
+    var t = 0;
+    while (t < num_tiers) {
+        var tier = vec_get(tiers, t);
+        var tier_len = vec_len(tier);
+
+        # Execute all steps in this tier
+        var s = 0;
+        while (s < tier_len) {
+            var step = vec_get(tier, s);
+            var step_id = load64(step);
+
+            # Check dependencies
+            if (_deps_satisfied(step, ctx) == 0) {
+                context_set_step_result(ctx, step_id, step_result_new(STEP_SKIPPED, 0, 0));
+                s = s + 1;
+                continue;
+            }
+
+            # Execute with retry
+            var max_retries = load64(step + 40);
+            var attempt = 0;
+            var result = 0;
+            while (attempt <= max_retries) {
+                result = fncall2(executor_fn, step, ctx);
+                if (result != 0 && load64(result) == STEP_COMPLETED) {
+                    break;
+                }
+                attempt = attempt + 1;
+                if (attempt <= max_retries) {
+                    # Backoff: sleep attempt * 10ms
+                    var ts[2];
+                    store64(&ts, 0);
+                    store64(&ts + 8, attempt * 10000000);
+                    syscall(35, &ts, 0);
+                }
+            }
+
+            if (result == 0) {
+                result = step_result_new(STEP_FAILED, 0, "executor returned null");
+            }
+
+            context_set_step_result(ctx, step_id, result);
+
+            # Handle failure based on error policy
+            if (load64(result) == STEP_FAILED) {
+                var policy = load64(step + 32);
+                if (policy == POLICY_FAIL) {
+                    final_status = RUN_FAILED;
+                    return final_status;
+                }
+                if (policy == POLICY_SKIP) {
+                    context_set_step_result(ctx, step_id, step_result_new(STEP_SKIPPED, 0, 0));
+                }
+                # POLICY_CONTINUE: keep going
+            }
+
+            s = s + 1;
+        }
+        t = t + 1;
+    }
+
+    return final_status;
+}
+
+# InMemoryWorkflowStorage: hashmap-based storage for definitions and runs.
+# WorkflowStorage struct (16 bytes):
+#   offset 0: definitions (i64) — hashmap: id -> WorkflowDefinition ptr
+#   offset 8: runs (i64) — hashmap: id -> run data ptr
+
+fn workflow_storage_new() {
+    var ws = fl_alloc(16);
+    store64(ws, map_new());
+    store64(ws + 8, map_new());
+    return ws;
+}
+
+fn storage_save_def(ws, def) {
+    map_set(load64(ws), load64(def), def);
+}
+
+fn storage_get_def(ws, id) {
+    return map_get(load64(ws), id);
+}
+
+fn storage_delete_def(ws, id) {
+    return map_delete(load64(ws), id);
+}
+
+fn storage_list_defs(ws) {
+    return map_values(load64(ws));
+}

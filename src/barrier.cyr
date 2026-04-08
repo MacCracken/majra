@@ -1,0 +1,295 @@
+# majra/barrier — N-way barrier synchronization with deadlock recovery
+#
+# A barrier waits for N participants to arrive before releasing all of them.
+# Supports force() to unblock when a participant is known dead.
+
+# BarrierResult values
+enum BarrierResultKind {
+    BARRIER_WAITING = 0;
+    BARRIER_RELEASED = 1;
+    BARRIER_UNKNOWN = 2;
+}
+
+# BarrierResult struct (24 bytes):
+#   offset 0: kind (i64)
+#   offset 8: arrived (i64)
+#   offset 16: expected (i64)
+
+fn _barrier_result(kind, arrived, expected) {
+    var r = fl_alloc(24);
+    store64(r, kind);
+    store64(r + 8, arrived);
+    store64(r + 16, expected);
+    return r;
+}
+
+# --- Helper: vec-based string set ---
+# Since we don't have HashSet, use a vec of strings with dedup.
+
+fn _set_contains(v, s) {
+    var i = 0;
+    var len = vec_len(v);
+    while (i < len) {
+        if (streq(vec_get(v, i), s) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _set_add(v, s) {
+    if (_set_contains(v, s) == 0) {
+        vec_push(v, s);
+    }
+}
+
+fn _set_remove(v, s) {
+    var i = 0;
+    var len = vec_len(v);
+    while (i < len) {
+        if (streq(vec_get(v, i), s) == 1) {
+            vec_remove(v, i);
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Check if arrived is a superset of expected
+fn _set_is_superset(arrived, expected) {
+    var i = 0;
+    var len = vec_len(expected);
+    while (i < len) {
+        if (_set_contains(arrived, vec_get(expected, i)) == 0) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# BarrierState struct (24 bytes):
+#   offset  0: expected (i64) — vec of participant name strings
+#   offset  8: arrived (i64) — vec of participant name strings
+#   offset 16: was_forced (i64)
+
+fn _barrier_state_new(participants_vec) {
+    var bs = fl_alloc(24);
+    store64(bs, participants_vec);
+    store64(bs + 8, vec_new());
+    store64(bs + 16, 0);
+    return bs;
+}
+
+fn _check_barrier(bs) {
+    var arrived = load64(bs + 8);
+    var expected = load64(bs);
+    if (_set_is_superset(arrived, expected) == 1) {
+        return _barrier_result(BARRIER_RELEASED, vec_len(arrived), vec_len(expected));
+    }
+    return _barrier_result(BARRIER_WAITING, vec_len(arrived), vec_len(expected));
+}
+
+# --- BarrierSet (single-threaded) ---
+# BarrierSet struct (8 bytes):
+#   offset 0: barriers (i64) — hashmap: name_str -> BarrierState ptr
+
+fn barrier_set_new() {
+    var bs = fl_alloc(8);
+    store64(bs, map_new());
+    return bs;
+}
+
+# Create a barrier. participants is a vec of name strings.
+fn barrier_create(bs, name, participants) {
+    var barriers = load64(bs);
+    var existed = map_has(barriers, name);
+    map_set(barriers, name, _barrier_state_new(participants));
+    return existed == 0;
+}
+
+fn barrier_arrive(bs, name, participant) {
+    var state = map_get(load64(bs), name);
+    if (state == 0) {
+        return _barrier_result(BARRIER_UNKNOWN, 0, 0);
+    }
+    _set_add(load64(state + 8), participant);
+    return _check_barrier(state);
+}
+
+fn barrier_force(bs, name, dead_participant) {
+    var state = map_get(load64(bs), name);
+    if (state == 0) {
+        return _barrier_result(BARRIER_UNKNOWN, 0, 0);
+    }
+    _set_remove(load64(state), dead_participant);
+    _set_remove(load64(state + 8), dead_participant);
+    store64(state + 16, 1);
+    return _check_barrier(state);
+}
+
+# Complete and remove a barrier. Returns 1 if found, 0 otherwise.
+fn barrier_complete(bs, name) {
+    return map_delete(load64(bs), name);
+}
+
+fn barrier_set_len(bs) {
+    return map_count(load64(bs));
+}
+
+fn barrier_set_is_empty(bs) {
+    return map_count(load64(bs)) == 0;
+}
+
+# --- ConcurrentBarrierSet (thread-safe) ---
+# Adds a mutex + futex-based notification for arrive_and_wait.
+# ConcurrentBarrierState extends BarrierState:
+#   offset  0: expected vec
+#   offset  8: arrived vec
+#   offset 16: was_forced
+#   offset 24: released_flag (i64) — 0 or 1
+#   offset 32: futex_addr (i64) — address for futex wait/wake
+
+fn _cbarrier_state_new(participants) {
+    var cbs = fl_alloc(40);
+    store64(cbs, participants);
+    store64(cbs + 8, vec_new());
+    store64(cbs + 16, 0);
+    store64(cbs + 24, 0);
+    store64(cbs + 32, 0);
+    return cbs;
+}
+
+fn _cbarrier_check_release(state) {
+    var arrived = load64(state + 8);
+    var expected = load64(state);
+    if (_set_is_superset(arrived, expected) == 1) {
+        store64(state + 24, 1);
+        store64(state + 32, load64(state + 32) + 1);
+        syscall(SYS_FUTEX, state + 32, FUTEX_WAKE, 1000, 0, 0, 0);
+        return 1;
+    }
+    return 0;
+}
+
+# ConcurrentBarrierSet struct (16 bytes):
+#   offset 0: barriers (i64) — hashmap
+#   offset 8: mutex (i64)
+
+fn cbarrier_set_new() {
+    var cbs = fl_alloc(16);
+    store64(cbs, map_new());
+    store64(cbs + 8, mutex_new());
+    return cbs;
+}
+
+fn cbarrier_create(cbs, name, participants) {
+    var mtx = load64(cbs + 8);
+    mutex_lock(mtx);
+    var barriers = load64(cbs);
+    var existed = map_has(barriers, name);
+    map_set(barriers, name, _cbarrier_state_new(participants));
+    mutex_unlock(mtx);
+    return existed == 0;
+}
+
+fn cbarrier_arrive(cbs, name, participant) {
+    var mtx = load64(cbs + 8);
+    mutex_lock(mtx);
+    var state = map_get(load64(cbs), name);
+    if (state == 0) {
+        mutex_unlock(mtx);
+        return _barrier_result(BARRIER_UNKNOWN, 0, 0);
+    }
+    _set_add(load64(state + 8), participant);
+
+    if (_cbarrier_check_release(state) == 1) {
+        mutex_unlock(mtx);
+        return _barrier_result(BARRIER_RELEASED, vec_len(load64(state + 8)), vec_len(load64(state)));
+    }
+    var arrived = vec_len(load64(state + 8));
+    var expected = vec_len(load64(state));
+    mutex_unlock(mtx);
+    return _barrier_result(BARRIER_WAITING, arrived, expected);
+}
+
+# Globals for arrive_and_wait — avoids local clobbering across function calls
+var _aaw_result_state = 0;
+var _aaw_result_code = 0;
+
+fn _cbarrier_do_arrive(cbs_ptr, name, participant) {
+    var barriers = load64(cbs_ptr);
+    var state = map_get(barriers, name);
+    if (state == 0) {
+        _aaw_result_state = 0;
+        _aaw_result_code = ERR_BARRIER;
+        return 0;
+    }
+    _set_add(load64(state + 8), participant);
+    if (_cbarrier_check_release(state) == 1) {
+        _aaw_result_state = 0;
+        _aaw_result_code = 0;
+        return 0;
+    }
+    _aaw_result_state = state;
+    _aaw_result_code = 1;
+    return 0;
+}
+
+# Blocking arrive — waits until the barrier releases.
+fn cbarrier_arrive_and_wait(cbs, name, participant) {
+    var mtx = load64(cbs + 8);
+    mutex_lock(mtx);
+    _cbarrier_do_arrive(load64(cbs), name, participant);
+
+    if (_aaw_result_code != 1) {
+        mutex_unlock(mtx);
+        return _aaw_result_code;
+    }
+
+    var state = _aaw_result_state;
+    var futex_addr = state + 32;
+    var released_addr = state + 24;
+    var val = load64(futex_addr);
+    mutex_unlock(mtx);
+
+    while (1) {
+        if (load64(released_addr) == 1) { return 0; }
+        syscall(SYS_FUTEX, futex_addr, FUTEX_WAIT, val, 0, 0, 0);
+        if (load64(released_addr) == 1) { return 0; }
+        val = load64(futex_addr);
+    }
+}
+
+fn cbarrier_force(cbs, name, dead_participant) {
+    var mtx = load64(cbs + 8);
+    mutex_lock(mtx);
+    var state = map_get(load64(cbs), name);
+    if (state == 0) {
+        mutex_unlock(mtx);
+        return _barrier_result(BARRIER_UNKNOWN, 0, 0);
+    }
+    _set_remove(load64(state), dead_participant);
+    _set_remove(load64(state + 8), dead_participant);
+    store64(state + 16, 1);
+
+    if (_cbarrier_check_release(state) == 1) {
+        mutex_unlock(mtx);
+        return _barrier_result(BARRIER_RELEASED, vec_len(load64(state + 8)), vec_len(load64(state)));
+    }
+    var arrived = vec_len(load64(state + 8));
+    var expected = vec_len(load64(state));
+    mutex_unlock(mtx);
+    return _barrier_result(BARRIER_WAITING, arrived, expected);
+}
+
+fn cbarrier_complete(cbs, name) {
+    var mtx = load64(cbs + 8);
+    mutex_lock(mtx);
+    var r = map_delete(load64(cbs), name);
+    mutex_unlock(mtx);
+    return r;
+}
+
+fn cbarrier_len(cbs) { return map_count(load64(cbs)); }
+fn cbarrier_is_empty(cbs) { return map_count(load64(cbs)) == 0; }
