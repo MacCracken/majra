@@ -13,12 +13,12 @@ CORE=$?
 
 echo ""
 echo "--- expanded tests ---"
-cyrius build tests/test_core.cyr "$BUILD/test_core" && "$BUILD/test_core"
+cyrius build tests/test_core.tcyr "$BUILD/test_core" && "$BUILD/test_core"
 EXPANDED=$?
 
 echo ""
 echo "--- backend tests ---"
-cyrius build tests/test_backends.cyr "$BUILD/test_backends" && "$BUILD/test_backends"
+cyrius build tests/test_backends.tcyr "$BUILD/test_backends" && "$BUILD/test_backends"
 BACKEND=$?
 
 echo ""

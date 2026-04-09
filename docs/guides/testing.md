@@ -11,11 +11,11 @@ cyrius audit
 
 # Individual test suites (manual)
 cyrius build src/main.cyr build/majra && ./build/majra
-cyrius build tests/test_core.cyr build/test_core && ./build/test_core
-cyrius build tests/test_backends.cyr build/test_backends && ./build/test_backends
+cyrius build tests/test_core.tcyr build/test_core && ./build/test_core
+cyrius build tests/test_backends.tcyr build/test_backends && ./build/test_backends
 
 # Live integration tests (requires Redis on :6379, PostgreSQL on :5432)
-cyrius build tests/test_live.cyr build/test_live && ./build/test_live
+cyrius build tests/test_live.tcyr build/test_live && ./build/test_live
 ```
 
 ## Test Suites
@@ -23,9 +23,9 @@ cyrius build tests/test_live.cyr build/test_live && ./build/test_live
 | Suite | File | Assertions | Coverage |
 |-------|------|-----------|----------|
 | Core | `src/main.cyr` | 144 | All 15 core modules |
-| Expanded | `tests/test_core.cyr` | 92 | Deep: queue lifecycle, pubsub patterns, DAG retry, fleet routing, circuit breaker, integration tests |
-| Backends | `tests/test_backends.cyr` | 25 | base64, SHA-1, encrypted IPC nonce, WebSocket RFC 6455, RESP, PG wire |
-| Live | `tests/test_live.cyr` | 36 | 7 Redis (ping, SET/GET, SETEX, sorted sets, hash, PUBLISH, KEYS) + 4 PostgreSQL (connect, query, CRUD, workflow storage) |
+| Expanded | `tests/test_core.tcyr` | 92 | Deep: queue lifecycle, pubsub patterns, DAG retry, fleet routing, circuit breaker, integration tests |
+| Backends | `tests/test_backends.tcyr` | 25 | base64, SHA-1, encrypted IPC nonce, WebSocket RFC 6455, RESP, PG wire |
+| Live | `tests/test_live.tcyr` | 36 | 7 Redis (ping, SET/GET, SETEX, sorted sets, hash, PUBLISH, KEYS) + 4 PostgreSQL (connect, query, CRUD, workflow storage) |
 | **Total** | | **295** | |
 
 ## Test Categories
@@ -33,19 +33,19 @@ cyrius build tests/test_live.cyr build/test_live && ./build/test_live
 | Category | Where | Count |
 |----------|-------|-------|
 | Error/envelope/namespace | `src/main.cyr` | ~30 |
-| Queue (priority, lifecycle, cancel) | `src/main.cyr` + `tests/test_core.cyr` | ~30 |
-| PubSub (patterns, wildcards, filters) | `src/main.cyr` + `tests/test_core.cyr` | ~25 |
-| Relay (send, subscribe, routing) | `src/main.cyr` + `tests/test_core.cyr` | ~15 |
-| Barrier (sync, concurrent, force) | `src/main.cyr` + `tests/test_core.cyr` | ~15 |
-| Heartbeat (FSM, telemetry, eviction) | `src/main.cyr` + `tests/test_core.cyr` | ~25 |
-| RateLimit (bucket, window, keys) | `src/main.cyr` + `tests/test_core.cyr` | ~15 |
-| Fleet (routing, submit, rebalance) | `src/main.cyr` + `tests/test_core.cyr` | ~10 |
-| DAG (linear, parallel, retry, skip) | `src/main.cyr` + `tests/test_core.cyr` | ~12 |
-| Transport (circuit breaker, pool) | `src/main.cyr` + `tests/test_core.cyr` | ~10 |
-| Crypto/protocol (base64, SHA-1, RESP, PG) | `tests/test_backends.cyr` | ~25 |
-| Live Redis | `tests/test_live.cyr` | ~20 |
-| Live PostgreSQL | `tests/test_live.cyr` | ~16 |
-| Integration (training job, namespaced pubsub) | `tests/test_core.cyr` | ~10 |
+| Queue (priority, lifecycle, cancel) | `src/main.cyr` + `tests/test_core.tcyr` | ~30 |
+| PubSub (patterns, wildcards, filters) | `src/main.cyr` + `tests/test_core.tcyr` | ~25 |
+| Relay (send, subscribe, routing) | `src/main.cyr` + `tests/test_core.tcyr` | ~15 |
+| Barrier (sync, concurrent, force) | `src/main.cyr` + `tests/test_core.tcyr` | ~15 |
+| Heartbeat (FSM, telemetry, eviction) | `src/main.cyr` + `tests/test_core.tcyr` | ~25 |
+| RateLimit (bucket, window, keys) | `src/main.cyr` + `tests/test_core.tcyr` | ~15 |
+| Fleet (routing, submit, rebalance) | `src/main.cyr` + `tests/test_core.tcyr` | ~10 |
+| DAG (linear, parallel, retry, skip) | `src/main.cyr` + `tests/test_core.tcyr` | ~12 |
+| Transport (circuit breaker, pool) | `src/main.cyr` + `tests/test_core.tcyr` | ~10 |
+| Crypto/protocol (base64, SHA-1, RESP, PG) | `tests/test_backends.tcyr` | ~25 |
+| Live Redis | `tests/test_live.tcyr` | ~20 |
+| Live PostgreSQL | `tests/test_live.tcyr` | ~16 |
+| Integration (training job, namespaced pubsub) | `tests/test_core.tcyr` | ~10 |
 
 ## Benchmarks
 
@@ -78,7 +78,7 @@ docker exec majra-postgres su postgres -c \
    pg_ctl reload -D /var/lib/postgresql/data"
 
 # Run live tests
-cyrius build tests/test_live.cyr build/test_live && ./build/test_live
+cyrius build tests/test_live.tcyr build/test_live && ./build/test_live
 
 # Cleanup
 docker stop majra-redis majra-postgres && docker rm majra-redis majra-postgres

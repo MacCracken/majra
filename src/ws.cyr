@@ -51,19 +51,20 @@ fn sha1(data, len) {
     store8(padded + padded_len - 1, bit_len & 0xFF);
 
     # Process each 64-byte block
-    var w[80];
+    var w = alloc(640);  # 80 entries × 8 bytes, heap-allocated
     var block = 0;
     while (block < padded_len) {
-        # Prepare message schedule
+        # Prepare message schedule (32-bit words stored in 64-bit slots)
         var wi = 0;
         while (wi < 16) {
             var off = block + wi * 4;
-            store64(&w + wi * 8, (load8(padded+off) << 24) | (load8(padded+off+1) << 16) | (load8(padded+off+2) << 8) | load8(padded+off+3));
+            var word = ((load8(padded+off) & 0xFF) << 24) | ((load8(padded+off+1) & 0xFF) << 16) | ((load8(padded+off+2) & 0xFF) << 8) | (load8(padded+off+3) & 0xFF);
+            store64(w +wi * 8, word & 0xFFFFFFFF);
             wi = wi + 1;
         }
         while (wi < 80) {
-            var xor_val = load64(&w + (wi-3)*8) ^ load64(&w + (wi-8)*8) ^ load64(&w + (wi-14)*8) ^ load64(&w + (wi-16)*8);
-            store64(&w + wi * 8, _sha1_rotl32(xor_val, 1));
+            var xor_val = load64(w +(wi-3)*8) ^ load64(w +(wi-8)*8) ^ load64(w +(wi-14)*8) ^ load64(w +(wi-16)*8);
+            store64(w +wi * 8, _sha1_rotl32(xor_val & 0xFFFFFFFF, 1));
             wi = wi + 1;
         }
 
@@ -91,7 +92,7 @@ fn sha1(data, len) {
                 k = 0xCA62C1D6;
             }
             f = f & 0xFFFFFFFF;
-            var temp = (_sha1_rotl32(a, 5) + f + e + k + load64(&w + ri*8)) & 0xFFFFFFFF;
+            var temp = (_sha1_rotl32(a, 5) + f + e + k + load64(w +ri*8)) & 0xFFFFFFFF;
             e = d;
             d = c;
             c = _sha1_rotl32(b, 30);

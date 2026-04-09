@@ -49,13 +49,13 @@ jobs:
 
       - name: Expanded tests
         run: |
-          cat tests/test_core.cyr | cc2 2>/dev/null > build/test_core
+          cat tests/test_core.tcyr | cc2 2>/dev/null > build/test_core
           chmod +x build/test_core
           ./build/test_core
 
       - name: Backend tests
         run: |
-          cat tests/test_backends.cyr | cc2 2>/dev/null > build/test_backends
+          cat tests/test_backends.tcyr | cc2 2>/dev/null > build/test_backends
           chmod +x build/test_backends
           ./build/test_backends
 
@@ -132,7 +132,7 @@ jobs:
       - name: Run live tests
         run: |
           mkdir -p build
-          cat tests/test_live.cyr | cc2 2>/dev/null > build/test_live
+          cat tests/test_live.tcyr | cc2 2>/dev/null > build/test_live
           chmod +x build/test_live
           ./build/test_live
 

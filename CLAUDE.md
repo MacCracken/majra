@@ -38,7 +38,7 @@ cyrius audit
 cyrius deny src/main.cyr
 
 # Run live integration tests (requires Redis + PostgreSQL)
-cyrius build tests/test_live.cyr build/test_live && ./build/test_live
+cyrius build tests/test_live.tcyr build/test_live && ./build/test_live
 ```
 
 ### Development Loop (continuous)
@@ -75,9 +75,9 @@ cyrius build tests/test_live.cyr build/test_live && ./build/test_live
 ```
 src/main.cyr           Entry point + core tests (144 assertions)
 src/*.cyr              19 library modules
-tests/test_core.cyr    Expanded unit tests (92 assertions)
-tests/test_backends.cyr Backend protocol tests (25 assertions)
-tests/test_live.cyr    Live Redis + PostgreSQL tests (36 assertions)
+tests/test_core.tcyr    Expanded unit tests (92 assertions)
+tests/test_backends.tcyr Backend protocol tests (25 assertions)
+tests/test_live.tcyr    Live Redis + PostgreSQL tests (36 assertions)
 tests/test.sh          Test runner script
 benches/bench_all.cyr  17 benchmarks
 examples/              managed_queue.cyr, pubsub_tiers.cyr

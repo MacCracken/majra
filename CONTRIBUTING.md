@@ -35,7 +35,7 @@ cyrius audit
 cyrius deny src/main.cyr
 
 # Live integration tests (requires Redis on :6379, PostgreSQL on :5432)
-cyrius build tests/test_live.cyr build/test_live && ./build/test_live
+cyrius build tests/test_live.tcyr build/test_live && ./build/test_live
 ```
 
 Before opening a PR, run `cyrius audit` to verify everything passes.
@@ -44,7 +44,7 @@ Before opening a PR, run `cyrius audit` to verify everything passes.
 
 1. Create `src/module.cyr` with your implementation.
 2. Add `include "src/module.cyr"` to `src/main.cyr` in dependency order.
-3. Add unit tests to the appropriate test file (`tests/test_core.cyr` or a new file).
+3. Add unit tests to the appropriate test file (`tests/test_core.tcyr` or a new file).
 4. If the module adds significant code, it may need its own test compilation unit
    (compiler fixup table limit is 8192 forward references).
 5. Update `README.md` with the new module's entry.
@@ -61,9 +61,9 @@ Before opening a PR, run `cyrius audit` to verify everything passes.
 
 ## Testing
 
-- Unit tests go in `src/main.cyr` or `tests/test_core.cyr`
-- Backend protocol tests go in `tests/test_backends.cyr`
-- Live integration tests go in `tests/test_live.cyr`
+- Unit tests go in `src/main.cyr` or `tests/test_core.tcyr`
+- Backend protocol tests go in `tests/test_backends.tcyr`
+- Live integration tests go in `tests/test_live.tcyr`
 - All new features require tests before merge
 - Concurrent types should have multi-thread tests where feasible
 
