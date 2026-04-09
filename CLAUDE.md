@@ -4,10 +4,10 @@
 
 **Majra** (Arabic: channel/waterway) — Distributed queue and multiplex engine — pub/sub, queues, relay, IPC, heartbeat, rate limiting
 
-- **Type**: Flat library crate
+- **Type**: Cyrius library (single-file compilation via `include`)
 - **License**: GPL-3.0-only
-- **MSRV**: 1.89
-- **Version**: SemVer 1.0.0 (stable)
+- **Version**: SemVer 2.0.0
+- **Language**: [Cyrius](https://github.com/MacCracken/cyrius) (ported from Rust v1.0.4)
 - **Genesis repo**: [agnosticos](https://github.com/MacCracken/agnosticos)
 - **Philosophy**: [AGNOS Philosophy & Intention](https://github.com/MacCracken/agnosticos/blob/main/docs/philosophy.md)
 - **Standards**: [First-Party Standards](https://github.com/MacCracken/agnosticos/blob/main/docs/development/applications/first-party-standards.md)
@@ -19,48 +19,72 @@ daimon (agent messaging), AgnosAI (crew coordination), hoosh (inference routing)
 
 ## Development Process
 
-### P(-1): Scaffold Hardening (before any new features)
+### Build & Test
 
-0. Read roadmap, CHANGELOG, and open issues — know what was intended before auditing what was built
-1. Test + benchmark sweep of existing code
-2. Cleanliness check: `cargo fmt --check`, `cargo clippy --all-features --all-targets -- -D warnings`, `cargo audit`, `cargo deny check`
-3. Get baseline benchmarks (`./scripts/bench-history.sh`)
-4. Initial refactor + audit (performance, memory, security, edge cases)
-5. Cleanliness check — must be clean after audit
-6. Additional tests/benchmarks from observations
-7. Post-audit benchmarks — prove the wins
-8. Repeat audit if heavy
-9. Documentation audit — ADRs, source citations, guides, examples (see Documentation Standards in first-party-standards.md)
+```bash
+# Compile
+cyrius build src/main.cyr build/majra
+
+# Run tests
+cyrius test
+
+# Run benchmarks (with history tracking)
+cyrius bench
+
+# Full audit: self-host, test, fmt, lint, vet, deny, bench
+cyrius audit
+
+# Policy enforcement
+cyrius deny src/main.cyr
+
+# Run live integration tests (requires Redis + PostgreSQL)
+cyrius build tests/test_live.cyr build/test_live && ./build/test_live
+```
 
 ### Development Loop (continuous)
 
 1. Work phase — new features, roadmap items, bug fixes
-2. Cleanliness check: `cargo fmt --check`, `cargo clippy --all-features --all-targets -- -D warnings`, `cargo audit`, `cargo deny check`
-3. Test + benchmark additions for new code
-4. Run benchmarks (`./scripts/bench-history.sh`)
-5. Audit phase — review performance, memory, security, throughput, correctness
-6. Cleanliness check — must be clean after audit
-7. Deeper tests/benchmarks from audit observations
-8. Run benchmarks again — prove the wins
-9. If audit heavy → return to step 5
-10. Documentation — update CHANGELOG, roadmap, docs, ADRs for design decisions, source citations for algorithms/formulas, update docs/sources.md, guides and examples for new API surface, verify recipe version in zugot
-11. Version check — VERSION, Cargo.toml, recipe (in zugot) all in sync
-12. Return to step 1
+2. Compile check: `cyrius build src/main.cyr build/majra`
+3. Test: `cyrius test` — all suites must pass
+4. Lint + format: `cyrius fmt --check`, `cyrius lint`
+5. Policy check: `cyrius deny src/main.cyr`
+6. Benchmark additions for new code
+7. Run benchmarks: `cyrius bench` (tracks history automatically)
+8. Audit phase — review performance, memory, security, correctness
+9. Deeper tests/benchmarks from audit observations
+10. Run benchmarks again — prove the wins
+11. If audit heavy → return to step 8
+12. Full audit: `cyrius audit` — self-host, test, fmt, lint, vet, deny, bench
+13. Documentation — update CHANGELOG, roadmap, docs
+14. Version check — VERSION and cyrius.toml in sync (`scripts/version-bump.sh`)
+15. Return to step 1
 
 ### Key Principles
 
-- **Never skip benchmarks.** Numbers don't lie. The CSV history is the proof.
-- **Tests + benchmarks are the way.** Minimum 80%+ coverage target.
-- **Own the stack.** If an AGNOS crate wraps an external lib, depend on the AGNOS crate.
+- **Never skip benchmarks.** Numbers don't lie.
+- **Tests + benchmarks are the way.** 295 assertions across 4 test suites.
+- **Own the stack.** Zero external dependencies — Cyrius stdlib only.
 - **No magic.** Every operation is measurable, auditable, traceable.
-- **`#[non_exhaustive]`** on all public enums.
-- **`#[must_use]`** on all pure functions.
-- **`#[inline]`** on hot-path functions.
-- **`write!` over `format!`** — avoid temporary allocations.
-- **Cow over clone** — borrow when you can, allocate only when you must.
-- **Vec arena over HashMap** — when indices are known, direct access beats hashing.
-- **Feature-gate optional deps** — consumers pull only what they need.
-- **tracing on all operations** — structured logging for audit trail.
+- **Globals for cross-call state.** Cyrius single-pass compiler clobbers locals across function calls — use globals when values must survive nested calls.
+- **Raw bytes for CR LF.** Cyrius does not support `\r` escape — use `store8(buf, 13); store8(buf+1, 10)` for network protocols.
+- **`fl_alloc` for structs, `alloc` for hashmaps.** Freelist supports individual free; bump allocator for long-lived collections.
+- **Compiler fixup limit: 8192.** Split large programs across multiple compilation units.
+
+## Project Structure
+
+```
+src/main.cyr           Entry point + core tests (144 assertions)
+src/*.cyr              19 library modules
+tests/test_core.cyr    Expanded unit tests (92 assertions)
+tests/test_backends.cyr Backend protocol tests (25 assertions)
+tests/test_live.cyr    Live Redis + PostgreSQL tests (36 assertions)
+tests/test.sh          Test runner script
+benches/bench_all.cyr  17 benchmarks
+examples/              managed_queue.cyr, pubsub_tiers.cyr
+lib/                   Vendored Cyrius stdlib (28 modules)
+rust-old/              Archived Rust source (reference)
+build/                 Compiled binaries (gitignored)
+```
 
 ## Documentation Structure
 
@@ -70,22 +94,23 @@ Root files (required):
 
 docs/ (required):
   architecture/overview.md — module map, data flow, consumers
-  development/roadmap.md — completed, backlog, future, v1.0 criteria
+  development/roadmap.md — completed, backlog, future
 
 docs/ (when earned):
-  adr/ — architectural decision records
   guides/ — usage guides, integration patterns
-  examples/ — worked examples
-  standards/ — external spec conformance
-  compliance/ — regulatory, audit, security compliance
-  sources.md — source citations for algorithms/formulas (required for science/math crates)
+  development/ — semver, threat model
 ```
 
 ## DO NOT
 - **Do not commit or push** — the user handles all git operations (commit, push, tag)
-
 - **NEVER use `gh` CLI** — use `curl` to GitHub API only
-- Do not add unnecessary dependencies — keep it lean
-- Do not `unwrap()` or `panic!()` in library code
+- Do not add unnecessary dependencies — Cyrius stdlib only
 - Do not skip benchmarks before claiming performance improvements
-- Do not commit `target/` or `Cargo.lock` (library crates only)
+- Do not commit `build/` or `rust-old/target/`
+
+## Known Cyrius Compiler Issues
+
+1. **Local variable clobbering** — function parameters and locals may be overwritten by nested function calls. Workaround: save critical values to globals before calling other functions.
+2. **`map_get` after `map_set` in same call chain** — hashmap lookups may fail to find entries set in deeply nested call contexts. Workaround: restructure to minimize call depth between set and get.
+3. **No `\r` escape sequence** — use raw byte 13 for carriage return in network protocols (RESP, HTTP, WebSocket).
+4. **Fixup table limit (8192)** — programs with more than ~8192 forward references fail to compile. Split into multiple compilation units.

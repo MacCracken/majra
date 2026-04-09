@@ -1,117 +1,104 @@
 # Architecture Overview
 
-majra is a modular concurrency primitives library. Each module is feature-gated
-and can be used independently.
+majra is a modular concurrency primitives library written in Cyrius. Each module
+is a `.cyr` file included via `include` directives in dependency order.
 
 ## Module Map
 
 ```
-majra (v1.0.0, ~12,000 lines across 20 modules)
+majra (v2.0.0, ~4,800 lines across 19 modules)
 │
-│ ── Always available ──────────────────────────────
-├── envelope        Universal message envelope (Envelope, Target)
-├── error           Shared error types (MajraError, IpcError)
-├── metrics         MajraMetrics trait + PrometheusMetrics
-├── namespace       Multi-tenant scoping (Namespace)
+│ ── Core (always included) ────────────────────
+├── error           Error codes (enum) + result helpers
+├── counter         Mutex-protected i64 counter
+├── envelope        Universal message envelope (UUID, routing, payload)
+├── namespace       Multi-tenant scoping (topic, key, node_id prefixing)
+├── metrics         22-slot function pointer vtable for observability
 │
-│ ── Default features ──────────────────────────────
-├── pubsub          Topic-based pub/sub + TypedPubSub<T>
-├── queue           PriorityQueue + ManagedQueue + DAG scheduler
-├── relay           Sequenced, deduplicated message relay + request-response
-├── transport       Transport trait + ConnectionPool (with stale eviction)
-├── heartbeat       Node health FSM + GPU telemetry + fleet stats
+│ ── Primitives ────────────────────────────────
+├── queue           5-tier priority queue + ManagedQueue with lifecycle
+├── pubsub          MQTT wildcard matching + DirectChannel + HashedChannel
+├── relay           Sequenced dedup relay with broadcast
+├── barrier         N-way barrier (sync + concurrent with futex)
+├── heartbeat       FSM health tracker + GPU telemetry + fleet stats
+├── ratelimit       Token bucket + sliding window (fixed-point math)
 │
-│ ── Optional features ─────────────────────────────
-├── ipc             Unix socket / Windows named pipe framing
-├── ipc_encrypted   AES-256-GCM encrypted IPC (ring)
-├── ratelimit       Token bucket rate limiter
-├── barrier         N-way barrier + AsyncBarrierSet
-├── dag             DAG workflow engine (WorkflowEngine, WorkflowStorage)
+│ ── Networking ────────────────────────────────
+├── ipc             Unix domain socket framing (4-byte BE length prefix)
+├── ipc_encrypted   AES-256-GCM framing with nonce management
+├── transport       Transport vtable + circuit breaker + connection pool
+├── ws              WebSocket (SHA-1 handshake, RFC 6455 framing)
+│
+│ ── Composition ───────────────────────────────
 ├── fleet           Distributed job queue with work-stealing
-├── ws              WebSocket bridge for pub/sub fan-out
+├── dag             DAG workflow engine (Kahn's sort, retry, error policies)
 │
-│ ── Backend features ──────────────────────────────
-├── redis_backend   RedisPubSub, RedisQueue, RedisRateLimiter, RedisHeartbeatTracker
-├── postgres_backend PostgresWorkflowStorage (deadpool connection pool)
-├── [sqlite]        SQLite persistence for ManagedQueue + WorkflowStorage
-└── [quic]          QUIC transport (quinn + rustls)
-```
-
-## Feature Dependencies
-
-```
-pubsub ─────────────────────── ws (implies pubsub)
-queue ──────────────────────── dag (implies queue)
-                            ── fleet (implies queue + heartbeat)
-relay ──────────────────────── quic (implies relay)
-                            ── transport (always with relay)
-ipc ────────────────────────── ipc-encrypted (implies ipc)
+│ ── Backends ──────────────────────────────────
+├── redis_backend   RESP2 protocol (SET/GET, ZADD, PUBLISH, HSET, EVAL)
+└── postgres_backend PostgreSQL v3 wire protocol (startup, auth, query, CRUD)
 ```
 
 ## Design Principles
 
-1. **Feature-gated** — consumers include only what they need.
-2. **Thread-safe by default** — concurrent variants use `DashMap` or `tokio::sync`.
-3. **Async-native** — built on tokio; `Send + Sync` on all public types.
-4. **Zero unsafe** — no unsafe code in the library.
-5. **Lean** — minimal core deps (tokio, dashmap, serde, chrono, uuid, thiserror, tracing).
-6. **Eviction everywhere** — all collections have TTL/capacity-based eviction to prevent unbounded growth.
-7. **Multi-tenant ready** — `Namespace` module provides topic/key/node-ID scoping.
-8. **Fragmentation-aware** — `compact()` methods on Relay and RateLimiter reclaim DashMap dead capacity. For long-running processes with high key churn, use `tikv-jemallocator` to avoid glibc heap fragmentation.
+1. **Zero dependencies** — Cyrius stdlib only. No external crates, no LLVM.
+2. **Thread-safe by default** — concurrent variants use mutex + futex.
+3. **Globals for cross-call state** — Cyrius clobbers locals across function calls.
+4. **Fixed-point math** — no floating point; token buckets use x1000 scaling.
+5. **Eviction everywhere** — all collections support TTL/capacity-based eviction.
+6. **Multi-tenant ready** — Namespace module provides topic/key/node-ID scoping.
+7. **Vtable polymorphism** — traits replaced by function pointer structs.
 
 ## Concurrency Model
 
 | Type | Backing | Use case |
 |------|---------|----------|
-| `PriorityQueue<T>` | `VecDeque` tiers | Single-owner, `&mut self` |
-| `ConcurrentPriorityQueue<T>` | `tokio::Mutex` | Shared, async dequeue |
-| `ManagedQueue<T>` | `tokio::Mutex` + `DashMap` | Full lifecycle management |
-| `ConcurrentHeartbeatTracker` | `DashMap` | Shared fleet tracking |
-| `AsyncBarrierSet` | `DashMap` + `Notify` | Async wait-for-release |
-| `RateLimiter` | `DashMap` | Token bucket, lock-free per key |
-| `SlidingWindowLimiter` | `DashMap` | Sliding window counter, ~5% accuracy |
-| `Relay` | `DashMap` + `AtomicU64` | Shared, lock-free dedup + request-response |
-| `DirectChannel<T>` | `broadcast::Sender<T>` | Raw broadcast, 73M msg/s |
-| `HashedChannel<T>` | `DashMap<u64, Sender>` | Hashed topic routing, 16M msg/s |
-| `TypedPubSub<T>` | Dual `DashMap` (exact + pattern) | Full pub/sub, 1.1M msg/s |
-| `ConnectionPool` | `tokio::Mutex<HashMap>` + circuit breaker | Per-endpoint reuse with failure tracking |
-| `FleetQueue<T>` | `DashMap<NodeId, FleetNode>` | Distributed work-stealing |
-| `InMemoryWorkflowStorage` | `DashMap` | DAG run/step storage with retention |
+| PriorityQueue | 5 vecs (one per tier) | Single-owner enqueue/dequeue |
+| ConcurrentPQ | PQ + mutex + futex | Shared, blocking dequeue_wait |
+| ManagedQueue | CPQ + hashmap + mutex | Full lifecycle management |
+| ConcurrentHeartbeatTracker | hashmap + mutex | Shared fleet tracking |
+| ConcurrentBarrierSet | hashmap + mutex + futex | Blocking arrive_and_wait |
+| RateLimiter | hashmap + mutex | Token bucket per key |
+| SlidingWindowLimiter | hashmap + mutex | Window counter per key |
+| Relay | hashmap + mutex + counter | Dedup + broadcast |
+| DirectChannel | MPSC channel | Raw point-to-point |
+| HashedChannel | hashmap of channels | Topic-routed |
+| PubSub | 2 hashmaps (exact + pattern) | Full pub/sub with wildcards |
+| ConnectionPool | hashmap + mutex | Per-endpoint reuse + circuit breaker |
+| FleetQueue | hashmap + mutex | Distributed work-stealing |
 
 ## Data Flow
 
-```text
-Producer ──► DirectChannel ──────────────────────────► broadcast::Receiver    (73M msg/s)
-Producer ──► HashedChannel ──► u64 hash lookup ────► broadcast::Receiver    (16M msg/s)
-Producer ──► TypedPubSub ──► exact O(1) + pattern ─► broadcast::Receiver    (1.1M msg/s)
-                                                   └──► WsBridge ──► WebSocket clients
+```
+Producer ──► DirectChannel ──────────────────────► chan_recv     (368 ns/op)
+Producer ──► HashedChannel ──► topic hash lookup ► chan_recv
+Producer ──► PubSub ──► exact O(1) + pattern ───► chan_recv     (1 us/op)
+                                                └──► WsBridge ──► WebSocket clients
 
-Producer ──► ManagedQueue ──► resource filter ──► Consumer
-                           └──► QueueEvent broadcast
-                           └──► SqliteBackend / PostgreSQL persistence
+Producer ──► ManagedQueue ──► priority dequeue ──► Consumer
+                           └──► job state lifecycle (queued → running → completed)
 
-Node A ──► Relay::send_request() ──► correlation_id ──► Node B
-Node B ──► Relay::reply() ──────────────────────────► oneshot::Receiver on A
+Node A ──► relay_send() ──────────────────────────► subscribers via channels
+Node B ──► relay_receive() ──► dedup filter ──────► subscribers
 
-FleetQueue::submit() ──► select_node (least loaded) ──► ManagedQueue on target node
-FleetQueue::rebalance() ──► steal from overloaded ──► redistribute to idle
+FleetQueue ──► select_node (least loaded) ──► ManagedQueue on target node
+            ──► rebalance() ──► steal from overloaded ──► redistribute
 ```
 
 ## Distributed Architecture
 
-```text
+```
 Process A                          Redis                          Process B
 ┌─────────────┐                  ┌─────────┐                  ┌─────────────┐
-│ RedisPubSub │ ◄──── pub/sub ──►│  Redis  │◄──── pub/sub ──►│ RedisPubSub │
-│ RedisQueue  │ ◄──── sorted ───►│  Server │◄──── sorted ───►│ RedisQueue  │
-│ RedisRL     │ ◄──── lua ──────►│         │◄──── lua ──────►│ RedisRL     │
-│ RedisHB     │ ◄──── TTL keys ─►│         │◄──── TTL keys ─►│ RedisHB     │
+│ redis_pub   │ ◄──── PUBLISH ──►│  Redis  │◄──── PUBLISH ──►│ redis_pub   │
+│ redis_zadd  │ ◄──── ZADD ────►│  Server │◄──── ZPOPMIN ──►│ redis_zpop  │
+│ redis_hset  │ ◄──── HSET ────►│         │◄──── HGET ────►│ redis_hget  │
+│ redis_setex │ ◄──── SETEX ───►│         │◄──── EXISTS ──►│ redis_exist │
 └─────────────┘                  └─────────┘                  └─────────────┘
 
 Process A                        PostgreSQL                    Process B
 ┌──────────────────┐           ┌───────────┐              ┌──────────────────┐
-│ PostgresWorkflow │ ◄── SQL ──►│  Postgres │◄── SQL ────►│ PostgresWorkflow │
-│ Storage          │           │  Server   │              │ Storage          │
+│ pg_query         │ ◄── SQL ──►│  Postgres │◄── SQL ────►│ pg_query         │
+│ pg_exec          │           │  Server   │              │ pg_exec          │
 └──────────────────┘           └───────────┘              └──────────────────┘
 ```
 
@@ -119,16 +106,8 @@ Process A                        PostgreSQL                    Process B
 
 | Project | Modules used |
 |---------|-------------|
-| **Ifran** | queue, heartbeat, ratelimit |
-| **SecureYeoman** | pubsub, ratelimit (via NAPI); expanding to queue, heartbeat, dag |
-| **AgnosAI** | pubsub, queue, relay, barrier |
 | **daimon** | pubsub, relay, ipc |
-| **stiva** | dag, heartbeat, queue |
-
-## Dependencies
-
-### Core (always compiled)
-tokio, dashmap, serde, serde_json, chrono, uuid, thiserror, tracing, async-trait
-
-### Optional (feature-gated)
-rusqlite (sqlite), prometheus, redis + futures-util (redis-backend), tokio-postgres + deadpool-postgres (postgres), quinn + rustls + rcgen (quic), ring (ipc-encrypted), tokio-tungstenite (ws), tracing-subscriber (logging)
+| **AgnosAI** | pubsub, queue, relay, barrier |
+| **hoosh** | queue, heartbeat, fleet |
+| **sutra** | heartbeat, fleet, dag |
+| **stiva** | dag, heartbeat, ipc |

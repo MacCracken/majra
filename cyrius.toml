@@ -1,0 +1,6 @@
+name = "majra"
+version = "2.0.0"
+license = "GPL-3.0-only"
+entry = "src/main.cyr"
+output = "majra"
+description = "Distributed queue & multiplex engine — pub/sub, queues, relay, IPC, heartbeat, rate limiting"

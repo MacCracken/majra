@@ -1,0 +1,91 @@
+# Fuzz: priority queue enqueue/dequeue with random priorities and payloads
+# Mirrors rust-old/fuzz/fuzz_targets/fuzz_queue.rs
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/freelist.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/hashmap.cyr"
+include "lib/syscalls.cyr"
+include "lib/tagged.cyr"
+include "lib/fnptr.cyr"
+include "lib/thread.cyr"
+
+include "src/error.cyr"
+include "src/counter.cyr"
+include "src/envelope.cyr"
+include "src/queue.cyr"
+
+var _fuzz_state = 12345;
+
+fn _fuzz_rand() {
+    _fuzz_state = _fuzz_state * 6364136223846793005 + 1442695040888963407;
+    return _fuzz_state;
+}
+
+fn _fuzz_rand_range(lo, hi) {
+    var r = _fuzz_rand();
+    if (r < 0) { r = 0 - r; }
+    return lo + (r % (hi - lo + 1));
+}
+
+fn _parse_argv1() {
+    # Read argv[1] manually: argc is at [rsp] on entry, argv at [rsp+8+i*8]
+    # For simplicity, default to 1000 iterations
+    return 1000;
+}
+
+fn main() {
+    alloc_init();
+    fl_init();
+
+    var iters = _parse_argv1();
+
+    _fuzz_state = time_now_ns();
+
+    var pq = pq_new();
+    var mq = mq_new("fuzz", 8);
+    var i = 0;
+
+    while (i < iters) {
+        var op = _fuzz_rand_range(0, 5);
+        var pri = _fuzz_rand_range(0, 4);
+        var payload = _fuzz_rand();
+
+        if (op == 0 || op == 1 || op == 2) {
+            # Enqueue
+            pq_enqueue(pq, queue_item_new(pri, payload));
+        }
+        elif (op == 3) {
+            # Dequeue
+            pq_dequeue(pq);
+        }
+        elif (op == 4) {
+            # Managed enqueue
+            mq_enqueue(mq, pri, payload);
+        }
+        elif (op == 5) {
+            # Managed dequeue + complete
+            var job = mq_dequeue(mq);
+            if (job != 0) {
+                if (_fuzz_rand_range(0, 1) == 0) {
+                    mq_complete(mq, job);
+                } else {
+                    mq_fail(mq, job);
+                }
+            }
+        }
+
+        i = i + 1;
+    }
+
+    # Drain
+    while (pq_dequeue(pq) != 0) {}
+
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

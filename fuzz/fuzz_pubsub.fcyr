@@ -1,0 +1,99 @@
+# Fuzz: pattern matching with random topic/pattern combinations
+# Mirrors rust-old/fuzz/fuzz_targets/fuzz_pubsub.rs
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/freelist.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/hashmap.cyr"
+include "lib/syscalls.cyr"
+include "lib/tagged.cyr"
+include "lib/fnptr.cyr"
+include "lib/thread.cyr"
+
+include "src/error.cyr"
+include "src/counter.cyr"
+include "src/envelope.cyr"
+include "src/pubsub.cyr"
+
+var _fuzz_state = 67890;
+
+fn _fuzz_rand() {
+    _fuzz_state = _fuzz_state * 6364136223846793005 + 1442695040888963407;
+    return _fuzz_state;
+}
+
+fn _fuzz_rand_range(lo, hi) {
+    var r = _fuzz_rand();
+    if (r < 0) { r = 0 - r; }
+    return lo + (r % (hi - lo + 1));
+}
+
+# Pre-built topic and pattern pools (avoids repeated allocation)
+var _topics[16];
+var _patterns[16];
+
+fn _init_pools() {
+    store64(&_topics, "a");
+    store64(&_topics + 8, "a/b");
+    store64(&_topics + 16, "a/b/c");
+    store64(&_topics + 24, "a/b/c/d");
+    store64(&_topics + 32, "events/created");
+    store64(&_topics + 40, "events/deleted");
+    store64(&_topics + 48, "sensors/temp");
+    store64(&_topics + 56, "sensors/room/temp");
+    store64(&_topics + 64, "x/y/z/w/v");
+    store64(&_topics + 72, "long/topic/with/many/segments/here");
+    store64(&_topics + 80, "z");
+    store64(&_topics + 88, "single");
+    store64(&_topics + 96, "a/b/c/d/e/f/g/h");
+    store64(&_topics + 104, "foo/bar");
+    store64(&_topics + 112, "test");
+    store64(&_topics + 120, "deep/nest/of/topics/goes/on");
+
+    store64(&_patterns, "a");
+    store64(&_patterns + 8, "a/+");
+    store64(&_patterns + 16, "a/+/c");
+    store64(&_patterns + 24, "#");
+    store64(&_patterns + 32, "events/#");
+    store64(&_patterns + 40, "+/+/+");
+    store64(&_patterns + 48, "sensors/+");
+    store64(&_patterns + 56, "+/room/+");
+    store64(&_patterns + 64, "x/#");
+    store64(&_patterns + 72, "+/+/+/+/+/+");
+    store64(&_patterns + 80, "m");
+    store64(&_patterns + 88, "+");
+    store64(&_patterns + 96, "a/b/c/d/e/f/g/h");
+    store64(&_patterns + 104, "foo/+");
+    store64(&_patterns + 112, "no/match/ever");
+    store64(&_patterns + 120, "+/+/#");
+}
+
+fn main() {
+    alloc_init();
+    fl_init();
+
+    var iters = 1000;
+    _fuzz_state = time_now_ns();
+    _init_pools();
+
+    # Fuzz pattern matching
+    var i = 0;
+    while (i < iters) {
+        var ti = _fuzz_rand_range(0, 15);
+        var pi = _fuzz_rand_range(0, 15);
+        var topic = load64(&_topics + ti * 8);
+        var pattern = load64(&_patterns + pi * 8);
+        matches_pattern(topic, pattern);
+        i = i + 1;
+    }
+
+    # Pub/sub publish removed — pattern matching is the fuzz target
+
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

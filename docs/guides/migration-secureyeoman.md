@@ -1,163 +1,83 @@
 # Migrating SecureYeoman to majra
 
-> SecureYeoman currently uses majra for **pub/sub** (event dispatcher) and
-> **rate limiting** (per-user, per-IP throttling) via NAPI bindings in `sy-napi`.
-> This guide covers expanding to the full majra feature set.
+> This guide covers integrating SecureYeoman with majra's Cyrius modules.
+> Since majra is now a Cyrius library, integration is via `include` directives
+> in the consumer's Cyrius source.
 
-## Current integration (via sy-napi)
+## Modules to adopt
 
-| SY component | majra feature | Status |
-|-------------|--------------|--------|
-| EventDispatcher | `pubsub` (TypedPubSub) | In production |
-| Rate limiter | `ratelimit` (token bucket) | In production |
+| SY component | majra module | Function prefix |
+|-------------|-------------|-----------------|
+| EventDispatcher | `pubsub.cyr` | `pubsub_*` |
+| Rate limiter | `ratelimit.cyr` | `ratelimit_*` |
+| HeartbeatManager | `heartbeat.cyr` | `chb_*` |
+| Webhook retry queue | `queue.cyr` | `mq_*` |
+| Workflow engine | `dag.cyr` | `workflow_*` |
+| Multi-tenant scoping | `namespace.cyr` | `namespace_*` |
+| A2A relay | `relay.cyr` | `relay_*` |
+| Encrypted IPC | `ipc_encrypted.cyr` | `encrypted_ipc_*` |
 
-## Phase 1: Expand NAPI bindings (low risk)
+## Phase 1: Pub/Sub + Rate Limiting
 
-### Add queue + heartbeat to sy-napi
+```cyrius
+include "src/pubsub.cyr"
+include "src/ratelimit.cyr"
+include "src/namespace.cyr"
 
-```toml
-# crates/sy-napi/Cargo.toml
-majra = { path = "../../../majra", features = ["pubsub", "ratelimit", "queue", "heartbeat", "dag"] }
-```
+var ns = namespace_new(tenant_id);
+var ps = pubsub_new();
+var rl = ratelimit_new(100000, 50);
 
-### Replace setInterval heartbeat scheduling
+# Scoped event dispatch
+pubsub_publish(ps, str_data(namespace_topic(ns, "events/created")), payload);
 
-SY's `HeartbeatManager` uses `setInterval` with custom interval tracking. Replace with majra:
-
-```rust
-// In sy-napi/src/majra.rs — add heartbeat bindings
-use majra::heartbeat::{ConcurrentHeartbeatTracker, HeartbeatConfig, EvictionPolicy};
-
-let tracker = ConcurrentHeartbeatTracker::new(HeartbeatConfig {
-    suspect_after: Duration::from_secs(15),
-    offline_after: Duration::from_secs(45),
-    eviction_policy: Some(EvictionPolicy {
-        offline_cycles: 3,
-        eviction_tx: Some(tx),
-    }),
-});
-```
-
-### Replace webhook retry polling with ManagedQueue
-
-SY polls `event_deliveries` table with `setInterval`. Replace with majra's priority queue:
-
-```rust
-use majra::queue::{ManagedQueue, ManagedQueueConfig, Priority};
-
-let queue = ManagedQueue::new(ManagedQueueConfig {
-    max_concurrency: 10,
-    finished_ttl: Duration::from_secs(3600),
-});
-
-// Enqueue webhook delivery.
-queue.enqueue(Priority::Normal, webhook_payload, None).await;
-
-// Dequeue and deliver (no polling needed — use dequeue_wait).
-let job = queue.dequeue_wait().await;
-```
-
-## Phase 2: DAG workflow engine (medium risk)
-
-SY's `workflow-engine.ts` has a custom topological sort. Replace with majra's DAG engine:
-
-```rust
-use majra::dag::{WorkflowEngine, WorkflowEngineConfig, InMemoryWorkflowStorage, StepExecutor};
-
-// Implement StepExecutor for SY's step types.
-struct SyStepExecutor { /* agent, tool, webhook, swarm handlers */ }
-
-#[async_trait]
-impl StepExecutor for SyStepExecutor {
-    async fn execute(&self, step: &WorkflowStep, ctx: &WorkflowContext) -> Result<Value, String> {
-        match step.config["type"].as_str() {
-            Some("agent") => execute_agent(step, ctx).await,
-            Some("webhook") => execute_webhook(step, ctx).await,
-            // ... 16+ step types
-        }
-    }
+# Scoped rate limiting
+if (ratelimit_check(rl, str_data(namespace_key(ns, "api"))) == 0) {
+    # rate limited
 }
-
-let engine = WorkflowEngine::new(
-    Arc::new(PostgresWorkflowStorage::connect(&pg_url).await?),
-    Arc::new(SyStepExecutor::new()),
-    WorkflowEngineConfig::default(),
-);
 ```
 
-## Phase 3: Multi-tenant isolation
+## Phase 2: Heartbeat + Queue
 
-SY is multi-tenant. Use `Namespace` to scope all operations:
+```cyrius
+include "src/heartbeat.cyr"
+include "src/queue.cyr"
 
-```rust
-use majra::namespace::Namespace;
+var tracker = chb_tracker_new(heartbeat_config_new(15000000000, 45000000000, 3));
+chb_register(tracker, "node-1", 0);
 
-let ns = Namespace::new(&tenant_id);
-
-// Scoped pub/sub.
-hub.publish(&ns.topic("events/created"), payload);
-let mut rx = hub.subscribe(&ns.pattern("events/#"));
-
-// Scoped rate limiting.
-limiter.check(&ns.key("api_requests"));
-
-// Scoped metrics.
-let metrics = NamespacedMetrics::new(&tenant_id, prometheus_metrics.clone());
+var mq = mq_new("webhook-delivery", 10);
+mq_enqueue(mq, PRIORITY_NORMAL, webhook_payload);
+var job = mq_dequeue(mq);
+mq_complete(mq, job);
 ```
 
-## Phase 4: Relay for A2A delegation (higher risk)
+## Phase 3: DAG Workflow Engine
 
-SY's A2A protocol uses custom encrypted envelopes. majra's relay provides:
+```cyrius
+include "src/dag.cyr"
 
-```rust
-use majra::relay::Relay;
+var def = workflow_def_new("sy-workflow", "SecureYeoman pipeline");
+var s1 = workflow_step_new("validate", "validate input");
+var s2 = workflow_step_new("process", "process request");
+step_add_dep(s2, "validate");
+workflow_def_add_step(def, s1);
+workflow_def_add_step(def, s2);
 
-let relay = Relay::new(&node_id);
-
-// Request-response for delegation.
-let (seq, rx) = relay.send_request("target-node", "a2a/delegate", json!({
-    "task": "summarize",
-    "context": "...",
-}));
-
-// Await reply with timeout.
-let reply = tokio::time::timeout(Duration::from_secs(30), rx).await??;
+var status = workflow_execute(def, &sy_step_executor, input_data);
 ```
 
-For encrypted IPC (desktop/capture):
+## Phase 4: Distributed Backends
 
-```rust
-use majra::ipc_encrypted::EncryptedIpcConnection;
+```cyrius
+include "src/redis_backend.cyr"
+include "src/postgres_backend.cyr"
 
-let conn = EncryptedIpcConnection::connect(path, &shared_key).await?;
-conn.send(&json!({"command": "capture"})).await?;
-```
+# Distributed rate limiting via Redis
+var rc = redis_connect_default();
+redis_set_prefix(rc, "sy:rl:");
 
-## Phase 5: Distributed backends
-
-When scaling beyond a single process:
-
-```rust
-// Distributed rate limiting via Redis.
-use majra::redis_backend::RedisRateLimiter;
-let rl = RedisRateLimiter::new(redis_client, 100.0, 50, "sy:rl:");
-
-// Distributed heartbeat for edge devices.
-use majra::redis_backend::RedisHeartbeatTracker;
-let hb = RedisHeartbeatTracker::new(redis_client, "sy:hb:", 30);
-
-// PostgreSQL workflow storage.
-use majra::postgres_backend::PostgresWorkflowStorage;
-let storage = PostgresWorkflowStorage::connect(&pg_url).await?;
-```
-
-## Cargo.toml (full integration)
-
-```toml
-[dependencies]
-majra = { version = "1", features = [
-    "pubsub", "queue", "relay", "heartbeat", "ratelimit",
-    "dag", "barrier", "ipc-encrypted", "redis-backend", "postgres",
-    "prometheus", "logging"
-] }
+# PostgreSQL workflow storage
+var pg = pg_connect("127.0.0.1", 5432, "postgres", "sydb", "password");
+pg_init_workflow_tables(pg);
 ```

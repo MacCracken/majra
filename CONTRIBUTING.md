@@ -12,48 +12,67 @@ development workflow, code standards, and project conventions.
 
 ## Prerequisites
 
-- Rust toolchain (MSRV: **1.89**)
-- `cargo-deny` — supply chain checks
-- `cargo-fuzz` — fuzz testing (requires nightly)
-- `cargo-llvm-cov` — code coverage
+- Cyrius compiler (`cc2`) — [cyrius](https://github.com/MacCracken/cyrius)
+- Redis (for live integration tests)
+- PostgreSQL (for live integration tests)
 
-## Makefile Targets
+## Building & Testing
 
-| Target          | Description                                      |
-| --------------- | ------------------------------------------------ |
-| `make check`    | Run fmt + clippy + test + audit (the full suite) |
-| `make fmt`      | Format code with `cargo fmt`                     |
-| `make clippy`   | Lint with `cargo clippy`                         |
-| `make test`     | Run the test suite                               |
-| `make deny`     | Audit dependencies with `cargo deny`             |
-| `make fuzz`     | Run fuzz targets                                 |
-| `make coverage` | Generate code coverage report                    |
+```bash
+# Compile
+cyrius build src/main.cyr build/majra
 
-Before opening a PR, run `make check` to verify everything passes.
+# Run tests
+cyrius test
+
+# Run benchmarks (with history)
+cyrius bench
+
+# Full audit (self-host, test, fmt, lint, vet, deny, bench)
+cyrius audit
+
+# Policy enforcement
+cyrius deny src/main.cyr
+
+# Live integration tests (requires Redis on :6379, PostgreSQL on :5432)
+cyrius build tests/test_live.cyr build/test_live && ./build/test_live
+```
+
+Before opening a PR, run `cyrius audit` to verify everything passes.
 
 ## Adding a New Module
 
-1. Create `src/module.rs` with your implementation.
-2. Add the module to `src/lib.rs` (feature-gated if appropriate).
-3. Add unit tests in the module file under `#[cfg(test)]`.
-4. Add the feature flag to `Cargo.toml` if applicable.
-5. Update `README.md` with the new module's feature table entry.
+1. Create `src/module.cyr` with your implementation.
+2. Add `include "src/module.cyr"` to `src/main.cyr` in dependency order.
+3. Add unit tests to the appropriate test file (`tests/test_core.cyr` or a new file).
+4. If the module adds significant code, it may need its own test compilation unit
+   (compiler fixup table limit is 8192 forward references).
+5. Update `README.md` with the new module's entry.
 
 ## Code Style
 
-- Run `cargo fmt` before committing. All code must be formatted.
-- `cargo clippy -D warnings` must pass with no warnings.
-- All public items (functions, structs, enums, traits, type aliases) must have
-  doc comments.
-- Keep functions focused and testable.
-- Use `#[non_exhaustive]` on public enums for forward compatibility.
+- Functions: `snake_case` — `fn pubsub_new()`, `fn mq_enqueue()`
+- Structs: document layout as comments — offsets, field sizes
+- Internal functions: prefix with `_` — `fn _set_contains()`
+- Globals for cross-call state: prefix with `_` — `var _recv_r = 0`
+- Constants via enums: `enum Priority { PRIORITY_HIGH = 1; }`
+- No `\r` in string literals — use raw byte 13 for CR
+- Use `fl_alloc` for structs that will be freed; `alloc` for long-lived collections
 
 ## Testing
 
-- Unit tests go in the module file under `#[cfg(test)]`.
-- Concurrent types must have multi-thread tests.
-- Property-based and fuzz tests are encouraged for serialisation paths.
-- All new features require tests before merge.
+- Unit tests go in `src/main.cyr` or `tests/test_core.cyr`
+- Backend protocol tests go in `tests/test_backends.cyr`
+- Live integration tests go in `tests/test_live.cyr`
+- All new features require tests before merge
+- Concurrent types should have multi-thread tests where feasible
+
+## Known Compiler Limitations
+
+- **Local variable clobbering**: function calls may overwrite caller's local variables.
+  Save values to globals before calling other functions when they must survive the call.
+- **Fixup table limit**: programs with >8192 forward references fail to compile.
+  Split into multiple compilation units if needed.
 
 ## License
 

@@ -1,25 +1,24 @@
 #!/bin/sh
 # majra test runner
-# Usage: sh tests/test.sh [path-to-cc2]
+# Usage: sh tests/test.sh
 
-CC="${1:-cc2}"
 BUILD="build"
 mkdir -p "$BUILD"
 
 echo "=== majra test suite ==="
 
 echo "--- core tests ---"
-cat src/main.cyr | "$CC" 2>/dev/null > "$BUILD/majra" && chmod +x "$BUILD/majra" && "$BUILD/majra"
+cyrius build src/main.cyr "$BUILD/majra" && "$BUILD/majra"
 CORE=$?
 
 echo ""
 echo "--- expanded tests ---"
-cat tests/test_core.cyr | "$CC" 2>/dev/null > "$BUILD/test_core" && chmod +x "$BUILD/test_core" && "$BUILD/test_core"
+cyrius build tests/test_core.cyr "$BUILD/test_core" && "$BUILD/test_core"
 EXPANDED=$?
 
 echo ""
 echo "--- backend tests ---"
-cat tests/test_backends.cyr | "$CC" 2>/dev/null > "$BUILD/test_backends" && chmod +x "$BUILD/test_backends" && "$BUILD/test_backends"
+cyrius build tests/test_backends.cyr "$BUILD/test_backends" && "$BUILD/test_backends"
 BACKEND=$?
 
 echo ""
@@ -30,6 +29,6 @@ echo "=== Results ==="
 
 echo ""
 echo "--- benchmarks ---"
-cat benches/bench_all.cyr | "$CC" 2>/dev/null > "$BUILD/bench_all" && chmod +x "$BUILD/bench_all" && "$BUILD/bench_all"
+cyrius bench
 
 exit $(( CORE + EXPANDED ))

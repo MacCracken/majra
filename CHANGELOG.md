@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] — 2026-04-08
+
+**Full port from Rust to Cyrius.** All 19 modules re-implemented from scratch with zero external dependencies. Original Rust source archived in `rust-old/`.
+
+### Changed
+- **Language**: Rust → Cyrius (compiled via `cc2`, statically linked)
+- **Build system**: Cargo → `cyrb` / direct `cc2` compilation
+- **Dependencies**: 25 Rust crates → 0 (Cyrius stdlib only)
+- **Binary output**: library crate → standalone executable (~93 KB)
+- **Generics**: `T: Send + Clone + Serialize` → `i64` (pointer to heap struct)
+- **Traits**: `MajraMetrics`, `Transport`, `WorkflowStorage` → function pointer vtables
+- **Async/await**: tokio → threads + mutexes + futex wait/wake
+- **DashMap**: → mutex-protected hashmap
+- **Floating point**: `f64` rate tokens → fixed-point i64 (x1000 scaling)
+- **UUID**: `uuid` crate → 128-bit random via `getrandom` syscall
+- **Timestamps**: `chrono` → `clock_gettime(CLOCK_MONOTONIC)` nanoseconds
+
+### Added
+- **Redis backend** (`redis_backend.cyr`) — full RESP2 protocol implementation over TCP: SET/GET/DEL, sorted sets (ZADD/ZPOPMIN/ZCARD), PUBLISH, HSET/HGET, EVAL, KEYS, SETEX, EXPIRE
+- **PostgreSQL backend** (`postgres_backend.cyr`) — wire protocol v3: startup, cleartext auth, simple query, row parsing, workflow table DDL/CRUD
+- **WebSocket** (`ws.cyr`) — RFC 6455: SHA-1 implementation (RFC 3174), base64 encode/decode, WebSocket handshake (Sec-WebSocket-Accept), frame send/recv with masking, ping/pong
+- **Encrypted IPC** (`ipc_encrypted.cyr`) — AES-256-GCM framing with nonce management, base64 wire encoding, key rotation. Crypto stubs ready for AES-NI (x86_64) and aarch64 intrinsics
+- **295 test assertions** across 4 suites: core (144), expanded (92), backends (25), live (36)
+- **17 benchmarks** covering all major operations
+- **2 examples**: managed_queue, pubsub_tiers
+- **Test runner**: `tests/test.sh` runs all suites + benchmarks
+
+### Removed
+- **QUIC transport** — deferred until sigil crypto port (TLS 1.3 dependency)
+- **SQLite persistence** — no SQLite binding in Cyrius
+- **Prometheus metrics** — replaced by generic function pointer vtable
+- **Logging module** — `println` suffices
+
+### Known Issues
+- Cyrius compiler local variable clobbering across function calls — mitigated via globals
+- Relay dedup and barrier `arrive_and_wait` affected by hashmap lookup issue in nested call contexts
+- No `\r` escape in Cyrius string literals — RESP/HTTP/WebSocket use raw byte 13
+
 ## [1.0.4]
 
 ### Changed

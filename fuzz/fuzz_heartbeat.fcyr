@@ -1,0 +1,114 @@
+# Fuzz: heartbeat operations with random sequences
+# Mirrors rust-old/fuzz/fuzz_targets/fuzz_heartbeat.rs
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/freelist.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/hashmap.cyr"
+include "lib/syscalls.cyr"
+include "lib/tagged.cyr"
+include "lib/fnptr.cyr"
+include "lib/thread.cyr"
+include "src/error.cyr"
+include "src/counter.cyr"
+include "src/envelope.cyr"
+include "src/heartbeat.cyr"
+
+var _fuzz_state = 24680;
+
+fn _fuzz_rand() {
+    _fuzz_state = _fuzz_state * 6364136223846793005 + 1442695040888963407;
+    return _fuzz_state;
+}
+
+fn _fuzz_rand_range(lo, hi) {
+    var r = _fuzz_rand();
+    if (r < 0) { r = 0 - r; }
+    return lo + (r % (hi - lo + 1));
+}
+
+fn _fuzz_node_id(n) {
+    return str_data(str_from_int(n));
+}
+
+fn main() {
+    alloc_init();
+    fl_init();
+
+    var iters = 1000;
+
+    _fuzz_state = time_now_ns();
+
+    # Random config
+    var suspect_ns = _fuzz_rand_range(1000000, 100000000);
+    var offline_ns = suspect_ns * 3;
+    var eviction = _fuzz_rand_range(0, 5);
+    var cfg = heartbeat_config_new(suspect_ns, offline_ns, eviction);
+
+    # Single-threaded tracker
+    var ht = hb_tracker_new(cfg);
+
+    var i = 0;
+    while (i < iters) {
+        var op = _fuzz_rand_range(0, 6);
+        var node = _fuzz_node_id(_fuzz_rand_range(0, 50));
+
+        if (op == 0 || op == 1) {
+            # Register
+            hb_register(ht, node, _fuzz_rand());
+        }
+        elif (op == 2 || op == 3) {
+            # Heartbeat
+            hb_heartbeat(ht, node);
+        }
+        elif (op == 4) {
+            # Deregister
+            hb_deregister(ht, node);
+        }
+        elif (op == 5) {
+            # Update statuses
+            hb_update_statuses(ht);
+        }
+        elif (op == 6) {
+            # List by status
+            hb_list_by_status(ht, _fuzz_rand_range(0, 2));
+        }
+
+        i = i + 1;
+    }
+
+    # Concurrent tracker
+    var cht = chb_tracker_new(cfg);
+
+    i = 0;
+    while (i < iters) {
+        var op = _fuzz_rand_range(0, 5);
+        var node = _fuzz_node_id(_fuzz_rand_range(0, 30));
+
+        if (op == 0) {
+            chb_register(cht, node, _fuzz_rand());
+        }
+        elif (op == 1 || op == 2) {
+            chb_heartbeat(cht, node);
+        }
+        elif (op == 3) {
+            chb_deregister(cht, node);
+        }
+        elif (op == 4) {
+            chb_update_statuses(cht);
+        }
+        elif (op == 5) {
+            chb_fleet_stats(cht);
+        }
+
+        i = i + 1;
+    }
+
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

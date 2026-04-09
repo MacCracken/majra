@@ -1,5 +1,5 @@
 # majra backend module tests
-# Run: cat tests/test_backends.cyr | cc2 > build/test_backends
+# Run: cyrius build tests/test_backends.cyr build/test_backends
 
 include "lib/string.cyr"
 include "lib/fmt.cyr"

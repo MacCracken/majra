@@ -2,162 +2,92 @@
 
 > Ifran manages model lifecycle (download, conversion, quantisation, indexing).
 > This guide covers replacing Ifran's internal queue, pub/sub, and heartbeat
-> implementations with majra primitives.
+> with majra Cyrius modules.
 
 ## Modules to adopt
 
-| Ifran component | majra replacement | Feature flag |
-|----------------|-------------------|-------------|
-| Job queue (training, indexing) | `ManagedQueue<T>` | `queue` |
-| Model event bus | `TypedPubSub<ModelEvent>` | `pubsub` |
-| Node health tracking | `ConcurrentHeartbeatTracker` | `heartbeat` |
-| GPU resource filtering | `ResourceReq` / `ResourcePool` | `queue` |
-| Job persistence | `SqliteBackend` | `sqlite` |
+| Ifran component | majra module | Function prefix |
+|----------------|-------------|-----------------|
+| Job queue (training, indexing) | `queue.cyr` | `mq_*` |
+| Model event bus | `pubsub.cyr` | `pubsub_*` |
+| Node health tracking | `heartbeat.cyr` | `chb_*` |
+| GPU resource filtering | `fleet.cyr` | `fleet_*` |
 
 ## Step 1: Replace the job queue
 
-Ifran's internal training/indexing queue becomes a `ManagedQueue<IfranJob>`:
+```cyrius
+include "src/queue.cyr"
 
-```rust
-use majra::queue::{ManagedQueue, ManagedQueueConfig, Priority, ResourceReq, ResourcePool};
+# Create queue with max 4 concurrent jobs
+var mq = mq_new("gpu-training", 4);
 
-#[derive(Clone, Serialize, Deserialize)]
-struct IfranJob {
-    model_id: String,
-    operation: IfranOp, // Train, Index, Convert, Quantise
-    params: serde_json::Value,
-}
+# Enqueue a training job (priority + payload pointer)
+var job = mq_enqueue(mq, PRIORITY_HIGH, job_data);
 
-let config = ManagedQueueConfig {
-    max_concurrency: 4,
-    finished_ttl: Duration::from_secs(3600),
-};
-let queue = ManagedQueue::<IfranJob>::new(config);
-
-// Enqueue a GPU training job.
-let id = queue.enqueue(
-    Priority::High,
-    IfranJob { model_id: "llama-70b".into(), operation: IfranOp::Train, params: json!({}) },
-    Some(ResourceReq { gpu_count: 2, vram_mb: 32000 }),
-).await;
-
-// Dequeue respecting available resources.
-let pool = ResourcePool { gpu_count: 4, vram_mb: 80000 };
-if let Some(job) = queue.dequeue(&pool).await {
-    // Run the job...
-    queue.complete(job.id)?;
-}
+# Dequeue highest priority
+var next = mq_dequeue(mq);
+# ... process ...
+mq_complete(mq, next);
 ```
-
-### Key differences from Ifran's internal queue
-
-- Priority tiers (5 levels) replace flat FIFO
-- Resource-aware dequeue replaces manual GPU slot tracking
-- Lifecycle events (`subscribe_events()`) replace callback hooks
-- `get()` replaces any internal job lookup
 
 ## Step 2: Replace the model event bus
 
-Replace Ifran's event emitter with `TypedPubSub`:
+```cyrius
+include "src/pubsub.cyr"
 
-```rust
-use majra::pubsub::{TypedPubSub, TypedPubSubConfig, BackpressurePolicy};
+var events = pubsub_new();
 
-#[derive(Clone, Serialize, Deserialize)]
-struct ModelEvent {
-    model_id: String,
-    event: String, // "download_complete", "training_started", etc.
-    progress: Option<f32>,
-}
+# Subscribe to all events for a model
+var ch = pubsub_subscribe_pattern(events, "models/llama-70b/#");
 
-let config = TypedPubSubConfig {
-    channel_capacity: 1024,
-    backpressure: BackpressurePolicy::DropOldest,
-    replay_capacity: 50, // Late subscribers catch up on recent events.
-};
-let events = TypedPubSub::<ModelEvent>::with_config(config);
+# Publish
+pubsub_publish(events, "models/llama-70b/training/started", event_data);
 
-// Subscribe to all events for a specific model.
-let mut rx = events.subscribe("models/llama-70b/#");
-
-// Publish.
-events.publish("models/llama-70b/training/started", ModelEvent {
-    model_id: "llama-70b".into(),
-    event: "training_started".into(),
-    progress: Some(0.0),
-});
+# Receive (blocking)
+var msg = chan_recv(ch);
 ```
 
 ## Step 3: Replace node health tracking
 
-```rust
-use majra::heartbeat::{ConcurrentHeartbeatTracker, HeartbeatConfig, GpuTelemetry};
+```cyrius
+include "src/heartbeat.cyr"
 
-let tracker = ConcurrentHeartbeatTracker::new(HeartbeatConfig {
-    suspect_after: Duration::from_secs(30),
-    offline_after: Duration::from_secs(90),
-    eviction_policy: None,
-});
+var tracker = chb_tracker_new(heartbeat_config_new(30000000000, 90000000000, 0));
 
-// Register a GPU node.
-tracker.register_with_telemetry("gpu-node-0", json!({"role": "trainer"}), vec![
-    GpuTelemetry {
-        utilization_pct: 0.0,
-        memory_used_mb: 0,
-        memory_total_mb: 80000,
-        temperature_c: Some(35.0),
-    },
-]);
+# Register GPU node with telemetry
+var gpus = vec_new();
+vec_push(gpus, gpu_telemetry_new(0, 0, 80000, 3500));
+chb_register_with_telemetry(tracker, "gpu-node-0", 0, gpus);
 
-// Periodic sweep — call from a background task.
-let transitions = tracker.update_statuses();
-let stats = tracker.fleet_stats();
+# Periodic sweep
+chb_update_statuses(tracker);
+var stats = chb_fleet_stats(tracker);
 ```
 
-## Step 4: Add persistence
+## Step 4: Fleet scheduling (multi-node GPU clusters)
 
-### SQLite (single-node)
+```cyrius
+include "src/fleet.cyr"
 
-```rust
-use majra::queue::persistence::SqliteBackend;
+var cfg = fleet_config_new(10, 5, 4);
+var fleet = fleet_new(cfg);
 
-let backend = Arc::new(SqliteBackend::open(Path::new("ifran-queue.db"))?);
-let queue = ManagedQueue::<IfranJob>::with_sqlite(config, backend);
+fleet_register_node(fleet, "gpu-0");
+fleet_register_node(fleet, "gpu-1");
+
+# Submit — routed to least-loaded node
+fleet_submit(fleet, PRIORITY_HIGH, job_data);
+
+# Periodic rebalancing
+fleet_rebalance(fleet);
 ```
 
-### PostgreSQL (multi-node)
+## Step 5: PostgreSQL persistence
 
-```rust
-use majra::postgres_backend::PostgresQueueBackend;
+```cyrius
+include "src/postgres_backend.cyr"
 
-let pg = Arc::new(PostgresQueueBackend::connect("postgresql://...").await?);
-let queue = ManagedQueue::<IfranJob>::with_postgres(config, pg);
-```
-
-## Step 5: Fleet scheduling (multi-node GPU clusters)
-
-For distributing jobs across GPU nodes with work-stealing:
-
-```rust
-use majra::fleet::{FleetQueue, FleetQueueConfig};
-use majra::queue::{ResourcePool, Priority, ResourceReq};
-
-let fleet = FleetQueue::new(FleetQueueConfig::default());
-
-// Register GPU nodes.
-fleet.register_node("gpu-0", ResourcePool { gpu_count: 4, vram_mb: 80_000 });
-fleet.register_node("gpu-1", ResourcePool { gpu_count: 2, vram_mb: 16_000 });
-
-// Submit — automatically routed to least-loaded node with sufficient resources.
-fleet.submit(Priority::High, job, Some(ResourceReq { gpu_count: 2, vram_mb: 32_000 }));
-
-// Periodic rebalancing — steal work from overloaded nodes.
-fleet.rebalance();
-```
-
-## Cargo.toml
-
-```toml
-[dependencies]
-majra = { version = "1", features = ["queue", "pubsub", "heartbeat", "fleet", "postgres"] }
+var pg = pg_connect("127.0.0.1", 5432, "postgres", "ifran", "password");
+pg_init_workflow_tables(pg);
+pg_save_workflow_def(pg, "training-pipeline", "GPU training", "[]");
 ```

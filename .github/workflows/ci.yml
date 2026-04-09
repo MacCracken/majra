@@ -11,174 +11,79 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-
 jobs:
-  check:
-    name: Check & Lint
+  build-and-test:
+    name: Build & Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Format check
-        run: cargo fmt --all -- --check
-      - name: Clippy (default features)
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Clippy (no default features)
-        run: cargo clippy --no-default-features --all-targets -- -D warnings
-      - name: Clippy (all features)
-        run: cargo clippy --all-features --all-targets -- -D warnings
-      - name: Type check
-        run: cargo check
 
-  security:
-    name: Security Audit
+      - name: Install Cyrius toolchain
+        run: |
+          curl -sL https://github.com/MacCracken/cyrius/releases/latest/download/cyrius-linux-x86_64.tar.gz | tar xz -C /usr/local
+          echo "/usr/local/cyrius/bin" >> $GITHUB_PATH
+
+      - name: Full audit (test + fmt + lint + vet + deny + bench)
+        run: cyrius audit
+
+      - name: Examples
+        run: |
+          cyrius build examples/managed_queue.cyr build/managed_queue && ./build/managed_queue
+          cyrius build examples/pubsub_tiers.cyr build/pubsub_tiers && ./build/pubsub_tiers
+
+  live-tests:
+    name: Live Integration Tests
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-      - name: Audit
-        run: cargo audit
-
-  deny:
-    name: Supply Chain (cargo-deny)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
-
-  test:
-    name: Test (${{ matrix.os }})
-    needs: [check]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-      - name: Run tests
-        run: cargo test --all-features
-      - name: Run doc tests
-        run: cargo test --doc
-
-  test-minimal:
-    name: Test (no default features)
-    needs: [check]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Test with no default features
-        run: cargo test --no-default-features
-
-  msrv:
-    name: MSRV (1.89)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.89"
-      - uses: Swatinem/rust-cache@v2
-      - name: Check with MSRV
-        run: cargo check --all-features
-      - name: Test with MSRV
-        run: cargo test --all-features
-
-  coverage:
-    name: Coverage
-    runs-on: ubuntu-latest
-    needs: [check]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov
-      - name: Generate coverage
-        run: cargo llvm-cov --all-features --lcov --output-path lcov.info
-      - name: Upload coverage
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: codecov/codecov-action@v4
-        with:
-          files: lcov.info
-          fail_ci_if_error: false
-
-  benchmarks:
-    name: Benchmarks
-    runs-on: ubuntu-latest
-    needs: [check]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Run benchmarks
-        run: cargo bench --all-features --no-fail-fast
-      - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmarks
-          path: target/criterion/
-          retention-days: 30
-
-  doc:
-    name: Documentation
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build docs
-        run: cargo doc --no-deps --all-features
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+      postgres:
+        image: postgres:16-alpine
         env:
-          RUSTDOCFLAGS: "-D warnings"
+          POSTGRES_PASSWORD: majra
+          POSTGRES_DB: majra
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Cyrius toolchain
+        run: |
+          curl -sL https://github.com/MacCracken/cyrius/releases/latest/download/cyrius-linux-x86_64.tar.gz | tar xz -C /usr/local
+          echo "/usr/local/cyrius/bin" >> $GITHUB_PATH
+
+      - name: Configure PostgreSQL auth
+        run: |
+          PGID=$(docker ps -q --filter "ancestor=postgres:16-alpine")
+          docker exec "$PGID" su postgres -c \
+            "echo 'host all all 0.0.0.0/0 password' > /var/lib/postgresql/data/pg_hba.conf && \
+             echo 'local all all trust' >> /var/lib/postgresql/data/pg_hba.conf && \
+             pg_ctl reload -D /var/lib/postgresql/data"
+
+      - name: Run live tests
+        run: |
+          cyrius build tests/test_live.cyr build/test_live
+          ./build/test_live
 
   version:
     name: Version Consistency
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Verify VERSION matches Cargo.toml
+      - name: Verify VERSION matches cyrius.toml
         run: |
           FILE_VERSION=$(cat VERSION | tr -d '[:space:]')
-          CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          if [ "$FILE_VERSION" != "$CARGO_VERSION" ]; then
-            echo "ERROR: VERSION ($FILE_VERSION) != Cargo.toml ($CARGO_VERSION)"
+          CYRIUS_VERSION=$(grep '^version = ' cyrius.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          if [ "$FILE_VERSION" != "$CYRIUS_VERSION" ]; then
+            echo "ERROR: VERSION ($FILE_VERSION) != cyrius.toml ($CYRIUS_VERSION)"
             exit 1
           fi
           echo "Versions match: $FILE_VERSION"
-
-  semver:
-    name: SemVer Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-semver-checks
-        run: cargo install cargo-semver-checks
-      - name: Check semver
-        run: cargo semver-checks check-release

@@ -1,51 +1,33 @@
 # Dependency Watch
 
-Pinned versions and upgrade considerations for majra's dependencies.
+majra v2.0.0 (Cyrius) has **zero external dependencies**. All functionality is built
+on the Cyrius standard library (vendored in `lib/`).
 
-## Core Dependencies (always compiled)
+## Cyrius Standard Library Modules Used
 
-| Crate | Pinned | Notes |
-|-------|--------|-------|
-| **tokio** | 1.x | Runtime. Features: sync, time, net, macros, rt, io-util. Major version bump is breaking. |
-| **dashmap** | 6.x | Lock-free concurrent hashmap. Used in every module. v6 dropped some deprecated APIs from v5. |
-| **serde** | 1.x | Serialisation framework. Stable API, rarely breaks. |
-| **serde_json** | 1.x | JSON codec. Used for envelopes, relay, IPC, redis. |
-| **chrono** | 0.4 | Timestamps. Pre-1.0 but stable in practice. `serde` feature required. |
-| **uuid** | 1.x | V4 UUIDs for task IDs and correlation IDs. `serde` feature required. |
-| **thiserror** | 2.x | Error derive macro. v2 dropped transparent requirement for `#[from]`. |
-| **tracing** | 0.1 | Structured logging facade. Near-zero overhead when inactive. |
-| **async-trait** | 0.1 | Async trait support. Will become unnecessary when Rust stabilises `async fn in trait`. |
-
-## Optional Dependencies
-
-| Crate | Feature | Pinned | Notes |
-|-------|---------|--------|-------|
-| **rusqlite** | `sqlite` | 0.32 | SQLite with bundled amalgamation. WAL mode. |
-| **prometheus** | `prometheus` | 0.14 | Metrics exporter. Stable API. |
-| **redis** | `redis-backend` | 0.27 | Async Redis client. `tokio-comp` + `aio` features. |
-| **futures-util** | `redis-backend` | 0.3 | Stream utilities for Redis pub/sub. |
-| **tokio-postgres** | `postgres` | 0.7 | Async PostgreSQL client. No TLS by default. |
-| **deadpool-postgres** | `postgres` | 0.14 | Connection pooling for tokio-postgres. |
-| **quinn** | `quic` | 0.11 | QUIC transport. Brings rustls. |
-| **rustls** | `quic` | 0.23 | TLS via ring. `ring` feature for crypto. |
-| **rcgen** | `quic` | 0.13 | Self-signed cert generation (testing). |
-| **ring** | `ipc-encrypted` | 0.17 | AES-256-GCM encryption. FIPS-grade crypto. |
-| **tokio-tungstenite** | `ws` | 0.24 | WebSocket server/client. |
-| **tracing-subscriber** | `logging` | 0.3 | Tracing output formatting. env-filter + fmt features. |
-
-## Dev Dependencies
-
-| Crate | Pinned | Notes |
-|-------|--------|-------|
-| **criterion** | 0.5 | Benchmark framework with HTML reports. Macro API. |
-| **proptest** | 1.x | Property-based testing. |
-| **tokio** (dev) | 1.x | Full features + test-util for async tests. |
+| Module | Purpose |
+|--------|---------|
+| `string.cyr` | C string operations (strlen, streq, memcpy, memset) |
+| `fmt.cyr` | Integer formatting (print_num, fmt_int) |
+| `alloc.cyr` | Bump allocator (alloc, alloc_reset) |
+| `freelist.cyr` | Free-list allocator with individual free (fl_alloc, fl_free) |
+| `vec.cyr` | Dynamic i64 array (vec_new, vec_push, vec_get) |
+| `str.cyr` | Fat string type (str_from, str_len, str_eq, str_builder) |
+| `hashmap.cyr` | Hash table — string keys, i64 values (FNV-1a) |
+| `syscalls.cyr` | Linux x86_64 syscall wrappers |
+| `tagged.cyr` | Option/Result tagged unions (Ok, Err, Some, None) |
+| `fnptr.cyr` | Function pointer dispatch (fncall0, fncall1, fncall2) |
+| `thread.cyr` | Threads (clone), mutexes (futex), MPSC channels |
+| `assert.cyr` | Test assertions (assert, assert_eq, assert_summary) |
+| `bench.cyr` | Benchmarking (bench_new, bench_batch_start/stop, bench_report) |
+| `net.cyr` | TCP/UDP sockets (sock_connect, sock_send, sock_recv) |
 
 ## Upgrade Considerations
 
-- **tokio 2.x**: Not yet released. When it arrives, will require significant migration.
-- **async-trait removal**: Once `async fn in trait` stabilises (expected ~1.85+), remove `async-trait` dep and use native syntax. Monitor [tracking issue](https://github.com/rust-lang/rust/issues/91611).
-- **dashmap 7.x**: Watch for API changes. v5→v6 was straightforward.
-- **ring 0.18+**: Watch for API changes to `LessSafeKey`/`UnboundKey`.
-- **redis 0.28+**: Watch for connection API changes (multiplexed async connection).
-- **criterion 0.8+**: Uses builder pattern instead of macro API. Both prakash and hisab have migrated; majra still on 0.5.
+- **Cyrius compiler upgrades**: when `cc2` is updated, recompile and re-run tests.
+- **Stdlib changes**: if vendored `lib/` modules are updated from Cyrius, verify no
+  function signatures changed.
+- **sigil crypto port**: when sigil is ported to Cyrius, it will provide AES-256-GCM
+  and TLS 1.3 primitives, enabling:
+  - Full encrypted IPC (currently stub)
+  - QUIC transport (currently deferred)
