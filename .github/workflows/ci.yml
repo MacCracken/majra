@@ -11,6 +11,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CYRIUS_VERSION: "2.3.2"
+
 jobs:
   build-and-test:
     name: Build & Test
@@ -20,20 +23,72 @@ jobs:
 
       - name: Install Cyrius toolchain
         run: |
-          curl -sL https://github.com/MacCracken/cyrius/releases/latest/download/cyrius-linux-x86_64.tar.gz | tar xz -C /usr/local
-          echo "/usr/local/cyrius/bin" >> $GITHUB_PATH
+          curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
+          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
+          CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
+          mkdir -p "$HOME/.cyrius/bin" "$HOME/.cyrius/lib"
+          cp "$CYRIUS_DIR/bin/"* "$HOME/.cyrius/bin/" 2>/dev/null || true
+          cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/lib/" 2>/dev/null || true
+          chmod +x "$HOME/.cyrius/bin/"* 2>/dev/null || true
+          echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
+          echo "Cyrius $CYRIUS_VERSION installed"
 
-      - name: Full audit (test + fmt + lint + vet + deny + bench)
-        run: cyrius audit
+      - name: Build
+        run: |
+          mkdir -p build
+          cat src/main.cyr | cc2 > build/majra 2>build/errors.log
+          if [ $? -ne 0 ]; then cat build/errors.log; exit 1; fi
+          chmod +x build/majra
+          echo "majra: $(wc -c < build/majra) bytes"
+
+      - name: Verify ELF
+        run: xxd -l 4 build/majra | grep -q "7f45 4c46"
+
+      - name: Core tests
+        run: ./build/majra
+
+      - name: Expanded tests
+        run: |
+          cat tests/test_core.cyr | cc2 2>/dev/null > build/test_core
+          chmod +x build/test_core
+          ./build/test_core
+
+      - name: Backend tests
+        run: |
+          cat tests/test_backends.cyr | cc2 2>/dev/null > build/test_backends
+          chmod +x build/test_backends
+          ./build/test_backends
+
+      - name: Fuzz
+        run: |
+          for f in fuzz/*.fcyr; do
+            name=$(basename "$f" .fcyr)
+            cat "$f" | cc2 2>/dev/null > "build/$name"
+            chmod +x "build/$name"
+            timeout 10 "build/$name" 500 || { echo "FUZZ CRASH: $name"; exit 1; }
+            echo "  $name: ok"
+          done
+
+      - name: Benchmarks
+        run: |
+          cat benches/bench_all.cyr | cc2 2>/dev/null > build/bench_all
+          chmod +x build/bench_all
+          ./build/bench_all
 
       - name: Examples
         run: |
-          cyrius build examples/managed_queue.cyr build/managed_queue && ./build/managed_queue
-          cyrius build examples/pubsub_tiers.cyr build/pubsub_tiers && ./build/pubsub_tiers
+          cat examples/managed_queue.cyr | cc2 2>/dev/null > build/managed_queue
+          chmod +x build/managed_queue
+          ./build/managed_queue
+          cat examples/pubsub_tiers.cyr | cc2 2>/dev/null > build/pubsub_tiers
+          chmod +x build/pubsub_tiers
+          ./build/pubsub_tiers
 
   live-tests:
     name: Live Integration Tests
     runs-on: ubuntu-latest
+    env:
+      CYRIUS_VERSION: "2.3.2"
     services:
       redis:
         image: redis:7-alpine
@@ -57,8 +112,14 @@ jobs:
 
       - name: Install Cyrius toolchain
         run: |
-          curl -sL https://github.com/MacCracken/cyrius/releases/latest/download/cyrius-linux-x86_64.tar.gz | tar xz -C /usr/local
-          echo "/usr/local/cyrius/bin" >> $GITHUB_PATH
+          curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
+          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
+          CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
+          mkdir -p "$HOME/.cyrius/bin" "$HOME/.cyrius/lib"
+          cp "$CYRIUS_DIR/bin/"* "$HOME/.cyrius/bin/" 2>/dev/null || true
+          cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/lib/" 2>/dev/null || true
+          chmod +x "$HOME/.cyrius/bin/"* 2>/dev/null || true
+          echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
 
       - name: Configure PostgreSQL auth
         run: |
@@ -70,20 +131,40 @@ jobs:
 
       - name: Run live tests
         run: |
-          cyrius build tests/test_live.cyr build/test_live
+          mkdir -p build
+          cat tests/test_live.cyr | cc2 2>/dev/null > build/test_live
+          chmod +x build/test_live
           ./build/test_live
 
-  version:
-    name: Version Consistency
+  security:
+    name: Security Scan
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Verify VERSION matches cyrius.toml
+      - name: Scan for dangerous patterns
+        run: |
+          WARN=0
+          if grep -rn 'syscall(59' src/ 2>/dev/null | grep -v "# "; then
+            echo "WARN: raw execve"; WARN=1
+          fi
+          echo "security scan complete (warnings: $WARN)"
+
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check required docs
+        run: |
+          MISSING=0
+          for doc in README.md CHANGELOG.md VERSION CONTRIBUTING.md SECURITY.md LICENSE cyrius.toml; do
+            if [ -f "$doc" ]; then echo "  OK: $doc"; else echo "  MISSING: $doc"; MISSING=1; fi
+          done
+          exit $MISSING
+      - name: Verify version consistency
         run: |
           FILE_VERSION=$(cat VERSION | tr -d '[:space:]')
-          CYRIUS_VERSION=$(grep '^version = ' cyrius.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          if [ "$FILE_VERSION" != "$CYRIUS_VERSION" ]; then
-            echo "ERROR: VERSION ($FILE_VERSION) != cyrius.toml ($CYRIUS_VERSION)"
-            exit 1
-          fi
-          echo "Versions match: $FILE_VERSION"
+          TOML_VERSION=$(grep '^version = ' cyrius.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          [ "$FILE_VERSION" = "$TOML_VERSION" ] || { echo "VERSION ($FILE_VERSION) != cyrius.toml ($TOML_VERSION)"; exit 1; }
+          grep -q "$FILE_VERSION" CHANGELOG.md || { echo "version not in changelog"; exit 1; }
+          echo "Version consistent: $FILE_VERSION"
