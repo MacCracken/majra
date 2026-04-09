@@ -12,7 +12,7 @@ development workflow, code standards, and project conventions.
 
 ## Prerequisites
 
-- Cyrius compiler (`cc2`) — [cyrius](https://github.com/MacCracken/cyrius)
+- Cyrius compiler (`cyrius`) — [cyrius](https://github.com/MacCracken/cyrius)
 - Redis (for live integration tests)
 - PostgreSQL (for live integration tests)
 

@@ -1,6 +1,6 @@
 # Dependency Watch
 
-majra v2.0.0 (Cyrius) has **zero external dependencies**. All functionality is built
+majra v2.1.0 (Cyrius) has **zero external dependencies**. All functionality is built
 on the Cyrius standard library (vendored in `lib/`).
 
 ## Cyrius Standard Library Modules Used
@@ -24,7 +24,7 @@ on the Cyrius standard library (vendored in `lib/`).
 
 ## Upgrade Considerations
 
-- **Cyrius compiler upgrades**: when `cc2` is updated, recompile and re-run tests.
+- **Cyrius compiler upgrades**: when `cyrius` is updated, recompile and re-run tests.
 - **Stdlib changes**: if vendored `lib/` modules are updated from Cyrius, verify no
   function signatures changed.
 - **sigil crypto port**: when sigil is ported to Cyrius, it will provide AES-256-GCM

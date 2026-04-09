@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 env:
-  CYRIUS_VERSION: "2.7.2"
+  CYRIUS_VERSION: "3.2.1"
 
 jobs:
   ci:
@@ -37,6 +37,7 @@ jobs:
           CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
           mkdir -p "$HOME/.cyrius/bin" "$HOME/.cyrius/lib"
           cp "$CYRIUS_DIR/bin/"* "$HOME/.cyrius/bin/" 2>/dev/null || true
+          cp "$CYRIUS_DIR/scripts/cyrius" "$HOME/.cyrius/bin/cyrius" 2>/dev/null || true
           cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/lib/" 2>/dev/null || true
           chmod +x "$HOME/.cyrius/bin/"* 2>/dev/null || true
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
@@ -44,9 +45,11 @@ jobs:
       - name: Build
         run: |
           mkdir -p build
-          cat src/main.cyr | cc2 > build/majra
-          chmod +x build/majra
+          cyrius build src/main.cyr build/majra
           echo "majra: $(wc -c < build/majra) bytes"
+
+      - name: Test
+        run: sh tests/test.sh
 
       - name: Clean toolchain artifacts
         run: rm -f cyrius-*.tar.gz

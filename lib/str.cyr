@@ -95,13 +95,13 @@ fn str_contains(s, needle) {
 
 # Check if Str starts with a C string prefix
 fn str_starts_with(s, prefix) {
+    # s = Str, prefix = C string (null-terminated)
     var plen = strlen(prefix);
     if (plen > str_len(s)) { return 0; }
     return memeq(str_data(s), prefix, plen);
 }
 
-# Check if Str ends with a C string suffix
-# Check if Str ends with suffix Str
+# Check if Str ends with suffix Str (both are Str objects)
 fn str_ends_with(s, suffix) {
     var xlen = str_len(suffix);
     var slen = str_len(s);
@@ -268,7 +268,7 @@ fn str_join(parts, sep) {
     var sb = str_builder_new();
     var ji = 0;
     while (ji < plen) {
-        if (ji > 0) { str_builder_add_cstr(sb, sep); }
+        if (ji > 0) { str_builder_add(sb, sep); }
         str_builder_add(sb, vec_get(parts, ji));
         ji = ji + 1;
     }

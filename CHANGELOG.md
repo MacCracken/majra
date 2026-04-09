@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-04-09
+
+### Changed
+- **Cyrius stdlib synced to v3.2.1** — vendored `lib/` updated from 28 to 35 modules, all existing modules refreshed to upstream
+- **Binary size**: 93 KB → 108 KB (expanded stdlib)
+- **Build tooling references**: `cc2` / `cyrb` → `cyrius` across README, CONTRIBUTING, dependency-watch docs
+- **Test runner**: fixed benchmark invocation (direct build+run instead of `cyrius bench`)
+
+### Added
+- **7 new stdlib modules** vendored from Cyrius 3.2.1:
+  - `sakshi.cyr` / `sakshi_full.cyr` — structured logging/tracing (v0.8.0, enum-based log levels)
+  - `base64.cyr` — base64 encode/decode
+  - `chrono.cyr` — timestamp formatting and parsing
+  - `csv.cyr` — RFC 4180 CSV parser/writer
+  - `hashmap_fast.cyr` — optimised hashmap variant
+  - `http.cyr` — minimal HTTP/1.0 client
+- **Upstream stdlib improvements** pulled into 9 existing modules:
+  - `assert.cyr` — `assert_lt`, `assert_gte`, `assert_lte`, `assert_nonnull`
+  - `io.cyr` — file locking: `file_lock`, `file_unlock`, `file_trylock`, `file_lock_shared`
+  - `string.cyr` — `atoi()` for string-to-integer parsing
+  - `regex.cyr` — bugfix: `str_replace` now uses `str_data`/`str_len` correctly
+  - `str.cyr` — bugfix: `str_join` uses `str_builder_add` for Str separators
+  - `syscalls.cyr` — inotify wrappers: `sys_inotify_init`, `sys_inotify_add_watch`, `sys_inotify_rm_watch`
+  - `hashmap.cyr` — `map_iter` support via fnptr
+  - `callback.cyr` — syscalls include for timing
+  - `tagged.cyr` — `option_print`/`result_print` support
+
+### Fixed
+- Stale `cc2`/`cyrb` references in documentation (README.md, CONTRIBUTING.md, dependency-watch.md)
+- Test runner benchmark command (`cyrius bench` → direct build+run of `benches/bench_all.cyr`)
+
 ## [2.0.0] — 2026-04-08
 
 **Full port from Rust to Cyrius.** All 19 modules re-implemented from scratch with zero external dependencies.

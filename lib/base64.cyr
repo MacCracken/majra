@@ -1,0 +1,67 @@
+# base64.cyr — RFC 4648 Base64 encoding/decoding
+# Usage: include "lib/base64.cyr"
+# Requires: alloc.cyr, string.cyr
+
+var _b64_enc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+# Encode buf[0..len] to base64. Returns null-terminated string.
+fn base64_encode(buf, len) {
+    var out_len = ((len + 2) / 3) * 4;
+    var out = alloc(out_len + 1);
+    var si = 0;
+    var di = 0;
+    while (si < len) {
+        var b0 = load8(buf + si);
+        var b1 = 0; if (si + 1 < len) { b1 = load8(buf + si + 1); }
+        var b2 = 0; if (si + 2 < len) { b2 = load8(buf + si + 2); }
+        store8(out + di, load8(_b64_enc + (b0 >> 2)));
+        store8(out + di + 1, load8(_b64_enc + ((b0 & 3) << 4 | (b1 >> 4))));
+        if (si + 1 < len) {
+            store8(out + di + 2, load8(_b64_enc + ((b1 & 15) << 2 | (b2 >> 6))));
+        } else { store8(out + di + 2, 61); }
+        if (si + 2 < len) {
+            store8(out + di + 3, load8(_b64_enc + (b2 & 63)));
+        } else { store8(out + di + 3, 61); }
+        si = si + 3;
+        di = di + 4;
+    }
+    store8(out + di, 0);
+    return out;
+}
+
+# Decode base64 string to buffer. Returns {data_ptr, length} as alloc'd pair.
+fn base64_decode(encoded, enc_len) {
+    # Build decode table
+    var dtbl = alloc(256);
+    memset(dtbl, 255, 256);
+    var i = 0;
+    while (i < 64) {
+        store8(dtbl + load8(_b64_enc + i), i);
+        i = i + 1;
+    }
+    var out_len = (enc_len / 4) * 3;
+    if (enc_len > 0) {
+        if (load8(encoded + enc_len - 1) == 61) { out_len = out_len - 1; }
+        if (enc_len > 1) { if (load8(encoded + enc_len - 2) == 61) { out_len = out_len - 1; } }
+    }
+    var out = alloc(out_len + 1);
+    var si = 0;
+    var di = 0;
+    while (si < enc_len) {
+        var a = load8(dtbl + load8(encoded + si));
+        var b = 0; if (si + 1 < enc_len) { b = load8(dtbl + load8(encoded + si + 1)); }
+        var c = 0; if (si + 2 < enc_len) { c = load8(dtbl + load8(encoded + si + 2)); }
+        var d = 0; if (si + 3 < enc_len) { d = load8(dtbl + load8(encoded + si + 3)); }
+        if (di < out_len) { store8(out + di, (a << 2) | (b >> 4)); }
+        if (di + 1 < out_len) { store8(out + di + 1, ((b & 15) << 4) | (c >> 2)); }
+        if (di + 2 < out_len) { store8(out + di + 2, ((c & 3) << 6) | d); }
+        si = si + 4;
+        di = di + 3;
+    }
+    store8(out + out_len, 0);
+    # Return {ptr, len} pair
+    var result = alloc(16);
+    store64(result, out);
+    store64(result + 8, out_len);
+    return result;
+}

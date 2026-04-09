@@ -4,7 +4,7 @@
 
 Majra provides shared messaging primitives for the [AGNOS](https://github.com/MacCracken) ecosystem, eliminating duplicate pub/sub, queue, relay, and heartbeat implementations across [AgnosAI](https://github.com/MacCracken/agnosai), [Ifran](https://github.com/MacCracken/synapse), [SecureYeoman](https://github.com/MacCracken/secureyeoman), and [daimon](https://github.com/agnostos/daimon).
 
-**Written in [Cyrius](https://github.com/MacCracken/cyrius)** — zero external dependencies, compiles to a statically linked binary via `cc2`.
+**Written in [Cyrius](https://github.com/MacCracken/cyrius)** — zero external dependencies, compiles to a statically linked binary via `cyrius build`.
 
 ## Modules
 

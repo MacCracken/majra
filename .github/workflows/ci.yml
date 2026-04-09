@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CYRIUS_VERSION: "2.7.2"
+  CYRIUS_VERSION: "3.2.1"
 
 jobs:
   build-and-test:
@@ -28,6 +28,7 @@ jobs:
           CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
           mkdir -p "$HOME/.cyrius/bin" "$HOME/.cyrius/lib"
           cp "$CYRIUS_DIR/bin/"* "$HOME/.cyrius/bin/" 2>/dev/null || true
+          cp "$CYRIUS_DIR/scripts/cyrius" "$HOME/.cyrius/bin/cyrius" 2>/dev/null || true
           cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/lib/" 2>/dev/null || true
           chmod +x "$HOME/.cyrius/bin/"* 2>/dev/null || true
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
@@ -36,9 +37,7 @@ jobs:
       - name: Build
         run: |
           mkdir -p build
-          cat src/main.cyr | cc2 > build/majra 2>build/errors.log
-          if [ $? -ne 0 ]; then cat build/errors.log; exit 1; fi
-          chmod +x build/majra
+          cyrius build src/main.cyr build/majra
           echo "majra: $(wc -c < build/majra) bytes"
 
       - name: Verify ELF
@@ -49,46 +48,38 @@ jobs:
 
       - name: Expanded tests
         run: |
-          cat tests/test_core.tcyr | cc2 2>/dev/null > build/test_core
-          chmod +x build/test_core
+          cyrius build tests/test_core.tcyr build/test_core
           ./build/test_core
 
       - name: Backend tests
         run: |
-          cat tests/test_backends.tcyr | cc2 2>/dev/null > build/test_backends
-          chmod +x build/test_backends
+          cyrius build tests/test_backends.tcyr build/test_backends
           ./build/test_backends
 
       - name: Fuzz
         run: |
           for f in fuzz/*.fcyr; do
             name=$(basename "$f" .fcyr)
-            cat "$f" | cc2 2>/dev/null > "build/$name"
-            chmod +x "build/$name"
+            cyrius build "$f" "build/$name"
             timeout 10 "build/$name" 500 || { echo "FUZZ CRASH: $name"; exit 1; }
             echo "  $name: ok"
           done
 
       - name: Benchmarks
         run: |
-          cat benches/bench_all.cyr | cc2 2>/dev/null > build/bench_all
-          chmod +x build/bench_all
+          cyrius build benches/bench_all.cyr build/bench_all
           ./build/bench_all
 
       - name: Examples
         run: |
-          cat examples/managed_queue.cyr | cc2 2>/dev/null > build/managed_queue
-          chmod +x build/managed_queue
+          cyrius build examples/managed_queue.cyr build/managed_queue
           ./build/managed_queue
-          cat examples/pubsub_tiers.cyr | cc2 2>/dev/null > build/pubsub_tiers
-          chmod +x build/pubsub_tiers
+          cyrius build examples/pubsub_tiers.cyr build/pubsub_tiers
           ./build/pubsub_tiers
 
   live-tests:
     name: Live Integration Tests
     runs-on: ubuntu-latest
-    env:
-      CYRIUS_VERSION: "2.7.2"
     services:
       redis:
         image: redis:7-alpine
@@ -117,6 +108,7 @@ jobs:
           CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
           mkdir -p "$HOME/.cyrius/bin" "$HOME/.cyrius/lib"
           cp "$CYRIUS_DIR/bin/"* "$HOME/.cyrius/bin/" 2>/dev/null || true
+          cp "$CYRIUS_DIR/scripts/cyrius" "$HOME/.cyrius/bin/cyrius" 2>/dev/null || true
           cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/lib/" 2>/dev/null || true
           chmod +x "$HOME/.cyrius/bin/"* 2>/dev/null || true
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
@@ -132,8 +124,7 @@ jobs:
       - name: Run live tests
         run: |
           mkdir -p build
-          cat tests/test_live.tcyr | cc2 2>/dev/null > build/test_live
-          chmod +x build/test_live
+          cyrius build tests/test_live.tcyr build/test_live
           ./build/test_live
 
   security:
@@ -146,6 +137,9 @@ jobs:
           WARN=0
           if grep -rn 'syscall(59' src/ 2>/dev/null | grep -v "# "; then
             echo "WARN: raw execve"; WARN=1
+          fi
+          if grep -rn '"/etc/' src/ 2>/dev/null; then
+            echo "WARN: hardcoded /etc paths"; WARN=1
           fi
           echo "security scan complete (warnings: $WARN)"
 

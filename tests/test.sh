@@ -29,6 +29,6 @@ echo "=== Results ==="
 
 echo ""
 echo "--- benchmarks ---"
-cyrius bench
+cyrius build benches/bench_all.cyr "$BUILD/bench_all" && "$BUILD/bench_all"
 
 exit $(( CORE + EXPANDED ))

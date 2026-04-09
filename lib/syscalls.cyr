@@ -1,5 +1,5 @@
-# agnosys/syscalls.cyr — Linux x86_64 syscall wrappers
-# Usage: include "lib/agnosys/syscalls.cyr"
+# syscalls.cyr — Linux x86_64 syscall wrappers
+# Usage: include "lib/syscalls.cyr"
 #
 # Cyrius re-implementation of agnosys syscall bindings.
 # Constants use enums to avoid gvar_toks overflow (64 slot limit).
@@ -482,3 +482,20 @@ fn is_err(ret) {
 fn err_code(ret) {
     return 0 - ret;
 }
+
+# Inotify — file system event monitoring
+enum InotifyEvent {
+    IN_MODIFY = 2;
+    IN_CREATE = 256;
+    IN_DELETE = 512;
+    IN_MOVED_FROM = 64;
+    IN_MOVED_TO = 128;
+    IN_CLOSE_WRITE = 8;
+}
+
+# SYS_INOTIFY_INIT1 = 294, SYS_INOTIFY_ADD_WATCH = 254, SYS_INOTIFY_RM_WATCH = 255
+fn sys_inotify_init() { return syscall(294, 0); }
+# Add a watch on a path for inotify events
+fn sys_inotify_add_watch(fd, path, mask) { return syscall(254, fd, path, mask); }
+# Remove an inotify watch
+fn sys_inotify_rm_watch(fd, wd) { return syscall(255, fd, wd); }

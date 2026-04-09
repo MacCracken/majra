@@ -1,0 +1,207 @@
+# sakshi.cyr — tracing and error handling (stderr profile)
+# Single-file distribution. Zero heap allocation. No external dependencies.
+# Version: 0.8.0
+#
+# Minimal global footprint — no ring buffer, no UDP, no span stack.
+# For the full version (spans, ring buffer, UDP): include "lib/sakshi_full.cyr"
+#
+# Usage: include "lib/sakshi.cyr"
+#
+# Error:  sakshi_err_new(code, cat), sakshi_err_with_ctx(code, cat, ctx),
+#         sakshi_err_code(e), sakshi_err_category(e), sakshi_err_context(e),
+#         sakshi_is_err(e), sakshi_is_ok(e)
+# Trace:  sakshi_error(msg, len), sakshi_warn, sakshi_info, sakshi_debug, sakshi_trace
+#         sakshi_set_level(lvl), sakshi_get_level()
+# Output: sakshi_set_output_fd(fd),
+#         sakshi_output_file(path), sakshi_output_file_close()
+
+# ================================================================
+# Constants (enums — zero global variable slots)
+# ================================================================
+
+# Error categories
+enum ErrCat {
+    ERR_CAT_NONE    = 0;
+    ERR_CAT_SYSCALL = 1;
+    ERR_CAT_IO      = 2;
+    ERR_CAT_PARSE   = 3;
+    ERR_CAT_CONFIG  = 4;
+    ERR_CAT_RUNTIME = 5;
+    ERR_CAT_ALLOC   = 6;
+    ERR_CAT_NET     = 7;
+    ERR_CAT_AUTH    = 8;
+}
+
+# Error codes
+enum ErrCode {
+    ERR_OK          = 0;
+    ERR_UNKNOWN     = 1;
+    ERR_INVALID     = 2;
+    ERR_NOT_FOUND   = 3;
+    ERR_PERMISSION  = 4;
+    ERR_TIMEOUT     = 5;
+    ERR_OVERFLOW    = 6;
+    ERR_BUSY        = 7;
+}
+
+# Log levels
+enum LogLevel {
+    SK_ERROR = 0;
+    SK_WARN  = 1;
+    SK_INFO  = 2;
+    SK_DEBUG = 3;
+    SK_TRACE = 4;
+}
+
+# ================================================================
+# Global state
+# ================================================================
+
+var _sk_log_level = 2;
+var _sk_stderr_fd = 2;
+var _sk_file_fd = 0;
+var _sk_file_mode = 0;
+
+# ================================================================
+# Internal primitives
+# ================================================================
+
+fn _sk_now_ns() {
+    var ts[16];
+    syscall(228, 4, &ts);
+    return load64(&ts) * 1000000000 + load64(&ts + 8);
+}
+
+fn _sk_fmt_int(n, buf) {
+    var bi = 23;
+    var neg: i64 = 0;
+    if (n < 0) { neg = 1; n = 0 - n; }
+    if (n == 0) { store8(buf + bi, 48); bi = bi - 1; }
+    while (n > 0) { store8(buf + bi, 48 + n % 10); bi = bi - 1; n = n / 10; }
+    if (neg == 1) { store8(buf + bi, 45); bi = bi - 1; }
+    var len = 23 - bi;
+    var src = bi + 1;
+    for (var si = 0; si < len; si = si + 1) { store8(buf + si, load8(buf + src + si)); }
+    store8(buf + len, 0);
+    return len;
+}
+
+fn _sk_write_int(buf, pos, cap, val) {
+    var tmp[24];
+    var tlen = _sk_fmt_int(val, &tmp);
+    var ti = 0;
+    while (ti < tlen && pos < cap) {
+        store8(buf + pos, load8(&tmp + ti)); pos = pos + 1; ti = ti + 1;
+    }
+    return pos;
+}
+
+fn _sk_write_str(buf, pos, cap, s, slen) {
+    var wi = 0;
+    while (wi < slen && pos < cap) { store8(buf + pos, load8(s + wi)); pos = pos + 1; wi = wi + 1; }
+    return pos;
+}
+
+# ================================================================
+# Output
+# ================================================================
+
+fn _sk_write(buf, len) {
+    syscall(1, _sk_stderr_fd, buf, len);
+    if (_sk_file_mode == 1) { syscall(1, _sk_file_fd, buf, len); }
+    return 0;
+}
+
+# Set the stderr file descriptor for output
+fn sakshi_set_output_fd(fd) { _sk_stderr_fd = fd; return 0; }
+
+# Open a file for log output (append mode, tee with stderr)
+fn sakshi_output_file(path) {
+    var fd = syscall(2, path, 1089, 0x1A4);
+    if (fd < 0) { return fd; }
+    _sk_file_fd = fd;
+    _sk_file_mode = 1;
+    return fd;
+}
+
+# Close the log output file
+fn sakshi_output_file_close() {
+    if (_sk_file_mode == 1) { syscall(3, _sk_file_fd); _sk_file_fd = 0; }
+    _sk_file_mode = 0;
+    return 0;
+}
+
+# ================================================================
+# Emit
+# ================================================================
+
+fn _sk_emit(level, msg, msg_len) {
+    if (level > _sk_log_level) { return 0; }
+    var buf[256];
+    var pos: i64 = 0;
+    var ts = _sk_now_ns();
+    if (pos < 256) { store8(&buf + pos, 91); pos = pos + 1; }
+    pos = _sk_write_int(&buf, pos, 256, ts);
+    if (pos < 256) { store8(&buf + pos, 93); pos = pos + 1; }
+    if (pos < 256) { store8(&buf + pos, 32); pos = pos + 1; }
+    if (pos < 256) { store8(&buf + pos, 91); pos = pos + 1; }
+    var ls = "?????";
+    var ll = 5;
+    match level {
+        0 => { ls = "ERROR"; ll = 5; }
+        1 => { ls = "WARN"; ll = 4; }
+        2 => { ls = "INFO"; ll = 4; }
+        3 => { ls = "DEBUG"; ll = 5; }
+        4 => { ls = "TRACE"; ll = 5; }
+        _ => {}
+    }
+    pos = _sk_write_str(&buf, pos, 256, ls, ll);
+    if (pos < 256) { store8(&buf + pos, 93); pos = pos + 1; }
+    if (pos < 256) { store8(&buf + pos, 32); pos = pos + 1; }
+    pos = _sk_write_str(&buf, pos, 256, msg, msg_len);
+    if (pos < 256) { store8(&buf + pos, 10); pos = pos + 1; }
+    _sk_write(&buf, pos);
+    return 0;
+}
+
+# ================================================================
+# Error API
+# ================================================================
+
+# Create a packed error (code + category)
+fn sakshi_err_new(code, category) { return ((category & 0xFFFF) << 16) | (code & 0xFFFF); }
+# Create a packed error with context
+fn sakshi_err_with_ctx(code, category, context) {
+    return ((context & 0xFFFFFFFF) << 32) |
+    ((category & 0xFFFF) << 16) | (code & 0xFFFF);
+}
+# Extract error code from packed error
+fn sakshi_err_code(err) { return err & 0xFFFF; }
+# Extract category from packed error
+fn sakshi_err_category(err) { return (err >> 16) & 0xFFFF; }
+# Extract context from packed error
+fn sakshi_err_context(err) { return (err >> 32) & 0xFFFFFFFF; }
+# Check if value is an error (non-zero)
+fn sakshi_is_err(err) { if (err != 0) { return 1; } return 0; }
+# Check if value is OK (zero)
+fn sakshi_is_ok(err) { if (err == 0) { return 1; } return 0; }
+
+# ================================================================
+# Trace API
+# ================================================================
+
+# Set minimum log level for output
+fn sakshi_set_level(level) { _sk_log_level = level; return 0; }
+# Get current minimum log level
+fn sakshi_get_level() { return _sk_log_level; }
+
+# Log an error message
+fn sakshi_error(msg, msg_len) { _sk_emit(SK_ERROR, msg, msg_len); return 0; }
+# Log a warning message
+fn sakshi_warn(msg, msg_len)  { _sk_emit(SK_WARN, msg, msg_len); return 0; }
+# Log an info message
+fn sakshi_info(msg, msg_len)  { _sk_emit(SK_INFO, msg, msg_len); return 0; }
+# Log a debug message
+fn sakshi_debug(msg, msg_len) { _sk_emit(SK_DEBUG, msg, msg_len); return 0; }
+# Log a trace message
+fn sakshi_trace(msg, msg_len) { _sk_emit(SK_TRACE, msg, msg_len); return 0; }

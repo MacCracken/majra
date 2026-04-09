@@ -1,0 +1,70 @@
+# chrono.cyr — time and duration utilities
+# Usage: include "lib/chrono.cyr"
+# Requires: syscalls.cyr (for clock_gettime)
+
+var CLOCK_REALTIME = 0;
+var CLOCK_MONOTONIC = 1;
+
+# Get current time in nanoseconds (monotonic clock)
+fn clock_now_ns() {
+    var ts[16];
+    syscall(228, CLOCK_MONOTONIC, &ts);
+    return load64(&ts) * 1000000000 + load64(&ts + 8);
+}
+
+# Get current time in milliseconds (monotonic)
+fn clock_now_ms() {
+    return clock_now_ns() / 1000000;
+}
+
+# Get current epoch seconds (wall clock)
+fn clock_epoch_secs() {
+    var ts[16];
+    syscall(228, CLOCK_REALTIME, &ts);
+    return load64(&ts);
+}
+
+# Get current epoch nanoseconds (wall clock)
+fn clock_epoch_ns() {
+    var ts[16];
+    syscall(228, CLOCK_REALTIME, &ts);
+    return load64(&ts) * 1000000000 + load64(&ts + 8);
+}
+
+# Duration struct: {secs: i64, nsecs: i64} = 16 bytes
+fn dur_new(secs, nsecs) {
+    var d = alloc(16);
+    store64(d, secs);
+    store64(d + 8, nsecs);
+    return d;
+}
+
+# Get seconds component of a duration
+fn dur_secs(d) { return load64(d); }
+# Get nanoseconds component of a duration
+fn dur_nsecs(d) { return load64(d + 8); }
+
+# Convert duration to total milliseconds
+fn dur_to_ms(d) {
+    return load64(d) * 1000 + load64(d + 8) / 1000000;
+}
+
+# Convert duration to total nanoseconds
+fn dur_to_ns(d) {
+    return load64(d) * 1000000000 + load64(d + 8);
+}
+
+# Measure elapsed time between two ns timestamps
+fn dur_between(start_ns, end_ns) {
+    var diff = end_ns - start_ns;
+    return dur_new(diff / 1000000000, diff % 1000000000);
+}
+
+# Sleep for ms milliseconds (blocking)
+fn sleep_ms(ms) {
+    var ts[16];
+    store64(&ts, ms / 1000);
+    store64(&ts + 8, (ms % 1000) * 1000000);
+    syscall(35, &ts, 0);
+    return 0;
+}

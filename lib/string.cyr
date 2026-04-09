@@ -83,3 +83,21 @@ fn println(s) {
     syscall(1, 1, "\n", 1);
     return 0;
 }
+
+# Parse null-terminated decimal string to integer
+# Returns 0 for invalid input. Handles negative numbers.
+fn atoi(s) {
+    var i = 0;
+    var neg = 0;
+    if (load8(s) == 45) { neg = 1; i = 1; }
+    var result = 0;
+    var c = load8(s + i);
+    while (c >= 48) {
+        if (c > 57) { break; }
+        result = result * 10 + (c - 48);
+        i = i + 1;
+        c = load8(s + i);
+    }
+    if (neg == 1) { result = 0 - result; }
+    return result;
+}
