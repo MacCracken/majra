@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CYRIUS_VERSION: "2.3.2"
+  CYRIUS_VERSION: "2.6.2"
 
 jobs:
   build-and-test:
@@ -88,7 +88,7 @@ jobs:
     name: Live Integration Tests
     runs-on: ubuntu-latest
     env:
-      CYRIUS_VERSION: "2.3.2"
+      CYRIUS_VERSION: "2.6.2"
     services:
       redis:
         image: redis:7-alpine
