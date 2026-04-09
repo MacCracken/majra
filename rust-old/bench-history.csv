@@ -1,7 +1,0 @@
-timestamp,commit,benchmark,median,unit
-2026-03-26T15:45:38Z,cd9aad1,envelope_new,207.71,ns
-2026-03-26T15:45:38Z,cd9aad1,matches_pattern exact,60.088,ns
-2026-03-26T15:45:38Z,cd9aad1,pubsub_publish_no_match,790.12,ns
-2026-03-26T21:08:27Z,7df17cc,envelope_new,226.41,ns
-2026-03-26T21:08:27Z,7df17cc,matches_pattern exact,99.612,ns
-2026-03-26T21:08:27Z,7df17cc,pubsub_publish_no_match,1.3495,µs

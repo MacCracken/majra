@@ -1,11 +1,8 @@
 # Cyrius build output
 /build/
 
-# Rust build artifacts (archived source)
+# Build artifacts
 /target/
-rust-old/target/
-Cargo.lock
-rust-old/Cargo.lock
 
 # Editor / IDE
 *.swp

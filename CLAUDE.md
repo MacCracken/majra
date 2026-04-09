@@ -82,7 +82,6 @@ tests/test.sh          Test runner script
 benches/bench_all.cyr  17 benchmarks
 examples/              managed_queue.cyr, pubsub_tiers.cyr
 lib/                   Vendored Cyrius stdlib (28 modules)
-rust-old/              Archived Rust source (reference)
 build/                 Compiled binaries (gitignored)
 ```
 
@@ -106,7 +105,7 @@ docs/ (when earned):
 - **NEVER use `gh` CLI** — use `curl` to GitHub API only
 - Do not add unnecessary dependencies — Cyrius stdlib only
 - Do not skip benchmarks before claiming performance improvements
-- Do not commit `build/` or `rust-old/target/`
+- Do not commit `build/`
 
 ## Known Cyrius Compiler Issues
 

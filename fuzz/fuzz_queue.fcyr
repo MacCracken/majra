@@ -1,5 +1,5 @@
 # Fuzz: priority queue enqueue/dequeue with random priorities and payloads
-# Mirrors rust-old/fuzz/fuzz_targets/fuzz_queue.rs
+# Fuzz target: queue operations
 
 include "lib/string.cyr"
 include "lib/fmt.cyr"

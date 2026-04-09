@@ -166,7 +166,7 @@ cyrius audit
 
 ## Ported from Rust
 
-Majra was originally a Rust library (v1.0.4, ~13,000 lines). It was ported to Cyrius via `cyrius port`, re-implementing all modules from scratch. The original Rust source is archived in `rust-old/` for reference.
+Majra was originally a Rust library (v1.0.4, ~13,000 lines). It was ported to Cyrius via `cyrius port`, re-implementing all modules from scratch.
 
 | Metric | Rust v1.0.4 | Cyrius v2.0.0 |
 |--------|-------------|---------------|

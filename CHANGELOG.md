@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.0.0] — 2026-04-08
 
-**Full port from Rust to Cyrius.** All 19 modules re-implemented from scratch with zero external dependencies. Original Rust source archived in `rust-old/`.
+**Full port from Rust to Cyrius.** All 19 modules re-implemented from scratch with zero external dependencies.
 
 ### Changed
 - **Language**: Rust → Cyrius (compiled via `cc2`, statically linked)

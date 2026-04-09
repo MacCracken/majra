@@ -12,7 +12,7 @@ Completed items are in [CHANGELOG.md](../../CHANGELOG.md).
 ## Engineering Backlog
 
 - Shared-memory IPC transport (mmap-based, deferred)
-- Soak tests (50k-100k ops, need non-blocking channel recv or epoll integration)
+- **Soak tests** (50k-100k ops) — revisit when Cyrius 3.0 ships (expected non-blocking channel recv / epoll integration)
 - SQLite persistence (if Cyrius gets a SQLite binding)
 
 ## Non-goals

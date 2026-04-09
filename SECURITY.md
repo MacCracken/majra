@@ -4,33 +4,32 @@
 
 majra is a concurrency primitives library providing pub/sub, queues, relay,
 heartbeat, rate limiting, barrier synchronisation, DAG workflows, and distributed
-backends. It is a pure Rust library with no C FFI and no `unsafe` code.
+backends. Written in Cyrius with zero external dependencies.
 
 ### Attack Surface
 
 | Area | Risk | Mitigation |
 |------|------|------------|
-| **Concurrency** | Data races, deadlocks, unsound `Send`/`Sync` | DashMap + tokio::sync primitives; compile-time `Send + Sync` assertions on all public types |
-| **Denial of service** | Unbounded memory growth in rate limiter, queue, pub/sub, relay dedup | TTL eviction on all collections (`evict_stale_*`), configurable capacity limits (`max_dedup_entries`, `max_subscriptions`, `max_runs`) |
-| **SQLite injection** | Malformed inputs to persistence layer | Parameterised queries exclusively |
-| **PostgreSQL injection** | Malformed inputs to persistence layer | Parameterised queries via `tokio-postgres` |
-| **Redis command injection** | Untrusted keys/values | Keys are prefixed strings; rate limiter uses atomic Lua script |
-| **IPC encryption** | Key compromise, nonce reuse | AES-256-GCM via `ring`, monotonic nonce counter per direction, pre-shared key model |
-| **WebSocket bridge** | Connection exhaustion | Configurable `max_connections` limit, connection counting |
-| **Serialisation** | Untrusted `serde_json` payloads in envelopes, relay, IPC | Size limits on IPC frames (16 MiB max), no arbitrary code execution |
-| **Relay dedup** | Unbounded dedup table growth | TTL eviction + configurable max entries |
-| **Pending requests** | Unbounded correlation map growth | TTL eviction via `evict_stale_requests()` |
+| **Memory safety** | Buffer overflows, use-after-free | Manual memory via freelist (size-class isolation) and bump allocator; struct layouts documented with offsets |
+| **Concurrency** | Data races, deadlocks | Mutex + futex primitives from Cyrius stdlib; single-lock-per-structure model |
+| **Denial of service** | Unbounded memory growth | TTL eviction on all collections, configurable capacity limits |
+| **PostgreSQL injection** | Malformed inputs to persistence layer | String-interpolated queries — consumers must sanitize inputs |
+| **Redis command injection** | Untrusted keys/values | Keys built via structured builder, not raw string concatenation |
+| **IPC encryption** | Key compromise, nonce reuse | AES-256-GCM framing with monotonic nonce counter, warning at 2^31, hard error at 2^32 |
+| **WebSocket bridge** | Connection exhaustion | Configurable `max_connections` limit |
+| **IPC framing** | Oversized frames | 1 MB max frame size check |
+| **Relay dedup** | Unbounded dedup table growth | TTL eviction + configurable max entries via `relay_set_max_dedup` |
+| **Pattern matching** | Deep nesting DoS | Character-by-character scan, no recursion |
+| **SHA-1 (WebSocket)** | Collision attacks | Used only for RFC 6455 handshake (not security-critical) |
+| **Nonce exhaustion** | AES-GCM nonce reuse after 2^32 messages | Hard error at limit, warning at 2^31, `encrypted_ipc_rekey()` for rotation |
 | **Circuit breaker** | Cascading failure from endpoint outages | Configurable failure threshold + cooldown, half-open probe, manual reset |
-| **Sliding window approximation** | ~5% accuracy loss vs exact counting | Documented tradeoff; token bucket available for burst-tolerant use cases |
-| **Nonce exhaustion** | AES-GCM nonce reuse after 2^32 messages | Hard error at limit, warning at 2^31, `rekey()` API for key rotation |
-| **HashedChannel collisions** | Topic hash collision (u64) routes to wrong subscriber | Probability ~1 in 2^64; use TypedPubSub if collision-free routing required |
 
 ## Supported Versions
 
 | Version | Supported |
 | ------- | --------- |
-| 1.0.x   | Yes       |
-| < 1.0   | No        |
+| 2.0.x   | Yes       |
+| 1.x     | No (Rust, archived) |
 
 ## Reporting a Vulnerability
 
@@ -54,11 +53,10 @@ responsibly:
 
 ## Security Design Principles
 
-- No `unsafe` code (compile-time enforced with `Send + Sync` assertions).
-- All concurrent types use `DashMap` or `tokio::sync` — no raw atomics or lock-free structures.
+- Zero external dependencies — Cyrius stdlib only, no supply chain attack vector.
+- All concurrent types use mutex + futex from `lib/thread.cyr`.
 - All collections have eviction mechanisms to prevent unbounded growth.
-- SQLite and PostgreSQL backends use parameterised queries exclusively.
-- Redis operations use atomic Lua scripts where race conditions would be possible.
-- IPC encryption uses AES-256-GCM with monotonic nonces (no nonce reuse).
-- Fuzz testing (`make fuzz`) targets serialisation and queue state transitions.
-- `cargo-deny` and `cargo-audit` run in CI for supply-chain security.
+- Network protocols (RESP, PostgreSQL, WebSocket) implemented from scratch.
+- IPC encryption uses AES-256-GCM framing with monotonic nonces.
+- Fuzz testing (`cyrius fuzz`) targets queue, pub/sub, and heartbeat.
+- Compiler is self-hosting with byte-identical verification.
