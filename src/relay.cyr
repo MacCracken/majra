@@ -199,7 +199,7 @@ fn relay_receive(r, msg) {
     # Enforce dedup table size limit
     var max_dedup = load64(_recv_r + 80);
     var seen = load64(_recv_r + 16);
-    if (max_dedup > 0 && map_count(seen) > max_dedup) {
+    if (max_dedup > 0 && map_size(seen) > max_dedup) {
         # Evict oldest entry
         var keys = map_keys(seen);
         var oldest_key = 0;
@@ -237,7 +237,7 @@ fn relay_receive(r, msg) {
 }
 
 fn relay_dedup_table_size(r) {
-    return map_count(load64(r + 16));
+    return map_size(load64(r + 16));
 }
 
 # Evict dedup entries idle longer than max_idle_ns. Returns count.
@@ -283,6 +283,6 @@ fn relay_stats(r) {
     store64(s + 8, counter_get(load64(r + 56)));
     store64(s + 16, counter_get(load64(r + 64)));
     store64(s + 24, counter_get(load64(r + 72)));
-    store64(s + 32, map_count(load64(r + 16)));
+    store64(s + 32, map_size(load64(r + 16)));
     return s;
 }

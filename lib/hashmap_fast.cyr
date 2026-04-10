@@ -132,6 +132,36 @@ fn fhm_get(m, key) {
     return 0;
 }
 
+# Get value with default. Returns value or default_val if not found.
+fn fhm_get_or(m, key, default_val) {
+    var meta = load64(m);
+    var keys = load64(m + 8);
+    var vals = load64(m + 16);
+    var cap = load64(m + 24);
+    var h = _fhm_hash(key);
+    var h2 = _fhm_h2(h);
+    var idx = (h & (cap - 1)) & (0 - 16);
+    var probes = 0;
+    while (probes < cap) {
+        var mask = _fhm_probe16(meta, idx, h2);
+        while (mask != 0) {
+            var si = idx + _fhm_ctz(mask);
+            if (streq(load64(keys + si * 8), key) == 1) {
+                return load64(vals + si * 8);
+            }
+            mask = mask & (mask - 1);
+        }
+        var empty = _fhm_empty16(meta, idx);
+        if (empty != 0) { return default_val; }
+        idx = (idx + 16) & (cap - 1);
+        probes = probes + 16;
+    }
+    return default_val;
+}
+
+# Alias for fhm_count
+fn fhm_size(m) { return load64(m + 32); }
+
 # Set key-value pair
 fn fhm_set(m, key, val) {
     var meta = load64(m);

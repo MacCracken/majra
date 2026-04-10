@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] — 2026-04-09
+
+### Changed
+- **Cyrius toolchain updated to v3.2.6** (cc3 compiler)
+- **Stdlib synced to v3.2.6** — updated `hashmap.cyr`, `hashmap_fast.cyr`, `json.cyr`, `string.cyr`
+- **`map_count` → `map_size`** across all source modules (17 call sites) — uses new idiomatic alias
+- **Chained `if/break` fix** in `postgres_backend.cyr` — uses compound `||` conditions per cc3 3.2.6 fix
+- **Bench file extension**: `bench_all.cyr` → `bench_all.bcyr` for `cyrius bench` auto-discovery
+
+### Added
+- **New stdlib modules from 3.2.6**:
+  - `patra.cyr` — structured storage, SQL queries, transactions, SHA-256
+- **New stdlib functions**:
+  - `map_get_or(m, key, default)` / `fhm_get_or(m, key, default)` — get with default value
+  - `map_size(m)` / `fhm_size(m)` — count aliases
+  - `strstr(haystack, needle)` — substring search
+
+### Fixed
+- `json.cyr` upstream fix: chained `if/break` inside while loops (broken in cc3 < 3.2.6)
+
 ## [2.1.1] - 2026-04-09
 
 ### Changed

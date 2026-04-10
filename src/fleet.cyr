@@ -140,7 +140,7 @@ fn fleet_rebalance(fq) {
 }
 
 fn fleet_node_count(fq) {
-    return map_count(load64(fq));
+    return map_size(load64(fq));
 }
 
 # FleetQueueStats struct (32 bytes):

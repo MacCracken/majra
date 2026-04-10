@@ -134,11 +134,11 @@ fn barrier_complete(bs, name) {
 }
 
 fn barrier_set_len(bs) {
-    return map_count(load64(bs));
+    return map_size(load64(bs));
 }
 
 fn barrier_set_is_empty(bs) {
-    return map_count(load64(bs)) == 0;
+    return map_size(load64(bs)) == 0;
 }
 
 # --- ConcurrentBarrierSet (thread-safe) ---
@@ -291,5 +291,5 @@ fn cbarrier_complete(cbs, name) {
     return r;
 }
 
-fn cbarrier_len(cbs) { return map_count(load64(cbs)); }
-fn cbarrier_is_empty(cbs) { return map_count(load64(cbs)) == 0; }
+fn cbarrier_len(cbs) { return map_size(load64(cbs)); }
+fn cbarrier_is_empty(cbs) { return map_size(load64(cbs)) == 0; }

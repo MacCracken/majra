@@ -107,5 +107,5 @@ fn conn_pool_reset_circuit(pool, endpoint) {
 }
 
 fn conn_pool_endpoint_count(pool) {
-    return map_count(load64(pool));
+    return map_size(load64(pool));
 }

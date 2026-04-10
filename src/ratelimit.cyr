@@ -83,7 +83,7 @@ fn ratelimit_check(rl, key) {
 
 # Number of tracked keys.
 fn ratelimit_key_count(rl) {
-    return map_count(load64(rl + 16));
+    return map_size(load64(rl + 16));
 }
 
 # Evict keys idle longer than max_idle_ns.
@@ -129,7 +129,7 @@ fn ratelimit_stats(rl) {
     var s = fl_alloc(32);
     store64(s, counter_get(load64(rl + 32)));
     store64(s + 8, counter_get(load64(rl + 40)));
-    store64(s + 16, map_count(load64(rl + 16)));
+    store64(s + 16, map_size(load64(rl + 16)));
     store64(s + 24, 0);
     return s;
 }
@@ -216,7 +216,7 @@ fn sliding_window_check(sw, key) {
 }
 
 fn sliding_window_key_count(sw) {
-    return map_count(load64(sw));
+    return map_size(load64(sw));
 }
 
 fn sliding_window_total_allowed(sw) {

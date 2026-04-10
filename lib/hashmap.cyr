@@ -19,8 +19,6 @@
 
 include "lib/fnptr.cyr"
 
-var HASHMAP_ENTRY_SIZE = 24;
-
 # FNV-1a hash for null-terminated string
 fn hash_str(s) {
     if (s == 0) { return 0; }
@@ -126,6 +124,16 @@ fn map_get(m, key) {
     if (ep == 0) { return 0; }
     return load64(ep + 8);
 }
+
+# Get value for key with default. Returns value or default_val if not found.
+fn map_get_or(m, key, default_val) {
+    var ep = _map_lookup(m, key);
+    if (ep == 0) { return default_val; }
+    return load64(ep + 8);
+}
+
+# Alias for map_count
+fn map_size(m) { return load64(m + 16); }
 
 # Check if key exists. Returns 1 or 0.
 fn map_has(m, key) {

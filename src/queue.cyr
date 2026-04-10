@@ -327,4 +327,4 @@ fn mq_cancel(mq, item) {
 fn mq_queued_count(mq) { return cpq_len(load64(mq)); }
 fn mq_running_count(mq) { return load64(mq + 32); }
 fn mq_total_completed(mq) { return counter_get(load64(mq + 56)); }
-fn mq_job_count(mq) { return map_count(load64(mq + 8)); }
+fn mq_job_count(mq) { return map_size(load64(mq + 8)); }

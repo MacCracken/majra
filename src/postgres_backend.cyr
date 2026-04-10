@@ -171,10 +171,12 @@ fn pg_connect(host, port, user, database, password) {
     }
 
     # Read until ReadyForQuery
-    while (1) {
+    var done = 0;
+    while (done == 0) {
         msg = _pg_read_msg(fd);
-        if (msg == 0) { break; }
-        if (load64(msg) == PG_MSG_READY) { break; }
+        if (msg == 0 || load64(msg) == PG_MSG_READY) {
+            done = 1;
+        }
     }
 
     var conn = fl_alloc(16);

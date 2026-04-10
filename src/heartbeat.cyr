@@ -205,11 +205,11 @@ fn hb_get(ht, id) {
 }
 
 fn hb_len(ht) {
-    return map_count(load64(ht));
+    return map_size(load64(ht));
 }
 
 fn hb_is_empty(ht) {
-    return map_count(load64(ht)) == 0;
+    return map_size(load64(ht)) == 0;
 }
 
 # List nodes by status — returns vec of id string pointers
@@ -405,11 +405,11 @@ fn chb_get_gpu_telemetry(cht, id) {
 }
 
 fn chb_len(cht) {
-    return map_count(load64(cht));
+    return map_size(load64(cht));
 }
 
 fn chb_is_empty(cht) {
-    return map_count(load64(cht)) == 0;
+    return map_size(load64(cht)) == 0;
 }
 
 fn chb_list_by_status(cht, status) {
