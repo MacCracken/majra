@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 env:
-  CYRIUS_VERSION: "3.2.1"
+  CYRIUS_VERSION: "3.2.6"
 
 jobs:
   ci:
