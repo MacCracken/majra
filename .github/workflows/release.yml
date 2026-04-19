@@ -2,21 +2,18 @@ name: Release
 
 on:
   push:
-    tags: ['*']
+    tags: ['[0-9]*']
 
 permissions:
   contents: write
-
-env:
-  CYRIUS_VERSION: "3.2.6"
 
 jobs:
   ci:
     name: CI Gate
     uses: ./.github/workflows/ci.yml
 
-  build:
-    name: Build Release
+  release:
+    name: Build & Release
     needs: [ci]
     runs-on: ubuntu-latest
     steps:
@@ -24,14 +21,14 @@ jobs:
 
       - name: Verify version
         run: |
-          FILE_VERSION=$(cat VERSION | tr -d '[:space:]')
-          TOML_VERSION=$(grep '^version = ' cyrius.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          FILE_VERSION=$(tr -d '[:space:]' < VERSION)
           TAG="${GITHUB_REF_NAME}"
           [ "$FILE_VERSION" = "$TAG" ] || { echo "VERSION ($FILE_VERSION) != tag ($TAG)"; exit 1; }
-          [ "$TOML_VERSION" = "$TAG" ] || { echo "cyrius.toml ($TOML_VERSION) != tag ($TAG)"; exit 1; }
 
       - name: Install Cyrius toolchain
         run: |
+          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -E '^cyrius[[:space:]]*=' cyrius.cyml | sed -E 's/^cyrius[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')}"
+          echo "Installing Cyrius $CYRIUS_VERSION"
           curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
@@ -48,8 +45,27 @@ jobs:
           cyrius build src/main.cyr build/majra
           echo "majra: $(wc -c < build/majra) bytes"
 
-      - name: Test
-        run: sh tests/test.sh
+      - name: Smoke test
+        run: |
+          ./build/majra > /tmp/majra_out 2>&1 || true
+          grep -q "0 failed" /tmp/majra_out || { echo "FAIL: tests did not report 0 failed"; exit 1; }
+
+      - name: Regenerate dist bundles (consumer distribution artifact)
+        run: |
+          # Self-compile check warns on stdlib symbols — expected; bundle emitted regardless.
+          cyrius distlib || true
+          cyrius distlib backends || true
+          test -s dist/majra.cyr          || { echo "FAIL: dist/majra.cyr not produced"; exit 1; }
+          test -s dist/majra-backends.cyr || { echo "FAIL: dist/majra-backends.cyr not produced"; exit 1; }
+          echo "dist/majra.cyr:          $(wc -l < dist/majra.cyr) lines, $(wc -c < dist/majra.cyr) bytes"
+          echo "dist/majra-backends.cyr: $(wc -l < dist/majra-backends.cyr) lines, $(wc -c < dist/majra-backends.cyr) bytes"
+
+      - name: Verify dist bundles match committed copies
+        run: |
+          if ! git diff --exit-code dist/; then
+            echo "FAIL: committed dist/ bundles are stale. Run 'cyrius distlib && cyrius distlib backends' and commit."
+            exit 1
+          fi
 
       - name: Clean toolchain artifacts
         run: rm -f cyrius-*.tar.gz
@@ -58,26 +74,14 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME}"
           git archive --format=tar.gz --prefix="majra-${TAG}/" -o "majra-${TAG}-src.tar.gz" HEAD
-          sha256sum majra-*.tar.gz > SHA256SUMS
+          cp dist/majra.cyr          "majra-${TAG}.cyr"
+          cp dist/majra-backends.cyr "majra-${TAG}-backends.cyr"
+          sha256sum majra-*.tar.gz majra-*.cyr build/majra > SHA256SUMS
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-artifacts
-          path: |
-            majra-*.tar.gz
-            SHA256SUMS
+      - name: Extract changelog
+        run: |
+          awk "/^## \\[${GITHUB_REF_NAME}\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md > /tmp/body.md
 
-  release:
-    name: Create GitHub Release
-    needs: [build]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: release-artifacts
-      - name: Changelog
-        run: awk "/^## \\[${GITHUB_REF_NAME}\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md > /tmp/body.md
       - uses: softprops/action-gh-release@v2
         with:
           name: "majra ${{ github.ref_name }}"
@@ -85,4 +89,6 @@ jobs:
           prerelease: ${{ startsWith(github.ref_name, '0.') }}
           files: |
             majra-*.tar.gz
+            majra-*.cyr
+            build/majra
             SHA256SUMS

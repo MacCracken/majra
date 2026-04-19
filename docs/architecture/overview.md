@@ -6,7 +6,7 @@ is a `.cyr` file included via `include` directives in dependency order.
 ## Module Map
 
 ```
-majra (v2.0.0, ~4,800 lines across 19 modules)
+majra (v2.3.0, ~4,800 lines across 19 modules)
 │
 │ ── Core (always included) ────────────────────
 ├── error           Error codes (enum) + result helpers
@@ -33,16 +33,25 @@ majra (v2.0.0, ~4,800 lines across 19 modules)
 ├── fleet           Distributed job queue with work-stealing
 ├── dag             DAG workflow engine (Kahn's sort, retry, error policies)
 │
-│ ── Backends ──────────────────────────────────
+│ ── Backends ([lib.backends] profile only) ────
 ├── redis_backend   RESP2 protocol (SET/GET, ZADD, PUBLISH, HSET, EVAL)
 └── postgres_backend PostgreSQL v3 wire protocol (startup, auth, query, CRUD)
 ```
+
+## Distribution profiles
+
+Two bundles are produced by `cyrius distlib`:
+
+| Bundle                    | Profile           | Modules            | Consumer use-case                                      |
+|---------------------------|-------------------|--------------------|--------------------------------------------------------|
+| `dist/majra.cyr`          | `[lib]` (default) | 15 core modules    | In-process concurrency primitives; no network surface  |
+| `dist/majra-backends.cyr` | `[lib.backends]`  | 15 core + 4 network modules (ipc_encrypted, ws, redis_backend, postgres_backend) | Full cross-process distribution |
 
 ## Design Principles
 
 1. **Zero dependencies** — Cyrius stdlib only. No external crates, no LLVM.
 2. **Thread-safe by default** — concurrent variants use mutex + futex.
-3. **Globals for cross-call state** — Cyrius clobbers locals across function calls.
+3. **Globals for cross-call state** — cc5 is better than cc3, but deeply nested call chains can still clobber locals. Several modules (`postgres_backend`, `relay`, `barrier`) promote critical values to globals defensively.
 4. **Fixed-point math** — no floating point; token buckets use x1000 scaling.
 5. **Eviction everywhere** — all collections support TTL/capacity-based eviction.
 6. **Multi-tenant ready** — Namespace module provides topic/key/node-ID scoping.

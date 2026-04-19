@@ -11,9 +11,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CYRIUS_VERSION: "3.2.6"
-
 jobs:
   build-and-test:
     name: Build & Test
@@ -23,6 +20,8 @@ jobs:
 
       - name: Install Cyrius toolchain
         run: |
+          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -E '^cyrius[[:space:]]*=' cyrius.cyml | sed -E 's/^cyrius[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')}"
+          echo "Installing Cyrius $CYRIUS_VERSION"
           curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
@@ -32,7 +31,25 @@ jobs:
           cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/lib/" 2>/dev/null || true
           chmod +x "$HOME/.cyrius/bin/"* 2>/dev/null || true
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
-          echo "Cyrius $CYRIUS_VERSION installed"
+          echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
+
+      - name: Manifest completeness ([lib] modules ⊇ main.cyr src/ includes)
+        run: |
+          # Every `include "src/<file>.cyr"` in src/main.cyr must be listed under
+          # cyrius.cyml [lib] modules. Otherwise `cyrius distlib` silently ships
+          # dist/majra.cyr missing a module, and the freshness gate below can't
+          # see it (manifest is both input and oracle). Mirrors libro's guard.
+          INCLUDES=$(grep -E 'include "src/[^"]+\.cyr"' src/main.cyr \
+            | sed -E 's/.*"(src\/[^"]+\.cyr)".*/\1/' | sort -u)
+          MANIFEST=$(awk '/^\[lib\]/{flag=1;next} /^\[/{flag=0} flag' cyrius.cyml \
+            | grep -oE '"src/[^"]+\.cyr"' | tr -d '"' | sort -u)
+          MISSING=$(comm -23 <(echo "$INCLUDES") <(echo "$MANIFEST"))
+          if [ -n "$MISSING" ]; then
+            echo "FAIL: src/ files included from main.cyr but not in cyrius.cyml [lib] modules:"
+            echo "$MISSING"
+            exit 1
+          fi
+          echo "Manifest covers all main.cyr src/ includes."
 
       - name: Build
         run: |
@@ -67,8 +84,11 @@ jobs:
 
       - name: Benchmarks
         run: |
-          cyrius build benches/bench_all.cyr build/bench_all
-          ./build/bench_all
+          for f in benches/*.bcyr; do
+            name=$(basename "$f" .bcyr)
+            cyrius build "$f" "build/$name"
+            "build/$name"
+          done
 
       - name: Examples
         run: |
@@ -76,6 +96,22 @@ jobs:
           ./build/managed_queue
           cyrius build examples/pubsub_tiers.cyr build/pubsub_tiers
           ./build/pubsub_tiers
+
+      - name: dist/majra.cyr is up-to-date
+        run: |
+          # `cyrius distlib` emits dist/majra.cyr from [lib] modules. The
+          # self-compile check will warn about stdlib symbols (e.g.
+          # CLOCK_MONOTONIC from lib/syscalls.cyr) — consumers supply their
+          # own stdlib. The bundle is still emitted. Same pattern as libro
+          # (see DEPS-PATTERN.md in libro for the full rationale).
+          cyrius distlib || true
+          cyrius distlib backends || true
+          test -s dist/majra.cyr          || { echo "FAIL: dist/majra.cyr not produced"; exit 1; }
+          test -s dist/majra-backends.cyr || { echo "FAIL: dist/majra-backends.cyr not produced"; exit 1; }
+          if ! git diff --exit-code dist/; then
+            echo "FAIL: dist/ bundles are stale. Run 'cyrius distlib && cyrius distlib backends' and commit."
+            exit 1
+          fi
 
   live-tests:
     name: Live Integration Tests
@@ -103,6 +139,7 @@ jobs:
 
       - name: Install Cyrius toolchain
         run: |
+          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -E '^cyrius[[:space:]]*=' cyrius.cyml | sed -E 's/^cyrius[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')}"
           curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
@@ -151,14 +188,18 @@ jobs:
       - name: Check required docs
         run: |
           MISSING=0
-          for doc in README.md CHANGELOG.md VERSION CONTRIBUTING.md SECURITY.md LICENSE cyrius.toml; do
+          for doc in README.md CHANGELOG.md CLAUDE.md CONTRIBUTING.md SECURITY.md CODE_OF_CONDUCT.md LICENSE VERSION cyrius.cyml; do
             if [ -f "$doc" ]; then echo "  OK: $doc"; else echo "  MISSING: $doc"; MISSING=1; fi
           done
           exit $MISSING
       - name: Verify version consistency
         run: |
-          FILE_VERSION=$(cat VERSION | tr -d '[:space:]')
-          TOML_VERSION=$(grep '^version = ' cyrius.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          [ "$FILE_VERSION" = "$TOML_VERSION" ] || { echo "VERSION ($FILE_VERSION) != cyrius.toml ($TOML_VERSION)"; exit 1; }
-          grep -q "$FILE_VERSION" CHANGELOG.md || { echo "version not in changelog"; exit 1; }
+          FILE_VERSION=$(tr -d '[:space:]' < VERSION)
+          CYML_VERSION=$(grep '^version = ' cyrius.cyml | head -1 | sed -E 's/version = "([^"]+)".*/\1/')
+          # cyrius.cyml uses ${file:VERSION} — treat the literal as "match"
+          if [ "$CYML_VERSION" != '${file:VERSION}' ] && [ "$CYML_VERSION" != "$FILE_VERSION" ]; then
+            echo "FAIL: VERSION ($FILE_VERSION) != cyrius.cyml ($CYML_VERSION)"
+            exit 1
+          fi
+          grep -q "\[$FILE_VERSION\]" CHANGELOG.md || { echo "FAIL: version $FILE_VERSION not in CHANGELOG.md"; exit 1; }
           echo "Version consistent: $FILE_VERSION"

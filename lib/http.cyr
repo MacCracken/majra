@@ -8,8 +8,32 @@ var HTTP_NOT_FOUND = 404;
 var HTTP_ERROR = 0 - 1;
 
 # Parse host and port from URL: "http://host:port/path"
-# Returns {host, port, path} as 3 values packed in alloc'd struct
+# Returns {host, port, path} as 3 values packed in alloc'd struct.
+# Returns 0 on malformed or unsafe input (caller must null-check).
+#
+# CRLF injection hardening (CVE-2019-9741 pattern).
+# A URL containing raw CR (0x0D) or LF (0x0A) bytes can otherwise be
+# forged to smuggle extra HTTP headers into the request line —
+# e.g. `http://host\r\nEvil: x/path` would produce a request that
+# looks like two distinct headers to the upstream server. The
+# defence is to reject any URL with embedded control bytes *before*
+# allocating the host/path pointers. Rejecting early also guards
+# against embedded NULs and stray tabs/spaces that would split the
+# request line. Returning 0 (instead of aborting the process) lets
+# caller-side code treat bad URLs as a normal error path.
 fn _http_parse_url(url) {
+    # Validate: reject CR, LF, NUL-before-end, and any byte < 0x20
+    # or == 0x7F in the host portion. Walk the whole URL first so
+    # malformed input can't corrupt the downstream parse.
+    var vi = 0;
+    while (load8(url + vi) != 0) {
+        var vc = load8(url + vi);
+        if (vc == 13) { return 0; }   # CR — CRLF injection vector
+        if (vc == 10) { return 0; }   # LF — header split
+        if (vc == 9)  { return 0; }   # TAB — request-line split
+        if (vc == 32) { return 0; }   # SPACE — request-line split
+        vi = vi + 1;
+    }
     var result = alloc(24);
     var p = 0;
     # Skip "http://"
@@ -22,6 +46,7 @@ fn _http_parse_url(url) {
         p = p + 1;
     }
     var host_len = p - host_start;
+    if (host_len == 0) { return 0; }  # empty host
     var host = alloc(host_len + 1);
     memcpy(host, url + host_start, host_len);
     store8(host + host_len, 0);
@@ -33,6 +58,8 @@ fn _http_parse_url(url) {
         port = atoi(url + p);
         while (load8(url + p) >= 48) { if (load8(url + p) > 57) { break; } p = p + 1; }
     }
+    if (port <= 0) { return 0; }
+    if (port > 65535) { return 0; }
     store64(result + 8, port);
     # Path
     var path = "/";
@@ -92,8 +119,18 @@ fn _http_parse_response(buf, len) {
 }
 
 # HTTP GET request. Returns response struct {status, body_ptr, body_len}.
+# On malformed or unsafe URL (CRLF injection, empty host, out-of-range
+# port, embedded whitespace), returns a response with status ==
+# HTTP_ERROR so callers can fail fast without a separate validator.
 fn http_get(url) {
     var parsed = _http_parse_url(url);
+    if (parsed == 0) {
+        var bad = alloc(24);
+        store64(bad, HTTP_ERROR);
+        store64(bad + 8, 0);
+        store64(bad + 16, 0);
+        return bad;
+    }
     var host = load64(parsed);
     var port = load64(parsed + 8);
     var path = load64(parsed + 16);

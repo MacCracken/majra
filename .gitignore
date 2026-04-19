@@ -1,9 +1,6 @@
 # Cyrius build output
 /build/
 
-# Build artifacts
-/target/
-
 # Editor / IDE
 *.swp
 *.swo
@@ -12,38 +9,22 @@
 .vscode/
 *.iml
 
-# OS files
+# OS
 .DS_Store
 Thumbs.db
 
-# Debugging
-*.pdb
+# Debug
 core
 core.*
 
-# Coverage
-lcov.info
-tarpaulin-report.html
-coverage/
-
-# Benchmark output (criterion generates large HTML reports)
-criterion/
-
-# Fuzz artifacts
-fuzz/target/
-fuzz/corpus/
-fuzz/artifacts/
-
-# Proptest persistence (regressions are committed, but not other state)
-proptest-regressions/
-
-# cargo-vet downloads
-supply-chain/.cache/
-
-# Environment / secrets
+# Secrets / environment
 .env
 .env.*
+!.env.example
 
-# Temporary test files
+# Claude Code
+.claude/
+
+# Temporary
 /tmp/
 *.tmp

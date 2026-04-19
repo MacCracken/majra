@@ -1,0 +1,89 @@
+[package]
+name = "majra"
+version = "${file:VERSION}"
+description = "Distributed queue & multiplex engine — pub/sub, queues, relay, IPC, heartbeat, rate limiting"
+license = "GPL-3.0-only"
+repository = "https://github.com/MacCracken/majra"
+language = "cyrius"
+cyrius = "5.4.8"
+
+[build]
+entry = "src/main.cyr"
+output = "build/majra"
+
+# `[lib]` exists so `cyrius distlib` knows what to concatenate into
+# dist/majra.cyr for downstream consumers (daimon, AgnosAI, hoosh,
+# sutra, stiva). Order mirrors the include order in src/main.cyr —
+# critical for Cyrius single-pass forward-reference resolution.
+#
+# Note: backend modules (redis_backend, postgres_backend, ipc_encrypted,
+# ws) are intentionally excluded from the default profile. They are
+# compiled via separate test entry points (tests/test_backends.tcyr,
+# tests/test_live.tcyr). The `backends` profile bundles them for
+# consumers that want the full surface.
+#
+# Profiles (Cyrius 5.4.6+):
+#   cyrius distlib           → dist/majra.cyr           (default [lib], core engine)
+#   cyrius distlib backends  → dist/majra-backends.cyr  ([lib.backends], +redis/pg/ws/encrypted-ipc)
+[lib]
+modules = [
+    "src/error.cyr",
+    "src/counter.cyr",
+    "src/envelope.cyr",
+    "src/namespace.cyr",
+    "src/metrics.cyr",
+    "src/ratelimit.cyr",
+    "src/heartbeat.cyr",
+    "src/queue.cyr",
+    "src/pubsub.cyr",
+    "src/relay.cyr",
+    "src/barrier.cyr",
+    "src/ipc.cyr",
+    "src/transport.cyr",
+    "src/fleet.cyr",
+    "src/dag.cyr",
+]
+
+[lib.backends]
+modules = [
+    "src/error.cyr",
+    "src/counter.cyr",
+    "src/envelope.cyr",
+    "src/namespace.cyr",
+    "src/metrics.cyr",
+    "src/ratelimit.cyr",
+    "src/heartbeat.cyr",
+    "src/queue.cyr",
+    "src/pubsub.cyr",
+    "src/relay.cyr",
+    "src/barrier.cyr",
+    "src/ipc.cyr",
+    "src/transport.cyr",
+    "src/fleet.cyr",
+    "src/dag.cyr",
+    "src/redis_backend.cyr",
+    "src/postgres_backend.cyr",
+    "src/ipc_encrypted.cyr",
+    "src/ws.cyr",
+]
+
+# ── Dependencies ─────────────────────────────────────────────────
+# Cyrius-stdlib modules vendored into lib/ by `cyrius deps`. majra
+# includes them directly via `include "lib/<name>.cyr"`; the list
+# here mirrors the top of src/main.cyr so the manifest stays
+# load-bearing for CI completeness checks.
+[deps]
+stdlib = [
+    "assert",
+    "alloc",
+    "freelist",
+    "vec",
+    "str",
+    "string",
+    "fmt",
+    "syscalls",
+    "hashmap",
+    "tagged",
+    "fnptr",
+    "thread",
+]

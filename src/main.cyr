@@ -32,12 +32,11 @@ include "src/ipc.cyr"
 include "src/transport.cyr"
 include "src/fleet.cyr"
 include "src/dag.cyr"
-# Backend modules loaded via separate test entry points
-# to avoid exceeding compiler fixup table (8192 limit).
-# include "src/redis_backend.cyr"
-# include "src/ipc_encrypted.cyr"
-# include "src/ws.cyr"
-# include "src/postgres_backend.cyr"
+# Backend modules (redis, postgres, ipc_encrypted, ws) are bundled
+# separately via the [lib.backends] profile in cyrius.cyml — see
+# dist/majra-backends.cyr. Consumers who don't need network transports
+# pull dist/majra.cyr and get the lean core engine. Tests run via
+# tests/test_backends.tcyr and tests/test_live.tcyr.
 
 # =============================================================================
 # Tests

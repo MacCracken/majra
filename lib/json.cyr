@@ -72,8 +72,9 @@ fn json_parse(src) {
             }
         } else {
             # Non-string value (number, true, false, null)
-            # Note: chained if/break inside while is broken in cc3 —
-            # use flag + || instead (fixed in 3.2.6, upstream from argonaut)
+            # Note: historical — chained if/break inside while was broken
+            # pre-3.2.6 (upstream report from argonaut, fixed long since);
+            # keep the flag + || form below anyway — it's clear enough.
             if (key != 0) {
                 var vs = ji;
                 var done = 0;

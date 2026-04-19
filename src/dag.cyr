@@ -175,7 +175,7 @@ fn _compute_tiers(def) {
             var sid = load64(s);
             if (map_get(in_degree, sid) == 0) {
                 vec_push(tier, s);
-                map_set(in_degree, sid, 0 - 1);
+                map_set(in_degree, sid, -1);
             }
             i = i + 1;
         }

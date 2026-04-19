@@ -91,7 +91,7 @@ redis_set(rc, "key", "value");
 var v = redis_get(rc, "key");
 
 # Sorted-set queue
-redis_zadd(rc, "queue:jobs", "job-data", 0 - priority);
+redis_zadd(rc, "queue:jobs", "job-data", -priority);
 var popped = redis_zpopmin(rc, "queue:jobs");
 ```
 
@@ -106,7 +106,7 @@ pg_save_workflow_def(conn, "wf-1", "my workflow", "[]");
 ## Architecture
 
 ```
-majra (v2.0.0, ~4,800 lines across 19 modules)
+majra (v2.3.0, ~4,800 lines across 19 modules)
 │
 │ ── Core ──────────────────────────────────────
 ├── error           Error codes + result helpers
@@ -141,18 +141,41 @@ majra (v2.0.0, ~4,800 lines across 19 modules)
 ## Building
 
 ```bash
-# Compile
+# Compile (core engine)
 cyrius build src/main.cyr build/majra
 
-# Run tests
-cyrius test
+# Run core tests
+./build/majra
 
-# Run benchmarks (with history tracking)
-cyrius bench
+# Expanded + backend test suites
+cyrius build tests/test_core.tcyr     build/test_core     && ./build/test_core
+cyrius build tests/test_backends.tcyr build/test_backends && ./build/test_backends
+
+# Benchmarks
+cyrius build benches/bench_all.bcyr build/bench_all && ./build/bench_all
 
 # Full audit: self-host, test, fmt, lint, vet, deny, bench
 cyrius audit
+
+# Regenerate distribution bundles (commit alongside src/ changes)
+cyrius distlib          # → dist/majra.cyr           (core engine)
+cyrius distlib backends # → dist/majra-backends.cyr  (+ redis/pg/ws/encrypted IPC)
 ```
+
+## Using majra as a dependency
+
+Downstream Cyrius projects wire majra into their `cyrius.cyml`:
+
+```toml
+[deps.majra]
+git = "https://github.com/MacCracken/majra.git"
+tag = "<majra version>"
+modules = ["dist/majra.cyr"]          # core engine — lean
+# or:
+modules = ["dist/majra-backends.cyr"] # engine + Redis/PG/WS/encrypted IPC
+```
+
+`cyrius deps` resolves the tag, copies the chosen bundle into `lib/majra_majra.cyr`, and you `include` it from your entry point.
 
 ## Ecosystem
 
@@ -168,12 +191,12 @@ cyrius audit
 
 Majra was originally a Rust library (v1.0.4, ~13,000 lines). It was ported to Cyrius via `cyrius port`, re-implementing all modules from scratch.
 
-| Metric | Rust v1.0.4 | Cyrius v2.0.0 |
+| Metric | Rust v1.0.4 | Cyrius v2.3.0 |
 |--------|-------------|---------------|
 | Source lines | 12,969 | 4,820 |
 | Modules | 22 | 19 (QUIC deferred) |
 | Dependencies | 25 crates | 0 (stdlib only) |
-| Binary size | N/A (library) | ~93 KB |
+| Toolchain | cargo + rustc + LLVM | cyrius 5.4.8 |
 
 ## License
 

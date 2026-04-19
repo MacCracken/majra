@@ -84,12 +84,23 @@ fn _map_lookup(m, key) {
     return ep;
 }
 
+# Maximum map capacity (2^26 = ~67M entries, 1.5GB data)
+var MAP_CAP_MAX = 0x4000000;
+
 # Grow the map (double capacity, rehash)
 fn _map_grow(m) {
     var old_entries = load64(m);
     var old_cap = load64(m + 8);
     var new_cap = old_cap * 2;
+    if (new_cap > MAP_CAP_MAX) {
+        syscall(1, 2, "map: capacity overflow\n", 23);
+        syscall(60, 1);
+    }
     var new_entries = alloc(new_cap * 24);
+    if (new_entries == 0) {
+        syscall(1, 2, "map: alloc failed\n", 18);
+        syscall(60, 1);
+    }
     memset(new_entries, 0, new_cap * 24);
     store64(m, new_entries);
     store64(m + 8, new_cap);

@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] — 2026-04-19
+
+Brings majra onto the modern Cyrius 5.4.x manifest + distribution
+convention. No runtime behavior change; this is the scaffold
+refresh libro did in its 1.1.0 → 2.0 arc, catching majra up.
+
+### Changed
+- **Cyrius toolchain pinned to 5.4.8** (cc5), up from 3.2.6 (cc3). 14-minor jump pulls in: `\r` escape, negative literals, compound assignment, undefined-function-as-error, 16384 fixup cap (up from 8192), and the PE-aware backend from 5.4.8.
+- **Manifest `cyrius.toml` → `cyrius.cyml`** — matches first-party convention (libro, yukti, cyrius, sakshi, patra, sigil). Now uses `[package] / [build] / [lib] / [lib.backends] / [deps]` sections. `version = "${file:VERSION}"` makes `VERSION` the single source of truth.
+- **CI toolchain resolution**: `.github/workflows/{ci,release}.yml` no longer hardcode `CYRIUS_VERSION`. They grep the pin out of `cyrius.cyml` at install time, same shape as libro / yukti.
+- **`scripts/version-bump.sh`** simplified — `cyrius.cyml` uses `${file:VERSION}` so there's nothing to sed in the manifest after a bump.
+
+### Added
+- **`dist/majra.cyr`** (core engine, ~3k lines) and **`dist/majra-backends.cyr`** (~4.2k lines, adds redis / postgres / ipc_encrypted / ws). Produced by `cyrius distlib` (default) and `cyrius distlib backends` respectively. Consumers (daimon, AgnosAI, hoosh, sutra, stiva) pick which surface to pull via `[deps.majra] modules = ["dist/majra.cyr" | "dist/majra-backends.cyr"]`. Same distribution contract as libro — see `CLAUDE.md` § Distribution Contract.
+- **`[lib.backends]` profile** in `cyrius.cyml` — bundles the 4 backend modules alongside the core 15 for consumers that want the full surface.
+- **CI manifest-completeness gate** — asserts every `include "src/*.cyr"` in `src/main.cyr` is listed under `[lib] modules`. Mirrors libro's guard; prevents silently shipping a bundle missing a module.
+- **CI dist-freshness gate** — regenerates both bundles and fails if `git diff dist/` is non-empty. Bundles must be regenerated and committed alongside any `src/` change.
+- **Release asset**: both `dist/*.cyr` bundles now attached to the GitHub Release alongside the source tarball and `build/majra` binary.
+
+### Docs
+- **`CLAUDE.md` rewritten** — dropped cc3-era quirks that are resolved under cc5 (`\r`, negative literals, `+=`, fixup cap, `map_get`-after-`map_set`). Added the distribution contract and CI gates. Build commands reflect `cyrius.cyml` / `cyrius distlib`.
+- **`README.md` updated** — `v2.3.0` header, `[deps.majra]` integration snippet, build section reflects `dist/` bundles. Removed the `0 - priority` idiom from the Redis quickstart (cc5 supports negative literals).
+- **`docs/architecture/overview.md`** — added "Distribution profiles" table explaining `dist/majra.cyr` vs `dist/majra-backends.cyr`; backends section renamed to `[lib.backends] profile only`; cc3-era "clobbers locals" principle rewritten to reflect cc5 improvement.
+- **`docs/development/roadmap.md`** — relay dedup + barrier `arrive_and_wait` moved to "revisit under cc5" (cc3 root cause expected to be fixed); added patra 1.1.1 integration and `lib/http_server.cyr` evaluation items.
+- **Relocated stale benchmark dumps** — `benchmark-rustvcyrius2.md` + `benchmarks.md` moved from repo root into `docs/benchmarks/`. Empty `programs/` directory removed.
+
+### Source modernization (cc5 idioms)
+- **`src/redis_backend.cyr`** — `_sb_crlf` now uses `str_builder_add_cstr(sb, "\r\n")`; dropped the byte-13/byte-10 `store8` hack and its 4-line scratch buffer. Replaced `return 0 - 1;` with `return -1;`.
+- **`src/dag.cyr`** — `map_set(in_degree, sid, 0 - 1)` → `map_set(in_degree, sid, -1)`.
+- **`src/main.cyr`** — backend-module include comment reframed: the split is now a distribution-profile decision, not a fixup-cap workaround (cap is 16384 on cc5, up from 8192 on cc3).
+
+### Stdlib refresh
+- **17 stdlib modules re-vendored from Cyrius 5.4.8** — `alloc`, `args`, `base64`, `bench`, `chrono`, `fmt`, `fnptr`, `hashmap`, `http`, `json`, `math`, `patra`, `sakshi`, `str`, `string`, `toml`, `vec`. `sakshi_full.cyr` kept as-is (not in upstream).
+
+### Repo hygiene
+- **`.gitignore` pruned** — removed Rust-era entries (`/target/`, `criterion/`, `proptest-regressions/`, `supply-chain/.cache/`, `lcov.info`, `tarpaulin-report.html`, `fuzz/target/`) that remained after the 2.0 Rust→Cyrius port. Added `.claude/`.
+
 ## [2.2.0] — 2026-04-09
 
 ### Changed

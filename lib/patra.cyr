@@ -1,181 +1,16 @@
-# patra.cyr — structured storage, SQL queries, and transactions for Cyrius
-# Single-file distribution. Version: 0.11.1
-# Usage: include "lib/patra.cyr"
-# Requires: alloc.cyr, freelist.cyr, string.cyr, fmt.cyr, str.cyr, vec.cyr,
-#           io.cyr, syscalls.cyr, sakshi.cyr
+# patra.cyr — structured storage and SQL queries for Cyrius
+# Bundled distribution of patra v1.1.1
+# Source: https://github.com/MacCracken/patra
+# License: GPL-3.0-only
 #
-# SQL: CREATE TABLE, INSERT, SELECT (WHERE, ORDER BY, LIMIT), UPDATE, DELETE
-# Storage: B-tree indexed pages, flock concurrency, WAL crash recovery
-# Transactions: patra_begin/commit/rollback with WAL durability
-# Hashing: SHA-256 (FIPS 180-4 verified)
+# Usage: include "lib/patra.cyr"
+# Init:  alloc_init(); fl_init(); patra_init();
+#
+# Requires stdlib: syscalls, string, alloc, freelist, io, fmt, str, vec, sakshi
 
-# ================================================================
-# sha256.cyr
-# ================================================================
-# sha256.cyr — SHA-256 hash (FIPS 180-4)
 
-enum ShaConst { SHA_MASK = 4294967295; }
+# --- file.cyr ---
 
-var _sha_k = 0;
-
-fn _sha_init_k() {
-    if (_sha_k != 0) { return 0; }
-    _sha_k = alloc(512);
-    store64(_sha_k+0,0x428a2f98); store64(_sha_k+8,0x71374491);
-    store64(_sha_k+16,0xb5c0fbcf); store64(_sha_k+24,0xe9b5dba5);
-    store64(_sha_k+32,0x3956c25b); store64(_sha_k+40,0x59f111f1);
-    store64(_sha_k+48,0x923f82a4); store64(_sha_k+56,0xab1c5ed5);
-    store64(_sha_k+64,0xd807aa98); store64(_sha_k+72,0x12835b01);
-    store64(_sha_k+80,0x243185be); store64(_sha_k+88,0x550c7dc3);
-    store64(_sha_k+96,0x72be5d74); store64(_sha_k+104,0x80deb1fe);
-    store64(_sha_k+112,0x9bdc06a7); store64(_sha_k+120,0xc19bf174);
-    store64(_sha_k+128,0xe49b69c1); store64(_sha_k+136,0xefbe4786);
-    store64(_sha_k+144,0x0fc19dc6); store64(_sha_k+152,0x240ca1cc);
-    store64(_sha_k+160,0x2de92c6f); store64(_sha_k+168,0x4a7484aa);
-    store64(_sha_k+176,0x5cb0a9dc); store64(_sha_k+184,0x76f988da);
-    store64(_sha_k+192,0x983e5152); store64(_sha_k+200,0xa831c66d);
-    store64(_sha_k+208,0xb00327c8); store64(_sha_k+216,0xbf597fc7);
-    store64(_sha_k+224,0xc6e00bf3); store64(_sha_k+232,0xd5a79147);
-    store64(_sha_k+240,0x06ca6351); store64(_sha_k+248,0x14292967);
-    store64(_sha_k+256,0x27b70a85); store64(_sha_k+264,0x2e1b2138);
-    store64(_sha_k+272,0x4d2c6dfc); store64(_sha_k+280,0x53380d13);
-    store64(_sha_k+288,0x650a7354); store64(_sha_k+296,0x766a0abb);
-    store64(_sha_k+304,0x81c2c92e); store64(_sha_k+312,0x92722c85);
-    store64(_sha_k+320,0xa2bfe8a1); store64(_sha_k+328,0xa81a664b);
-    store64(_sha_k+336,0xc24b8b70); store64(_sha_k+344,0xc76c51a3);
-    store64(_sha_k+352,0xd192e819); store64(_sha_k+360,0xd6990624);
-    store64(_sha_k+368,0xf40e3585); store64(_sha_k+376,0x106aa070);
-    store64(_sha_k+384,0x19a4c116); store64(_sha_k+392,0x1e376c08);
-    store64(_sha_k+400,0x2748774c); store64(_sha_k+408,0x34b0bcb5);
-    store64(_sha_k+416,0x391c0cb3); store64(_sha_k+424,0x4ed8aa4a);
-    store64(_sha_k+432,0x5b9cca4f); store64(_sha_k+440,0x682e6ff3);
-    store64(_sha_k+448,0x748f82ee); store64(_sha_k+456,0x78a5636f);
-    store64(_sha_k+464,0x84c87814); store64(_sha_k+472,0x8cc70208);
-    store64(_sha_k+480,0x90befffa); store64(_sha_k+488,0xa4506ceb);
-    store64(_sha_k+496,0xbef9a3f7); store64(_sha_k+504,0xc67178f2);
-    return 0;
-}
-
-fn _sha_rotr(x, n) { return ((x >> n) | (x << (32 - n))) & SHA_MASK; }
-
-fn _sha_ch(e, f, g) { return ((e & f) ^ ((SHA_MASK ^ e) & g)) & SHA_MASK; }
-fn _sha_maj(a, b, c) { return ((a & b) ^ (a & c) ^ (b & c)) & SHA_MASK; }
-fn _sha_S0(a) { return (_sha_rotr(a,2) ^ _sha_rotr(a,13) ^ _sha_rotr(a,22)) & SHA_MASK; }
-fn _sha_S1(e) { return (_sha_rotr(e,6) ^ _sha_rotr(e,11) ^ _sha_rotr(e,25)) & SHA_MASK; }
-fn _sha_s0(w) { return (_sha_rotr(w,7) ^ _sha_rotr(w,18) ^ ((w >> 3) & SHA_MASK)) & SHA_MASK; }
-fn _sha_s1(w) { return (_sha_rotr(w,17) ^ _sha_rotr(w,19) ^ ((w >> 10) & SHA_MASK)) & SHA_MASK; }
-
-# Read 4 bytes as big-endian u32
-fn _sha_be32(p) {
-    return (load8(p) << 24) | (load8(p+1) << 16) | (load8(p+2) << 8) | load8(p+3);
-}
-
-# Write u32 as big-endian
-fn _sha_wbe32(p, v) {
-    store8(p, (v >> 24) & 255);
-    store8(p+1, (v >> 16) & 255);
-    store8(p+2, (v >> 8) & 255);
-    store8(p+3, v & 255);
-}
-
-# Process one 64-byte block
-fn _sha_block(h, block) {
-    var w = fl_alloc(512);
-    for (var i = 0; i < 16; i = i + 1) {
-        store64(w + i * 8, _sha_be32(block + i * 4));
-    }
-    for (var i = 16; i < 64; i = i + 1) {
-        var v1 = _sha_s1(load64(w+(i-2)*8)) + load64(w+(i-7)*8);
-        var v2 = _sha_s0(load64(w+(i-15)*8)) + load64(w+(i-16)*8);
-        var v = (v1 + v2) & SHA_MASK;
-        store64(w + i * 8, v);
-    }
-
-    var a = load64(h); var b = load64(h+8); var c = load64(h+16); var d = load64(h+24);
-    var e = load64(h+32); var f = load64(h+40); var g = load64(h+48); var hh = load64(h+56);
-
-    for (var i = 0; i < 64; i = i + 1) {
-        var t1 = (hh + _sha_S1(e) + _sha_ch(e,f,g) + load64(_sha_k+i*8) + load64(w+i*8)) & SHA_MASK;
-        var t2 = (_sha_S0(a) + _sha_maj(a,b,c)) & SHA_MASK;
-        hh = g; g = f; f = e;
-        e = (d + t1) & SHA_MASK;
-        d = c; c = b; b = a;
-        a = (t1 + t2) & SHA_MASK;
-    }
-
-    store64(h, (load64(h)+a) & SHA_MASK);
-    store64(h+8, (load64(h+8)+b) & SHA_MASK);
-    store64(h+16, (load64(h+16)+c) & SHA_MASK);
-    store64(h+24, (load64(h+24)+d) & SHA_MASK);
-    store64(h+32, (load64(h+32)+e) & SHA_MASK);
-    store64(h+40, (load64(h+40)+f) & SHA_MASK);
-    store64(h+48, (load64(h+48)+g) & SHA_MASK);
-    store64(h+56, (load64(h+56)+hh) & SHA_MASK);
-    fl_free(w);
-}
-
-# SHA-256: hash data into 32-byte output
-fn sha256(data, len, out) {
-    _sha_init_k();
-    var h = fl_alloc(64);
-    store64(h,0x6a09e667); store64(h+8,0xbb67ae85);
-    store64(h+16,0x3c6ef372); store64(h+24,0xa54ff53a);
-    store64(h+32,0x510e527f); store64(h+40,0x9b05688c);
-    store64(h+48,0x1f83d9ab); store64(h+56,0x5be0cd19);
-
-    # Process full blocks
-    var off = 0;
-    while (off + 64 <= len) {
-        _sha_block(h, data + off);
-        off = off + 64;
-    }
-
-    # Pad: remaining bytes + 0x80 + zeros + 8-byte big-endian bit length
-    var pad = fl_alloc(128);
-    memset(pad, 0, 128);
-    var rem = len - off;
-    memcpy(pad, data + off, rem);
-    store8(pad + rem, 0x80);
-    var total_pad = 64;
-    if (rem >= 56) { total_pad = 128; }
-    # Store bit length as big-endian 64-bit at end of last block
-    var bits = len * 8;
-    store8(pad + total_pad - 1, bits & 255);
-    store8(pad + total_pad - 2, (bits >> 8) & 255);
-    store8(pad + total_pad - 3, (bits >> 16) & 255);
-    store8(pad + total_pad - 4, (bits >> 24) & 255);
-    store8(pad + total_pad - 5, (bits >> 32) & 255);
-
-    _sha_block(h, pad);
-    if (total_pad == 128) { _sha_block(h, pad + 64); }
-    fl_free(pad);
-
-    # Write hash as 32 bytes big-endian
-    for (var i = 0; i < 8; i = i + 1) {
-        _sha_wbe32(out + i * 4, load64(h + i * 8));
-    }
-    fl_free(h);
-    return 0;
-}
-
-# SHA-256 → 64-char hex string (null-terminated)
-fn sha256_hex(data, len, out) {
-    var raw = fl_alloc(32);
-    sha256(data, len, raw);
-    var hex = "0123456789abcdef";
-    for (var i = 0; i < 32; i = i + 1) {
-        var b = load8(raw + i);
-        store8(out + i * 2, load8(hex + ((b >> 4) & 15)));
-        store8(out + i * 2 + 1, load8(hex + (b & 15)));
-    }
-    store8(out + 64, 0);
-    fl_free(raw);
-    return 0;
-}
-
-# ================================================================
-# file.cyr
-# ================================================================
 # file.cyr — .patra file format constants, header, flock locking
 
 # ── Constants ────────────────────
@@ -186,7 +21,7 @@ enum PageConst { PAGE_SIZE = 4096; MAX_TABLES = 63; MAX_COLS = 32; }
 enum PatraFmt { PATRA_MAGIC = 0x41525450; PATRA_VER = 1; }
 
 enum PageType  { PAGE_FREE = 0; PAGE_DATA = 1; PAGE_SCHEMA = 2; PAGE_BTREE = 3; }
-enum ColType   { COL_INT = 0; COL_STR = 1; COL_INT_SZ = 8; COL_STR_SZ = 64; }
+enum ColType   { COL_INT = 0; COL_STR = 1; COL_INT_SZ = 8; COL_STR_SZ = 256; }
 
 enum PatraErr {
     PATRA_OK = 0;
@@ -325,9 +160,125 @@ fn _pt_file_open(path) {
     return syscall(SYS_OPEN, path, 2, 0);
 }
 
-# ================================================================
-# page.cyr
-# ================================================================
+# --- wal.cyr ---
+
+# wal.cyr — Write-ahead logging for crash recovery
+#
+# Before modifying a page, the current (before) content is saved to a .wal file.
+# On commit: WAL is deleted. On crash recovery: WAL is replayed (undo).
+# Integrates with page_write via globals — no call-site changes needed.
+
+var _wal_fd = 0 - 1;
+var _wal_db_fd = 0 - 1;
+var _wal_pages = 0;
+var _wal_nlog = 0;
+var _wal_overflow = 0;
+
+enum WalConst { WAL_MAX_PAGES = 64; WAL_REC_SZ = 4104; }
+
+# Begin WAL logging for a transaction
+fn wal_start(db_fd, wal_path) {
+    _wal_fd = syscall(SYS_OPEN, wal_path, 578, 420);
+    # O_RDWR | O_CREAT | O_TRUNC = 2 + 64 + 512 = 578
+    if (_wal_fd < 0) { _wal_fd = 0 - 1; return PATRA_ERR_IO; }
+    _wal_db_fd = db_fd;
+    if (_wal_pages == 0) { _wal_pages = alloc(WAL_MAX_PAGES * 8); }
+    _wal_nlog = 0;
+    _wal_overflow = 0;
+    return PATRA_OK;
+}
+
+# Returns 1 if WAL logging is active
+fn wal_is_active() {
+    if (_wal_fd >= 0) { return 1; }
+    return 0;
+}
+
+# Returns 1 if WAL overflowed (more than 64 pages in transaction)
+fn wal_overflowed() { return _wal_overflow; }
+
+# Log before-image of a page (called from page_write)
+fn wal_log_page(page_num) {
+    if (_wal_fd < 0) { return 0; }
+    # Check if already logged
+    for (var i = 0; i < _wal_nlog; i = i + 1) {
+        if (load64(_wal_pages + i * 8) == page_num) { return 0; }
+    }
+    if (_wal_nlog >= WAL_MAX_PAGES) { _wal_overflow = 1; return 0; }
+    store64(_wal_pages + _wal_nlog * 8, page_num);
+    _wal_nlog = _wal_nlog + 1;
+
+    # Read current page from disk
+    var buf = fl_alloc(WAL_REC_SZ);
+    store64(buf, page_num);
+    _pt_seek(_wal_db_fd, page_offset(page_num));
+    var nr = syscall(SYS_READ, _wal_db_fd, buf + 8, PAGE_SIZE);
+    if (nr < 0) { nr = 0; }
+    # Write record to WAL
+    syscall(SYS_WRITE, _wal_fd, buf, WAL_REC_SZ);
+    fl_free(buf);
+    return 0;
+}
+
+# Commit transaction: sync WAL, delete it
+fn wal_commit(wal_path) {
+    if (_wal_fd >= 0) {
+        syscall(SYS_FDATASYNC, _wal_fd);
+        syscall(SYS_CLOSE, _wal_fd);
+    }
+    _wal_fd = 0 - 1;
+    _wal_nlog = 0;
+    # Delete WAL — transaction complete
+    syscall(SYS_UNLINK, wal_path);
+    return 0;
+}
+
+# Rollback: restore before-images from WAL, delete it
+fn wal_rollback(wal_path) {
+    if (_wal_fd < 0) { return 0; }
+    # Replay WAL: restore before-images
+    syscall(SYS_LSEEK, _wal_fd, 0, 0);
+    var buf = fl_alloc(WAL_REC_SZ);
+    var done = 0;
+    while (done == 0) {
+        var nr = syscall(SYS_READ, _wal_fd, buf, WAL_REC_SZ);
+        if (nr != WAL_REC_SZ) { done = 1; continue; }
+        var pg = load64(buf);
+        _pt_seek(_wal_db_fd, page_offset(pg));
+        syscall(SYS_WRITE, _wal_db_fd, buf + 8, PAGE_SIZE);
+    }
+    fl_free(buf);
+    syscall(SYS_FDATASYNC, _wal_db_fd);
+    syscall(SYS_CLOSE, _wal_fd);
+    _wal_fd = 0 - 1;
+    _wal_nlog = 0;
+    syscall(SYS_UNLINK, wal_path);
+    return 0;
+}
+
+# Recover from crash: if WAL file exists, replay it
+fn wal_recover(db_fd, wal_path) {
+    var wfd = syscall(SYS_OPEN, wal_path, 0, 0);
+    if (wfd < 0) { return 0; }
+    # WAL exists — replay
+    var buf = fl_alloc(WAL_REC_SZ);
+    var done = 0;
+    while (done == 0) {
+        var nr = syscall(SYS_READ, wfd, buf, WAL_REC_SZ);
+        if (nr != WAL_REC_SZ) { done = 1; continue; }
+        var pg = load64(buf);
+        _pt_seek(db_fd, page_offset(pg));
+        syscall(SYS_WRITE, db_fd, buf + 8, PAGE_SIZE);
+    }
+    fl_free(buf);
+    syscall(SYS_FDATASYNC, db_fd);
+    syscall(SYS_CLOSE, wfd);
+    syscall(SYS_UNLINK, wal_path);
+    return 1;
+}
+
+# --- page.cyr ---
+
 # page.cyr — 4KB page management (alloc, read, write, free list)
 
 # Compute byte offset for page number
@@ -349,9 +300,6 @@ fn page_write(fd, num, buf) {
     if (syscall(SYS_WRITE, fd, buf, PAGE_SIZE) != PAGE_SIZE) { return PATRA_ERR_IO; }
     return PATRA_OK;
 }
-
-# Flush buffer pool (no-op, reserved for future use)
-fn bp_flush() { return 0; }
 
 # Allocate a new page (from free list or extend file)
 fn page_alloc(fd, hdr) {
@@ -391,12 +339,11 @@ fn page_init_data(buf) {
     store64(buf + DP_TYPE, PAGE_DATA);
 }
 
-# ================================================================
-# row.cyr
-# ================================================================
+# --- row.cyr ---
+
 # row.cyr — row encoding/decoding (i64 + fixed-length strings)
 
-# Size in bytes for a column type (INT=8, STR=64)
+# Size in bytes for a column type (INT=8, STR=256)
 fn row_col_size(ctype) {
     if (ctype == COL_INT) { return COL_INT_SZ; }
     return COL_STR_SZ;
@@ -429,7 +376,7 @@ fn row_write_int(row, off, val) {
     store64(row + off, val);
 }
 
-# Write string value padded to COL_STR_SZ (64 bytes), null-terminated
+# Write string value padded to COL_STR_SZ (256 bytes), null-terminated
 # Write string value to row at offset (padded to 64 bytes)
 fn row_write_str(row, off, ptr, len) {
     memset(row + off, 0, COL_STR_SZ);
@@ -443,15 +390,14 @@ fn row_read_int(row, off) {
     return load64(row + off);
 }
 
-# Returns pointer to the 64-byte string field (null-terminated)
+# Returns pointer to the 256-byte string field (null-terminated)
 # Read string pointer from row at offset
 fn row_read_str(row, off) {
     return row + off;
 }
 
-# ================================================================
-# sql.cyr
-# ================================================================
+# --- sql.cyr ---
+
 # sql.cyr — SQL tokenizer and parser (v0.2: WHERE, ORDER BY, LIMIT, UPDATE, DELETE)
 
 # ── Token types ────────────────────
@@ -499,6 +445,7 @@ enum TokType {
     TK_MAXF = 39;
     TK_INDEX = 40;
     TK_ON = 41;
+    TK_DROP = 42;
 }
 
 enum StmtType {
@@ -509,6 +456,7 @@ enum StmtType {
     STMT_UPDATE = 4;
     STMT_DELETE = 5;
     STMT_CREATE_INDEX = 6;
+    STMT_DROP = 7;
 }
 
 enum AggType { AGG_NONE = 0; AGG_COUNT = 1; AGG_SUM = 2; AGG_MIN = 3; AGG_MAX = 4; }
@@ -674,6 +622,7 @@ fn _classify_ident(ptr, len) {
     if (_kw_eq(ptr, len, "MAX"))   { return TK_MAXF; }
     if (_kw_eq(ptr, len, "INDEX")) { return TK_INDEX; }
     if (_kw_eq(ptr, len, "ON"))    { return TK_ON; }
+    if (_kw_eq(ptr, len, "DROP"))  { return TK_DROP; }
     return TK_IDENT;
 }
 
@@ -873,6 +822,8 @@ fn _parse_where(pos) {
         }
     }
 
+    # WHERE with no conditions is malformed
+    if (count == 0) { return 0 - 1; }
     store64(_sql_pr + PR_WHERE_N, count);
     if (join == (0 - 1)) { join = WH_AND; }
     store64(_sql_pr + PR_WHERE_JOIN, join);
@@ -1179,6 +1130,20 @@ fn _parse_create_index() {
     return PATRA_OK;
 }
 
+fn _parse_drop() {
+    # DROP TABLE name
+    var pos = 0;
+    if (_tok_type(pos) != TK_DROP) { return PATRA_ERR_SYNTAX; }
+    pos = pos + 1;
+    if (_tok_type(pos) != TK_TABLE) { return PATRA_ERR_SYNTAX; }
+    pos = pos + 1;
+    if (_tok_type(pos) != TK_IDENT) { return PATRA_ERR_SYNTAX; }
+    store64(_sql_pr + PR_STMT, STMT_DROP);
+    store64(_sql_pr + PR_TNAME, _tok_ptr(pos));
+    store64(_sql_pr + PR_TNLEN, _tok_len(pos));
+    return PATRA_OK;
+}
+
 # Parse tokenized SQL into parse result
 fn sql_parse() {
     memset(_sql_pr, 0, 4096);
@@ -1191,12 +1156,12 @@ fn sql_parse() {
     if (tt == TK_SELECT) { return _parse_select(); }
     if (tt == TK_UPDATE) { return _parse_update(); }
     if (tt == TK_DELETE) { return _parse_delete(); }
+    if (tt == TK_DROP)   { return _parse_drop(); }
     return PATRA_ERR_SYNTAX;
 }
 
-# ================================================================
-# where.cyr
-# ================================================================
+# --- where.cyr ---
+
 # where.cyr — WHERE clause evaluation
 
 # Resolve column name to index in schema. Returns -1 if not found.
@@ -1302,9 +1267,8 @@ fn where_eval(row, schema, ncols, pr) {
     return result;
 }
 
-# ================================================================
-# btree.cyr
-# ================================================================
+# --- btree.cyr ---
+
 # btree.cyr — B+ tree index (order 64, keys are i64)
 
 enum BtConst {
@@ -1696,122 +1660,8 @@ fn btree_remove_ref(fd, root, key, ref) {
     return 0;
 }
 
-# ================================================================
-# wal.cyr
-# ================================================================
-# wal.cyr — Write-ahead logging for crash recovery
-#
-# Before modifying a page, the current (before) content is saved to a .wal file.
-# On commit: WAL is deleted. On crash recovery: WAL is replayed (undo).
-# Integrates with page_write via globals — no call-site changes needed.
+# --- table.cyr ---
 
-var _wal_fd = 0 - 1;
-var _wal_db_fd = 0 - 1;
-var _wal_pages = 0;
-var _wal_nlog = 0;
-
-enum WalConst { WAL_MAX_PAGES = 64; WAL_REC_SZ = 4104; }
-
-# Begin WAL logging for a transaction
-fn wal_start(db_fd, wal_path) {
-    _wal_fd = syscall(SYS_OPEN, wal_path, 578, 420);
-    # O_RDWR | O_CREAT | O_TRUNC = 2 + 64 + 512 = 578
-    if (_wal_fd < 0) { _wal_fd = 0 - 1; return PATRA_ERR_IO; }
-    _wal_db_fd = db_fd;
-    if (_wal_pages == 0) { _wal_pages = alloc(WAL_MAX_PAGES * 8); }
-    _wal_nlog = 0;
-    return PATRA_OK;
-}
-
-# Returns 1 if WAL logging is active
-fn wal_is_active() {
-    if (_wal_fd >= 0) { return 1; }
-    return 0;
-}
-
-# Log before-image of a page (called from page_write)
-fn wal_log_page(page_num) {
-    if (_wal_fd < 0) { return 0; }
-    # Check if already logged
-    for (var i = 0; i < _wal_nlog; i = i + 1) {
-        if (load64(_wal_pages + i * 8) == page_num) { return 0; }
-    }
-    if (_wal_nlog >= WAL_MAX_PAGES) { return 0; }
-    store64(_wal_pages + _wal_nlog * 8, page_num);
-    _wal_nlog = _wal_nlog + 1;
-
-    # Read current page from disk
-    var buf = fl_alloc(WAL_REC_SZ);
-    store64(buf, page_num);
-    _pt_seek(_wal_db_fd, page_offset(page_num));
-    var nr = syscall(SYS_READ, _wal_db_fd, buf + 8, PAGE_SIZE);
-    if (nr < 0) { nr = 0; }
-    # Write record to WAL
-    syscall(SYS_WRITE, _wal_fd, buf, WAL_REC_SZ);
-    fl_free(buf);
-    return 0;
-}
-
-# Commit transaction: sync WAL, delete it
-fn wal_commit(wal_path) {
-    if (_wal_fd >= 0) {
-        syscall(SYS_FDATASYNC, _wal_fd);
-        syscall(SYS_CLOSE, _wal_fd);
-    }
-    _wal_fd = 0 - 1;
-    _wal_nlog = 0;
-    # Delete WAL — transaction complete
-    syscall(SYS_UNLINK, wal_path);
-    return 0;
-}
-
-# Rollback: restore before-images from WAL, delete it
-fn wal_rollback(wal_path) {
-    if (_wal_fd < 0) { return 0; }
-    # Replay WAL: restore before-images
-    syscall(SYS_LSEEK, _wal_fd, 0, 0);
-    var buf = fl_alloc(WAL_REC_SZ);
-    var done = 0;
-    while (done == 0) {
-        var nr = syscall(SYS_READ, _wal_fd, buf, WAL_REC_SZ);
-        if (nr != WAL_REC_SZ) { done = 1; continue; }
-        var pg = load64(buf);
-        _pt_seek(_wal_db_fd, page_offset(pg));
-        syscall(SYS_WRITE, _wal_db_fd, buf + 8, PAGE_SIZE);
-    }
-    fl_free(buf);
-    syscall(SYS_FDATASYNC, _wal_db_fd);
-    syscall(SYS_CLOSE, _wal_fd);
-    _wal_fd = 0 - 1;
-    _wal_nlog = 0;
-    syscall(SYS_UNLINK, wal_path);
-    return 0;
-}
-
-# Recover from crash: if WAL file exists, replay it
-fn wal_recover(db_fd, wal_path) {
-    var wfd = syscall(SYS_OPEN, wal_path, 0, 0);
-    if (wfd < 0) { return 0; }
-    # WAL exists — replay
-    var buf = fl_alloc(WAL_REC_SZ);
-    var done = 0;
-    while (done == 0) {
-        var nr = syscall(SYS_READ, wfd, buf, WAL_REC_SZ);
-        if (nr != WAL_REC_SZ) { done = 1; continue; }
-        var pg = load64(buf);
-        _pt_seek(db_fd, page_offset(pg));
-        syscall(SYS_WRITE, db_fd, buf + 8, PAGE_SIZE);
-    }
-    fl_free(buf);
-    syscall(SYS_FDATASYNC, db_fd);
-    syscall(SYS_CLOSE, wfd);
-    syscall(SYS_UNLINK, wal_path);
-    return 1;
-}
-
-# ================================================================
-# table.cyr
-# ================================================================
 # table.cyr — table metadata, create, insert, scan, update, delete
 
 var _tbl_last_ref = 0;
@@ -1893,6 +1743,52 @@ fn tbl_create(fd, hdr, name, nlen, col_names, col_types, ncols) {
     store64(entry + TBL_SCHEMA, spg);
     store64(hdr + HDR_TBLCOUNT, idx + 1);
 
+    return PATRA_OK;
+}
+
+# Drop table: free data pages, schema page, compact directory
+fn tbl_drop(fd, hdr, idx) {
+    _tbl_lp_idx = 0 - 1;
+    var entry = _tbl_entry(hdr, idx);
+    var spg = load64(entry + TBL_SCHEMA);
+
+    # Free data page chain
+    var cur = load64(entry + TBL_ROOT);
+    var buf = fl_alloc(PAGE_SIZE);
+    while (cur != 0) {
+        page_read(fd, cur, buf);
+        var next = load64(buf + DP_NEXT);
+        page_free(fd, hdr, cur);
+        cur = next;
+    }
+
+    # Free B-tree pages (walk from schema index root)
+    var sbuf = fl_alloc(PAGE_SIZE);
+    page_read(fd, spg, sbuf);
+    var ic = load64(sbuf + SCH_IDX_COL);
+    if (ic >= 0) {
+        var ir = load64(sbuf + SCH_IDX_ROOT);
+        if (ir != 0) {
+            page_free(fd, hdr, ir);
+        }
+    }
+    fl_free(sbuf);
+
+    # Free schema page
+    page_free(fd, hdr, spg);
+
+    # Compact table directory: shift entries after idx left by one
+    var count = load64(hdr + HDR_TBLCOUNT);
+    var i = idx;
+    while (i < count - 1) {
+        var dst = _tbl_entry(hdr, i);
+        var src = _tbl_entry(hdr, i + 1);
+        memcpy(dst, src, TBL_ENTRY_SZ);
+        i = i + 1;
+    }
+    store64(hdr + HDR_TBLCOUNT, count - 1);
+
+    fl_free(buf);
     return PATRA_OK;
 }
 
@@ -2131,9 +2027,8 @@ fn tbl_delete(fd, hdr, idx, row_sz, schema, ncols, pr) {
     return PATRA_OK;
 }
 
-# ================================================================
-# jsonl.cyr
-# ================================================================
+# --- jsonl.cyr ---
+
 # jsonl.cyr — JSON Lines append-only mode (libro compatibility)
 #
 # JSONL files: one JSON object per line, newline-delimited.
@@ -2450,9 +2345,8 @@ fn jsonl_count(fd) {
     return count;
 }
 
-# ================================================================
-# Public API
-# ================================================================
+# --- lib.cyr ---
+
 # lib.cyr — Patra public API
 #
 # Structured storage and SQL queries for Cyrius.
@@ -2493,7 +2387,6 @@ fn patra_init() {
 # Open or create a .patra database file
 fn patra_open(path) {
     _tbl_lp_idx = 0 - 1;
-    bp_flush();
     var fd = _pt_file_open(path);
     if (fd < 0) {
         fd = _pt_file_create(path);
@@ -2737,6 +2630,29 @@ fn _exec_delete(db) {
     return r;
 }
 
+# ── Exec: DROP TABLE ────────────────────
+
+fn _exec_drop(db) {
+    var fd = _db_fd(db);
+    var hdr = _db_hdr(db);
+
+    patra_lock_ex(fd);
+    patra_hdr_read(fd, hdr);
+
+    var tname = load64(_sql_pr + PR_TNAME);
+    var tnlen = load64(_sql_pr + PR_TNLEN);
+    var idx = tbl_find(hdr, tname, tnlen);
+    if (idx < 0) {
+        patra_unlock(fd);
+        return PATRA_ERR_NOTFOUND;
+    }
+
+    var r = tbl_drop(fd, hdr, idx);
+    if (r == PATRA_OK) { patra_hdr_write(fd, hdr); }
+    patra_unlock(fd);
+    return r;
+}
+
 # ── Exec: CREATE INDEX ────────────────────
 
 fn _exec_create_index(db) {
@@ -2816,10 +2732,12 @@ fn patra_commit(db) {
     if (load64(db + DB_TX) == 0) { return PATRA_OK; }
     var fd = _db_fd(db);
     var wpath = load64(db + DB_PATH);
+    var overflow = wal_overflowed();
     patra_hdr_write(fd, _db_hdr(db));
     wal_commit(wpath);
     patra_unlock(fd);
     store64(db + DB_TX, 0);
+    if (overflow != 0) { return PATRA_ERR_FULL; }
     return PATRA_OK;
 }
 
@@ -2849,6 +2767,7 @@ fn patra_exec(db, sql) {
     if (stmt == STMT_UPDATE) { return _exec_update(db); }
     if (stmt == STMT_DELETE) { return _exec_delete(db); }
     if (stmt == STMT_CREATE_INDEX) { return _exec_create_index(db); }
+    if (stmt == STMT_DROP) { return _exec_drop(db); }
     return PATRA_ERR_SYNTAX;
 }
 
@@ -3077,28 +2996,50 @@ fn patra_query(db, sql) {
                 }
                 if (idx_found != 0) {
                     if (idx_lo <= idx_hi) {
-                        used_index = 1;
-                        var refs = fl_alloc(2048);
-                        var nrefs = _bt_range(fd, ir, idx_lo, idx_hi, refs, 256);
-                        var rbuf = fl_alloc(PAGE_SIZE);
-                        var lpg = 0 - 1;
-                        for (var ri = 0; ri < nrefs; ri = ri + 1) {
-                            var ref = load64(refs + ri * 8);
-                            if (ref == (0 - 1)) { continue; }
-                            var rpg = _bt_ref_pg(ref);
-                            var rsl = _bt_ref_slot(ref);
-                            if (rpg != lpg) {
-                                page_read(fd, rpg, rbuf);
-                                lpg = rpg;
-                            }
-                            var rp = rbuf + DP_DATA + rsl * rsz;
-                            if (where_eval(rp, schema, ncols, _sql_pr)) {
-                                memcpy(data_ptr + actual * rsz, rp, rsz);
-                                actual = actual + 1;
-                            }
+                        # 1024 refs * 8 bytes = 8KB ref buffer
+                        var refs = fl_alloc(8192);
+                        var nrefs = _bt_range(fd, ir, idx_lo, idx_hi, refs, 1024);
+
+                        # Selectivity-based planner: when the index returns
+                        # most of the rows in the table, a full scan reads
+                        # the same pages without the B-tree walk overhead.
+                        # Only triggers for nrefs >= 128 so small result
+                        # sets always take the index. `nrows` comes from
+                        # the table directory and is maintained on every
+                        # insert/delete.
+                        var low_selectivity = 0;
+                        if (nrefs >= 128) {
+                            if (nrefs * 2 >= nrows) { low_selectivity = 1; }
                         }
-                        fl_free(rbuf);
-                        fl_free(refs);
+
+                        if (nrefs >= 1024) {
+                            # Index returned max refs — may be truncated, fall back to scan
+                            fl_free(refs);
+                        } elif (low_selectivity != 0) {
+                            # Index would return >=50% of rows — scan is cheaper
+                            fl_free(refs);
+                        } else {
+                            used_index = 1;
+                            var rbuf = fl_alloc(PAGE_SIZE);
+                            var lpg = 0 - 1;
+                            for (var ri = 0; ri < nrefs; ri = ri + 1) {
+                                var ref = load64(refs + ri * 8);
+                                if (ref == (0 - 1)) { continue; }
+                                var rpg = _bt_ref_pg(ref);
+                                var rsl = _bt_ref_slot(ref);
+                                if (rpg != lpg) {
+                                    page_read(fd, rpg, rbuf);
+                                    lpg = rpg;
+                                }
+                                var rp = rbuf + DP_DATA + rsl * rsz;
+                                if (where_eval(rp, schema, ncols, _sql_pr)) {
+                                    memcpy(data_ptr + actual * rsz, rp, rsz);
+                                    actual = actual + 1;
+                                }
+                            }
+                            fl_free(rbuf);
+                            fl_free(refs);
+                        }
                     }
                 }
             }

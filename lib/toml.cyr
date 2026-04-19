@@ -218,12 +218,13 @@ fn toml_parse_file(path) {
 }
 
 # Get value for a key from a pairs vec. Returns Str or 0 if not found.
+# Get value by key. Key can be a cstring (e.g. "name") or a Str.
 fn toml_get(pairs, key) {
     var i = 0;
     var len = vec_len(pairs);
     while (i < len) {
         var p = vec_get(pairs, i);
-        if (str_eq(toml_pair_key(p), key) == 1) {
+        if (str_eq_cstr(toml_pair_key(p), key) == 1) {
             return toml_pair_value(p);
         }
         i = i + 1;
@@ -238,7 +239,7 @@ fn toml_get_sections(sections, name) {
     var len = vec_len(sections);
     while (i < len) {
         var s = vec_get(sections, i);
-        if (str_eq(toml_section_name(s), name) == 1) {
+        if (str_eq_cstr(toml_section_name(s), name) == 1) {
             vec_push(result, s);
         }
         i = i + 1;
