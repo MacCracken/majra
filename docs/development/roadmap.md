@@ -25,12 +25,10 @@ Completed items live in [CHANGELOG.md](../../CHANGELOG.md).
 ## Open Items
 
 ### Waiting on upstream
-- **QUIC transport** — needs sigil to port the remaining TLS 1.3 primitives (X25519 key agreement, HKDF). AES-GCM is in since sigil 2.8.4; X25519 is in sigil 2.x (verify latest); HKDF is the remaining gap.
-- **AES-NI / pmull hardware acceleration** — sigil 2.9.0 staged the AES-NI opcode scaffold but deferred the dispatch wiring. The blocker is a cc5 inline-asm codegen bug (`cyrius/docs/development/issues/inline-asm-stores-silently-drop-when-fn-included.md`) where stores through caller-supplied pointers no-op when the emitting fn is pulled in via `include`. Realistically scheduled for the 5.5.x cycle, not 5.4.x. Majra will benefit transparently once sigil flips the dispatch on.
+- **QUIC transport + AES-NI hardware acceleration** — both are pending the **next sigil release** (2.10.0 or 2.9.1 — TBD), which will bundle two things together: (a) **X25519 key agreement** — the last TLS 1.3 primitive sigil needs to complete its crypto surface, which unblocks majra's QUIC transport module; (b) **AES-NI / pmull dispatch wiring** on top of sigil 2.9.0's staged scaffold. AES-NI is currently blocked by a cc5 inline-asm codegen bug (`cyrius/docs/development/issues/inline-asm-stores-silently-drop-when-fn-included.md`) scheduled for cyrius 5.5.x. Both items land together so consumers see one coherent crypto-surface bump rather than two.
 
 ### Engineering backlog
 
-- **More soak targets** — `soak_queue` ships; `soak_pubsub`, `soak_relay`, and `soak_heartbeat` would round out the infrastructure. Low priority until a production use case wants proof.
 - **Shared-memory IPC transport** (mmap-based) — still deferred. Most workloads are fine with Unix-socket IPC; revisit when a consumer hits the syscall-per-message ceiling.
 - **Multi-row patra WHERE** — `patra_queue` currently scans all rows and filters client-side because patra 1.1.1 returned null result sets for column-list SELECT + WHERE. Revisit when patra's SQL parser tolerates more query shapes, or switch to explicit column indices once we've characterized the parser's WHERE behavior.
 

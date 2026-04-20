@@ -1,0 +1,67 @@
+# soak_pubsub — pub/sub dispatch invariants under sustained subscribe + publish
+#
+# Creates N distinct topics (one subscriber each), publishes once per topic,
+# and verifies every `pubsub_publish` reports delivered=1. This exercises:
+#   - pubsub_new internal allocators
+#   - topic-map insertion / lookup under N subscriptions (hits hashmap resize)
+#   - subscription list append
+#   - publish dispatch fast path (exact-match)
+#
+# We don't drain the subscriber channels — each gets exactly one message
+# and channel default capacity is 64, so no overflow.
+#
+# Usage: cyrius build tests/soak/soak_pubsub.cyr build/soak_pubsub
+# Default: 2000 topics × 1 publish = 2000 deliveries, ~sub-second.
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/freelist.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/hashmap.cyr"
+include "lib/syscalls.cyr"
+include "lib/tagged.cyr"
+include "lib/fnptr.cyr"
+include "lib/thread.cyr"
+include "lib/assert.cyr"
+
+include "src/error.cyr"
+include "src/counter.cyr"
+include "src/envelope.cyr"
+include "src/namespace.cyr"
+include "src/pubsub.cyr"
+
+var ITERS = 2000;
+
+fn main() {
+    alloc_init();
+    fl_init();
+
+    println("=== soak_pubsub ===");
+    fmt_int_fd(1, ITERS); println(" topics");
+
+    var ps = pubsub_new();
+    var i = 0;
+    while (i < ITERS) {
+        # Build unique topic name: "t/<i>"
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "t/");
+        str_builder_add_int(sb, i);
+        var topic = str_cstr(str_builder_build(sb));
+        pubsub_subscribe(ps, topic);
+        var delivered = pubsub_publish(ps, topic, i);
+        if (delivered != 1) {
+            println("FAIL: delivered != 1");
+            return 1;
+        }
+        i = i + 1;
+    }
+
+    fmt_int_fd(1, ITERS); println(" publishes, all delivered=1");
+    println("OK");
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

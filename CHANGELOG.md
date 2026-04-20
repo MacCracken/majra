@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.1-dev] - unreleased
+
+Docs + soak-test cleanup cycle. No API changes; no new deps.
+
+### Added
+- **Three new soak targets** — `soak_pubsub` (2000-topic dispatch), `soak_relay` (dedup correctness + eviction under `max_dedup`), `soak_heartbeat` (register/heartbeat/deregister + auto-eviction). All pass cleanly on 5.4.17. See `tests/soak/README.md`. Completes the soak-test infrastructure seeded in 2.4.0.
+
+### Changed
+- **Docs sweep across the tree** — README (v2.4.x module map + 4 dist profiles + sigil-dep note), CLAUDE.md (305-assertion matrix, cc5 5.4.17 quirks, new `map_new_str` guidance), `docs/architecture/overview.md` (new modules + 4-profile matrix), `docs/development/dependency-watch.md` (first-party sigil dep per-profile), `docs/development/threat-model.md` (rows for signed_envelope, admin, patra_queue), `docs/guides/testing.md` (current 341 assertions with separate `test_patra_queue` entry).
+- **Roadmap** — QUIC + AES-NI paired as the next sigil arc (sigil 2.10 or 2.9.1 will bundle X25519 + AES-NI dispatch wiring). HKDF-as-gap note removed (shipped in sigil 2.9.0).
+
 ## [2.4.0] — 2026-04-20
 
 Engineering-backlog minor release. All four roadmap items shipped;

@@ -1,0 +1,131 @@
+# soak_heartbeat — register/deregister/heartbeat cycles under sustained load
+#
+# Two phases:
+#   Phase A — register N nodes, heartbeat each K times, deregister all. Verify
+#             hb_len returns to 0 after deregistration; every heartbeat returns 1.
+#   Phase B — register N, let them all go offline (sleep > offline_after),
+#             hb_update_statuses twice with evict_after=2, verify all evicted.
+#
+# Usage: cyrius build tests/soak/soak_heartbeat.cyr build/soak_heartbeat
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/freelist.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/hashmap.cyr"
+include "lib/syscalls.cyr"
+include "lib/tagged.cyr"
+include "lib/fnptr.cyr"
+include "lib/thread.cyr"
+include "lib/assert.cyr"
+
+include "src/error.cyr"
+include "src/counter.cyr"
+include "src/envelope.cyr"
+include "src/namespace.cyr"
+include "src/heartbeat.cyr"
+
+var NODES = 100;
+var HEARTBEATS = 20;
+
+fn _node_name(i) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "n");
+    str_builder_add_int(sb, i);
+    return str_cstr(str_builder_build(sb));
+}
+
+fn main() {
+    alloc_init();
+    fl_init();
+
+    println("=== soak_heartbeat ===");
+    println("phase A: register + heartbeat + deregister cycles");
+
+    var cfg = heartbeat_config_default();
+    var ht = hb_tracker_new(cfg);
+
+    # Register NODES
+    var names = vec_new();
+    var i = 0;
+    while (i < NODES) {
+        var n = _node_name(i);
+        vec_push(names, n);
+        hb_register(ht, n, i);
+        i = i + 1;
+    }
+    if (hb_len(ht) != NODES) {
+        println("FAIL A: wrong length after register");
+        return 1;
+    }
+
+    # Heartbeat each node HEARTBEATS times
+    var h = 0;
+    while (h < HEARTBEATS) {
+        i = 0;
+        while (i < NODES) {
+            if (hb_heartbeat(ht, vec_get(names, i)) != 1) {
+                println("FAIL A: heartbeat returned 0 for known node");
+                return 1;
+            }
+            i = i + 1;
+        }
+        h = h + 1;
+    }
+
+    # Deregister all
+    i = 0;
+    while (i < NODES) {
+        if (hb_deregister(ht, vec_get(names, i)) != 1) {
+            println("FAIL A: deregister returned 0 for known node");
+            return 1;
+        }
+        i = i + 1;
+    }
+    if (hb_len(ht) != 0) {
+        println("FAIL A: length non-zero after full deregister");
+        return 1;
+    }
+    println("  phase A: ok");
+
+    # Phase B — auto-eviction after 2 offline cycles.
+    # Config: online_after=10ms, offline_after=20ms, evict_after=2 cycles.
+    println("phase B: auto-eviction under offline timeout");
+    var cfg2 = heartbeat_config_new(10000000, 20000000, 2);
+    var ht2 = hb_tracker_new(cfg2);
+    var subset = 10;
+    i = 0;
+    while (i < subset) {
+        hb_register(ht2, vec_get(names, i), i);
+        i = i + 1;
+    }
+    if (hb_len(ht2) != subset) {
+        println("FAIL B: wrong length after register");
+        return 1;
+    }
+    # Sleep 30ms to go offline
+    var ts[2];
+    store64(&ts, 0);
+    store64(&ts + 8, 30000000);
+    syscall(35, &ts, 0);
+
+    hb_update_statuses(ht2);
+    if (hb_len(ht2) != subset) {
+        println("FAIL B: nodes prematurely evicted after cycle 1");
+        return 1;
+    }
+    hb_update_statuses(ht2);
+    if (hb_len(ht2) != 0) {
+        println("FAIL B: nodes not evicted after cycle 2");
+        return 1;
+    }
+    println("  phase B: ok");
+
+    println("OK");
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

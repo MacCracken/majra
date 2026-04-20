@@ -9,12 +9,23 @@ heartbeat eviction.
 ## Running
 
 ```
-cyrius build tests/soak/soak_queue.cyr build/soak_queue
-./build/soak_queue
+cyrius build tests/soak/soak_queue.cyr     build/soak_queue     && ./build/soak_queue
+cyrius build tests/soak/soak_pubsub.cyr    build/soak_pubsub    && ./build/soak_pubsub
+cyrius build tests/soak/soak_relay.cyr     build/soak_relay     && ./build/soak_relay
+cyrius build tests/soak/soak_heartbeat.cyr build/soak_heartbeat && ./build/soak_heartbeat
 ```
 
 Each soak file prints a banner, runs to completion, and exits 0
 on success / non-zero on invariant violation.
+
+## Current targets
+
+| File              | Surface                                                  | Load |
+|-------------------|----------------------------------------------------------|------|
+| `soak_queue`      | ManagedQueue lifecycle (enqueue, priority dequeue, complete, invariants) | 1000 rounds × 5 jobs = 5k ops |
+| `soak_pubsub`     | pubsub_new + topic-map growth + subscribe + publish dispatch | 2000 distinct topics |
+| `soak_relay`      | Relay dedup correctness + eviction under max_dedup cap   | 20 senders × 50 msgs × 2 passes + 200-sender eviction phase |
+| `soak_heartbeat`  | Register/heartbeat/deregister cycles + auto-eviction     | 100 nodes × 20 heartbeats + offline-timeout phase |
 
 ## Known limitations
 

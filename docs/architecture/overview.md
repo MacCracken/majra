@@ -6,7 +6,7 @@ is a `.cyr` file included via `include` directives in dependency order.
 ## Module Map
 
 ```
-majra (v2.3.0, ~4,800 lines across 19 modules)
+majra (v2.4.x, ~5,500 lines across 22 modules)
 │
 │ ── Core (always included) ────────────────────
 ├── error           Error codes (enum) + result helpers
@@ -25,7 +25,7 @@ majra (v2.3.0, ~4,800 lines across 19 modules)
 │
 │ ── Networking ────────────────────────────────
 ├── ipc             Unix domain socket framing (4-byte BE length prefix)
-├── ipc_encrypted   AES-256-GCM framing with nonce management
+├── ipc_encrypted   AES-256-GCM framing with nonce management (sigil AES-GCM)
 ├── transport       Transport vtable + circuit breaker + connection pool
 ├── ws              WebSocket (SHA-1 handshake, RFC 6455 framing)
 │
@@ -33,23 +33,32 @@ majra (v2.3.0, ~4,800 lines across 19 modules)
 ├── fleet           Distributed job queue with work-stealing
 ├── dag             DAG workflow engine (Kahn's sort, retry, error policies)
 │
+│ ── Trust ([lib.signed] / [lib.backends]) ─────
+├── signed_envelope Ed25519 signatures over canonical envelope encoding (sigil Ed25519)
+│
+│ ── Operations ([lib.admin] / [lib.backends]) ─
+├── admin           HTTP admin/metrics endpoint (/health, /fleet, /ratelimit)
+│
 │ ── Backends ([lib.backends] profile only) ────
-├── redis_backend   RESP2 protocol (SET/GET, ZADD, PUBLISH, HSET, EVAL)
-└── postgres_backend PostgreSQL v3 wire protocol (startup, auth, query, CRUD)
+├── redis_backend    RESP2 protocol (SET/GET, ZADD, PUBLISH, HSET, EVAL)
+├── postgres_backend PostgreSQL v3 wire protocol (startup, auth, query, CRUD)
+└── patra_queue      Durable priority queue backed by patra (survives restart)
 ```
 
 ## Distribution profiles
 
-Two bundles are produced by `cyrius distlib`:
+Four bundles are produced by `cyrius distlib`. Consumers pick the smallest profile that covers their needs:
 
-| Bundle                    | Profile           | Modules            | Consumer use-case                                      |
-|---------------------------|-------------------|--------------------|--------------------------------------------------------|
-| `dist/majra.cyr`          | `[lib]` (default) | 15 core modules    | In-process concurrency primitives; no network surface  |
-| `dist/majra-backends.cyr` | `[lib.backends]`  | 15 core + 4 network modules (ipc_encrypted, ws, redis_backend, postgres_backend) | Full cross-process distribution |
+| Bundle                    | Profile           | Modules            | Needs sigil? | Consumer use-case |
+|---------------------------|-------------------|--------------------|--------------|-------------------|
+| `dist/majra.cyr`          | `[lib]` (default) | 15 core modules    | no  | In-process concurrency primitives; no network surface |
+| `dist/majra-signed.cyr`   | `[lib.signed]`    | 15 core + `signed_envelope` | **yes** | Cross-node integrity via Ed25519 signatures |
+| `dist/majra-admin.cyr`    | `[lib.admin]`     | 15 core + `admin`  | no  | Operator-facing HTTP observability endpoint |
+| `dist/majra-backends.cyr` | `[lib.backends]`  | 15 core + signed + admin + 5 network modules (ipc_encrypted, ws, redis_backend, postgres_backend, patra_queue) | **yes** | Full cross-process distribution with durability |
 
 ## Design Principles
 
-1. **Zero dependencies** — Cyrius stdlib only. No external crates, no LLVM.
+1. **Zero core dependencies** — `dist/majra.cyr` pulls nothing beyond the Cyrius stdlib. Richer profiles (`signed`, `backends`) pull sigil — first-party, vendored, no external crates.
 2. **Thread-safe by default** — concurrent variants use mutex + futex.
 3. **Globals for cross-call state** — cc5 is better than cc3, but deeply nested call chains can still clobber locals. Several modules (`postgres_backend`, `relay`, `barrier`) promote critical values to globals defensively.
 4. **Fixed-point math** — no floating point; token buckets use x1000 scaling.
@@ -113,10 +122,12 @@ Process A                        PostgreSQL                    Process B
 
 ## Consumers
 
-| Project | Modules used |
-|---------|-------------|
-| **daimon** | pubsub, relay, ipc |
-| **AgnosAI** | pubsub, queue, relay, barrier |
-| **hoosh** | queue, heartbeat, fleet |
-| **sutra** | heartbeat, fleet, dag |
-| **stiva** | dag, heartbeat, ipc |
+| Project | Modules used | Profile |
+|---------|-------------|---------|
+| **daimon** | pubsub, relay, ipc, signed_envelope | `majra-signed` |
+| **AgnosAI** | pubsub, queue, relay, barrier, signed_envelope | `majra-signed` |
+| **hoosh** | queue, heartbeat, fleet | `majra` |
+| **sutra** | heartbeat, fleet, dag, admin | `majra-admin` |
+| **stiva** | dag, heartbeat, ipc, signed_envelope, patra_queue | `majra-backends` |
+
+Profiles are indicative — consumers pin whatever they need. A consumer wanting only the core can always pin `majra` regardless of what modules they reference.
