@@ -14,6 +14,11 @@ include "lib/fnptr.cyr"
 include "lib/thread.cyr"
 include "lib/assert.cyr"
 include "lib/net.cyr"
+include "lib/io.cyr"
+include "lib/bigint.cyr"
+
+# sigil (vendored dist, 2.8.4+) provides AES-256-GCM consumed by ipc_encrypted.
+include "lib/sigil.cyr"
 
 include "src/error.cyr"
 include "src/counter.cyr"
@@ -89,6 +94,40 @@ fn test_encrypted_ipc() {
     println("  encrypted_ipc: ok");
 }
 
+fn test_aes_gcm_roundtrip() {
+    # Verify sigil's AES-256-GCM is wired in and functioning end-to-end.
+    # This is the crypto path used by encrypted_ipc_send/recv.
+    aes_gcm_global_init();
+
+    var key[4];
+    memset(&key, 0x42, 32);
+    var nonce[2];
+    memset(&nonce, 0x55, 12);
+
+    var pt = "hello majra encrypted ipc";
+    var pt_len = strlen(pt);
+    var ct = alloc(pt_len);
+    var tag = alloc(16);
+    aes_gcm_encrypt(&key, &nonce, 0, 0, pt, pt_len, ct, tag);
+
+    var decrypted = alloc(pt_len + 1);
+    var rc = aes_gcm_decrypt(&key, &nonce, 0, 0, ct, pt_len, tag, decrypted);
+    assert_eq(rc, 0, "aes-gcm decrypt valid tag returns 0");
+    assert(memeq(decrypted, pt, pt_len) == 1, "aes-gcm roundtrip recovers plaintext");
+
+    # Forge: flip one bit of tag — decrypt must fail, plaintext must be zeroed.
+    store8(tag, load8(tag) ^ 1);
+    var forged = alloc(pt_len + 1);
+    memset(forged, 0xAA, pt_len);
+    var rc2 = aes_gcm_decrypt(&key, &nonce, 0, 0, ct, pt_len, tag, forged);
+    assert(rc2 != 0, "aes-gcm forged tag returns error");
+    # Sigil zeroes pt_out on tag mismatch; verify first few bytes are 0
+    assert_eq(load8(forged), 0, "forged pt byte 0 zeroed");
+    assert_eq(load8(forged + pt_len / 2), 0, "forged pt mid zeroed");
+
+    println("  aes_gcm_roundtrip: ok");
+}
+
 fn test_ws_accept_key() {
     var client_key = "dGhlIHNhbXBsZSBub25jZQ==";
     var accept = _ws_accept_key(client_key);
@@ -125,6 +164,7 @@ fn main() {
     test_base64();
     test_sha1();
     test_encrypted_ipc();
+    test_aes_gcm_roundtrip();
     test_ws_accept_key();
     test_redis_resp();
     test_pg_wire();

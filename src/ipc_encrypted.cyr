@@ -1,49 +1,28 @@
 # majra/ipc_encrypted — AES-256-GCM encrypted IPC channel
 #
 # Wraps ipc.cyr with symmetric encryption using a pre-shared 256-bit key.
-# Each frame: [4B length][12B nonce][ciphertext + 16B GCM tag]
+# Each frame on the wire: [4B ipc length] [12B nonce] [N bytes ciphertext] [16B tag]
 #
-# Uses AES-NI instructions (x86_64) with aarch64 support planned.
-# Architecture detection via #ifdef when available; currently x86_64.
+# Crypto is provided by sigil (see lib/sigil.cyr): aes_gcm_encrypt /
+# aes_gcm_decrypt with the 96-bit-IV fast path. Constant-time tag
+# verification, key zeroization, and the full FIPS-197 AES-256
+# block cipher live in sigil — this module owns framing, nonce
+# management, rekey policy, and connection lifecycle.
 
 # --- AES-256-GCM constants ---
 var AES_BLOCK_SIZE = 16;
 var AES_256_KEY_SIZE = 32;
 var AES_GCM_TAG_SIZE = 16;
 var AES_GCM_NONCE_SIZE = 12;
+# Warn at 2^31 frames, hard-fail at 2^32 — well below GCM's 2^32-2
+# block-reuse ceiling per RFC 5116 §5.1.
 var NONCE_WARN_THRESHOLD = 2147483648;
 var NONCE_HARD_LIMIT = 4294967296;
 
-# --- AES-256 Key Expansion (software fallback) ---
-# Expands 32-byte key into 15 round keys (240 bytes).
-# Uses the Rijndael S-box and RCON schedule.
-
-# Rijndael S-box (256 bytes)
-var _sbox[32];
-
-fn _init_sbox() {
-    # Standard AES S-box values stored as 8 bytes per array element
-    # Row 0
-    store8(&_sbox, 0x63); store8(&_sbox+1, 0x7c); store8(&_sbox+2, 0x77); store8(&_sbox+3, 0x7b);
-    store8(&_sbox+4, 0xf2); store8(&_sbox+5, 0x6b); store8(&_sbox+6, 0x6f); store8(&_sbox+7, 0xc5);
-    store8(&_sbox+8, 0x30); store8(&_sbox+9, 0x01); store8(&_sbox+10, 0x67); store8(&_sbox+11, 0x2b);
-    store8(&_sbox+12, 0xfe); store8(&_sbox+13, 0xd7); store8(&_sbox+14, 0xab); store8(&_sbox+15, 0x76);
-    # Rows 1-15 (first 64 bytes shown, pattern continues)
-    store8(&_sbox+16, 0xca); store8(&_sbox+17, 0x82); store8(&_sbox+18, 0xc9); store8(&_sbox+19, 0x7d);
-    store8(&_sbox+20, 0xfa); store8(&_sbox+21, 0x59); store8(&_sbox+22, 0x47); store8(&_sbox+23, 0xf0);
-    store8(&_sbox+24, 0xad); store8(&_sbox+25, 0xd4); store8(&_sbox+26, 0xa2); store8(&_sbox+27, 0xaf);
-    store8(&_sbox+28, 0x9c); store8(&_sbox+29, 0xa4); store8(&_sbox+30, 0x72); store8(&_sbox+31, 0xc0);
-    # NOTE: Full 256-byte S-box would be needed for production.
-    # For this port, we implement a minimal version that demonstrates
-    # the architecture. Full S-box will be completed when sigil provides
-    # the AES primitives natively.
-}
-
-fn _sbox_lookup(b) {
-    return load8(&_sbox + (b & 0xFF));
-}
-
-# --- Base64 encode/decode ---
+# --- Base64 helpers ---
+# Kept here (not moved to lib/base64.cyr) because ws.cyr's WebSocket
+# accept-key path depends on base64_encode being in scope via the
+# include order established by tests/test_backends.tcyr. Trim carefully.
 
 var _b64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -112,11 +91,9 @@ fn base64_decode(data, len) {
         si = si + 4;
         di = di + 3;
     }
-    # Adjust length for padding
     if (len > 0 && load8(data + len - 1) == 61) { di = di - 1; }
     if (len > 1 && load8(data + len - 2) == 61) { di = di - 1; }
     store8(out + di, 0);
-    # Return {data_ptr, actual_len}
     var result = fl_alloc(16);
     store64(result, out);
     store64(result + 8, di);
@@ -133,9 +110,9 @@ fn base64_decode(data, len) {
 #   offset 32: needs_rekey (i64) — 0 or 1
 
 fn encrypted_ipc_new(ipc_fd, key_ptr) {
+    aes_gcm_global_init();
     var e = fl_alloc(40);
     store64(e, ipc_fd);
-    # Copy key
     var kcopy = fl_alloc(32);
     memcpy(kcopy, key_ptr, 32);
     store64(e + 8, kcopy);
@@ -157,7 +134,7 @@ fn _make_nonce(e) {
     }
     var nonce = fl_alloc(12);
     memset(nonce, 0, 4);
-    # Store counter as big-endian in bytes 4-11
+    # Big-endian counter in bytes 4-11
     store8(nonce + 4, (counter >> 56) & 0xFF);
     store8(nonce + 5, (counter >> 48) & 0xFF);
     store8(nonce + 6, (counter >> 40) & 0xFF);
@@ -187,14 +164,10 @@ fn encrypted_ipc_rekey(e, new_key_ptr) {
     mutex_unlock(mtx);
 }
 
-# NOTE: The actual AES-256-GCM encrypt/decrypt operations require either:
-# 1. AES-NI inline assembly (x86_64: aesenc, aesenclast, pclmulqdq for GCM)
-# 2. AES intrinsics via aarch64 (aesd, aese, pmull for GCM)
-# 3. Software AES (pure integer, ~10x slower)
-#
-# These will be provided by the sigil crypto port. For now, the framing,
-# nonce management, base64, and connection lifecycle are fully implemented.
-# The encrypt/decrypt functions are stubs that pass plaintext (for development).
+# --- Encrypt / Decrypt ---
+# Wire format: [12B nonce] [N bytes ciphertext] [16B tag]
+# aes_gcm_encrypt / aes_gcm_decrypt from sigil produce the ciphertext
+# and tag separately; we concatenate them into the frame.
 
 fn encrypted_ipc_send(e, data, len) {
     var mtx = load64(e + 24);
@@ -204,37 +177,48 @@ fn encrypted_ipc_send(e, data, len) {
         mutex_unlock(mtx);
         return Err(ERR_IPC);
     }
-    # Frame: nonce(12) + data (plaintext stub — will be ciphertext+tag with AES)
-    var frame_len = 12 + len;
+    var frame_len = AES_GCM_NONCE_SIZE + len + AES_GCM_TAG_SIZE;
     var frame = fl_alloc(frame_len);
-    memcpy(frame, nonce, 12);
-    memcpy(frame + 12, data, len);
-    # Base64 encode for wire compatibility
-    var encoded = base64_encode(frame, frame_len);
-    var enc_len = strlen(encoded);
+    memcpy(frame, nonce, AES_GCM_NONCE_SIZE);
+    var ct_out = frame + AES_GCM_NONCE_SIZE;
+    var tag_out = frame + AES_GCM_NONCE_SIZE + len;
+    aes_gcm_encrypt(load64(e + 8), nonce, 0, 0, data, len, ct_out, tag_out);
     mutex_unlock(mtx);
-    return ipc_send_frame(load64(e), encoded, enc_len);
+    return ipc_send_frame(load64(e), frame, frame_len);
 }
 
 fn encrypted_ipc_recv(e) {
     var frame_result = ipc_recv_frame(load64(e));
     if (is_err_result(frame_result) == 1) { return frame_result; }
     var frame_ptr = payload(frame_result);
-    var enc_data = load64(frame_ptr + 8);
-    var enc_len = load64(frame_ptr);
-    # Base64 decode
-    var decoded = base64_decode(enc_data, enc_len);
-    var raw = load64(decoded);
-    var raw_len = load64(decoded + 8);
-    if (raw_len < 12) { return Err(ERR_IPC); }
-    # Skip 12-byte nonce, return plaintext (stub — will decrypt with AES)
-    var plain_len = raw_len - 12;
+    var raw = load64(frame_ptr + 8);
+    var raw_len = load64(frame_ptr);
+    if (raw_len < AES_GCM_NONCE_SIZE + AES_GCM_TAG_SIZE) {
+        return Err(ERR_IPC);
+    }
+    var nonce = raw;
+    var ct = raw + AES_GCM_NONCE_SIZE;
+    var ct_len = raw_len - AES_GCM_NONCE_SIZE - AES_GCM_TAG_SIZE;
+    var tag = raw + AES_GCM_NONCE_SIZE + ct_len;
+    var pt = fl_alloc(ct_len + 1);
+    var rc = aes_gcm_decrypt(load64(e + 8), nonce, 0, 0, ct, ct_len, tag, pt);
+    if (rc != 0) {
+        # Tag mismatch — AEAD contract says do NOT leak plaintext.
+        # aes_gcm_decrypt already zeroes pt on failure, but belt-and-braces:
+        memset(pt, 0, ct_len);
+        return Err(ERR_IPC);
+    }
     var result = fl_alloc(16);
-    store64(result, plain_len);
-    store64(result + 8, raw + 12);
+    store64(result, ct_len);
+    store64(result + 8, pt);
     return Ok(result);
 }
 
 fn encrypted_ipc_close(e) {
+    # Zeroize the key buffer before free
+    var k = load64(e + 8);
+    if (k != 0) {
+        memset(k, 0, AES_256_KEY_SIZE);
+    }
     ipc_close(load64(e));
 }

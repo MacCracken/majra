@@ -309,14 +309,32 @@ fn test_cbarrier_arrive_and_wait() {
     var r2 = cbarrier_arrive(cbs, "sync", "b");
     assert_eq(load64(r2), BARRIER_RELEASED, "aaw non-blocking released");
 
-    # Blocking path — deferred: threaded arrive_and_wait crashes under
-    # cc5 5.4.8. The non-blocking path above covers the hashmap mutation
-    # surface; the blocking path additionally uses thread_create +
-    # futex + shared globals, which produces a SIGSEGV on the second
-    # thread's return from cbarrier_arrive_and_wait. Filed as a
-    # cyrius proposal (see docs/development/proposals/ upstream).
+    # Blocking path — 3 threads, each calls cbarrier_arrive_and_wait;
+    # none return until the barrier is fully populated. Previously
+    # crashed under 5.4.8 due to an RBP/child-stack race in
+    # thread_create's clone sequence — fixed upstream in cyrius 5.4.10
+    # (see the thread.cyr _thread_spawn inline-asm trampoline).
+    _aaw_cbs = cbarrier_set_new();
+    _aaw_done_count = 0;
+    _aaw_done_mutex = mutex_new();
 
-    println("  cbarrier_arrive_and_wait: ok (non-blocking path)");
+    var p3 = vec_new();
+    vec_push(p3, "t1"); vec_push(p3, "t2"); vec_push(p3, "t3");
+    cbarrier_create(_aaw_cbs, "sync-mt", p3);
+
+    var th1 = thread_create(&_aaw_worker, "t1");
+    var th2 = thread_create(&_aaw_worker, "t2");
+    var th3 = thread_create(&_aaw_worker, "t3");
+    assert(th1 != 0, "thread t1 spawned");
+    assert(th2 != 0, "thread t2 spawned");
+    assert(th3 != 0, "thread t3 spawned");
+
+    thread_join(th1);
+    thread_join(th2);
+    thread_join(th3);
+    assert_eq(_aaw_done_count, 3, "all three threads released from barrier");
+
+    println("  cbarrier_arrive_and_wait: ok");
 }
 
 

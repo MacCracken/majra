@@ -5,7 +5,7 @@ description = "Distributed queue & multiplex engine — pub/sub, queues, relay, 
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/majra"
 language = "cyrius"
-cyrius = "5.4.8"
+cyrius = "5.4.12-1"
 
 [build]
 entry = "src/main.cyr"
@@ -87,3 +87,14 @@ stdlib = [
     "fnptr",
     "thread",
 ]
+
+# External first-party deps. Vendored into lib/ for reproducibility;
+# `cyrius deps` resyncs to the pinned tag.
+#
+# sigil provides AES-256-GCM (since 2.8.4) used by src/ipc_encrypted.cyr.
+# Only the backends profile needs it; the core engine has no crypto
+# surface. See lib/sigil.cyr (bundled dist, ~5.8k lines).
+[deps.sigil]
+git = "https://github.com/MacCracken/sigil.git"
+tag = "2.8.4"
+modules = ["dist/sigil.cyr"]

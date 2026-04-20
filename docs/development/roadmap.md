@@ -4,10 +4,8 @@ Completed items are in [CHANGELOG.md](../../CHANGELOG.md).
 
 ## Open Items
 
-- **QUIC transport** — waiting on sigil crypto port (TLS 1.3: X25519, AES-GCM, HKDF)
-- **AES-256-GCM implementation** — AES-NI (x86_64) + aarch64 intrinsics for encrypted IPC (currently stub)
-- **Relay dedup revisit** — original issue was cc3-era `map_get` after `map_set` in nested calls. cc5 is expected to handle this; re-enable the dedup count assertions in `test_relay` and confirm.
-- **Barrier `arrive_and_wait` threading** — same historical root cause as relay dedup; revisit under cc5.
+- **QUIC transport** — waiting on sigil crypto port (TLS 1.3: X25519, HKDF — AES-GCM is in since sigil 2.8.4)
+- **AES-NI hardware acceleration** — sigil currently ships software-only AES. AES-NI (x86_64) + pmull (aarch64) paths pending Cyrius inline-asm support. Majra will benefit transparently when sigil upgrades.
 
 ## Engineering Backlog
 

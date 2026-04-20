@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Cyrius toolchain pin bumped to 5.4.12-1** (was 5.4.8 when 2.3.0 shipped). Brings in four upstream fixes: (a) the `_thread_spawn` inline-asm clone trampoline in `lib/thread.cyr` (5.4.10) that fixes the RBP/child-stack race crashing multi-threaded `cbarrier_arrive_and_wait` — see cyrius `docs/development/issues/majra-cbarrier-arrive-and-wait-crash.md` (filed by majra 2.3.0); (b) an aarch64 SP-alignment fix in the same trampoline (5.4.11, LDP-pair load instead of two LDRs to avoid SIGBUS); (c) the `cyriusly` version-manager script + arch-peer syscalls packaging restored in 5.4.12 (5.4.11 release tarballs dropped `cyriusly` from `bin/`); (d) the bundled `lib/sigil.cyr` now reliably resolves to 2.8.4 in 5.4.12-1 (5.4.10 and 5.4.12 shipped stale 2.8.3 snapshots — being fully addressed in the 5.4.x closeout by removing hardcoded-version multi-sourcing). majra independently vendors `lib/sigil.cyr` at 2.8.4 per the `[deps.sigil]` pin, so the stdlib bundle version isn't load-bearing here.
+
+### Fixed
+- **Multi-threaded `cbarrier_arrive_and_wait` now works.** `tests/test_core.tcyr` revives the 3-thread blocking test that was stubbed-out with a non-blocking-only fallback under 5.4.8. Expanded suite: 92 → 96 assertions. Removed the local `tests/repro_aaw_crash.cyr` — fixed upstream.
+
+### Added
+- **Real AES-256-GCM** in `src/ipc_encrypted.cyr` — the crypto path is no longer a stub. Wires in sigil 2.8.4's `aes_gcm_encrypt` / `aes_gcm_decrypt` (NIST SP 800-38D, constant-time tag verification, key zeroization on close).
+- **sigil vendored as a dep** — `cyrius.cyml` gains `[deps.sigil] tag = "2.8.4"` pointing at `dist/sigil.cyr`; `lib/sigil.cyr` (bundled ~5.8k lines) is committed so CI doesn't need `cyrius deps` resolution for the backends profile.
+- **AES-GCM roundtrip test** in `tests/test_backends.tcyr` — encrypts, decrypts with valid tag, and decrypts with a flipped-bit tag to confirm the AEAD contract (error + zeroed plaintext) holds through the wire layer. Backend suite: 20 → 25 assertions.
+
+### Changed
+- **Wire format for encrypted IPC** changed from `base64(nonce || plaintext_stub)` to `nonce(12) || ciphertext(N) || tag(16)` — the real GCM shape, no base64 overhead. Incompatible with any prior (stub-era) frames, but there were no such frames in production: the prior impl was plaintext-in-base64 and never semantically secure.
+- **Removed stub AES S-box** from `src/ipc_encrypted.cyr` (was 32 of 256 bytes, never functional). Sigil owns the full FIPS-197 S-box now.
+- **`encrypted_ipc_close`** now zeroes the 32-byte key buffer before close (defense-in-depth; was leaving the PSK in memory).
+
+### Docs
+- **`docs/development/roadmap.md`** — AES-256-GCM moves from "Open Items" (AES-NI stub) to shipped-via-sigil. AES-NI hardware acceleration remains deferred at the sigil layer (pending Cyrius inline asm).
+
 ## [2.3.0] — 2026-04-19
 
 Brings majra onto the modern Cyrius 5.4.x manifest + distribution
