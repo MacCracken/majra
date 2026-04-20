@@ -5,7 +5,7 @@ description = "Distributed queue & multiplex engine — pub/sub, queues, relay, 
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/majra"
 language = "cyrius"
-cyrius = "5.4.12-1"
+cyrius = "5.4.17"
 
 [build]
 entry = "src/main.cyr"
@@ -49,6 +49,7 @@ modules = [
     "src/error.cyr",
     "src/counter.cyr",
     "src/envelope.cyr",
+    "src/signed_envelope.cyr",
     "src/namespace.cyr",
     "src/metrics.cyr",
     "src/ratelimit.cyr",
@@ -65,6 +66,55 @@ modules = [
     "src/postgres_backend.cyr",
     "src/ipc_encrypted.cyr",
     "src/ws.cyr",
+    "src/admin.cyr",
+    "src/patra_queue.cyr",
+]
+
+# Admin-endpoint profile — core engine plus the HTTP admin/metrics
+# endpoint. For operators who want /health + /fleet + /ratelimit
+# observability without pulling the full network-backends set.
+[lib.admin]
+modules = [
+    "src/error.cyr",
+    "src/counter.cyr",
+    "src/envelope.cyr",
+    "src/namespace.cyr",
+    "src/metrics.cyr",
+    "src/ratelimit.cyr",
+    "src/heartbeat.cyr",
+    "src/queue.cyr",
+    "src/pubsub.cyr",
+    "src/relay.cyr",
+    "src/barrier.cyr",
+    "src/ipc.cyr",
+    "src/transport.cyr",
+    "src/fleet.cyr",
+    "src/dag.cyr",
+    "src/admin.cyr",
+]
+
+# Signed-envelope profile — core engine plus Ed25519-backed envelope
+# integrity. For consumers who want cross-node signature verification
+# without pulling in the network backends (redis/pg/ws). Requires
+# sigil (via lib/sigil.cyr) at consume-time.
+[lib.signed]
+modules = [
+    "src/error.cyr",
+    "src/counter.cyr",
+    "src/envelope.cyr",
+    "src/signed_envelope.cyr",
+    "src/namespace.cyr",
+    "src/metrics.cyr",
+    "src/ratelimit.cyr",
+    "src/heartbeat.cyr",
+    "src/queue.cyr",
+    "src/pubsub.cyr",
+    "src/relay.cyr",
+    "src/barrier.cyr",
+    "src/ipc.cyr",
+    "src/transport.cyr",
+    "src/fleet.cyr",
+    "src/dag.cyr",
 ]
 
 # ── Dependencies ─────────────────────────────────────────────────
@@ -96,5 +146,5 @@ stdlib = [
 # surface. See lib/sigil.cyr (bundled dist, ~5.8k lines).
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"
-tag = "2.8.4"
+tag = "2.9.0"
 modules = ["dist/sigil.cyr"]

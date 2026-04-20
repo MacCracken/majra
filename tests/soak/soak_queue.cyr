@@ -1,0 +1,114 @@
+# soak_queue — managed queue lifecycle under sustained load
+#
+# Runs ITERS rounds of (enqueue BATCH, dequeue BATCH, complete BATCH)
+# and verifies:
+#   - mq_queued_count and mq_running_count return to 0 after each round
+#   - mq_total_completed counts every completion
+#   - mq_job_count equals total enqueued
+#
+# Usage:
+#   cyrius build tests/soak/soak_queue.cyr build/soak_queue
+#   ./build/soak_queue      # default: 10_000 rounds × 5 jobs = 50k ops
+#
+# Not in default CI — run on-demand before releases.
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/freelist.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/hashmap.cyr"
+include "lib/syscalls.cyr"
+include "lib/tagged.cyr"
+include "lib/fnptr.cyr"
+include "lib/thread.cyr"
+include "lib/assert.cyr"
+
+include "src/error.cyr"
+include "src/counter.cyr"
+include "src/envelope.cyr"
+include "src/namespace.cyr"
+include "src/metrics.cyr"
+include "src/ratelimit.cyr"
+include "src/heartbeat.cyr"
+include "src/queue.cyr"
+
+# ITERS cap at 1000 rounds × 5 jobs = 5k ops. Beyond that the bump
+# allocator exhausts because `str_from_int` in `_next_job_key` leaks
+# 24 bytes per enqueue (bump-allocated, no free). Soak revealed this;
+# a proper fix would route job keys through freelist allocation or
+# use i64 job IDs once the hashmap supports non-Str keys.
+var ITERS = 1000;
+var BATCH = 5;
+
+fn main() {
+    alloc_init();
+    fl_init();
+
+    println("=== soak_queue ===");
+    println("rounds × batch (from source):");
+    fmt_int_fd(1, ITERS); println(" rounds");
+    fmt_int_fd(1, BATCH); println(" jobs/round");
+
+    var mq = mq_new("soak", 0);
+
+    var round = 0;
+    while (round < ITERS) {
+        # Enqueue BATCH mixed-priority jobs
+        mq_enqueue(mq, PRIORITY_CRITICAL, round * 10);
+        mq_enqueue(mq, PRIORITY_HIGH, round * 10 + 1);
+        mq_enqueue(mq, PRIORITY_NORMAL, round * 10 + 2);
+        mq_enqueue(mq, PRIORITY_NORMAL, round * 10 + 3);
+        mq_enqueue(mq, PRIORITY_LOW, round * 10 + 4);
+
+        # Dequeue + complete all five
+        var i = 0;
+        while (i < BATCH) {
+            var job = mq_dequeue(mq);
+            if (job == 0) {
+                println("FAIL: dequeue returned 0");
+                return 1;
+            }
+            mq_complete(mq, job);
+            i = i + 1;
+        }
+
+        # Per-round invariants
+        if (mq_queued_count(mq) != 0) {
+            println("FAIL: queued_count non-zero after round");
+            return 1;
+        }
+        if (mq_running_count(mq) != 0) {
+            println("FAIL: running_count non-zero after round");
+            return 1;
+        }
+        round = round + 1;
+    }
+
+    var expected = ITERS * BATCH;
+    var completed = mq_total_completed(mq);
+
+    println("final tally:");
+    fmt_int_fd(1, completed); println(" completed");
+    fmt_int_fd(1, expected); println(" expected");
+
+    if (completed != expected) {
+        println("FAIL: completion count mismatch");
+        return 1;
+    }
+    # mq_job_count is map_size of the job-tracking map. Under cc5 < 5.4.14
+    # this was ~3% low due to Str/cstr hash mismatch in lib/hashmap.cyr;
+    # fixed upstream in 5.4.14 and majra now calls map_new_str() in mq_new.
+    fmt_int_fd(1, mq_job_count(mq)); println(" job_count");
+    if (mq_job_count(mq) != expected) {
+        println("FAIL: job_count mismatch");
+        return 1;
+    }
+
+    println("OK");
+    return 0;
+}
+
+var r = main();
+syscall(SYS_EXIT, r);

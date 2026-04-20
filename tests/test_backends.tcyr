@@ -16,6 +16,7 @@ include "lib/assert.cyr"
 include "lib/net.cyr"
 include "lib/io.cyr"
 include "lib/bigint.cyr"
+include "lib/http_server.cyr"
 
 # sigil (vendored dist, 2.8.4+) provides AES-256-GCM consumed by ipc_encrypted.
 include "lib/sigil.cyr"
@@ -23,12 +24,17 @@ include "lib/sigil.cyr"
 include "src/error.cyr"
 include "src/counter.cyr"
 include "src/envelope.cyr"
+include "src/signed_envelope.cyr"
 include "src/namespace.cyr"
+include "src/metrics.cyr"
+include "src/ratelimit.cyr"
+include "src/heartbeat.cyr"
 include "src/ipc.cyr"
 include "src/ipc_encrypted.cyr"
 include "src/ws.cyr"
 include "src/redis_backend.cyr"
 include "src/postgres_backend.cyr"
+include "src/admin.cyr"
 
 # =============================================================================
 # Tests
@@ -94,6 +100,53 @@ fn test_encrypted_ipc() {
     println("  encrypted_ipc: ok");
 }
 
+fn test_signed_envelope() {
+    ed25519_init();
+
+    # Generate a signing keypair. sigil sk is 64 bytes: seed[32] || pk[32].
+    var sk = fl_alloc(64);
+    var pk = fl_alloc(32);
+    var kp_ok = ed25519_generate_keypair(sk, pk);
+    assert_eq(kp_ok, 1, "keypair generated");
+
+    # Build a basic envelope
+    var from = str_from("node-a");
+    var topic = str_from("events/heartbeat");
+    var payload = str_from("ok");
+    var e = envelope_new(from, TARGET_TOPIC, topic, payload);
+
+    # Sign it
+    var se = signed_envelope_new(e, sk, pk);
+    assert(se != 0, "signed envelope allocated");
+    assert(signed_envelope_envelope(se) == e, "inner envelope preserved");
+    assert(signed_envelope_signed_at(se) > 0, "signed_at populated");
+
+    # Verify with no expected_pk (transport integrity only)
+    var rc = signed_envelope_verify(se, 0);
+    assert_eq(rc, 0, "signed envelope verifies clean");
+
+    # Verify with matching expected_pk (identity binding)
+    var rc2 = signed_envelope_verify(se, pk);
+    assert_eq(rc2, 0, "verifies with matching expected pk");
+
+    # Verify with wrong expected_pk — should fail with code 2
+    var wrong_pk = fl_alloc(32);
+    memset(wrong_pk, 0xAA, 32);
+    var rc3 = signed_envelope_verify(se, wrong_pk);
+    assert_eq(rc3, 2, "rejects non-matching expected pk");
+
+    # Tamper with signature — flip one bit, verification should fail
+    var sig = signed_envelope_signature(se);
+    store8(sig, load8(sig) ^ 1);
+    var rc4 = signed_envelope_verify(se, 0);
+    assert_eq(rc4, 3, "tampered signature rejected");
+    # Restore
+    store8(sig, load8(sig) ^ 1);
+    assert_eq(signed_envelope_verify(se, 0), 0, "restored sig verifies");
+
+    println("  signed_envelope: ok");
+}
+
 fn test_aes_gcm_roundtrip() {
     # Verify sigil's AES-256-GCM is wired in and functioning end-to-end.
     # This is the crypto path used by encrypted_ipc_send/recv.
@@ -126,6 +179,41 @@ fn test_aes_gcm_roundtrip() {
     assert_eq(load8(forged + pt_len / 2), 0, "forged pt mid zeroed");
 
     println("  aes_gcm_roundtrip: ok");
+}
+
+fn test_admin() {
+    # Verify the admin struct wires up correctly. We don't exercise
+    # the TCP accept loop here — that needs a listening socket and
+    # a client, which is integration-test territory (belongs in
+    # test_live, not here).
+    var cfg = heartbeat_config_default();
+    var cht = chb_tracker_new(cfg);
+    chb_register(cht, "node-a", 100);
+    chb_register(cht, "node-b", 200);
+
+    var rl = ratelimit_new(1000000, 5);
+    ratelimit_check(rl, "k1");
+
+    var admin = majra_admin_new(cht, rl);
+    assert(admin != 0, "admin allocated");
+    assert(majra_admin_fleet_tracker(admin) == cht, "fleet tracker wired");
+    assert(majra_admin_ratelimiter(admin) == rl, "ratelimiter wired");
+
+    # JSON-body builders — pure functions, no socket required.
+    var fleet_body = _admin_fleet_json(admin);
+    var fleet_len = rethi();
+    assert(fleet_len > 0, "fleet json non-empty");
+    var fleet_s = str_new(fleet_body, fleet_len);
+    assert(str_contains_cstr(fleet_s, "online") == 1, "fleet json has 'online'");
+    assert(str_contains_cstr(fleet_s, "total") == 1, "fleet json has 'total'");
+
+    var rl_body = _admin_ratelimit_json(admin, "k1");
+    var rl_len = rethi();
+    assert(rl_len > 0, "ratelimit json non-empty");
+    var rl_s = str_new(rl_body, rl_len);
+    assert(str_contains_cstr(rl_s, "allowed") == 1, "ratelimit json has 'allowed'");
+
+    println("  admin: ok");
 }
 
 fn test_ws_accept_key() {
@@ -165,6 +253,8 @@ fn main() {
     test_sha1();
     test_encrypted_ipc();
     test_aes_gcm_roundtrip();
+    test_signed_envelope();
+    test_admin();
     test_ws_accept_key();
     test_redis_resp();
     test_pg_wire();

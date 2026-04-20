@@ -1,0 +1,142 @@
+# majra/signed_envelope — Ed25519-signed envelopes
+#
+# Wraps `envelope` with a sigil-backed Ed25519 signature for cross-node
+# integrity. The signature covers a canonical serialization of the
+# envelope fields; verifiers MUST use the same serialization.
+#
+# Opt-in: unsigned envelopes still flow through pub/sub, relay, etc.
+# Signing is per-message and costs one Ed25519 sign (~50-100 μs under
+# sigil's software impl; AES-NI-style speedup pending AES-NI in sigil).
+#
+# SignedEnvelope struct layout (40 bytes, 5 fields):
+#   offset  0: envelope  (i64) — ptr to the inner envelope (56 B struct)
+#   offset  8: signature (i64) — ptr to 64 raw bytes (Ed25519 sig)
+#   offset 16: signer_pk (i64) — ptr to 32 raw bytes (the Ed25519 public key
+#                                that signed it; verifiers key off this —
+#                                consumers can look up trust separately)
+#   offset 24: signed_at (i64) — nanoseconds since CLOCK_MONOTONIC
+#   offset 32: canon_len (i64) — length of the canonical buffer (cached
+#                                for debug/observability; verifier recomputes)
+
+var SIGNED_ENV_SIG_LEN = 64;
+var SIGNED_ENV_PK_LEN = 32;
+
+# Canonical serialization of an envelope into a byte buffer.
+# Layout (fixed 48 B header + 3 variable-length Str fields, length-prefixed):
+#   [8] id_hi
+#   [8] id_lo
+#   [8] timestamp_ns
+#   [8] to_kind
+#   [4] from_len       [from bytes]
+#   [4] to_name_len    [to_name bytes (0 bytes if to_name == 0)]
+#   [4] payload_len    [payload bytes (payload is treated as a Str)]
+#
+# Returns a buffer pointer; length returned via ret2/rethi.
+# Canonical = deterministic: same envelope → same bytes.
+fn _envelope_canonicalize(e) {
+    var from = envelope_from(e);
+    var to_name = envelope_to_name(e);
+    var payload = envelope_payload(e);
+
+    var from_len = 0;
+    if (from != 0) { from_len = str_len(from); }
+    var to_len = 0;
+    if (to_name != 0) { to_len = str_len(to_name); }
+    var pay_len = 0;
+    if (payload != 0) { pay_len = str_len(payload); }
+
+    var hdr = 8 + 8 + 8 + 8 + 4 + 4 + 4;
+    var total = hdr + from_len + to_len + pay_len;
+    var buf = fl_alloc(total);
+
+    store64(buf, envelope_id_hi(e));
+    store64(buf + 8, envelope_id_lo(e));
+    store64(buf + 16, envelope_timestamp(e));
+    store64(buf + 24, envelope_to_kind(e));
+
+    var pos = 32;
+    # Write u32 big-endian length + bytes for each variable field
+    store8(buf + pos, (from_len >> 24) & 0xFF);
+    store8(buf + pos + 1, (from_len >> 16) & 0xFF);
+    store8(buf + pos + 2, (from_len >> 8) & 0xFF);
+    store8(buf + pos + 3, from_len & 0xFF);
+    pos = pos + 4;
+    if (from_len > 0) { memcpy(buf + pos, str_data(from), from_len); pos = pos + from_len; }
+
+    store8(buf + pos, (to_len >> 24) & 0xFF);
+    store8(buf + pos + 1, (to_len >> 16) & 0xFF);
+    store8(buf + pos + 2, (to_len >> 8) & 0xFF);
+    store8(buf + pos + 3, to_len & 0xFF);
+    pos = pos + 4;
+    if (to_len > 0) { memcpy(buf + pos, str_data(to_name), to_len); pos = pos + to_len; }
+
+    store8(buf + pos, (pay_len >> 24) & 0xFF);
+    store8(buf + pos + 1, (pay_len >> 16) & 0xFF);
+    store8(buf + pos + 2, (pay_len >> 8) & 0xFF);
+    store8(buf + pos + 3, pay_len & 0xFF);
+    pos = pos + 4;
+    if (pay_len > 0) { memcpy(buf + pos, str_data(payload), pay_len); pos = pos + pay_len; }
+
+    ret2(buf, total);
+}
+
+# Sign an envelope. Produces a SignedEnvelope.
+#   sk_ptr: raw 32-byte Ed25519 secret key (caller owns; typically fl_alloc'd
+#           and zeroized after signing session ends)
+#   pk_ptr: raw 32-byte Ed25519 public key that corresponds to sk
+fn signed_envelope_new(e, sk_ptr, pk_ptr) {
+    ed25519_init();
+
+    var canon = _envelope_canonicalize(e);
+    var canon_len = rethi();
+
+    var sig = fl_alloc(SIGNED_ENV_SIG_LEN);
+    ed25519_sign(sk_ptr, canon, canon_len, sig);
+
+    var pk_copy = fl_alloc(SIGNED_ENV_PK_LEN);
+    memcpy(pk_copy, pk_ptr, SIGNED_ENV_PK_LEN);
+
+    var se = fl_alloc(40);
+    store64(se, e);
+    store64(se + 8, sig);
+    store64(se + 16, pk_copy);
+    store64(se + 24, time_now_ns());
+    store64(se + 32, canon_len);
+    return se;
+}
+
+# Verify a SignedEnvelope. Returns 0 if the signature is valid over the
+# canonical encoding of the inner envelope and the stored public key.
+# Returns non-zero on any failure (bad signature, mismatched content,
+# pk mismatch if expected_pk != 0).
+#
+# expected_pk: if non-zero, verify that the signer_pk matches this
+#              specific key (trust anchoring). If 0, verify only that
+#              the signature is valid for the embedded pk (transport
+#              integrity without identity binding).
+fn signed_envelope_verify(se, expected_pk) {
+    if (se == 0) { return 1; }
+    var e = load64(se);
+    var sig = load64(se + 8);
+    var signer_pk = load64(se + 16);
+
+    if (expected_pk != 0) {
+        # Constant-time compare of 32 public-key bytes
+        if (ct_eq(signer_pk, SIGNED_ENV_PK_LEN, expected_pk, SIGNED_ENV_PK_LEN) == 0) {
+            return 2;
+        }
+    }
+
+    var canon = _envelope_canonicalize(e);
+    var canon_len = rethi();
+    var ok = ed25519_verify(signer_pk, canon, canon_len, sig);
+    if (ok == 0) { return 3; }
+    return 0;
+}
+
+# Accessors
+fn signed_envelope_envelope(se)  { return load64(se); }
+fn signed_envelope_signature(se) { return load64(se + 8); }
+fn signed_envelope_signer_pk(se) { return load64(se + 16); }
+fn signed_envelope_signed_at(se) { return load64(se + 24); }
+fn signed_envelope_canon_len(se) { return load64(se + 32); }

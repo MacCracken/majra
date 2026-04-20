@@ -185,7 +185,11 @@ fn cpq_len(cpq) {
 fn mq_new(name, max_concurrent) {
     var mq = fl_alloc(64);
     store64(mq, cpq_new());
-    store64(mq + 8, map_new());
+    # map_new_str: keys are Str structs (_next_job_key returns str_from_int).
+    # Cyrius 5.4.14+ fixed the collision bug where the legacy map_new()
+    # cstr hash walked Str struct bytes as chars. See docs/development
+    # /roadmap.md and cyrius/.../stdlib-hashmap-str-key-collision.md.
+    store64(mq + 8, map_new_str());
     store64(mq + 16, mutex_new());
     store64(mq + 24, name);
     store64(mq + 32, 0);

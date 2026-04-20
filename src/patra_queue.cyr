@@ -1,0 +1,210 @@
+# majra/patra_queue — durable job queue backed by patra
+#
+# Persistent alternative to `ManagedQueue` in src/queue.cyr. Trades the
+# in-memory priority queue's nanosecond ops for durability: jobs
+# survive a process restart. Backed by a single `jobs` table in a
+# .patra file.
+#
+# Schema:
+#   jobs(id INT, priority INT, payload STR, status INT, created_ns INT)
+#
+# Status codes match the in-memory queue's JOB_* constants from queue.cyr:
+#   0=queued, 1=running, 2=completed, 3=failed
+#
+# API:
+#   var q = patra_queue_new("jobs.patra");
+#   var id = patra_queue_enqueue(q, PRIORITY_HIGH, "payload");
+#   var job = patra_queue_dequeue(q);   # returns fl_alloc'd {id, pri, pay} or 0
+#   patra_queue_complete(q, id);
+#   patra_queue_queued_count(q);
+#   patra_queue_close(q);
+
+# patra_queue struct (24 bytes):
+#   offset  0: db (i64)       — patra_open handle
+#   offset  8: next_id (i64)  — monotonic ID counter
+#   offset 16: initialized (i64) — 1 once CREATE TABLE has run
+
+fn _pq_create_sql() {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "CREATE TABLE jobs (");
+    str_builder_add_cstr(sb, "id INT, priority INT, payload STR, status INT, created_ns INT)");
+    return str_cstr(str_builder_build(sb));
+}
+
+fn _pq_ensure_table(pq) {
+    if (load64(pq + 16) == 1) { return 0; }
+    var db = load64(pq);
+    var r = patra_exec(db, _pq_create_sql());
+    # PATRA_OK on first create, PATRA_ERR_EXISTS on reopen — both fine.
+    if (r == PATRA_OK || r == PATRA_ERR_EXISTS) {
+        store64(pq + 16, 1);
+    }
+    return 0;
+}
+
+# On open, find the max id in the existing jobs table so new IDs don't
+# collide with durable ones.
+fn _pq_load_next_id(pq) {
+    var db = load64(pq);
+    # Patra doesn't support MAX(), so scan and take the largest id.
+    # Acceptable for small-to-medium queues; a proper impl would index on id.
+    var rs = patra_query(db, "SELECT * FROM jobs");
+    var max_id = 0;
+    if (rs != 0) {
+        var nrows = patra_result_count(rs);
+        var i = 0;
+        while (i < nrows) {
+            var id = patra_result_get_int(rs, i, 0);
+            if (id > max_id) { max_id = id; }
+            i = i + 1;
+        }
+        patra_result_free(rs);
+    }
+    store64(pq + 8, max_id + 1);
+}
+
+fn patra_queue_new(path) {
+    patra_init();
+    var db = patra_open(path);
+    if (db == 0) { return 0; }
+    var pq = fl_alloc(24);
+    store64(pq, db);
+    store64(pq + 8, 1);
+    store64(pq + 16, 0);
+    _pq_ensure_table(pq);
+    _pq_load_next_id(pq);
+    return pq;
+}
+
+fn patra_queue_close(pq) {
+    if (pq == 0) { return 0; }
+    patra_close(load64(pq));
+    fl_free(pq);
+    return 0;
+}
+
+fn patra_queue_enqueue(pq, priority, payload) {
+    var db = load64(pq);
+    var id = load64(pq + 8);
+    store64(pq + 8, id + 1);
+
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "INSERT INTO jobs VALUES (");
+    str_builder_add_int(sb, id);
+    str_builder_add_cstr(sb, ", ");
+    str_builder_add_int(sb, priority);
+    str_builder_add_cstr(sb, ", '");
+    str_builder_add_cstr(sb, payload);
+    str_builder_add_cstr(sb, "', 0, ");
+    str_builder_add_int(sb, time_now_ns());
+    str_builder_add_cstr(sb, ")");
+    patra_exec(db, str_cstr(str_builder_build(sb)));
+    return id;
+}
+
+# Dequeue highest-priority queued job (and mark it running). Returns
+# a 32-byte struct: {id, priority, payload_str_ptr, status} — or 0 if
+# no queued jobs. Caller fl_free's the returned struct.
+#
+# Priority convention matches src/queue.cyr: lower numeric = higher
+# priority (CRITICAL=0 is highest, BACKGROUND=4 is lowest). We scan
+# all rows (patra 1.1.1 has no WHERE clause) and pick the lowest
+# priority number among status=0, ties broken by lowest id.
+fn patra_queue_dequeue(pq) {
+    var db = load64(pq);
+    var rs = patra_query(db, "SELECT * FROM jobs");
+    if (rs == 0) { return 0; }
+    var nrows = patra_result_count(rs);
+    if (nrows == 0) { patra_result_free(rs); return 0; }
+
+    var best_id = 0;
+    var best_pri = 999999;
+    var best_row = -1;
+    var i = 0;
+    while (i < nrows) {
+        # SELECT * order: id(0), priority(1), payload(2), status(3), created_ns(4)
+        var status = patra_result_get_int(rs, i, 3);
+        if (status == 0) {
+            var id = patra_result_get_int(rs, i, 0);
+            var pri = patra_result_get_int(rs, i, 1);
+            if (pri < best_pri) {
+                best_pri = pri;
+                best_id = id;
+                best_row = i;
+            } elif (pri == best_pri) {
+                if (id < best_id) {
+                    best_id = id;
+                    best_row = i;
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    if (best_row == -1) { patra_result_free(rs); return 0; }
+
+    # Copy payload BEFORE freeing the result set (result rows are owned
+    # by the rs buffer).
+    var pay_cstr = patra_result_get_str(rs, best_row, 2);
+    var pay_len = strlen(pay_cstr);
+    var pay_copy = fl_alloc(pay_len + 1);
+    memcpy(pay_copy, pay_cstr, pay_len);
+    store8(pay_copy + pay_len, 0);
+
+    patra_result_free(rs);
+
+    # Mark running
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "UPDATE jobs SET status = 1 WHERE id = ");
+    str_builder_add_int(sb, best_id);
+    patra_exec(db, str_cstr(str_builder_build(sb)));
+
+    var job = fl_alloc(32);
+    store64(job, best_id);
+    store64(job + 8, best_pri);
+    store64(job + 16, pay_copy);
+    store64(job + 24, 1);
+    return job;
+}
+
+fn _pq_update_status(pq, id, new_status) {
+    var db = load64(pq);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "UPDATE jobs SET status = ");
+    str_builder_add_int(sb, new_status);
+    str_builder_add_cstr(sb, " WHERE id = ");
+    str_builder_add_int(sb, id);
+    patra_exec(db, str_cstr(str_builder_build(sb)));
+    return 0;
+}
+
+fn patra_queue_complete(pq, id) { return _pq_update_status(pq, id, 2); }
+fn patra_queue_fail(pq, id)     { return _pq_update_status(pq, id, 3); }
+
+# Count rows matching a status.
+# patra 1.1.1's SELECT doesn't take a WHERE clause (limited SQL dialect),
+# so we fetch all rows and filter client-side. Acceptable for small queues;
+# a proper impl would wait for patra WHERE support.
+fn _pq_count_where_status(pq, status) {
+    var rs = patra_query(load64(pq), "SELECT * FROM jobs");
+    if (rs == 0) { return 0; }
+    var n = patra_result_count(rs);
+    var matched = 0;
+    var i = 0;
+    while (i < n) {
+        # SELECT * order: id(0), priority(1), payload(2), status(3), created_ns(4)
+        if (patra_result_get_int(rs, i, 3) == status) { matched = matched + 1; }
+        i = i + 1;
+    }
+    patra_result_free(rs);
+    return matched;
+}
+
+fn patra_queue_queued_count(pq)   { return _pq_count_where_status(pq, 0); }
+fn patra_queue_running_count(pq)  { return _pq_count_where_status(pq, 1); }
+fn patra_queue_completed_count(pq){ return _pq_count_where_status(pq, 2); }
+
+# Accessors for the dequeued-job struct
+fn patra_job_id(j)       { return load64(j); }
+fn patra_job_priority(j) { return load64(j + 8); }
+fn patra_job_payload(j)  { return load64(j + 16); }

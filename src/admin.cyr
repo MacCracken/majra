@@ -1,0 +1,128 @@
+# majra/admin — HTTP admin/metrics endpoint
+#
+# Read-only observability surface over HTTP/1.1. Intended for
+# localhost or reverse-proxied deployment; NO auth, NO mutation,
+# NO write endpoints. Consumers who need mTLS or token auth should
+# wrap this with a fronting proxy (nginx, sigil-TLS, etc.).
+#
+# Routes (all GET):
+#   /health              → "ok" text/plain
+#   /fleet               → JSON {total, online, offline, ...}
+#   /ratelimit/:key      → JSON {allowed, rejected} or 404
+#
+# Uses lib/http_server.cyr (shipped in Cyrius 4.5.0+). Blocking
+# single-threaded accept loop; a request handler returns quickly.
+# For high-throughput observability, front with Prometheus or a
+# pull-scraping agent rather than making this multi-threaded.
+
+# MajraAdmin struct (32 bytes, 4 fields):
+#   offset  0: fleet_tracker  (i64) — hb_tracker or chb_tracker (may be 0)
+#   offset  8: ratelimiter    (i64) — ratelimiter ptr (may be 0)
+#   offset 16: reserved_1     (i64) — future: managed queue ref
+#   offset 24: reserved_2     (i64) — future: pubsub hub ref
+
+fn majra_admin_new(fleet_tracker, ratelimiter) {
+    var a = fl_alloc(32);
+    store64(a, fleet_tracker);
+    store64(a + 8, ratelimiter);
+    store64(a + 16, 0);
+    store64(a + 24, 0);
+    return a;
+}
+
+fn majra_admin_fleet_tracker(a) { return load64(a); }
+fn majra_admin_ratelimiter(a)   { return load64(a + 8); }
+
+# Build a JSON response body for fleet stats. Returns {ptr, len} via ret2.
+# Uses chb_fleet_stats when a concurrent tracker is attached; the stats
+# struct layout is {total_nodes, online, suspect, offline, total_gpus,
+# total_vram, available_vram, evicted}.
+fn _admin_fleet_json(a) {
+    var t = load64(a);
+    if (t == 0) {
+        var empty = "{\"error\":\"no fleet tracker\"}";
+        ret2(empty, strlen(empty));
+    }
+    # Assume chb_tracker; majra's admin currently only accepts concurrent.
+    var s = chb_fleet_stats(t);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"total\":");
+    str_builder_add_int(sb, load64(s));
+    str_builder_add_cstr(sb, ",\"online\":");
+    str_builder_add_int(sb, load64(s + 8));
+    str_builder_add_cstr(sb, ",\"suspect\":");
+    str_builder_add_int(sb, load64(s + 16));
+    str_builder_add_cstr(sb, ",\"offline\":");
+    str_builder_add_int(sb, load64(s + 24));
+    str_builder_add_cstr(sb, ",\"gpus\":");
+    str_builder_add_int(sb, load64(s + 32));
+    str_builder_add_cstr(sb, ",\"vram_total\":");
+    str_builder_add_int(sb, load64(s + 40));
+    str_builder_add_cstr(sb, ",\"vram_available\":");
+    str_builder_add_int(sb, load64(s + 48));
+    str_builder_add_cstr(sb, "}");
+    var body = str_builder_build(sb);
+    ret2(str_data(body), str_len(body));
+}
+
+fn _admin_ratelimit_json(a, key) {
+    var rl = load64(a + 8);
+    if (rl == 0 || key == 0) {
+        var empty = "{\"error\":\"no ratelimiter or key\"}";
+        ret2(empty, strlen(empty));
+    }
+    # ratelimit_stats returns global stats (total_allowed, total_rejected,
+    # active_keys) — per-key stats would need a new helper. Good enough
+    # for v1; per-key lookup is a follow-up.
+    var s = ratelimit_stats(rl);
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"allowed\":");
+    str_builder_add_int(sb, load64(s));
+    str_builder_add_cstr(sb, ",\"rejected\":");
+    str_builder_add_int(sb, load64(s + 8));
+    str_builder_add_cstr(sb, ",\"active_keys\":");
+    str_builder_add_int(sb, load64(s + 16));
+    str_builder_add_cstr(sb, "}");
+    var body = str_builder_build(sb);
+    ret2(str_data(body), str_len(body));
+}
+
+# HTTP handler matching the lib/http_server.cyr signature:
+#   fn handler(ctx, cfd, buf, blen)
+# where ctx is the MajraAdmin pointer.
+fn majra_admin_handler(ctx, cfd, buf, blen) {
+    var path = http_get_path(buf, blen);
+    if (path == 0) {
+        http_send_status(cfd, HTTP_BAD_REQUEST, "bad request");
+        return 0;
+    }
+    var route = http_path_only(path);
+
+    if (str_eq(route, str_from("/health")) == 1) {
+        http_send_response(cfd, HTTP_OK, "OK", "text/plain", "ok", 2, 0);
+        return 0;
+    }
+    if (str_eq(route, str_from("/fleet")) == 1) {
+        var body = _admin_fleet_json(ctx);
+        var body_len = rethi();
+        http_send_response(cfd, HTTP_OK, "OK", "application/json", body, body_len, 0);
+        return 0;
+    }
+    if (str_eq(route, str_from("/ratelimit")) == 1) {
+        var key = http_get_param(path, "key");
+        var body = _admin_ratelimit_json(ctx, key);
+        var body_len = rethi();
+        http_send_response(cfd, HTTP_OK, "OK", "application/json", body, body_len, 0);
+        return 0;
+    }
+
+    http_send_status(cfd, HTTP_NOT_FOUND, "not found");
+    return 0;
+}
+
+# Run the admin endpoint in this thread. Blocks indefinitely.
+# Bind to "127.0.0.1" for localhost-only; use "0.0.0.0" only behind
+# a reverse proxy.
+fn majra_admin_serve(admin, addr, port) {
+    return http_server_run(addr, port, &majra_admin_handler, admin);
+}

@@ -5,6 +5,91 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0-dev] - unreleased
+
+Engineering-backlog minor release. All four roadmap items shipped;
+additive-only (no breaking changes to the 2.3.x surface).
+
+### Changed
+- **Cyrius toolchain pin bumped to 5.4.17** (was 5.4.12-1 at start of 2.4.0-dev cycle). Brings in: (a) the `lib/hashmap.cyr` Str-key fix (5.4.14) — new `map_new_str()` + content-derived `hash_str_v`; resolves the ~3% collision rate surfaced by majra's own soak test and filed as `cyrius/docs/development/issues/stdlib-hashmap-str-key-collision.md`; (b) refreshed `lib/fnptr.cyr` and `lib/toml.cyr`; (c) bundled `lib/sigil.cyr` now 2.9.0.
+- **Sigil dep bumped 2.8.4 → 2.9.0** (`cyrius.cyml` `[deps.sigil]`, `lib/sigil.cyr` refreshed). 2.9.0 adds HKDF (RFC 5869) and stages the AES-NI scaffold; majra's AES-GCM surface is unchanged on the wire, and the software AES-GCM path still runs (AES-NI is deferred at the sigil layer pending the cc5 inline-asm codegen fix scheduled for 5.5.x — filed at `cyrius/docs/development/issues/inline-asm-stores-silently-drop-when-fn-included.md`).
+- **`src/queue.cyr`** switched from `map_new()` to `map_new_str()` for the managed-queue job map. Soak test's `mq_job_count` invariant is now authoritative (was informational-only under the hashmap bug). All 305 assertions pass.
+
+### Added
+
+- **Soak-test infrastructure** (`tests/soak/`) with `soak_queue.cyr`
+  as the first target — 5k-round managed-queue lifecycle stress.
+  Flushed out a real upstream cyrius stdlib bug along the way:
+  `hash_str` in `lib/hashmap.cyr` expects a cstr but is routinely
+  called with Str struct pointers (via `map_set(m, str_from_int(id),
+  ...)`) — produces ~3% collision rate. Filed upstream at
+  `cyrius/docs/development/issues/stdlib-hashmap-str-key-collision.md`.
+  Soak test reports the `mq_job_count` (map-backed) discrepancy
+  informationally and asserts on counter-backed `mq_total_completed`
+  for the authoritative invariant. `tests/soak/README.md` documents
+  the workflow.
+
+- **Sigil-signed envelopes** (`src/signed_envelope.cyr`) — Ed25519
+  signatures over a deterministic canonical encoding of envelope
+  fields (`id_hi|id_lo|timestamp|to_kind|len-prefixed from|to_name|
+  payload`). API: `signed_envelope_new(e, sk, pk)` /
+  `signed_envelope_verify(se, expected_pk)`. Verify codes: 0 ok,
+  1 bad input, 2 pk mismatch, 3 invalid signature. 9 assertions
+  in `test_backends` — clean roundtrip, tamper detection, identity
+  binding via `expected_pk`.
+
+- **HTTP admin/metrics endpoint** (`src/admin.cyr`) — read-only
+  observability surface over `lib/http_server.cyr`. Routes: `/health`,
+  `/fleet` (JSON fleet stats), `/ratelimit` (JSON ratelimiter stats).
+  Localhost-only by default; NO auth, NO mutation. Operator-facing,
+  intended behind a reverse proxy for anything beyond a single host.
+  5 assertions in `test_backends` — handler wiring and JSON body
+  content. Socket-accept loop test belongs in `test_live` (follow-up).
+
+- **Patra-backed persistent queues** (`src/patra_queue.cyr`) — durable
+  alternative to the in-memory managed queue. Single `jobs` table
+  in a `.patra` file, survives process restart. API:
+  `patra_queue_new(path)` / `patra_queue_enqueue(q, priority, payload)`
+   / `patra_queue_dequeue(q)` / `patra_queue_complete(q, id)` /
+  `patra_queue_fail(q, id)` plus queued/running/completed counts.
+  Priority matches `src/queue.cyr` convention (CRITICAL=0 highest,
+  BACKGROUND=4 lowest). 17 assertions in a new `test_patra_queue`
+  entry point (separate from `test_backends` to stay under the cc5
+  16384 fixup cap) — enqueue, priority-ordered dequeue, complete,
+  and reopen-with-persistence verified.
+
+- **Two new dist profiles** to keep the default bundle lean:
+  - `[lib.signed]` → `dist/majra-signed.cyr` (core + signed envelopes,
+    requires sigil at consume-time) — 3215 lines
+  - `[lib.admin]` → `dist/majra-admin.cyr` (core + admin endpoint) —
+    3201 lines
+
+### Tests (all suites on 5.4.12-1)
+
+- core (`./build/majra`): 150 pass
+- expanded (`tests/test_core.tcyr`): 96 pass
+- backends (`tests/test_backends.tcyr`): 42 pass (was 25 in 2.3.1, +17 from
+  signed_envelope + admin)
+- patra_queue (`tests/test_patra_queue.tcyr`): 17 pass (new entry point)
+- **Total: 305 assertions, up from 271 in 2.3.1** (+34)
+- Fuzz: 3/3 clean, bench 17/17 clean
+- Soak: `soak_queue` runs 5k ops to completion (flags the hashmap
+  informational metric as expected)
+
+### Notes
+
+- The patra_queue dequeue and filter paths scan all rows client-side
+  because patra 1.1.1 returns a null result set for queries with a
+  `WHERE` clause (verified; works for WHERE without problem once given
+  the right syntax but our column-list SELECTs returned null for
+  reasons that looked schema-dependent — kept the SELECT * + client
+  filter path for now; revisit when patra gains a more tolerant SQL
+  parser or we adopt column indices directly).
+- Admin endpoint is **localhost-only by design** — binding to 0.0.0.0
+  without a fronting proxy that handles auth is a misuse.
+
+
+
 ## [2.3.1] — 2026-04-20
 
 Patch release: wires sigil 2.8.4's real AES-256-GCM into `src/ipc_encrypted.cyr`

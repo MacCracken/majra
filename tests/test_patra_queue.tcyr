@@ -1,0 +1,84 @@
+# tests/test_patra_queue.tcyr — durable queue via patra
+#
+# Separate compilation unit from test_backends to avoid exhausting
+# the cc5 16384-fixup cap. Includes only what patra_queue actually
+# pulls on: core queue constants + patra stdlib.
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/freelist.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/hashmap.cyr"
+include "lib/syscalls.cyr"
+include "lib/tagged.cyr"
+include "lib/fnptr.cyr"
+include "lib/assert.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+include "lib/sakshi.cyr"
+include "lib/patra.cyr"
+
+include "src/error.cyr"
+include "src/counter.cyr"
+include "src/envelope.cyr"
+include "src/queue.cyr"
+include "src/patra_queue.cyr"
+
+fn test_patra_queue() {
+    patra_init();
+    # Use /tmp for the test db; unlink first if it exists.
+    syscall(SYS_UNLINK, "/tmp/majra_patra_queue_test.patra");
+
+    var q = patra_queue_new("/tmp/majra_patra_queue_test.patra");
+    assert(q != 0, "patra_queue opened");
+    assert_eq(patra_queue_queued_count(q), 0, "fresh queue is empty");
+
+    var id1 = patra_queue_enqueue(q, PRIORITY_NORMAL, "job-normal");
+    var id2 = patra_queue_enqueue(q, PRIORITY_CRITICAL, "job-critical");
+    var id3 = patra_queue_enqueue(q, PRIORITY_LOW, "job-low");
+    assert(id1 != 0, "enqueue 1 returned id");
+    assert(id2 != 0, "enqueue 2 returned id");
+    assert(id3 != 0, "enqueue 3 returned id");
+    assert_eq(patra_queue_queued_count(q), 3, "3 jobs queued");
+
+    # Dequeue should return critical first.
+    var job1 = patra_queue_dequeue(q);
+    assert(job1 != 0, "dequeue returned a job");
+    assert_eq(patra_job_priority(job1), PRIORITY_CRITICAL, "critical dequeued first");
+    assert_eq(patra_queue_queued_count(q), 2, "2 queued after dequeue");
+    assert_eq(patra_queue_running_count(q), 1, "1 running");
+
+    patra_queue_complete(q, patra_job_id(job1));
+    assert_eq(patra_queue_running_count(q), 0, "0 running after complete");
+    assert_eq(patra_queue_completed_count(q), 1, "1 completed");
+
+    # Second dequeue → normal priority
+    var job2 = patra_queue_dequeue(q);
+    assert_eq(patra_job_priority(job2), PRIORITY_NORMAL, "normal dequeued second");
+
+    patra_queue_close(q);
+
+    # Reopen and verify persistence.
+    var q2 = patra_queue_new("/tmp/majra_patra_queue_test.patra");
+    assert(q2 != 0, "reopen");
+    assert_eq(patra_queue_queued_count(q2), 1, "reopen: 1 queued persisted");
+    assert_eq(patra_queue_running_count(q2), 1, "reopen: 1 running persisted");
+    assert_eq(patra_queue_completed_count(q2), 1, "reopen: 1 completed persisted");
+
+    patra_queue_close(q2);
+    syscall(SYS_UNLINK, "/tmp/majra_patra_queue_test.patra");
+    println("  patra_queue: ok");
+}
+
+fn main() {
+    alloc_init();
+    fl_init();
+    println("=== majra patra_queue tests ===");
+    test_patra_queue();
+    return assert_summary();
+}
+
+var r = main();
+syscall(SYS_EXIT, r);
