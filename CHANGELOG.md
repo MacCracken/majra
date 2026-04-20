@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.4.0-dev] - unreleased
+## [2.4.0] — 2026-04-20
 
 Engineering-backlog minor release. All four roadmap items shipped;
 additive-only (no breaking changes to the 2.3.x surface).
