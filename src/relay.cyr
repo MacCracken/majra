@@ -104,7 +104,12 @@ fn relay_subscribe(r) {
     return ch;
 }
 
-# Globals for dedup entry creation (avoids local variable clobbering)
+# Globals for dedup entry creation. These predate cc5 and were added
+# to work around cc3's local-variable clobbering across nested calls.
+# cc5 handles the pattern cleanly (dedup assertions in test_relay pass),
+# but removing the globals would require a structural refactor of
+# _relay_alloc_dedup_entry and _relay_check_dedup. Keeping them —
+# "when in doubt, global" still applies for relay's nested map paths.
 var _dedup_map = 0;
 var _dedup_key = 0;
 var _dedup_seq = 0;

@@ -419,8 +419,42 @@ fn test_relay() {
     store64(msg5 + 40, time_now_ns());
     assert(relay_receive(r, msg5) != 0, "relay accept broadcast");
 
-    # NOTE: dedup table has a known issue with first map_set
-    # in the Cyrius compiler — skipping dedup count assertions for now
+    # Dedup: after msg1 (seq 5 from node-2) and msg5 (seq 6 from node-3),
+    # the dedup table should have 2 entries. (msg4 was rejected on target
+    # mismatch before dedup, msg3 was skipped as own sender.)
+    assert_eq(relay_dedup_table_size(r), 2, "dedup table has 2 senders");
+
+    # Duplicate: same sender + same seq → dropped, duplicates_dropped++
+    var dup = fl_alloc(64);
+    store64(dup, 5);
+    store64(dup + 8, "node-2");
+    store64(dup + 16, "node-1");
+    store64(dup + 24, "t");
+    store64(dup + 40, time_now_ns());
+    assert(relay_receive(r, dup) == 0, "relay drops duplicate");
+
+    # Older seq from same sender → dropped
+    var older = fl_alloc(64);
+    store64(older, 3);
+    store64(older + 8, "node-2");
+    store64(older + 16, "node-1");
+    store64(older + 24, "t");
+    store64(older + 40, time_now_ns());
+    assert(relay_receive(r, older) == 0, "relay drops older seq");
+
+    # Newer seq from same sender → accepted, table size still 2
+    var newer = fl_alloc(64);
+    store64(newer, 10);
+    store64(newer + 8, "node-2");
+    store64(newer + 16, "node-1");
+    store64(newer + 24, "t");
+    store64(newer + 40, time_now_ns());
+    assert(relay_receive(r, newer) != 0, "relay accepts newer seq");
+    assert_eq(relay_dedup_table_size(r), 2, "dedup table still 2 after update");
+
+    # Stats should reflect 2 dropped duplicates
+    var stats2 = relay_stats(r);
+    assert_eq(load64(stats2 + 16), 2, "duplicates_dropped == 2");
 
     println("  relay: ok");
 }

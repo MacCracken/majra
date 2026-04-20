@@ -299,14 +299,7 @@ fn _aaw_worker(participant) {
 }
 
 fn test_cbarrier_arrive_and_wait() {
-    # NOTE: cbarrier_arrive_and_wait is implemented (barrier.cyr:217) with
-    # futex WAIT/WAKE for blocking synchronization. The implementation is
-    # correct but hits the same Cyrius compiler map_get-after-map_set issue
-    # seen in relay dedup. The non-blocking cbarrier_arrive path works and
-    # is tested. The blocking path will be testable once the compiler's
-    # hashmap interaction is fixed.
-    #
-    # For now, verify the non-blocking concurrent path works:
+    # Non-blocking path
     var cbs = cbarrier_set_new();
     var parts = vec_new();
     vec_push(parts, "a"); vec_push(parts, "b");
@@ -315,6 +308,14 @@ fn test_cbarrier_arrive_and_wait() {
     assert_eq(load64(r1), BARRIER_WAITING, "aaw non-blocking waiting");
     var r2 = cbarrier_arrive(cbs, "sync", "b");
     assert_eq(load64(r2), BARRIER_RELEASED, "aaw non-blocking released");
+
+    # Blocking path — deferred: threaded arrive_and_wait crashes under
+    # cc5 5.4.8. The non-blocking path above covers the hashmap mutation
+    # surface; the blocking path additionally uses thread_create +
+    # futex + shared globals, which produces a SIGSEGV on the second
+    # thread's return from cbarrier_arrive_and_wait. Filed as a
+    # cyrius proposal (see docs/development/proposals/ upstream).
+
     println("  cbarrier_arrive_and_wait: ok (non-blocking path)");
 }
 
