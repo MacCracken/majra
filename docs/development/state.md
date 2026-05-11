@@ -6,7 +6,7 @@ type: state
 
 # Current State — majra
 
-> **Last refresh**: 2026-05-10 (post-2.4.3) | **Refresh cadence**: every release (ideally bumped by the release post-hook).
+> **Last refresh**: 2026-05-11 (post-2.4.4) | **Refresh cadence**: every release (ideally bumped by the release post-hook).
 > **What this file is**: volatile state. The companion `CLAUDE.md` holds durable rules; this file holds whatever drifts release-to-release. Per [first-party-documentation § CLAUDE.md](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/first-party-documentation.md#claudemd), version numbers, test counts, consumer lists, and in-flight work all live here, not in `CLAUDE.md`.
 
 ---
@@ -15,15 +15,15 @@ type: state
 
 | File | Value | Source |
 |---|---|---|
-| `VERSION` | **2.4.3** | single source of truth |
+| `VERSION` | **2.4.4** | single source of truth |
 | `cyrius.cyml [package].version` | `${file:VERSION}` | reads `VERSION` |
-| Latest git tag | `2.4.3` | release workflow asserts `VERSION == tag` |
+| Latest git tag | `2.4.4` | release workflow asserts `VERSION == tag` |
 
 ## Toolchain
 
 | Pin | Value | Source |
 |---|---|---|
-| Cyrius | **5.10.34** | `cyrius.cyml [package].cyrius` |
+| Cyrius | **5.10.44** | `cyrius.cyml [package].cyrius` |
 | cc5_aarch64 cross-build | not wired (transitive agnosys SYS_OPEN — see Blockers) |
 
 ## Dependencies (resolved)
@@ -63,7 +63,7 @@ Rationale for the sigil pin lives in [`dependency-watch.md`](dependency-watch.md
 | Live integration | `tests/test_live.tcyr` | 32 | requires Redis + PostgreSQL running |
 | Fuzz harnesses | `fuzz/*.fcyr` | 3 binaries | 500-iter run × 10s timeout per harness in CI |
 | Benchmarks | `benches/bench_all.bcyr` | 17 targets | history tracked via `bench-history.csv` (gitignored) |
-| Soak | `tests/soak/soak_queue.cyr` | 5k-round managed-queue lifecycle | on-demand; soak_pubsub/relay/heartbeat tbd |
+| Soak | `tests/soak/soak_*.cyr` (4 files) | queue 5k ops, pubsub 2k topics, relay dedup+evict, heartbeat 100×20 + auto-evict | on-demand; all 4 ran clean under 5.10.44 at the 2.4.4 bump |
 
 ## Distribution bundles (4 profiles)
 
@@ -92,6 +92,7 @@ Rationale for the sigil pin lives in [`dependency-watch.md`](dependency-watch.md
 
 | Tag | Date | Headline |
 |---|---|---|
+| 2.4.4 | 2026-05-11 | Cyrius toolchain pin 5.10.34 → 5.10.44. No source change; bundle bodies byte-identical (only version banner moved). Sigil held at 2.9.0 — [upstream P1](https://github.com/MacCracken/sigil/blob/main/docs/development/issues/2026-05-10-cyrius-510-asm-stack-frame-drift-breaks-ni-paths.md) still open at sigil 3.1.1. |
 | 2.4.3 | 2026-05-10 | `patra_queue` retires the patra-1.1.1 client-side workarounds; server-side `WHERE`/`ORDER BY`/`LIMIT`/`COUNT(*)`/`MAX()` via patra 1.9.3. `tests/test_patra_queue.tcyr` ported to `sys_unlink()`. |
 | 2.4.2 | 2026-05-10 | Cyrius toolchain pin 5.4.17 → 5.10.34. sandhi-from-stdlib for the HTTP server surface. `lib/` gitignored. CI installer fetches stdlib via the source archive. `src/ipc.cyr` ported to `sys_unlink()`. |
 | 2.4.1 | 2026-04-20 | Docs + soak-test cleanup cycle. soak_pubsub / soak_relay / soak_heartbeat added. |

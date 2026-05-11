@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.4] — 2026-05-11
+
+Cyrius toolchain refresh. No source change; no API, ABI, or
+wire-format drift. All 305 CI assertions + 3 fuzz harnesses + 4
+soak suites pass under the new pin. Sigil stays held at 2.9.0 —
+upstream P1 ([sigil asm stack-frame drift](https://github.com/MacCracken/sigil/blob/main/docs/development/issues/2026-05-10-cyrius-510-asm-stack-frame-drift-breaks-ni-paths.md))
+is still open at sigil 3.1.1 (the 5/11 sigil patch was the
+stdlib annotation pass, not the NI-path fix).
+
+### Changed
+
+- **Cyrius toolchain pin bumped 5.10.34 → 5.10.44** (`cyrius.cyml [package].cyrius`).
+  Ten patch-level cyrius releases worth of stdlib / codegen
+  bugfixes pulled in via `cyrius deps`. `cyrius.lock` unchanged
+  — sigil/sakshi/agnosys all resolve to the same git tags
+  (2.9.0 / 2.0.0 / 1.0.0).
+- **Dist bundles regenerated** at v2.4.4. Bundle bodies are
+  byte-identical to 2.4.3; only the version banner line moved.
+  Sizes unchanged: `dist/majra.cyr` 3127 lines / 85 KB,
+  `dist/majra-signed.cyr` 3273 lines / 90 KB,
+  `dist/majra-admin.cyr` 3259 lines / 90 KB,
+  `dist/majra-backends.cyr` 4727 lines / 137 KB.
+
+### Verified
+
+- Core (main.cyr smoke): **150/150**.
+- `tests/test_core.tcyr`: **96/96**.
+- `tests/test_backends.tcyr`: **42/42** — including
+  `signed_envelope`, `aes_gcm_roundtrip`, and `encrypted_ipc`,
+  which sit directly on the sigil 2.9.0 surface and would have
+  SIGILL'd at the first asm dispatch had the toolchain bump
+  perturbed the reference paths.
+- `tests/test_patra_queue.tcyr`: **17/17**.
+- Fuzz (`cyrius fuzz`): **3/3** harnesses pass (heartbeat / pubsub / queue).
+- Soak: **4/4** (queue 5k ops, pubsub 2000 topics, relay dedup +
+  eviction, heartbeat 100 nodes × 20 cycles + auto-eviction).
+- `cyrius lint src/main.cyr`: 0 warnings.
+- `cyrius vet src/main.cyr`: 27 deps, 0 untrusted, 0 missing.
+- `cyrius fmt src/main.cyr --check`: clean.
+
 ## [2.4.3] — 2026-05-10
 
 `patra_queue` retire-the-workarounds patch. No API or wire-format

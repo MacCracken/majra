@@ -6,7 +6,7 @@ type: state
 
 # Documentation Health — majra
 
-> **Last refresh**: 2026-05-10 (initial audit + doc sweep + CLAUDE audit restructure — restructured CLAUDE.md per first-party-documentation standards, scaffolded `docs/development/state.md` and `docs/development/cyrius-quirks.md`) | **Refresh cadence**: when docs are touched, update the affected row. No release attachment.
+> **Last refresh**: 2026-05-11 (2.4.4 toolchain bump — cyrius pin 5.10.34 → 5.10.44; CHANGELOG + state.md + dependency-watch.md touched; sigil P1 remains open at sigil 3.1.1) | **Refresh cadence**: when docs are touched, update the affected row. No release attachment.
 > **Scope**: This repo only (`majra`) — root-level files (README, CHANGELOG, CLAUDE.md, etc.) plus the entire `docs/` tree, plus `tests/soak/README.md`. Cross-repo dep/pin drift lives in [`development/dependency-watch.md`](development/dependency-watch.md), not here.
 
 This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change. Majra is the distributed-queue + multiplex engine for the AGNOS first-party tree (daimon, AgnosAI, hoosh, sutra, stiva, ifran, secureyeoman); stale module / SQL / crypto docs propagate downstream as consumer-side mis-integrations, so doc currency carries weight. The doc surface is small (~17 files) but most are load-bearing.
@@ -21,7 +21,7 @@ Pattern lifted from the agnosys ledger ([`agnosys/docs/doc-health.md`](https://g
 
 | Bucket | Count | What it means |
 |---|---|---|
-| ✅ **Fresh — touched in 2.4.2 → 2.4.3 cycle, the 2026-05-10 sweep, or the CLAUDE audit restructure** | 10 | `CHANGELOG.md`, `docs/development/roadmap.md`, `VERSION` (ship arc); `README.md`, `docs/development/dependency-watch.md`, `docs/guides/testing.md`, `docs/development/threat-model.md` (sweep); `CLAUDE.md` (rewritten per standards), `docs/development/state.md` (new — live state ledger), `docs/development/cyrius-quirks.md` (new — toolchain gotchas, formerly inlined in CLAUDE.md). All carry the cyrius-5.10.34 / sigil-2.9.0 / sandhi-from-stdlib / patra-1.9.3 reality. |
+| ✅ **Fresh — touched in 2.4.2 → 2.4.3 cycle, the 2026-05-10 sweep, or the CLAUDE audit restructure** | 10 | `CHANGELOG.md`, `docs/development/roadmap.md`, `VERSION` (ship arc); `README.md`, `docs/development/dependency-watch.md`, `docs/guides/testing.md`, `docs/development/threat-model.md` (sweep); `CLAUDE.md` (rewritten per standards), `docs/development/state.md` (new — live state ledger), `docs/development/cyrius-quirks.md` (new — toolchain gotchas, formerly inlined in CLAUDE.md). All carry the cyrius-5.10.44 / sigil-2.9.0 / sandhi-1.3.3 / patra-1.9.3 reality (cyrius pin moved 5.10.34 → 5.10.44 at the 2.4.4 bump on 2026-05-11; all transitive versions unchanged). |
 | 🟡 **Stale — refresh in place** | 0 | All 3 stale rows from the initial audit closed in the 2026-05-10 sweep — see the "Sweep" block below. |
 | 🟠 **Read-through outstanding** | 0 | `docs/development/threat-model.md` read-through completed 2026-05-10: all four trust-boundary claims (admin localhost-only + read-only contract, signed_envelope `ct_eq` constant-time pk compare, ipc_encrypted nonce limit + rekey warning, patra_queue payload-injection contract) verified against current src/ — no drift. Two minor wording fixes landed (sigil "vendored" → "resolved by `cyrius deps`" in the Crypto trust boundary + Supply Chain sections). |
 | 🔵 **Probably evergreen** | 5 | `SECURITY.md`, `CODE_OF_CONDUCT.md`, `LICENSE`, `CONTRIBUTING.md`, `docs/development/semver.md`. No version-tied claims that drift between minor releases. Re-read pass annually. |
@@ -53,13 +53,13 @@ Pattern lifted from the agnosys ledger ([`agnosys/docs/doc-health.md`](https://g
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `README.md` | 2026-05-10 | ✅ Fresh | Rust→Cyrius comparison table updated to `cyrius 5.10.34` in the 2026-05-10 sweep. Module map + 4-profile distribution surface + consumer list still match. |
-| `CHANGELOG.md` | 2026-05-10 | ✅ Fresh | Source of truth for shipped work. Entries through 2.4.3. |
+| `README.md` | 2026-05-11 | ✅ Fresh | Rust→Cyrius comparison table moved to `cyrius 5.10.44` at the 2.4.4 bump. Module map + 4-profile distribution surface + consumer list still match. |
+| `CHANGELOG.md` | 2026-05-11 | ✅ Fresh | Source of truth for shipped work. Entries through 2.4.4 (cyrius 5.10.34 → 5.10.44 toolchain bump, sigil held at 2.9.0). |
 | `CLAUDE.md` | 2026-05-10 | ✅ Fresh | Rewritten 2026-05-10 against [`first-party-documentation § CLAUDE.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/first-party-documentation.md#claudemd) — durable rules only. Volatile state moved to [`docs/development/state.md`](development/state.md); compiler quirks moved to [`docs/development/cyrius-quirks.md`](development/cyrius-quirks.md). Now has all 8 required sections (identity / goal / state-pointer / quick-start / principles / rules / process-with-P(-1) / docs-pointer). ~155 lines, down from 243. |
 | `CONTRIBUTING.md` | 2026-04-09 | 🔵 Evergreen | Generic contributor workflow + tone guidance. No version-tied claims. Re-read annually. |
 | `SECURITY.md` | 2026-04-08 | 🔵 Evergreen | Reporting policy + scope. No version-tied claims; re-read annually. |
 | `CODE_OF_CONDUCT.md` | 2026-03-21 | 🔵 Evergreen | Standard. |
-| `VERSION` | 2026-05-10 | ✅ Fresh | `2.4.3` — single source of truth, read into `cyrius.cyml` via `${file:VERSION}`. |
+| `VERSION` | 2026-05-11 | ✅ Fresh | `2.4.4` — single source of truth, read into `cyrius.cyml` via `${file:VERSION}`. |
 | `LICENSE` | (initial commit) | 🔵 Evergreen | GPL-3.0-only. |
 
 ---
@@ -78,10 +78,10 @@ Pattern lifted from the agnosys ledger ([`agnosys/docs/doc-health.md`](https://g
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `state.md` | 2026-05-10 | ✅ Fresh | Scaffolded by the CLAUDE audit restructure — live volatile state (version, cyrius pin, resolved dep versions, test counts, bundle sizes, consumer table, recent releases, blockers). Cadence: refresh every release; ideally bumped by the release post-hook. Pair-document with `doc-health.md` (state.md = code state; doc-health.md = doc state). |
+| `state.md` | 2026-05-11 | ✅ Fresh | Refreshed for the 2.4.4 toolchain bump: version 2.4.4, cyrius pin 5.10.44, soak row updated to reflect all-4-suites-pass status. Cadence: refresh every release; ideally bumped by the release post-hook. Pair-document with `doc-health.md` (state.md = code state; doc-health.md = doc state). |
 | `cyrius-quirks.md` | 2026-05-10 | ✅ Fresh | Scaffolded by the CLAUDE audit restructure — five active toolchain gotchas + a "resolved in cc5" historical footer. Strikethrough-and-archive resolved entries when the cyrius pin moves; don't delete. Lives under `development/` (not `architecture/`) because it's about how the toolchain affects how the work happens, not about majra design. |
-| `roadmap.md` | 2026-05-10 | ✅ Fresh | 2.4.2 + 2.4.3 marked "Recently shipped". "Waiting on upstream" carries the sigil asm-offset drift (filed P1) with the agnosys SYS_OPEN observation as a sub-bullet (resolves transitively when sigil unblocks). patra-WHERE workaround retired. |
-| `dependency-watch.md` | 2026-05-10 | ✅ Fresh | Rewritten in the 2026-05-10 sweep. admin profile points at `lib/sandhi.cyr` (sandhi M6 fold-in); stdlib table adds `tls.cyr` (transitive for sandhi); sigil "Why pinned" carries the actual 2026-05-10 bisect (2.9.0 pass / 2.9.1–3.0.1 ed25519-NI SIGILL / 3.1.0 aes-gcm-NI SIGILL too) with a link to the upstream sigil P1 issue; "Upgrade considerations" rewritten around the `cyrius deps` flow, the asm-stable NI dispatch gate, and the patra/sandhi stdlib-fold story. |
+| `roadmap.md` | 2026-05-11 | ✅ Fresh | 2.4.4 entry added at top of "Recently shipped" (cyrius 5.10.34 → 5.10.44 toolchain bump). 2.4.2 + 2.4.3 entries retained. "Waiting on upstream" carries the sigil asm-offset drift (filed P1, still open at sigil 3.1.1) with the agnosys SYS_OPEN observation as a sub-bullet (resolves transitively when sigil unblocks). |
+| `dependency-watch.md` | 2026-05-11 | ✅ Fresh | Refreshed at the 2.4.4 toolchain bump: 2026-05-11 sigil status-check bullet added under "Why exactly 2.9.0, not 2.9.x+" noting sigil 3.1.1 shipped a stdlib annotation pass rather than the P1 fix; "Cyrius compiler upgrades" upgrade-consideration now lists the 2.4.4 in-minor stair-step as the worked example alongside the 2.4.2 minor-spanning case; patra row notes 1.9.3 unchanged across the 5.10.34 → 5.10.44 snapshot range. Underlying 2026-05-10 rewrite (sigil bisect, sandhi M6 fold, stdlib table) carries through. |
 | `semver.md` | 2026-04-08 | 🔵 Evergreen | Promise framing for the 2.x line. No version-tied details inside (just the promise + categories). |
 | `threat-model.md` | 2026-05-10 | ✅ Fresh | Read-through completed 2026-05-10: admin localhost-only + read-only contract (src/admin.cyr L4, L8, L124), signed_envelope `ct_eq` constant-time pk compare (src/signed_envelope.cyr L125), ipc_encrypted nonce limit at 2^31 with hard-fail at 2^32 (src/ipc_encrypted.cyr L17, L127), patra_queue payload-injection contract (still applies after the 2.4.3 server-side WHERE rewrite — payload is the only consumer-provided string concatenated into SQL) — all four match current src/. Two wording fixes landed: sigil "first-party, vendored" → "resolved into `lib/sigil.cyr` by `cyrius deps`" in the Crypto trust boundary + Supply Chain sections. |
 
@@ -180,4 +180,4 @@ This file's refresh cadence is **opportunistic** (touched when other docs are to
 
 ---
 
-*Last refresh: 2026-05-10 (initial audit + doc sweep + CLAUDE audit restructure — CLAUDE.md rewritten per first-party-documentation standards; state.md + cyrius-quirks.md scaffolded under `development/`). Refresh in place when docs are touched.*
+*Last refresh: 2026-05-11 (2.4.4 cyrius 5.10.34 → 5.10.44 toolchain bump — CHANGELOG / state.md / dependency-watch.md / VERSION rows refreshed). Refresh in place when docs are touched.*

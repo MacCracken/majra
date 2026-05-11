@@ -2,6 +2,10 @@
 
 Completed items live in [CHANGELOG.md](../../CHANGELOG.md).
 
+## Recently shipped (2.4.4)
+
+- **Cyrius toolchain pin bumped 5.10.34 → 5.10.44** — ten patch-level cyrius releases. No source change; `cyrius.lock` byte-identical (sigil/sakshi/agnosys git tags unchanged); dist bundle bodies byte-identical (only the version banner moves). Full matrix re-ran clean: 305/305 CI assertions + 3/3 fuzz harnesses + 4/4 soak suites. Sigil held at 2.9.0 — [upstream P1](https://github.com/MacCracken/sigil/blob/main/docs/development/issues/2026-05-10-cyrius-510-asm-stack-frame-drift-breaks-ni-paths.md) still open at sigil 3.1.1 (the 5/11 sigil patch was the stdlib annotation pass, not the NI-path fix).
+
 ## Recently shipped (2.4.3)
 
 - **`patra_queue` retires the patra-1.1.1 workarounds.** Migrated dequeue / count / max-id paths to server-side `WHERE` + `ORDER BY` + `LIMIT` + `COUNT(*)`/`MAX()` using patra 1.9.3's SQL surface. Drops the O(n) client-side scans that the original implementation had to do. Tests still 17/17.
