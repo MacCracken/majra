@@ -82,13 +82,19 @@ libro 3.0.1-track).
   blocks cross-builds. Code-hygiene change — keep using the helpers
   on either side of the syscall boundary so a future aarch64 build
   isn't blocked by majra's own code.
-- **aarch64 cross-build is NOT wired into CI.** Tried it; blocked by
-  an unrelated upstream bug at `lib/agnosys.cyr:791` (transitive dep
-  via sigil) that uses raw `syscall(SYS_OPEN, ...)`. The 5.10.34
-  cc5_aarch64 errors on the undefined symbol even with `CYRIUS_DCE=1`.
-  Re-enable once agnosys ships a portable replacement for that call
-  site. All majra consumers run x86_64 server-side; no blocker for
-  shipping 2.4.2 without an aarch64 artifact.
+- **aarch64 cross-build is NOT wired into CI.** Tried it; blocked
+  downstream-of-the-sigil-pin: with `[deps.sigil] = "2.9.0"` we get
+  agnosys 1.0.4 transitively, and that agnosys version's
+  `lib/agnosys.cyr:791` uses raw `syscall(SYS_OPEN, ...)` (x86_64-only;
+  aarch64 Linux uses `SYS_OPENAT`). The 5.10.34 cc5_aarch64 errors on
+  the undefined symbol even with `CYRIUS_DCE=1`. **Note: agnosys
+  mainline (1.2.4) has zero `SYS_OPEN` refs** — the bug was fixed
+  upstream long ago. We just can't pick up the fixed agnosys without
+  bumping past sigil 2.9.0, which is gated on the asm-stack-frame
+  drift issue (see roadmap "Waiting on upstream"). When the sigil
+  P1 lands, agnosys rolls forward transitively and the aarch64 build
+  unblocks. All majra consumers run x86_64 server-side; no blocker
+  for shipping 2.4.2 without an aarch64 artifact.
 - **CI installer fetches the source archive at the version tag** for
   `lib/` (the stdlib snapshot). 5.10.x release tarballs ship `bin/`
   + `deps/` only — no `lib/`. The official `install.sh` covers this
