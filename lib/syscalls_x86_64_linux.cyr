@@ -45,6 +45,8 @@ enum SysNr {
     SYS_MKDIR = 83;
     SYS_RMDIR = 84;
     SYS_UNLINK = 87;
+    SYS_SYMLINK = 88;
+    SYS_READLINK = 89;
     SYS_CHMOD = 90;
     SYS_GETUID = 102;
     SYS_GETGID = 104;
@@ -72,6 +74,12 @@ enum SysNr {
     SYS_GETTID = 186;
     SYS_SET_TID_ADDRESS = 218;
     SYS_EXIT_GROUP = 231;
+    # v5.7.35 (agnosys-surfaced — drm/luks/security)
+    SYS_GETDENTS64 = 217;
+    SYS_GETRANDOM = 318;
+    SYS_LANDLOCK_CREATE_RULESET = 444;
+    SYS_LANDLOCK_ADD_RULE = 445;
+    SYS_LANDLOCK_RESTRICT_SELF = 446;
 }
 
 # ================================================================
@@ -255,6 +263,8 @@ enum Stat {
     STAT_UID = 28;
     STAT_GID = 32;
     STAT_SIZE = 48;
+    STAT_MTIME = 88;
+    STAT_MTIME_NSEC = 96;
     STAT_BUFSZ = 144;
 }
 
@@ -263,23 +273,50 @@ enum Stat {
 # ================================================================
 
 # File operations
+#io
 fn sys_open(path, flags, mode) {
     return syscall(SYS_OPEN, path, flags, mode);
 }
 
 # Close a file descriptor.
+#io
 fn sys_close(fd) {
     return syscall(SYS_CLOSE, fd);
 }
 
 # Read bytes from fd into buffer. Returns bytes read.
+#io
 fn sys_read(fd, buf, count) {
     return syscall(SYS_READ, fd, buf, count);
 }
 
 # Write bytes from buffer to fd. Returns bytes written.
+#io
 fn sys_write(fd, buf, count) {
     return syscall(SYS_WRITE, fd, buf, count);
+}
+
+# v5.8.6: phylax #2 backfill — sys_stat / sys_fstat to match the
+# aarch64 wrapper surface (lib/syscalls_aarch64_linux.cyr:346-353).
+# Pre-v5.8.6, x86_64's stdlib defined the SYS_STAT (4) / SYS_FSTAT
+# (5) enum slots but exposed no wrapper fns; consumers calling
+# sys_stat(path, buf) portably (relying on aarch64's wrapper to
+# dispatch through the at-family) hit `undefined function 'sys_stat'`
+# warnings on x86 builds. Phylax + agnosys's src/fuse.cyr both
+# carried local backfills; v5.8.6 lets them drop those.
+#
+# x86_64 has direct stat/fstat syscalls (the aarch64 wrapper goes
+# through newfstatat with AT_FDCWD because aarch64 dropped the
+# direct stat in favor of the at-family). Both arches' wrappers
+# now have the same (path, buf) / (fd, buf) signatures — consumer
+# code is portable.
+fn sys_stat(path, buf) {
+    return syscall(SYS_STAT, path, buf);
+}
+
+# Stat an already-open fd into the caller's struct stat buffer.
+fn sys_fstat(fd, buf) {
+    return syscall(SYS_FSTAT, fd, buf);
 }
 
 # Duplicate fd oldfd to newfd.
@@ -300,6 +337,20 @@ fn sys_rmdir(path) {
 # Delete a file.
 fn sys_unlink(path) {
     return syscall(SYS_UNLINK, path);
+}
+
+# Create a symbolic link at `linkpath` pointing to `target`.
+# Returns 0 on success, negative errno on failure.
+fn sys_symlink(target, linkpath) {
+    return syscall(SYS_SYMLINK, target, linkpath);
+}
+
+# Read the target of a symbolic link into `buf` (cap `bufsize`).
+# Returns the number of bytes placed in buf (no null terminator),
+# or negative errno on failure. Buf is NOT null-terminated by the
+# kernel — caller must store0 if used as a cstring.
+fn sys_readlink(path, buf, bufsize) {
+    return syscall(SYS_READLINK, path, buf, bufsize);
 }
 
 # Change file permissions.
@@ -534,3 +585,46 @@ fn sys_inotify_init() { return syscall(294, 0); }
 fn sys_inotify_add_watch(fd, path, mask) { return syscall(254, fd, path, mask); }
 # Remove an inotify watch
 fn sys_inotify_rm_watch(fd, wd) { return syscall(255, fd, wd); }
+
+# v5.7.35 — agnosys-surfaced (drm/luks/security)
+
+# Read directory entries. `buf` receives a sequence of
+# `struct linux_dirent64` records: u64 d_ino; s64 d_off;
+# u16 d_reclen; u8 d_type; char d_name[];
+# Returns bytes written into buf, 0 at end-of-dir, -errno on error.
+# Used by drm device-node enumeration; high-level fs::list_dir
+# wraps this for the typical case.
+fn sys_getdents64(fd, buf, count) {
+    return syscall(SYS_GETDENTS64, fd, buf, count);
+}
+
+# Fill `buf` with `len` bytes from the kernel CSPRNG. `flags`
+# is GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE (see
+# lib/random.cyr for constants). Returns bytes filled or -errno.
+# Used by luks key/nonce generation; lib/random.cyr provides
+# the convenience `random_bytes(buf, len)` wrapper.
+fn sys_getrandom(buf, len, flags) {
+    return syscall(SYS_GETRANDOM, buf, len, flags);
+}
+
+# Landlock — kernel-enforced unprivileged sandbox (Linux 5.13+).
+# `attr_ptr` points at `struct landlock_ruleset_attr`; see
+# lib/security.cyr for the struct layout + access-FS flag
+# constants. Returns ruleset fd or -errno.
+fn sys_landlock_create_ruleset(attr_ptr, size, flags) {
+    return syscall(SYS_LANDLOCK_CREATE_RULESET, attr_ptr, size, flags);
+}
+
+# Add a rule to a ruleset created by sys_landlock_create_ruleset.
+# `rule_type` is LANDLOCK_RULE_PATH_BENEATH (1) or
+# LANDLOCK_RULE_NET_PORT (2). Returns 0 or -errno.
+fn sys_landlock_add_rule(ruleset_fd, rule_type, rule_attr, flags) {
+    return syscall(SYS_LANDLOCK_ADD_RULE, ruleset_fd, rule_type, rule_attr, flags);
+}
+
+# Apply a ruleset to the calling thread (and children, via
+# clone(2) inheritance). Once called, restrictions cannot be
+# relaxed by the same thread. Returns 0 or -errno.
+fn sys_landlock_restrict_self(ruleset_fd, flags) {
+    return syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, flags);
+}

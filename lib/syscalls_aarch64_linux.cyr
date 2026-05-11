@@ -52,6 +52,8 @@ enum SysNr {
     SYS_FSTAT = 80;         # bare fstat exists; takes fd
     SYS_MKDIRAT = 34;       # → sys_mkdir (AT_FDCWD)
     SYS_UNLINKAT = 35;      # → sys_rmdir (AT_REMOVEDIR) and sys_unlink
+    SYS_SYMLINKAT = 36;     # → sys_symlink (AT_FDCWD)
+    SYS_READLINKAT = 78;    # → sys_readlink (AT_FDCWD)
     SYS_FCHMODAT = 53;      # → sys_chmod (AT_FDCWD)
     SYS_FACCESSAT = 48;     # → sys_access (AT_FDCWD)
     SYS_PIPE2 = 59;         # → sys_pipe (flags=0)
@@ -114,6 +116,13 @@ enum SysNr {
     SYS_INOTIFY_INIT1 = 26;
     SYS_INOTIFY_ADD_WATCH = 27;
     SYS_INOTIFY_RM_WATCH = 28;
+
+    # v5.7.35 (agnosys-surfaced — drm/luks/security)
+    SYS_GETDENTS64 = 61;
+    SYS_GETRANDOM = 278;
+    SYS_LANDLOCK_CREATE_RULESET = 444;
+    SYS_LANDLOCK_ADD_RULE = 445;
+    SYS_LANDLOCK_RESTRICT_SELF = 446;
 }
 
 # AT_FDCWD = special "current working directory" fd for at-family
@@ -304,6 +313,8 @@ enum Stat {
     STAT_UID = 24;
     STAT_GID = 28;
     STAT_SIZE = 48;
+    STAT_MTIME = 88;
+    STAT_MTIME_NSEC = 96;
     STAT_BUFSZ = 144;
 }
 
@@ -366,6 +377,22 @@ fn sys_rmdir(path) {
 # Translates to unlinkat(AT_FDCWD, path, 0).
 fn sys_unlink(path) {
     return syscall(SYS_UNLINKAT, AT_FDCWD, path, 0);
+}
+
+# Create a symbolic link at `linkpath` pointing to `target`.
+# Translates to symlinkat(target, AT_FDCWD, linkpath).
+# Returns 0 on success, negative errno on failure.
+fn sys_symlink(target, linkpath) {
+    return syscall(SYS_SYMLINKAT, target, AT_FDCWD, linkpath);
+}
+
+# Read the target of a symbolic link into `buf` (cap `bufsize`).
+# Translates to readlinkat(AT_FDCWD, path, buf, bufsize).
+# Returns the number of bytes placed in buf (no null terminator),
+# or negative errno on failure. Buf is NOT null-terminated by the
+# kernel — caller must store0 if used as a cstring.
+fn sys_readlink(path, buf, bufsize) {
+    return syscall(SYS_READLINKAT, AT_FDCWD, path, buf, bufsize);
 }
 
 # Change file permissions.
@@ -619,3 +646,32 @@ fn sys_inotify_init() { return syscall(SYS_INOTIFY_INIT1, 0); }
 fn sys_inotify_add_watch(fd, path, mask) { return syscall(SYS_INOTIFY_ADD_WATCH, fd, path, mask); }
 # Remove an inotify watch
 fn sys_inotify_rm_watch(fd, wd) { return syscall(SYS_INOTIFY_RM_WATCH, fd, wd); }
+
+# v5.7.35 — agnosys-surfaced (drm/luks/security). Same wrapper
+# bodies as the x86_64 peer; the per-arch SYS_* constants in
+# this file's enum route to the right kernel entry points.
+
+# Read directory entries — see x86_64 peer for record layout.
+fn sys_getdents64(fd, buf, count) {
+    return syscall(SYS_GETDENTS64, fd, buf, count);
+}
+
+# Fill buf with kernel-CSPRNG bytes — see x86_64 peer.
+fn sys_getrandom(buf, len, flags) {
+    return syscall(SYS_GETRANDOM, buf, len, flags);
+}
+
+# Landlock — create a ruleset; see x86_64 peer + lib/security.cyr.
+fn sys_landlock_create_ruleset(attr_ptr, size, flags) {
+    return syscall(SYS_LANDLOCK_CREATE_RULESET, attr_ptr, size, flags);
+}
+
+# Landlock — add a rule to a ruleset; see x86_64 peer.
+fn sys_landlock_add_rule(ruleset_fd, rule_type, rule_attr, flags) {
+    return syscall(SYS_LANDLOCK_ADD_RULE, ruleset_fd, rule_type, rule_attr, flags);
+}
+
+# Landlock — apply ruleset to calling thread; see x86_64 peer.
+fn sys_landlock_restrict_self(ruleset_fd, flags) {
+    return syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, flags);
+}
