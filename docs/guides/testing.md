@@ -72,7 +72,7 @@ Currently shipped:
 
 ## Compiler Limitations
 
-Cyrius 5.4.x fixup table cap is 16384 forward references (up from 8192 in cc3). Large test entry points that aggregate many src modules can still hit the cap — `test_patra_queue` is split out for this reason. If adding significant new test code causes a "fixup table full" error, create a new `.tcyr` entry point scoped to what you're testing.
+Cyrius's fixup table cap is 16384 forward references (raised from 8192 in cc3, held at 16384 through the cc5 5.10.x line). Large test entry points that aggregate many src modules can still hit the cap — `test_patra_queue` is split out for this reason. If adding significant new test code causes a "fixup table full" error, create a new `.tcyr` entry point scoped to what you're testing.
 
 ## Live Test Setup
 

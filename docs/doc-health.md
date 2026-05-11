@@ -6,7 +6,7 @@ type: state
 
 # Documentation Health — majra
 
-> **Last refresh**: 2026-05-10 (initial audit, after the 2.4.2 + 2.4.3 ship arc) | **Refresh cadence**: when docs are touched, update the affected row. No release attachment.
+> **Last refresh**: 2026-05-10 (initial audit + doc sweep — refreshed the 3 stale rows + completed the 1 read-through that the initial audit surfaced) | **Refresh cadence**: when docs are touched, update the affected row. No release attachment.
 > **Scope**: This repo only (`majra`) — root-level files (README, CHANGELOG, CLAUDE.md, etc.) plus the entire `docs/` tree, plus `tests/soak/README.md`. Cross-repo dep/pin drift lives in [`development/dependency-watch.md`](development/dependency-watch.md), not here.
 
 This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change. Majra is the distributed-queue + multiplex engine for the AGNOS first-party tree (daimon, AgnosAI, hoosh, sutra, stiva, ifran, secureyeoman); stale module / SQL / crypto docs propagate downstream as consumer-side mis-integrations, so doc currency carries weight. The doc surface is small (~17 files) but most are load-bearing.
@@ -21,14 +21,20 @@ Pattern lifted from the agnosys ledger ([`agnosys/docs/doc-health.md`](https://g
 
 | Bucket | Count | What it means |
 |---|---|---|
-| ✅ **Fresh — touched in 2.4.2 → 2.4.3 cycle** | 4 | `CHANGELOG.md`, `CLAUDE.md`, `docs/development/roadmap.md`, `VERSION`. All carry the cyrius-5.10.34 / sigil-2.9.0 / sandhi-from-stdlib / patra-1.9.3 reality. |
-| 🟡 **Stale — refresh in place** | 3 | `README.md` (Rust→Cyrius comparison table at L217 still cites `cyrius 5.4.17`), `docs/development/dependency-watch.md` (says sigil pins to 2.9.0 because of cyrius 5.5.x asm-fix promise; reality is now the sigil-2.9.1+ asm-offset drift documented in `roadmap.md` + the sigil-side issue we filed; also says "patra 1.1.1 ships with cyrius stdlib" — now 1.9.3; also lists `http_server.cyr` under stdlib modules — folded into `sandhi`), `docs/guides/testing.md` (refers to the cyrius 5.4.x fixup cap; functionally still right at 16384 in 5.10.x but the version note is dated). |
-| 🟠 **Read-through outstanding** | 1 | `docs/development/threat-model.md` — last touched 2026-04-19, pre-2.4.x. The 2.4.0 surface adds (signed_envelope, admin, patra_queue) all show up in the file but were written against the original sigil 2.8.4 / vendored http_server world. Read-through against current src/ to confirm the trust-boundary claims (Ed25519 verification ABI, admin endpoint's localhost-only assertion, patra-queue's on-disk persistence model) still match. |
+| ✅ **Fresh — touched in 2.4.2 → 2.4.3 cycle (or the 2026-05-10 sweep)** | 8 | `CHANGELOG.md`, `CLAUDE.md`, `docs/development/roadmap.md`, `VERSION` (touched by the ship arc); plus `README.md`, `docs/development/dependency-watch.md`, `docs/guides/testing.md`, `docs/development/threat-model.md` (touched by the sweep). All carry the cyrius-5.10.34 / sigil-2.9.0 / sandhi-from-stdlib / patra-1.9.3 reality. |
+| 🟡 **Stale — refresh in place** | 0 | All 3 stale rows from the initial audit closed in the 2026-05-10 sweep — see the "Sweep" block below. |
+| 🟠 **Read-through outstanding** | 0 | `docs/development/threat-model.md` read-through completed 2026-05-10: all four trust-boundary claims (admin localhost-only + read-only contract, signed_envelope `ct_eq` constant-time pk compare, ipc_encrypted nonce limit + rekey warning, patra_queue payload-injection contract) verified against current src/ — no drift. Two minor wording fixes landed (sigil "vendored" → "resolved by `cyrius deps`" in the Crypto trust boundary + Supply Chain sections). |
 | 🔵 **Probably evergreen** | 5 | `SECURITY.md`, `CODE_OF_CONDUCT.md`, `LICENSE`, `CONTRIBUTING.md`, `docs/development/semver.md`. No version-tied claims that drift between minor releases. Re-read pass annually. |
 | 📦 **Archive / frozen by design** | 4 | `docs/benchmarks/results-v2.0.0.md` + `docs/benchmarks/rust-vs-cyrius-v2.0.0.md` (point-in-time at the 2.0.0 Cyrius-port cutover; the rust-vs-cyrius file is the HEADLINER — don't refresh in place); `docs/guides/migration-ifran.md` + `docs/guides/migration-secureyeoman.md` (consumer-specific migration recipes — frozen at the consumer's adoption point, not refreshed when majra moves). |
 | ❓ **Open strategic question** | 0 | See [Open questions](#open-strategic-questions) for what would re-open. |
 
-**Doc cleanup completed 2026-05-10 across the 2.4.2 / 2.4.3 ship arc:**
+**Doc sweep completed 2026-05-10:**
+- ✅ `README.md` L217 — cyrius 5.4.17 → 5.10.34 in the Rust→Cyrius comparison table.
+- ✅ `docs/development/dependency-watch.md` — rewrote five items: (a) admin-profile row notes sandhi-from-stdlib path instead of `lib/http_server.cyr`; (b) stdlib modules table adds `tls.cyr` (transitive for sandhi's TLS-early-data references), drops the dated 5.4.x version notes on `hashmap.cyr` / `syscalls.cyr`; (c) `http_server.cyr` row replaced with `sandhi.cyr`; (d) `patra.cyr` row updated to 1.9.3 + the 2.4.3 SQL-surface migration note; (e) sigil "Why pinned" rewritten against the actual 2026-05-10 bisect (2.9.0 = pass, 2.9.1–3.0.1 = ed25519-NI SIGILL, 3.1.0 = aes-gcm-NI too) with a cross-link to the upstream sigil-side P1 issue; (f) "Upgrade considerations" rewritten with `cyrius deps` flow, the new sigil-upgrade gate (asm-stable NI dispatch surface), the patra/sandhi stdlib-fold story.
+- ✅ `docs/guides/testing.md` — fixup-cap note rephrased to drop the dated "5.4.x" framing while keeping the 16384 number; reads as cc5-line-wide instead of stuck on the 2.4.0-era pin.
+- ✅ `docs/development/threat-model.md` — read-through against current src/; all four trust-boundary claims verified; two wording fixes (sigil "vendored" → "resolved by `cyrius deps`").
+
+**Doc cleanup completed 2026-05-10 across the 2.4.2 / 2.4.3 ship arc** (separate from the sweep block above; this block records what the ship arc itself touched):
 - ✅ `CHANGELOG.md` — 2.4.2 + 2.4.3 stanzas. 2.4.2 captures the cyrius 5.10.34 jump + sandhi-from-stdlib + sigil pin rationale + CI installer fix. 2.4.3 captures the patra_queue server-side SQL migration.
 - ✅ `CLAUDE.md` — cyrius pin reference + sigil tag + lib/ resolution model + cc5 quirks list trimmed for the 5.10.x floor. sandhi-from-stdlib path documented.
 - ✅ `docs/development/roadmap.md` — 2.4.2 + 2.4.3 marked "Recently shipped"; the QUIC/AES-NI entry rewritten against the actual sigil-asm-offset bisect; agnosys SYS_OPEN portability filed under "Waiting on upstream"; the patra-1.1.1 workaround item retired (shipped in 2.4.3).
@@ -40,7 +46,7 @@ Pattern lifted from the agnosys ledger ([`agnosys/docs/doc-health.md`](https://g
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `README.md` | 2026-04-19 | 🟡 Stale | L217 Rust→Cyrius comparison table cites `cyrius 5.4.17` — refresh to `cyrius 5.10.34`. Otherwise structurally fine; module map + 4-profile distribution surface + consumer list still match. Quick edit when next touched. |
+| `README.md` | 2026-05-10 | ✅ Fresh | Rust→Cyrius comparison table updated to `cyrius 5.10.34` in the 2026-05-10 sweep. Module map + 4-profile distribution surface + consumer list still match. |
 | `CHANGELOG.md` | 2026-05-10 | ✅ Fresh | Source of truth for shipped work. Entries through 2.4.3. |
 | `CLAUDE.md` | 2026-05-10 | ✅ Fresh | Durable rules. Refreshed in 2.4.2: cyrius pin (5.10.34), sigil pin (2.9.0 + reason), lib/-is-resolved-by-cyrius-deps note, sandhi-from-stdlib path, cc5 5.10.x quirks list. |
 | `CONTRIBUTING.md` | 2026-04-09 | 🔵 Evergreen | Generic contributor workflow + tone guidance. No version-tied claims. Re-read annually. |
@@ -64,9 +70,9 @@ Pattern lifted from the agnosys ledger ([`agnosys/docs/doc-health.md`](https://g
 | File | Last touched | Status | Notes |
 |---|---|---|---|
 | `roadmap.md` | 2026-05-10 | ✅ Fresh | 2.4.2 + 2.4.3 marked "Recently shipped". "Waiting on upstream" carries the sigil asm-offset drift bisect + the agnosys SYS_OPEN portability item. patra-WHERE workaround retired. |
-| `dependency-watch.md` | 2026-04-19 | 🟡 Stale | Multiple inaccuracies: (a) sigil rationale still talks about the cyrius 5.5.x inline-asm fix as the gate — actual story is now the sigil-2.9.1+ asm-offset drift (see roadmap.md + the sigil-side P1 issue); (b) lists `http_server.cyr` under stdlib modules — folded into `sandhi` as of 5.10.34; (c) "patra 1.1.1 ships with cyrius stdlib" — actually 1.9.3 in the cyrius 5.10.34 snapshot, and 2.4.3 retired the 1.1.1-shaped workarounds. Rewrite next time it's touched. |
+| `dependency-watch.md` | 2026-05-10 | ✅ Fresh | Rewritten in the 2026-05-10 sweep. admin profile points at `lib/sandhi.cyr` (sandhi M6 fold-in); stdlib table adds `tls.cyr` (transitive for sandhi); sigil "Why pinned" carries the actual 2026-05-10 bisect (2.9.0 pass / 2.9.1–3.0.1 ed25519-NI SIGILL / 3.1.0 aes-gcm-NI SIGILL too) with a link to the upstream sigil P1 issue; "Upgrade considerations" rewritten around the `cyrius deps` flow, the asm-stable NI dispatch gate, and the patra/sandhi stdlib-fold story. |
 | `semver.md` | 2026-04-08 | 🔵 Evergreen | Promise framing for the 2.x line. No version-tied details inside (just the promise + categories). |
-| `threat-model.md` | 2026-04-19 | 🟠 Read-through | Pre-2.4.x. Read-through against current src/ to confirm the trust-boundary claims (Ed25519 verify ABI from signed_envelope, admin endpoint's localhost-only contract, patra_queue's on-disk persistence model) still match the as-shipped surface. No urgent gap surfaced — call it before the next minor cut. |
+| `threat-model.md` | 2026-05-10 | ✅ Fresh | Read-through completed 2026-05-10: admin localhost-only + read-only contract (src/admin.cyr L4, L8, L124), signed_envelope `ct_eq` constant-time pk compare (src/signed_envelope.cyr L125), ipc_encrypted nonce limit at 2^31 with hard-fail at 2^32 (src/ipc_encrypted.cyr L17, L127), patra_queue payload-injection contract (still applies after the 2.4.3 server-side WHERE rewrite — payload is the only consumer-provided string concatenated into SQL) — all four match current src/. Two wording fixes landed: sigil "first-party, vendored" → "resolved into `lib/sigil.cyr` by `cyrius deps`" in the Crypto trust boundary + Supply Chain sections. |
 
 ---
 
@@ -74,7 +80,7 @@ Pattern lifted from the agnosys ledger ([`agnosys/docs/doc-health.md`](https://g
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `testing.md` | 2026-04-19 | 🟡 Stale (light) | The Cyrius 5.4.x fixup-cap-16384 note is functionally still right under 5.10.x but the version reference is dated. Three-line touch next time the file is edited. |
+| `testing.md` | 2026-05-10 | ✅ Fresh | Fixup-cap note rephrased in the 2026-05-10 sweep to drop the "5.4.x" framing while keeping the 16384 number — now reads as cc5-line-wide rather than stuck on a 2.4.0-era pin. |
 | `migration-ifran.md` | 2026-04-08 | 📦 Frozen | Consumer-specific recipe captured at ifran's adoption point. Don't refresh in place when majra evolves; ifran is the source of truth for what got migrated. Re-author only if ifran returns for a second migration round. |
 | `migration-secureyeoman.md` | 2026-04-08 | 📦 Frozen | Same posture as `migration-ifran.md`. |
 
@@ -163,4 +169,4 @@ This file's refresh cadence is **opportunistic** (touched when other docs are to
 
 ---
 
-*Last refresh: 2026-05-10 (initial audit, after the 2.4.2 + 2.4.3 ship arc). Refresh in place when docs are touched.*
+*Last refresh: 2026-05-10 (initial audit + doc sweep — refreshed the 3 stale rows + completed the 1 read-through that the initial audit surfaced). Refresh in place when docs are touched.*

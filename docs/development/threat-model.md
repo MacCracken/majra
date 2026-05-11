@@ -8,9 +8,11 @@ network connections (Redis, PostgreSQL, WebSocket, IPC) are initiated by the
 consumer's code.
 
 **Crypto trust boundary**: when using the `signed` or `backends` profiles, sigil
-(first-party, vendored) is the sole crypto implementation. AES-256-GCM, Ed25519,
-HMAC-SHA256, HKDF all live there. sigil's own `docs/audit/` directory documents
-its crypto audit surface.
+(first-party, resolved into `lib/sigil.cyr` by `cyrius deps` from the version
+pinned in `[deps.sigil]`) is the sole crypto implementation. AES-256-GCM,
+Ed25519, HMAC-SHA256, HKDF all live there. sigil's own `docs/audit/` directory
+documents its crypto audit surface. See [`dependency-watch.md`](dependency-watch.md)
+for the rationale on the current sigil 2.9.0 pin.
 
 ## Attack Surface
 
@@ -47,8 +49,8 @@ Mitigations:
 
 ## Supply Chain
 
-- **Zero external dependencies for the core profile** — `dist/majra.cyr` uses only the Cyrius stdlib (vendored in `lib/`)
-- **One first-party dep for the richer profiles** — `sigil` (vendored as `lib/sigil.cyr`, pinned via `[deps.sigil]` in `cyrius.cyml`). sigil is in the same organization, bootstrapped from the same compiler, audited as part of the AGNOS crypto boundary
+- **Zero external dependencies for the core profile** — `dist/majra.cyr` uses only the Cyrius stdlib (resolved into `lib/` by `cyrius deps` from the version pinned in `cyrius.cyml`; `lib/` itself is gitignored, repopulated on every CI run + every developer build)
+- **One first-party dep for the richer profiles** — `sigil` (resolved into `lib/sigil.cyr` via `[deps.sigil]` in `cyrius.cyml`; `cyrius.lock` carries a SHA-256 over the resolved file and CI's `cyrius deps --verify` enforces hash match). sigil is in the same organization, bootstrapped from the same compiler, audited as part of the AGNOS crypto boundary
 - **No package manager** — no supply chain attack vector via crate registries
 - **Compiler is self-hosting** — Cyrius bootstraps from a 29 KB seed binary
 - **Byte-identical verification** — compiler self-compilation produces identical output
