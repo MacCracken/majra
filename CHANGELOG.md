@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.3] — 2026-05-10
+
+`patra_queue` retire-the-workarounds patch. No API or wire-format
+change; all 305 assertions still pass. Cleans up the only meaningful
+piece of tech debt the 2.4.2 toolchain bump exposed.
+
+### Changed
+
+- **`src/patra_queue.cyr` now uses server-side SQL** for its three
+  hot paths. patra (resolved via the cyrius stdlib at v1.9.3 now,
+  not the 1.1.1 the workarounds were written against) supports
+  `WHERE`, `ORDER BY`, `LIMIT`, and the `COUNT`/`MAX` aggregates:
+  - `_pq_load_next_id`: `SELECT MAX(id) FROM jobs` — single-row
+    aggregate, no full-table scan to find the largest id at open.
+  - `patra_queue_dequeue`: `SELECT * FROM jobs WHERE status = 0
+    ORDER BY priority ASC, id ASC LIMIT 1` — the dequeue ordering
+    (lower priority number = higher priority, ties broken by id)
+    is now server-side. Drops the ~30-line client-side scan + sort.
+  - `_pq_count_where_status`: `SELECT COUNT(*) FROM jobs WHERE
+    status = N` — single-int aggregate result instead of
+    fetching every row to bump a counter.
+  Behaviour preserved against `tests/test_patra_queue.tcyr`
+  (17/17). Useful at queue sizes where the prior O(n) scans were
+  starting to matter; correct at any size.
+- **`tests/test_patra_queue.tcyr`** ported from raw `syscall(SYS_UNLINK, ...)`
+  to the `sys_unlink()` helper — same arch-portability cleanup as
+  `src/ipc.cyr` got in 2.4.2.
+
 ## [2.4.2] — 2026-05-10
 
 Toolchain + dep refresh. No source API changes; no consumer-visible

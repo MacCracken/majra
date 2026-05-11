@@ -2,6 +2,18 @@
 
 Completed items live in [CHANGELOG.md](../../CHANGELOG.md).
 
+## Recently shipped (2.4.3)
+
+- **`patra_queue` retires the patra-1.1.1 workarounds.** Migrated dequeue / count / max-id paths to server-side `WHERE` + `ORDER BY` + `LIMIT` + `COUNT(*)`/`MAX()` using patra 1.9.3's SQL surface. Drops the O(n) client-side scans that the original implementation had to do. Tests still 17/17.
+- **`tests/test_patra_queue.tcyr` `sys_unlink()` cleanup** — same arch-portability fix as `src/ipc.cyr` got in 2.4.2.
+
+## Recently shipped (2.4.2)
+
+- **Cyrius toolchain pin bumped 5.4.17 → 5.10.34** + sandhi-from-stdlib for the HTTP server surface (no more vendored `lib/http_server.cyr`).
+- **`lib/` gitignored** — repopulated by `cyrius deps`. Matches agnosys/agnostik/yukti/patra convention. `cyrius.lock` committed for hash verification.
+- **`src/ipc.cyr` ported to `sys_unlink()`** (was raw `syscall(SYS_UNLINK, ...)`) so majra's own code stays cross-arch portable even though we don't currently ship an aarch64 binary.
+- **CI installer fetches the stdlib via the source archive at the version tag** — 5.10.x release tarballs ship `bin/` + `deps/` only, no `lib/`.
+
 ## Upstream wins landed in 2.4.0
 
 - **Hashmap Str-key fix (cyrius 5.4.14)** — the ~3% collision bug majra filed upstream during soak-test development. Fixed with a new `map_new_str()` + content-derived `hash_str_v`. `src/queue.cyr` flipped to `map_new_str()`; soak test's `mq_job_count` invariant is now authoritative.
@@ -25,12 +37,12 @@ Completed items live in [CHANGELOG.md](../../CHANGELOG.md).
 ## Open Items
 
 ### Waiting on upstream
-- **QUIC transport + AES-NI hardware acceleration** — both are pending the **next sigil release** (2.10.0 or 2.9.1 — TBD), which will bundle two things together: (a) **X25519 key agreement** — the last TLS 1.3 primitive sigil needs to complete its crypto surface, which unblocks majra's QUIC transport module; (b) **AES-NI / pmull dispatch wiring** on top of sigil 2.9.0's staged scaffold. AES-NI is currently blocked by a cc5 inline-asm codegen bug (`cyrius/docs/development/issues/inline-asm-stores-silently-drop-when-fn-included.md`) scheduled for cyrius 5.5.x. Both items land together so consumers see one coherent crypto-surface bump rather than two.
+- **QUIC transport + AES-NI hardware acceleration** — gated on **sigil emitting cyrius-stable asm**. Bisect against cyrius 5.10.34 (2026-05-10): sigil 2.9.0 = full pass; 2.9.1–3.0.1 = SIGILL on the ed25519-NI path; 3.1.0 = SIGILL earlier on aes_gcm-NI too. All the regressions trace to inline-asm blocks that hardcode `[rbp-N]` parameter offsets matching cyrius's pre-5.5 stack frame, which has shifted under 5.10.x's expanded prologue. We pinned at sigil 2.9.0 (asm-free reference paths) during the 2.4.2 toolchain bump. Once sigil emits an asm dispatch surface that survives a cyrius minor bump — or migrates off raw byte arrays for parameter loads — bump the pin and revisit QUIC (still needs X25519 from sigil too).
+- **`lib/agnosys.cyr:791` SYS_OPEN portability** — transitive dep via sigil. Raw `syscall(SYS_OPEN, ...)` is x86_64-only, blocks any aarch64 cross-build even when the call site is unreachable from majra's entry points. cyrius 5.10.34 cc5_aarch64 doesn't DCE through it; cyrius 5.10.41 (current local) does. File upstream against agnosys with the portable-helper migration as the fix.
 
 ### Engineering backlog
 
 - **Shared-memory IPC transport** (mmap-based) — still deferred. Most workloads are fine with Unix-socket IPC; revisit when a consumer hits the syscall-per-message ceiling.
-- **Multi-row patra WHERE** — `patra_queue` currently scans all rows and filters client-side because patra 1.1.1 returned null result sets for column-list SELECT + WHERE. Revisit when patra's SQL parser tolerates more query shapes, or switch to explicit column indices once we've characterized the parser's WHERE behavior.
 
 ### Upstream cleanup (not majra work)
 - `cyrius/docs/development/issues/majra-cbarrier-arrive-and-wait-crash.md` is fixed in 5.4.10 but hasn't been moved to `issues/archived/` with a `— RESOLVED` suffix yet. Per the `issues/README.md` lifecycle, someone on the Cyrius side should archive it.

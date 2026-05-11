@@ -29,7 +29,7 @@ include "src/patra_queue.cyr"
 fn test_patra_queue() {
     patra_init();
     # Use /tmp for the test db; unlink first if it exists.
-    syscall(SYS_UNLINK, "/tmp/majra_patra_queue_test.patra");
+    sys_unlink("/tmp/majra_patra_queue_test.patra");
 
     var q = patra_queue_new("/tmp/majra_patra_queue_test.patra");
     assert(q != 0, "patra_queue opened");
@@ -68,7 +68,7 @@ fn test_patra_queue() {
     assert_eq(patra_queue_completed_count(q2), 1, "reopen: 1 completed persisted");
 
     patra_queue_close(q2);
-    syscall(SYS_UNLINK, "/tmp/majra_patra_queue_test.patra");
+    sys_unlink("/tmp/majra_patra_queue_test.patra");
     println("  patra_queue: ok");
 }
 
