@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.2] — 2026-05-10
+
+Toolchain + dep refresh. No source API changes; no consumer-visible
+behaviour drift. Brings majra onto the same cyrius/sigil floor as
+the rest of the first-party tree (agnosys 1.2.4, agnostik 1.2.1,
+libro 3.0.1-track).
+
+### Changed
+
+- **Cyrius toolchain pin bumped 5.4.17 → 5.10.34.** Matches the
+  current first-party floor (agnosys/agnostik). Notable upstream
+  changes spanning this range: arch-peer include resolution now
+  expects `~/.cyrius/versions/<V>/lib` (5.10.9+) — CI installer
+  updated accordingly; richer fmt/lint/vet/capacity surfaces;
+  DCE (`CYRIUS_DCE=1`) available for release binaries; raised
+  fixup cap; stdlib `ct_eq_bytes` family (the prerequisite for
+  sigil's 3.0.2 `src/ct.cyr` retirement).
+- **Sigil dep held at 2.9.0.** Investigated 2.9.5 and 3.1.0 — both
+  fail under cyrius 5.10.34 with SIGILL inside different inline-asm
+  hot paths (2.9.5: ed25519; 3.1.0: aes-gcm). The asm blocks in
+  sigil 2.9.5+ hardcode `[rbp-N]` parameter offsets that match
+  cyrius's pre-5.5 stack-frame layout but drift under 5.10.x's
+  expanded prologue. 2.9.0 keeps the software AES + reference
+  ed25519 paths (no architecture-specific asm dispatch), so it
+  rides through the toolchain bump unchanged. Re-evaluate once
+  sigil ships an AES-NI/ed25519 path that emits cyrius-stable
+  asm or migrates off raw byte arrays. Filing the offset-drift
+  upstream as an issue.
+- **`lib/` is no longer committed.** Added `/lib/` to `.gitignore`;
+  the directory is repopulated by `cyrius deps` from the
+  version-pinned manifest. Matches agnosys / agnostik / yukti /
+  patra convention. Prevents stale stubs from prior cyrius
+  versions sitting in tree.
+- **CI / release modernized.** Adopted the agnosys/agnostik pattern:
+  versioned `~/.cyrius/versions/<V>/lib` toolchain layout (required
+  by 5.10.9+ for arch-peer include resolution), `cyrius deps` step,
+  `cyrius.lock` hash verification (best-effort until the lockfile
+  lands in-tree), aarch64 cross-build (best-effort when
+  `cc5_aarch64` ships), all four `cyrius distlib` profiles in the
+  freshness gate, fmt-by-diff (drift detection works around the
+  `--check` no-op in cyrius 5.9+).
+- **CLAUDE.md** — cyrius pin reference + sigil tag refreshed; quirks
+  list trimmed for the cc5 5.10.x floor; lib/ now described as
+  resolved-by-`cyrius deps` rather than vendored-in-tree.
+
 ## [2.4.1] — 2026-04-20
 
 Docs + soak-test cleanup cycle. No API changes; no new deps.

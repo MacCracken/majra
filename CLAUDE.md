@@ -29,14 +29,35 @@ daimon (agent messaging), AgnosAI (crew coordination), hoosh (inference routing)
 
 ## Dependencies
 
-- **Cyrius stdlib** — vendored under `lib/`. The `[deps] stdlib = [...]`
-  list in `cyrius.cyml` mirrors the `include "lib/<name>.cyr"` lines at
-  the top of `src/main.cyr`. Keep them in sync.
-- **sigil ≥ 2.9.0** — first-party crypto library, vendored at `lib/sigil.cyr`
-  via `[deps.sigil]`. Used by `src/ipc_encrypted.cyr` (AES-256-GCM) and
-  `src/signed_envelope.cyr` (Ed25519). Consumer projects picking the
-  core `dist/majra.cyr` profile don't need sigil; the `signed`, `admin`
-  (no — admin doesn't), and `backends` profiles do.
+- **Cyrius stdlib** — resolved into `lib/` by `cyrius deps` from the
+  version-pinned snapshot. `lib/` is gitignored (matches agnosys /
+  agnostik / yukti / patra convention) so no stale stubs sit in tree.
+  The `[deps] stdlib = [...]` list in `cyrius.cyml` mirrors the union
+  of `include "lib/<name>.cyr"` lines across `src/`, `tests/`,
+  `fuzz/`, `benches/`, and `examples/`. Keep them in sync — `cyrius
+  deps` only resolves what's listed.
+- **sigil = 2.9.0** — first-party crypto library, pulled via
+  `[deps.sigil]`. Used by `src/ipc_encrypted.cyr` (AES-256-GCM) and
+  `src/signed_envelope.cyr` (Ed25519). The 2.9.5 / 3.0.x / 3.1.0
+  builds hardcode `[rbp-N]` parameter offsets inside AES-NI / SHA-NI
+  / ed25519-NI inline-asm blocks that match cyrius's pre-5.5
+  stack-frame layout but drift under 5.10.x (SIGILL at runtime).
+  2.9.0's reference (asm-free) crypto paths still build & run cleanly
+  on cyrius 5.10.34, so we pin there. Re-bump when sigil ships an
+  asm-dispatch path that's cyrius-stable or migrates off raw byte
+  arrays.
+- **`lib/http_server.cyr`** — vendored in-tree (carve-out in
+  `.gitignore`). Was dropped from the cyrius stdlib at the sandhi
+  M1 fold-out; `src/admin.cyr` and `tests/test_backends.tcyr` still
+  depend on it. Migrate the admin/ws surface onto sandhi proper to
+  retire the vendored copy.
+
+Consumer profiles and what they pull:
+- `dist/majra.cyr` — core engine; no sigil dependency.
+- `dist/majra-signed.cyr` — adds `signed_envelope.cyr`; needs sigil.
+- `dist/majra-admin.cyr` — adds the HTTP admin endpoint; needs
+  `lib/http_server.cyr` (vendored in this repo).
+- `dist/majra-backends.cyr` — everything; needs sigil + http_server.
 
 If another external first-party dep is added, wire it under
 `[deps.<name>]` with `git` + `tag` + `modules` like we wire sigil.
@@ -126,7 +147,7 @@ dist/majra.cyr             Consumer dist — core engine (default [lib])
 dist/majra-signed.cyr      Consumer dist — core + signed envelopes ([lib.signed])
 dist/majra-admin.cyr       Consumer dist — core + admin endpoint ([lib.admin])
 dist/majra-backends.cyr    Consumer dist — everything ([lib.backends])
-lib/                       Vendored Cyrius stdlib + sigil (2.9.0+)
+lib/                       Resolved Cyrius stdlib + sigil 2.9.0 (gitignored; only http_server.cyr is checked in)
 build/                     Compiled binaries (gitignored)
 scripts/version-bump.sh    Syncs VERSION
 docs/                      architecture, development, guides
@@ -151,11 +172,13 @@ docs/ (when earned):
 
 ## CI / Release
 
-- **Toolchain pin**: `cyrius` field inside `cyrius.cyml` (currently `cyrius = "5.4.17"`). CI and release extract it dynamically — no hardcoded version strings in YAML.
+- **Toolchain pin**: `cyrius` field inside `cyrius.cyml` (currently `cyrius = "5.10.34"`). CI and release extract it dynamically — no hardcoded version strings in YAML.
+- **Toolchain layout**: CI installs into `~/.cyrius/versions/<V>/{bin,lib}` with `~/.cyrius/{bin,lib}` symlinking to the active version. Required by cc5 5.10.9+ for arch-peer include resolution (`syscalls_x86_64_linux.cyr` etc.). The flat layout that worked under 5.4.x no longer resolves the peer files.
+- **Dep resolution**: CI runs `cyrius deps` before any build/test step (mirrors agnosys/agnostik). With `cyrius.lock` committed, `cyrius deps --verify` enforces hash match; without it, the verify step emits a warning and continues.
 - **Manifest**: `cyrius.cyml` (migrated from `cyrius.toml` in 2.3.0 to match first-party convention). Uses `${file:VERSION}` so `VERSION` remains the single source of truth.
 - **Manifest completeness gate**: CI asserts every `include "src/<file>.cyr"` in `src/main.cyr` is listed under `[lib] modules`. If not, `cyrius distlib` would silently ship a broken bundle.
 - **Distribution freshness gate**: CI runs all four `cyrius distlib` invocations and fails if `git diff dist/` is non-empty. All four bundles must be regenerated and committed alongside any `src/` change.
-- **Tag filter**: release triggers on `tags: ['[0-9]*']` — semver-only.
+- **Tag filter**: release triggers on `v[0-9]+.[0-9]+.[0-9]+` or `[0-9]+.[0-9]+.[0-9]+` — semver shape enforced post-trigger.
 - **Version gate**: release asserts `VERSION == git tag` before building.
 - **Docs gate**: CI verifies `VERSION` appears as `[x.y.z]` heading in `CHANGELOG.md`.
 
@@ -191,16 +214,17 @@ pull time for whichever profile they chose.
 - Do not skip benchmarks before claiming performance improvements
 - Do not commit `build/`
 
-## Known Cyrius Compiler Quirks (5.4.17)
+## Known Cyrius Compiler Quirks (5.10.34)
 
 Most cc3-era workarounds documented in earlier majra versions are now
 resolved under cc5. Quirks still worth knowing:
 
-1. **Local variable clobbering** — still possible across deeply nested call chains in cc5, though rarer than cc3. Not a guaranteed bug. If a local's value looks wrong after a function call, promote it to a global as a workaround.
+1. **Local variable clobbering** — still possible across deeply nested call chains in cc5, though rarer than cc3/early-cc5. Not a guaranteed bug. If a local's value looks wrong after a function call, promote it to a global as a workaround.
 2. **Freelist vs bump allocator discipline** — `fl_alloc` + `fl_free` for individually-freed structs; `alloc()` for long-lived collections. Correct either way, but mix them thoughtfully.
-3. **Single-pass compiler** — forward references across function boundaries work via fixups (cap **16384** in 5.4.x, up from 8192 in cc3). Module include order still matters for type/struct visibility. The patra_queue test lives in its own entry point because adding it to test_backends blew the 16384 cap.
+3. **Single-pass compiler** — forward references across function boundaries work via fixups (cap **16384** in 5.4.x+). Module include order still matters for type/struct visibility. The patra_queue test lives in its own entry point because adding it to test_backends blew the 16384 cap.
 4. **`map_new()` keys are cstrs; use `map_new_str()` for Str keys** — cyrius 5.4.14+ added `map_new_str` + content-derived `hash_str_v` to fix the Str-struct key collision bug (majra surfaced this via soak tests). `src/queue.cyr` uses `map_new_str()`; other modules keyed on cstrs keep `map_new()`.
-5. **Inline asm stores through caller output pointers no-op across `include` boundaries** — confirmed via sigil 2.9.0's AES-NI work (scheduled for fix in cyrius 5.5.x; see `cyrius/docs/development/issues/inline-asm-stores-silently-drop-when-fn-included.md`). Avoid `asm {}` blocks that write to caller-supplied pointers from an include'd fn until the fix lands.
+5. **Stack-frame layout drifts between cyrius minor lines** — sigil 2.9.5+ AES-NI / SHA-NI / ed25519-NI inline asm blocks hardcode `[rbp-N]` parameter offsets that matched cyrius's pre-5.5 prologue but SIGILL under 5.10.x. Pinned at sigil 2.9.0 (asm-free reference paths) until upstream re-emits asm against a stable convention or migrates off raw byte arrays.
+6. **`var buf[N]` inside fns is static, not stack** — consecutive calls share the backing memory; returned `Str`/buf borrows are invalidated by the next call. Heap-allocate (`fl_alloc(N)` or `alloc(N)`) anything you intend to return out of the fn.
 
 ### Resolved under cc5 (stop treating as bugs)
 

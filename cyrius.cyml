@@ -5,7 +5,7 @@ description = "Distributed queue & multiplex engine — pub/sub, queues, relay, 
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/majra"
 language = "cyrius"
-cyrius = "5.4.17"
+cyrius = "5.10.34"
 
 [build]
 entry = "src/main.cyr"
@@ -24,7 +24,9 @@ output = "build/majra"
 #
 # Profiles (Cyrius 5.4.6+):
 #   cyrius distlib           → dist/majra.cyr           (default [lib], core engine)
-#   cyrius distlib backends  → dist/majra-backends.cyr  ([lib.backends], +redis/pg/ws/encrypted-ipc)
+#   cyrius distlib signed    → dist/majra-signed.cyr    ([lib.signed],   +signed_envelope)
+#   cyrius distlib admin     → dist/majra-admin.cyr     ([lib.admin],    +admin endpoint)
+#   cyrius distlib backends  → dist/majra-backends.cyr  ([lib.backends], everything)
 [lib]
 modules = [
     "src/error.cyr",
@@ -123,6 +125,13 @@ modules = [
 # here mirrors the top of src/main.cyr so the manifest stays
 # load-bearing for CI completeness checks.
 [deps]
+# Modules listed here mirror the union of `include "lib/<name>.cyr"`
+# lines across src/, tests/, fuzz/, benches/, and examples/. Keep
+# this list aligned with the actual include set — CI doesn't gate
+# on it, but `cyrius deps` only resolves what's listed.
+# (`http_server` is vendored in-tree under `lib/http_server.cyr`
+# because it was lifted out of the cyrius stdlib at the sandhi M1
+# fold-out; see `.gitignore` for the carve-out comment.)
 stdlib = [
     "assert",
     "alloc",
@@ -136,6 +145,12 @@ stdlib = [
     "tagged",
     "fnptr",
     "thread",
+    "io",
+    "net",
+    "bench",
+    "bigint",
+    "fs",
+    "patra",
 ]
 
 # External first-party deps. Vendored into lib/ for reproducibility;
