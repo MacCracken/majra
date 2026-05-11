@@ -47,8 +47,8 @@ Full test matrix + soak + fuzz + bench commands in [`docs/guides/testing.md`](do
 - **Own the stack.** Zero external deps for the core profile. Richer profiles pull sigil (first-party). Nothing from outside the AGNOS tree.
 - **No magic.** Every operation measurable, auditable, traceable. If you can't measure it, you can't ship it.
 - **Numbers don't lie.** Benchmark before claiming perf. Test before claiming correctness. `0 failed` or it didn't pass.
-- **`fl_alloc` for structs, `alloc` for hashmaps.** Freelist supports individual free; bump allocator is for long-lived collections. See [`docs/architecture/001-cyrius-compiler-quirks.md`](docs/architecture/001-cyrius-compiler-quirks.md) §2.
-- **Reach for globals when cc5 clobbers locals.** Rare under the cc5 5.10.x line but real. See [`docs/architecture/001-cyrius-compiler-quirks.md`](docs/architecture/001-cyrius-compiler-quirks.md) §1.
+- **`fl_alloc` for structs, `alloc` for hashmaps.** Freelist supports individual free; bump allocator is for long-lived collections.
+- **Reach for globals when cc5 clobbers locals.** Rare under 5.10.x but real on deep call chains — see [`docs/development/cyrius-quirks.md`](docs/development/cyrius-quirks.md) §1.
 - **The dist bundles ARE the distribution contract.** Four `cyrius distlib` profiles — every tagged release commits all four. CI's freshness gate fails on stale diff.
 
 ## Rules (Hard Constraints)
@@ -133,24 +133,24 @@ Every tagged release MUST ship all four bundles. A consumer pinning a profile th
 
 ## Cyrius Conventions
 
-- All struct fields are 8 bytes (`i64`), accessed via `load64` / `store64` with offset.
-- Heap allocation: `fl_alloc()` / `fl_free()` (freelist) for structs with explicit lifetimes; `alloc()` for long-lived collections.
-- `var buf[N]` inside a fn is **static data, not stack** — see [`docs/architecture/001-cyrius-compiler-quirks.md`](docs/architecture/001-cyrius-compiler-quirks.md) §6.
+How we write majra code in cyrius. For *compiler gotchas* (clobbering, fixup cap, asm fragility, `var buf[N]` is static, `map_new` vs `map_new_str`), see [`docs/development/cyrius-quirks.md`](docs/development/cyrius-quirks.md).
+
+- All struct fields are 8 bytes (`i64`), accessed via `load64` / `store64` with explicit offset.
+- Heap allocation: `fl_alloc()` / `fl_free()` (freelist) for structs with explicit lifetimes; `alloc()` for long-lived collections (hashmaps, vec internals, anything that lives until process exit).
 - `match` is reserved — don't use as a variable name.
 - `return;` without value is invalid — always `return 0;`.
 - All `var` declarations are function-scoped — no block scoping.
-
-Full compiler-quirk list: [`docs/architecture/001-cyrius-compiler-quirks.md`](docs/architecture/001-cyrius-compiler-quirks.md).
 
 ## Docs
 
 - [`README.md`](README.md) — what / why / quick start / module table / consumer ecosystem. The reader-landing page.
 - [`CHANGELOG.md`](CHANGELOG.md) — source of truth for shipped work.
-- [`docs/architecture/`](docs/architecture/) — non-obvious invariants and quirks. Numbered, never renumbered.
 - [`docs/architecture/overview.md`](docs/architecture/overview.md) — system-level module map + data flow.
+- [`docs/architecture/`](docs/architecture/) — design notes about majra (numbered, never-renumbered). Empty beyond `overview.md` today; add an entry when a load-bearing majra invariant earns one. *Not* the place for "cyrius did X weird"-style notes — toolchain conventions live in this file's Cyrius Conventions section; toolchain-version-tied gotchas live in [`docs/development/dependency-watch.md`](docs/development/dependency-watch.md).
 - [`docs/development/roadmap.md`](docs/development/roadmap.md) — recently shipped + open items + waiting-on-upstream.
 - [`docs/development/state.md`](docs/development/state.md) — **live state, refreshed every release.**
 - [`docs/development/dependency-watch.md`](docs/development/dependency-watch.md) — per-dep version tracking, upgrade rationale.
+- [`docs/development/cyrius-quirks.md`](docs/development/cyrius-quirks.md) — toolchain gotchas affecting how majra is written. Strikethrough-and-archive resolved entries when the cyrius pin moves.
 - [`docs/development/semver.md`](docs/development/semver.md) — semver promise for the 2.x line.
 - [`docs/development/threat-model.md`](docs/development/threat-model.md) — trust boundaries, attack surface table.
 - [`docs/guides/`](docs/guides/) — testing how-to, consumer migration recipes.
