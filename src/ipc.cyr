@@ -28,7 +28,7 @@ fn _sockaddr_un(path) {
 fn ipc_bind(path) {
     var fd = syscall(_SYS_SOCKET, _AF_UNIX, _SOCK_STREAM, 0);
     if (fd < 0) { return Err(ERR_IPC); }
-    syscall(SYS_UNLINK, path);
+    sys_unlink(path);
     var sa = _sockaddr_un(path);
     var ret = syscall(_SYS_BIND, fd, sa, 110);
     if (ret < 0) { return Err(ERR_IPC); }

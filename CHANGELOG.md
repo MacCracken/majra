@@ -38,6 +38,21 @@ libro 3.0.1-track).
   version-pinned manifest. Matches agnosys / agnostik / yukti /
   patra convention. Prevents stale stubs from prior cyrius
   versions sitting in tree.
+- **HTTP server surface moved from vendored copy to stdlib `sandhi`.**
+  The old `lib/http_server.cyr` (committed in-tree during the M1
+  fold-out window) is gone. `src/admin.cyr` and
+  `tests/test_backends.tcyr` now pull `HTTP_BAD_REQUEST` /
+  `http_send_status` / `http_server_run` from `lib/sandhi.cyr`,
+  which is the cyrius stdlib bundle of sandhi 1.3.3 (folded into
+  the stdlib at the M6 milestone). `tls` added to `[deps] stdlib`
+  because sandhi references `TLS_EARLY_DATA_ACCEPTED` at parse
+  time — without it, cyrius's deps-aware build can't validate
+  the dep graph.
+- **`src/ipc.cyr` ported to `sys_unlink()`** (was raw
+  `syscall(SYS_UNLINK, ...)`). `SYS_UNLINK` is x86_64-only —
+  aarch64 Linux uses `SYS_UNLINKAT`. The stdlib helper picks the
+  right syscall per target arch; raw constants block cross-build.
+  Unblocks the aarch64 cross-compile in CI.
 - **CI / release modernized.** Adopted the agnosys/agnostik pattern:
   versioned `~/.cyrius/versions/<V>/lib` toolchain layout (required
   by 5.10.9+ for arch-peer include resolution), `cyrius deps` step,

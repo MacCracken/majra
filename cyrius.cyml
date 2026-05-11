@@ -129,9 +129,9 @@ modules = [
 # lines across src/, tests/, fuzz/, benches/, and examples/. Keep
 # this list aligned with the actual include set — CI doesn't gate
 # on it, but `cyrius deps` only resolves what's listed.
-# (`http_server` is vendored in-tree under `lib/http_server.cyr`
-# because it was lifted out of the cyrius stdlib at the sandhi M1
-# fold-out; see `.gitignore` for the carve-out comment.)
+# (`sandhi` ships the HTTP server surface — folded into the cyrius
+# stdlib post-M6. `src/admin.cyr` consumes `HTTP_BAD_REQUEST` /
+# `http_send_status` / `http_server_run` from there.)
 stdlib = [
     "assert",
     "alloc",
@@ -151,6 +151,8 @@ stdlib = [
     "bigint",
     "fs",
     "patra",
+    "tls",
+    "sandhi",
 ]
 
 # External first-party deps. Vendored into lib/ for reproducibility;

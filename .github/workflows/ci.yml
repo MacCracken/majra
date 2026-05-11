@@ -11,6 +11,16 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # `cyrius deps` populates ./lib/ from the version-pinned snapshot,
+  # which then shadows the global ~/.cyrius/versions/<V>/lib snapshot
+  # on every subsequent `cyrius build` invocation. That's intentional
+  # (the cwd lib IS the version-pinned content cyrius deps just
+  # copied), but cyrius emits an informational note about it on every
+  # build. Silence it across all CI steps. Same pattern as agnosys CI
+  # post-5.10.x.
+  CYRIUS_NO_WARN_SHADOW_LIB: "1"
+
 jobs:
   build-and-test:
     name: Build & Test

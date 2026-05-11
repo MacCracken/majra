@@ -11,6 +11,11 @@ on:
 permissions:
   contents: write
 
+env:
+  # See ci.yml — `cyrius deps` shadows the version-pinned snapshot
+  # with cwd lib (identical content); silence the informational note.
+  CYRIUS_NO_WARN_SHADOW_LIB: "1"
+
 jobs:
   ci:
     name: CI Gate

@@ -46,11 +46,15 @@ daimon (agent messaging), AgnosAI (crew coordination), hoosh (inference routing)
   on cyrius 5.10.34, so we pin there. Re-bump when sigil ships an
   asm-dispatch path that's cyrius-stable or migrates off raw byte
   arrays.
-- **`lib/http_server.cyr`** — vendored in-tree (carve-out in
-  `.gitignore`). Was dropped from the cyrius stdlib at the sandhi
-  M1 fold-out; `src/admin.cyr` and `tests/test_backends.tcyr` still
-  depend on it. Migrate the admin/ws surface onto sandhi proper to
-  retire the vendored copy.
+- **sandhi (via cyrius stdlib)** — sandhi 1.3.3 ships in the cyrius
+  5.10.34 stdlib at `lib/sandhi.cyr` (folded in at M6). Provides the
+  `HTTP_*` status constants, `http_send_status`, and
+  `http_server_run` used by `src/admin.cyr` and
+  `tests/test_backends.tcyr`. `tls` is listed alongside sandhi in
+  `[deps] stdlib` because sandhi's TLS-early-data path references
+  `TLS_EARLY_DATA_ACCEPTED` at parse time — without `lib/tls.cyr`
+  resolved, cyrius's deps-aware build fails to validate the
+  bundle. No vendored copy in the repo.
 
 Consumer profiles and what they pull:
 - `dist/majra.cyr` — core engine; no sigil dependency.
@@ -147,7 +151,7 @@ dist/majra.cyr             Consumer dist — core engine (default [lib])
 dist/majra-signed.cyr      Consumer dist — core + signed envelopes ([lib.signed])
 dist/majra-admin.cyr       Consumer dist — core + admin endpoint ([lib.admin])
 dist/majra-backends.cyr    Consumer dist — everything ([lib.backends])
-lib/                       Resolved Cyrius stdlib + sigil 2.9.0 (gitignored; only http_server.cyr is checked in)
+lib/                       Resolved Cyrius stdlib + sigil 2.9.0 (gitignored; populated by `cyrius deps`)
 build/                     Compiled binaries (gitignored)
 scripts/version-bump.sh    Syncs VERSION
 docs/                      architecture, development, guides
