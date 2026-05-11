@@ -1,243 +1,161 @@
 # Majra — Claude Code Instructions
 
-> **READ the distribution section before touching build or release.**
-> majra ships to downstream Cyrius projects via four committed
-> bundles produced by `cyrius distlib`:
->   - `dist/majra.cyr`          — core engine (15 modules)
->   - `dist/majra-signed.cyr`   — core + Ed25519-signed envelopes
->   - `dist/majra-admin.cyr`    — core + HTTP admin/metrics endpoint
->   - `dist/majra-backends.cyr` — everything (adds redis/pg/ws/encrypted-IPC/patra_queue)
-> That is the only distribution contract. Libro and patra are the
-> references. Do not invent alternatives.
+> **Core rule**: this file is **preferences, process, and procedures** — durable rules that change rarely. Volatile state (current version, dep versions, binary sizes, test counts, consumers, in-flight work) lives in [`docs/development/state.md`](docs/development/state.md), refreshed every release. Do not inline state here — inlined state rots within a minor. See [first-party-documentation § CLAUDE.md](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/first-party-documentation.md#claudemd).
+
+---
 
 ## Project Identity
 
-**Majra** (Arabic: channel/waterway) — Distributed queue and multiplex engine — pub/sub, queues, relay, IPC, heartbeat, rate limiting
+**Majra** (Arabic / Persian: مجرا — channel, conduit, waterway) — Distributed queue and multiplex engine for the AGNOS ecosystem: pub/sub, queues, relay, IPC, heartbeat, rate limiting, encrypted transport, signed envelopes.
 
-- **Type**: Cyrius library (single-file compilation via `include`)
+- **Type**: Cyrius shared library (single-file dist bundles, `include`-driven consumption)
 - **License**: GPL-3.0-only
-- **Version**: See `VERSION` and `cyrius.cyml`
-- **Language**: [Cyrius](https://github.com/MacCracken/cyrius) (pin in `cyrius.cyml` `cyrius = "..."` field)
+- **Language**: Cyrius (toolchain pinned in `cyrius.cyml [package].cyrius`)
+- **Version**: `VERSION` at repo root is the source of truth — do not inline the number anywhere
 - **Genesis repo**: [agnosticos](https://github.com/MacCracken/agnosticos)
-- **Philosophy**: [AGNOS Philosophy & Intention](https://github.com/MacCracken/agnosticos/blob/main/docs/philosophy.md)
-- **Standards**: [First-Party Standards](https://github.com/MacCracken/agnosticos/blob/main/docs/development/applications/first-party-standards.md)
-- **Recipes**: [zugot](https://github.com/MacCracken/zugot) — takumi build recipes
+- **Standards**: [First-Party Standards](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/first-party-standards.md) · [First-Party Documentation](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/first-party-documentation.md)
+- **Shared crates**: [shared-crates.md](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/shared-crates.md)
 
-## Consumers
+## Goal
 
-daimon (agent messaging), AgnosAI (crew coordination), hoosh (inference routing), sutra (fleet), stiva (container IPC)
+Own the messaging primitives so consumer projects (daimon, AgnosAI, hoosh, sutra, stiva, ifran, secureyeoman) don't each rebuild pub/sub, queues, relay, and heartbeat in subtly different ways. Zero external deps for the core profile; first-party sigil for the crypto profiles; nothing else. Every operation measurable, auditable, traceable. No magic.
 
-## Dependencies
+## Current State
 
-- **Cyrius stdlib** — resolved into `lib/` by `cyrius deps` from the
-  version-pinned snapshot. `lib/` is gitignored (matches agnosys /
-  agnostik / yukti / patra convention) so no stale stubs sit in tree.
-  The `[deps] stdlib = [...]` list in `cyrius.cyml` mirrors the union
-  of `include "lib/<name>.cyr"` lines across `src/`, `tests/`,
-  `fuzz/`, `benches/`, and `examples/`. Keep them in sync — `cyrius
-  deps` only resolves what's listed.
-- **sigil = 2.9.0** — first-party crypto library, pulled via
-  `[deps.sigil]`. Used by `src/ipc_encrypted.cyr` (AES-256-GCM) and
-  `src/signed_envelope.cyr` (Ed25519). The 2.9.5 / 3.0.x / 3.1.0
-  builds hardcode `[rbp-N]` parameter offsets inside AES-NI / SHA-NI
-  / ed25519-NI inline-asm blocks that match cyrius's pre-5.5
-  stack-frame layout but drift under 5.10.x (SIGILL at runtime).
-  2.9.0's reference (asm-free) crypto paths still build & run cleanly
-  on cyrius 5.10.34, so we pin there. Re-bump when sigil ships an
-  asm-dispatch path that's cyrius-stable or migrates off raw byte
-  arrays.
-- **sandhi (via cyrius stdlib)** — sandhi 1.3.3 ships in the cyrius
-  5.10.34 stdlib at `lib/sandhi.cyr` (folded in at M6). Provides the
-  `HTTP_*` status constants, `http_send_status`, and
-  `http_server_run` used by `src/admin.cyr` and
-  `tests/test_backends.tcyr`. `tls` is listed alongside sandhi in
-  `[deps] stdlib` because sandhi's TLS-early-data path references
-  `TLS_EARLY_DATA_ACCEPTED` at parse time — without `lib/tls.cyr`
-  resolved, cyrius's deps-aware build fails to validate the
-  bundle. No vendored copy in the repo.
+> Volatile state lives in [`docs/development/state.md`](docs/development/state.md) — current version, cyrius pin, resolved dep versions, test counts per suite, bundle sizes, consumer table, recent releases, in-flight blockers. Refreshed every release.
+>
+> Historical release narrative lives in [`CHANGELOG.md`](CHANGELOG.md).
+>
+> Doc-currency ledger lives in [`docs/doc-health.md`](docs/doc-health.md).
 
-Consumer profiles and what they pull:
-- `dist/majra.cyr` — core engine; no sigil dependency.
-- `dist/majra-signed.cyr` — adds `signed_envelope.cyr`; needs sigil.
-- `dist/majra-admin.cyr` — adds the HTTP admin endpoint; needs
-  `lib/http_server.cyr` (vendored in this repo).
-- `dist/majra-backends.cyr` — everything; needs sigil + http_server.
+This file (`CLAUDE.md`) is durable rules.
 
-If another external first-party dep is added, wire it under
-`[deps.<name>]` with `git` + `tag` + `modules` like we wire sigil.
-
-## Build & Test
+## Quick Start
 
 ```bash
-# Compile (entry + output come from cyrius.cyml [build])
-cyrius build src/main.cyr build/majra
-
-# Full test matrix (150 + 96 + 42 + 17 = 305 assertions)
-./build/majra                                                                      # core
-cyrius build tests/test_core.tcyr        build/test_core        && ./build/test_core
-cyrius build tests/test_backends.tcyr    build/test_backends    && ./build/test_backends
-cyrius build tests/test_patra_queue.tcyr build/test_patra_queue && ./build/test_patra_queue
-
-# Live integration (requires Redis + PostgreSQL running locally)
-cyrius build tests/test_live.tcyr build/test_live && ./build/test_live
-
-# Benchmarks (17 targets, history tracked)
-cyrius build benches/bench_all.bcyr build/bench_all && ./build/bench_all
-
-# Soak tests (on-demand, not in CI; slow)
-cyrius build tests/soak/soak_queue.cyr build/soak_queue && ./build/soak_queue
-
-# Fuzz harnesses
-for f in fuzz/*.fcyr; do cyrius build "$f" "build/$(basename $f .fcyr)"; done
-
-# Regenerate all four distribution bundles (commit alongside src/ changes)
-cyrius distlib          # → dist/majra.cyr           (core engine)
-cyrius distlib signed   # → dist/majra-signed.cyr    (+ signed_envelope)
-cyrius distlib admin    # → dist/majra-admin.cyr     (+ admin endpoint)
-cyrius distlib backends # → dist/majra-backends.cyr  (everything)
-
-# Policy enforcement
-cyrius deny src/main.cyr
-
-# Full audit: self-host, test, fmt, lint, vet, deny, bench
-cyrius audit
+cyrius deps                                            # resolve lib/ from cyrius.cyml
+cyrius build src/main.cyr build/majra && ./build/majra # build + core tests
+cyrius build tests/test_backends.tcyr build/test_backends && ./build/test_backends
+cyrius distlib && cyrius distlib signed && cyrius distlib admin && cyrius distlib backends  # regenerate 4 dist bundles
+cyrius audit                                           # full: self-host, test, fmt, lint, vet, deny, bench
 ```
 
-## Development Loop (continuous)
+Full test matrix + soak + fuzz + bench commands in [`docs/guides/testing.md`](docs/guides/testing.md).
 
-1. Work phase — new features, roadmap items, bug fixes
-2. Compile check: `cyrius build src/main.cyr build/majra`
-3. Test: all suites must pass (`0 failed`)
-4. Lint + format: `cyrius fmt --check`, `cyrius lint`
-5. Policy check: `cyrius deny src/main.cyr`
-6. Benchmark additions for new code
-7. Run benchmarks: `cyrius bench` (tracks history automatically)
-8. Audit phase — review performance, memory, security, correctness
-9. Deeper tests/benchmarks from audit observations
-10. Run benchmarks again — prove the wins
-11. Regenerate all bundles: `cyrius distlib && cyrius distlib signed && cyrius distlib admin && cyrius distlib backends`
-12. Full audit: `cyrius audit`
-13. Documentation — update CHANGELOG, roadmap, docs
-14. Version sync — `VERSION` is source of truth; `cyrius.cyml` uses `${file:VERSION}` (`scripts/version-bump.sh`)
-15. Return to step 1
+## Key Principles
 
-### Key Principles
+- **Own the stack.** Zero external deps for the core profile. Richer profiles pull sigil (first-party). Nothing from outside the AGNOS tree.
+- **No magic.** Every operation measurable, auditable, traceable. If you can't measure it, you can't ship it.
+- **Numbers don't lie.** Benchmark before claiming perf. Test before claiming correctness. `0 failed` or it didn't pass.
+- **`fl_alloc` for structs, `alloc` for hashmaps.** Freelist supports individual free; bump allocator is for long-lived collections. See [`docs/architecture/001-cyrius-compiler-quirks.md`](docs/architecture/001-cyrius-compiler-quirks.md) §2.
+- **Reach for globals when cc5 clobbers locals.** Rare under the cc5 5.10.x line but real. See [`docs/architecture/001-cyrius-compiler-quirks.md`](docs/architecture/001-cyrius-compiler-quirks.md) §1.
+- **The dist bundles ARE the distribution contract.** Four `cyrius distlib` profiles — every tagged release commits all four. CI's freshness gate fails on stale diff.
 
-- **Never skip benchmarks.** Numbers don't lie.
-- **Tests + benchmarks are the way.** 305 assertions across 4 suites (150 core + 96 expanded + 42 backends + 17 patra_queue), plus 36 live-integration and on-demand soak targets under `tests/soak/`.
-- **Own the stack.** Zero external dependencies for the core engine. The richer profiles (signed, admin, backends) pull sigil — first-party, vendored — as the only external surface.
-- **No magic.** Every operation is measurable, auditable, traceable.
-- **`fl_alloc` for structs, `alloc` for hashmaps.** Freelist supports individual free; bump allocator for long-lived collections.
-- **Globals for cross-call state when cc5 clobbers locals.** cc5 is significantly better than cc3 at this, but if a local's value looks wrong after a nested call, promote it to a global.
+## Rules (Hard Constraints)
 
-## Project Structure
+- **Read the genesis repo's CLAUDE.md first** — [agnosticos/CLAUDE.md](https://github.com/MacCracken/agnosticos/blob/main/CLAUDE.md)
+- **Do not commit or push** — the user handles all git operations (commit, push, tag)
+- **NEVER use `gh` CLI** — use `curl` against the GitHub API if needed
+- **Do not hardcode the Cyrius version in CI YAML** — the `cyrius = "..."` field in `cyrius.cyml` is the single source of truth. CI reads it dynamically.
+- **Do not forget to regenerate `dist/`** after any `src/` change — all four profile bundles must move together.
+- **Do not add dependencies beyond the Cyrius toolchain + sigil.** Crypto goes through sigil; everything else uses stdlib.
+- **Do not commit `build/` or `lib/`** — both are gitignored, repopulated by `cyrius build` / `cyrius deps`.
+- **Do not skip benchmarks before claiming performance improvements.**
+- **Do not skip the soak set** if a change could plausibly affect queue lifecycle, relay dedup, pubsub fan-out, barrier cycles, or heartbeat eviction.
 
-```
-cyrius.cyml                Manifest ([package], [build], [lib], [lib.signed], [lib.admin], [lib.backends], [deps])
-VERSION                    Source of truth for the version string
-src/main.cyr               Entry point + core tests (150 assertions)
-src/*.cyr                  22 modules across: core primitives, networking, composition,
-                           backends (redis/pg/ipc_encrypted/ws/patra_queue), trust (signed_envelope),
-                           operations (admin)
-tests/test_core.tcyr       Expanded unit tests (96 assertions)
-tests/test_backends.tcyr   Backend protocol tests (42 assertions — redis/pg/ws/aes-gcm/signed_envelope/admin)
-tests/test_patra_queue.tcyr Persistent queue tests (17 assertions — separate entry to stay under 16384 fixup cap)
-tests/test_live.tcyr       Live Redis + PostgreSQL tests (36 assertions)
-tests/soak/*.cyr           On-demand soak tests (not in CI). soak_queue ships; soak_pubsub/relay/heartbeat tbd
-benches/bench_all.bcyr     17 benchmarks
-examples/                  managed_queue.cyr, pubsub_tiers.cyr
-fuzz/*.fcyr                Fuzz harnesses (heartbeat, pubsub, queue)
-dist/majra.cyr             Consumer dist — core engine (default [lib])
-dist/majra-signed.cyr      Consumer dist — core + signed envelopes ([lib.signed])
-dist/majra-admin.cyr       Consumer dist — core + admin endpoint ([lib.admin])
-dist/majra-backends.cyr    Consumer dist — everything ([lib.backends])
-lib/                       Resolved Cyrius stdlib + sigil 2.9.0 (gitignored; populated by `cyrius deps`)
-build/                     Compiled binaries (gitignored)
-scripts/version-bump.sh    Syncs VERSION
-docs/                      architecture, development, guides
-```
+## Process
 
-## Documentation Structure
+### P(-1): Hardening (before any minor cut, and at v3.0 cut)
 
-```
-Root files (required):
-  README.md, CHANGELOG.md, CLAUDE.md, CONTRIBUTING.md,
-  SECURITY.md, CODE_OF_CONDUCT.md, LICENSE, VERSION, cyrius.cyml
+Run this pass before tagging `X.Y.0` or `X.0.0` — ship the result as the last patch of the current minor (e.g. `2.4.5` before `2.5.0`).
 
-docs/ (required):
-  architecture/overview.md — module map, data flow, consumers
-  development/roadmap.md — completed, backlog, future
+1. **Cleanliness** — `cyrius build`, `cyrius lint`, `cyrius fmt --check`, `cyrius vet`; all four test suites + fuzz + benches clean.
+2. **Benchmark baseline** — `cyrius bench`; archive the CSV row in `bench-history.csv` for comparison.
+3. **Internal deep review** — module-by-module walk for gaps, missed guards, ABI leaks, silently-ignored errors, off-by-ones, dead code.
+4. **External research** — domain completeness against current state-of-the-art (RFC drift, new CVE classes for the protocol surfaces we ship: RESP, PostgreSQL wire, WebSocket, HTTP, AES-GCM, Ed25519).
+5. **Security audit** — input handling, syscall usage, buffer sizes, pointer validation. File findings in `docs/audit/YYYY-MM-DD-audit.md` (directory created when first earned).
+6. **Additional tests / benchmarks** from review + audit findings.
+7. **Post-review benchmarks** — prove the wins against the step-2 baseline.
+8. **Doc audit** — refresh `docs/development/state.md`, run the [`docs/doc-health.md`](docs/doc-health.md) sweep, add an architecture note for any quirk surfaced, file an ADR for any decision the cycle earned.
+9. **Bundle freshness** — regenerate all four dist bundles; CI gate stays green.
+10. **Repeat if heavy** — keep drilling until the pass is genuinely clean, not just "no errors."
 
-docs/ (when earned):
-  guides/ — usage guides, integration patterns
-  development/ — semver, threat model
-  adr/ — architecture decision records
-```
+### Development Loop (continuous, between hardening passes)
 
-## CI / Release
+1. Work phase — new features, roadmap items, bug fixes.
+2. Compile + test: all suites must report `0 failed`.
+3. Lint + format: `cyrius fmt --check`, `cyrius lint`.
+4. Benchmark additions for new code; `cyrius bench` for regression check.
+5. Policy: `cyrius deny src/main.cyr` if touching syscall / network / fs surfaces.
+6. Regenerate all four dist bundles if `src/` changed.
+7. Docs: `CHANGELOG.md`, `docs/development/roadmap.md`, `docs/development/state.md`, [`docs/doc-health.md`](docs/doc-health.md) row touch.
+8. Version sync: `VERSION` is the source of truth; `cyrius.cyml` reads it via `${file:VERSION}`.
 
-- **Toolchain pin**: `cyrius` field inside `cyrius.cyml` (currently `cyrius = "5.10.34"`). CI and release extract it dynamically — no hardcoded version strings in YAML.
-- **Toolchain layout**: CI installs into `~/.cyrius/versions/<V>/{bin,lib}` with `~/.cyrius/{bin,lib}` symlinking to the active version. Required by cc5 5.10.9+ for arch-peer include resolution (`syscalls_x86_64_linux.cyr` etc.). The flat layout that worked under 5.4.x no longer resolves the peer files.
-- **Dep resolution**: CI runs `cyrius deps` before any build/test step (mirrors agnosys/agnostik). With `cyrius.lock` committed, `cyrius deps --verify` enforces hash match; without it, the verify step emits a warning and continues.
-- **Manifest**: `cyrius.cyml` (migrated from `cyrius.toml` in 2.3.0 to match first-party convention). Uses `${file:VERSION}` so `VERSION` remains the single source of truth.
-- **Manifest completeness gate**: CI asserts every `include "src/<file>.cyr"` in `src/main.cyr` is listed under `[lib] modules`. If not, `cyrius distlib` would silently ship a broken bundle.
-- **Distribution freshness gate**: CI runs all four `cyrius distlib` invocations and fails if `git diff dist/` is non-empty. All four bundles must be regenerated and committed alongside any `src/` change.
-- **Tag filter**: release triggers on `v[0-9]+.[0-9]+.[0-9]+` or `[0-9]+.[0-9]+.[0-9]+` — semver shape enforced post-trigger.
-- **Version gate**: release asserts `VERSION == git tag` before building.
-- **Docs gate**: CI verifies `VERSION` appears as `[x.y.z]` heading in `CHANGELOG.md`.
+### Closeout Pass (last patch of every minor, before tagging `X.Y+1.0`)
 
-## Distribution Contract
+Subset of P(-1) — same shape, lighter touch:
 
-majra is an **upstream Cyrius library**. Downstream projects (daimon,
-AgnosAI, hoosh, sutra, stiva) wire it into their `cyrius.cyml` like:
+1. Full test suite — `0 failed` across all 4 suites + fuzz.
+2. Benchmark vs prior closeout — flag regressions > 10%.
+3. Cleanup sweep — stale comments, dead `#ifdef` branches, unused includes.
+4. Doc sync — CHANGELOG stanza, roadmap "Recently shipped" update, state.md refresh, doc-health.md sweep.
+5. Bundle regen — all four `cyrius distlib` profiles.
+6. Version verify — `VERSION`, `cyrius.cyml`, CHANGELOG header, intended git tag all match.
+7. Clean build — `rm -rf build lib && cyrius deps && cyrius build src/main.cyr build/majra` passes from cold.
+
+### Distribution Contract
+
+majra is an **upstream Cyrius library**. Downstream projects wire it via `cyrius.cyml`:
 
 ```toml
 [deps.majra]
 git = "https://github.com/MacCracken/majra.git"
 tag = "<majra version>"
-modules = ["dist/majra.cyr"]           # core engine — lean, no crypto
+modules = ["dist/majra.cyr"]           # core engine, no crypto
 # or a richer profile:
-modules = ["dist/majra-signed.cyr"]    # core + signed envelopes (pulls sigil)
-modules = ["dist/majra-admin.cyr"]     # core + admin endpoint
-modules = ["dist/majra-backends.cyr"]  # everything (signed + admin + network backends)
+# modules = ["dist/majra-signed.cyr"]    core + signed envelopes (pulls sigil)
+# modules = ["dist/majra-admin.cyr"]     core + HTTP admin endpoint
+# modules = ["dist/majra-backends.cyr"]  everything
 ```
 
-`cyrius deps` clones at the tag and copies the chosen bundle into the
-consumer's `lib/majra_majra.cyr`. Every tagged release MUST have ALL FOUR
-bundles (`dist/majra.cyr`, `dist/majra-signed.cyr`, `dist/majra-admin.cyr`,
-`dist/majra-backends.cyr`) committed, or consumer `cyrius deps` breaks at
-pull time for whichever profile they chose.
+Every tagged release MUST ship all four bundles. A consumer pinning a profile that's missing or stale breaks at `cyrius deps` time. CI's distribution-freshness gate enforces this on every push.
 
-## DO NOT
+### CI / Release shape
 
-- **Do not commit or push** — the user handles all git operations (commit, push, tag)
-- **NEVER use `gh` CLI** — use `curl` to GitHub API only
-- Do not hardcode the Cyrius version in CI YAML — read the `cyrius = "..."` field from `cyrius.cyml`
-- Do not forget to regenerate `dist/` after any `src/` change
-- Do not add dependencies beyond the Cyrius toolchain
-- Do not skip benchmarks before claiming performance improvements
-- Do not commit `build/`
+- **Toolchain pin** in `cyrius.cyml [package].cyrius`. CI extracts dynamically; never hardcoded in YAML.
+- **Versioned toolchain layout** in CI: `~/.cyrius/versions/<V>/{bin,lib}` with `~/.cyrius/{bin,lib}` symlinking active. Required by cc5 5.10.9+ for arch-peer include resolution.
+- **`cyrius deps` runs before any build/test step.** With `cyrius.lock` committed, `cyrius deps --verify` enforces hash match.
+- **Manifest completeness gate**: every `include "src/<file>.cyr"` in `src/main.cyr` must appear under `[lib] modules` in `cyrius.cyml`.
+- **Distribution freshness gate**: all four `cyrius distlib` invocations run; CI fails on `git diff dist/` non-empty.
+- **Release tag pattern**: `v[0-9]+.[0-9]+.[0-9]+` or `[0-9]+.[0-9]+.[0-9]+` (semver shape enforced post-trigger).
+- **Version gate**: release asserts `VERSION == git tag` before building.
+- **Docs gate**: CI verifies `VERSION` appears as `[x.y.z]` heading in `CHANGELOG.md`.
 
-## Known Cyrius Compiler Quirks (5.10.34)
+## Cyrius Conventions
 
-Most cc3-era workarounds documented in earlier majra versions are now
-resolved under cc5. Quirks still worth knowing:
+- All struct fields are 8 bytes (`i64`), accessed via `load64` / `store64` with offset.
+- Heap allocation: `fl_alloc()` / `fl_free()` (freelist) for structs with explicit lifetimes; `alloc()` for long-lived collections.
+- `var buf[N]` inside a fn is **static data, not stack** — see [`docs/architecture/001-cyrius-compiler-quirks.md`](docs/architecture/001-cyrius-compiler-quirks.md) §6.
+- `match` is reserved — don't use as a variable name.
+- `return;` without value is invalid — always `return 0;`.
+- All `var` declarations are function-scoped — no block scoping.
 
-1. **Local variable clobbering** — still possible across deeply nested call chains in cc5, though rarer than cc3/early-cc5. Not a guaranteed bug. If a local's value looks wrong after a function call, promote it to a global as a workaround.
-2. **Freelist vs bump allocator discipline** — `fl_alloc` + `fl_free` for individually-freed structs; `alloc()` for long-lived collections. Correct either way, but mix them thoughtfully.
-3. **Single-pass compiler** — forward references across function boundaries work via fixups (cap **16384** in 5.4.x+). Module include order still matters for type/struct visibility. The patra_queue test lives in its own entry point because adding it to test_backends blew the 16384 cap.
-4. **`map_new()` keys are cstrs; use `map_new_str()` for Str keys** — cyrius 5.4.14+ added `map_new_str` + content-derived `hash_str_v` to fix the Str-struct key collision bug (majra surfaced this via soak tests). `src/queue.cyr` uses `map_new_str()`; other modules keyed on cstrs keep `map_new()`.
-5. **Stack-frame layout drifts between cyrius minor lines** — sigil 2.9.5+ AES-NI / SHA-NI / ed25519-NI inline asm blocks hardcode `[rbp-N]` parameter offsets that matched cyrius's pre-5.5 prologue but SIGILL under 5.10.x. Pinned at sigil 2.9.0 (asm-free reference paths) until upstream re-emits asm against a stable convention or migrates off raw byte arrays.
-6. **`var buf[N]` inside fns is static, not stack** — consecutive calls share the backing memory; returned `Str`/buf borrows are invalidated by the next call. Heap-allocate (`fl_alloc(N)` or `alloc(N)`) anything you intend to return out of the fn.
+Full compiler-quirk list: [`docs/architecture/001-cyrius-compiler-quirks.md`](docs/architecture/001-cyrius-compiler-quirks.md).
 
-### Resolved under cc5 (stop treating as bugs)
+## Docs
 
-- **`\r` escape sequence** — works since 4.x. Don't hand-emit byte 13 with `store8(buf, 13)`. The old `# --- Raw bytes for CR LF` workaround across network protocols is obsolete.
-- **Negative literals `-1`, `-N`** — work since 3.10.3. No need for `(0 - N)`.
-- **Compound assignment `+=`, `-=`, `*=`, etc.** — work since 3.10.3.
-- **Undefined functions** — now a compile-time error, not a silent NULL stub.
-- **256-initialized-global cap** — removed.
-- **Fixup table cap** — raised to **16384** (was 8192). The "split across multiple compilation units" workaround is only needed for very large test entry points now (e.g. `tests/test_patra_queue.tcyr` vs `tests/test_backends.tcyr`).
-- **`map_get` after `map_set` in deep call chains** — cc5 resolves this.
-- **`thread_create` + futex correctness** — fixed via the `_thread_spawn` inline-asm clone trampoline in `lib/thread.cyr` (5.4.10) + aarch64 SP-alignment fix (5.4.11). Multi-threaded `cbarrier_arrive_and_wait` works under cc5 5.4.10+.
-- **Str-keyed hashmaps** — use `map_new_str()` (5.4.14+) for Str-struct keys. Legacy `map_new()` continues to serve cstr keys correctly.
+- [`README.md`](README.md) — what / why / quick start / module table / consumer ecosystem. The reader-landing page.
+- [`CHANGELOG.md`](CHANGELOG.md) — source of truth for shipped work.
+- [`docs/architecture/`](docs/architecture/) — non-obvious invariants and quirks. Numbered, never renumbered.
+- [`docs/architecture/overview.md`](docs/architecture/overview.md) — system-level module map + data flow.
+- [`docs/development/roadmap.md`](docs/development/roadmap.md) — recently shipped + open items + waiting-on-upstream.
+- [`docs/development/state.md`](docs/development/state.md) — **live state, refreshed every release.**
+- [`docs/development/dependency-watch.md`](docs/development/dependency-watch.md) — per-dep version tracking, upgrade rationale.
+- [`docs/development/semver.md`](docs/development/semver.md) — semver promise for the 2.x line.
+- [`docs/development/threat-model.md`](docs/development/threat-model.md) — trust boundaries, attack surface table.
+- [`docs/guides/`](docs/guides/) — testing how-to, consumer migration recipes.
+- [`docs/benchmarks/`](docs/benchmarks/) — point-in-time perf snapshots (v2.0.0 cutover headliner).
+- [`docs/doc-health.md`](docs/doc-health.md) — whole-tree doc-currency ledger.
+- [`tests/soak/README.md`](tests/soak/README.md) — soak-test conventions.
+
+Full doc-tree convention: [first-party-documentation.md](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/first-party-documentation.md).
