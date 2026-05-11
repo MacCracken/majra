@@ -21,6 +21,13 @@ env:
   # post-5.10.x.
   CYRIUS_NO_WARN_SHADOW_LIB: "1"
 
+  # Whole-program dead-code elimination — keeps binaries lean and
+  # matches the agnosys/agnostik CI pattern. (Note: doesn't help
+  # the aarch64 cross-build hit the `lib/agnosys.cyr:791` SYS_OPEN
+  # symbol-resolution bug — that step is intentionally not wired
+  # up; see the block in build-and-test below.)
+  CYRIUS_DCE: "1"
+
 jobs:
   build-and-test:
     name: Build & Test
@@ -34,24 +41,51 @@ jobs:
         # by cc5 5.10.9+: arch-peer includes (syscalls_x86_64_linux.cyr
         # etc.) are resolved against the version-pinned snapshot, so the
         # flat ~/.cyrius/lib layout that worked under 5.4.x no longer
-        # finds the peer files. Matches agnosys / agnostik installer.
+        # finds the peer files.
+        #
+        # 5.10.x release tarballs ship `bin/` + `deps/` only — the
+        # `lib/` (stdlib snapshot) is NOT in the tarball, so we fetch
+        # the GitHub source-archive at the version tag and copy lib/
+        # from there. The official install.sh handles this via source
+        # bootstrap, but that requires a full git clone + self-host
+        # build cycle which is overkill for CI. Pulling the source
+        # archive's lib/ is the minimal path.
         run: |
           CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -E '^cyrius[[:space:]]*=' cyrius.cyml | sed -E 's/^cyrius[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')}"
           echo "Installing Cyrius $CYRIUS_VERSION"
+
+          # Release tarball — binaries + first-party deps cache
           curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
+
+          # Source archive — stdlib (lib/) snapshot at the version tag
+          curl -sL "https://github.com/MacCracken/cyrius/archive/refs/tags/$CYRIUS_VERSION.tar.gz" -o cyrius-src.tar.gz
+          tar xzf cyrius-src.tar.gz
+          CYRIUS_SRC="cyrius-$CYRIUS_VERSION"
+
           VERSIONED="$HOME/.cyrius/versions/$CYRIUS_VERSION"
           mkdir -p "$VERSIONED/bin" "$VERSIONED/lib"
           cp "$CYRIUS_DIR/bin/"* "$VERSIONED/bin/" 2>/dev/null || true
           cp "$CYRIUS_DIR/scripts/cyrius" "$VERSIONED/bin/cyrius" 2>/dev/null || true
-          cp -r "$CYRIUS_DIR/lib/"* "$VERSIONED/lib/" 2>/dev/null || true
+          cp -r "$CYRIUS_SRC/lib/"* "$VERSIONED/lib/"
+          # Carry the prebuilt deps snapshot (sigil/sakshi/agnosys etc.)
+          # so `cyrius deps` doesn't have to git-clone on every CI run.
+          if [ -d "$CYRIUS_DIR/deps" ]; then
+            mkdir -p "$HOME/.cyrius/deps"
+            cp -r "$CYRIUS_DIR/deps/"* "$HOME/.cyrius/deps/"
+          fi
           chmod +x "$VERSIONED/bin/"* 2>/dev/null || true
           ln -sfn "$VERSIONED/bin" "$HOME/.cyrius/bin"
           ln -sfn "$VERSIONED/lib" "$HOME/.cyrius/lib"
           echo "$CYRIUS_VERSION" > "$HOME/.cyrius/current"
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
           echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
+
+          # Sanity check
+          test -f "$VERSIONED/lib/syscalls_x86_64_linux.cyr" || { echo "FAIL: stdlib lib/syscalls_x86_64_linux.cyr missing — source archive extraction failed"; exit 1; }
+          test -x "$VERSIONED/bin/cc5" || { echo "FAIL: bin/cc5 missing — release tarball extraction failed"; exit 1; }
+          echo "OK: stdlib + binaries installed under $VERSIONED"
 
       - name: Resolve dependencies
         # Populates ./lib/ from cyrius.cyml [deps] stdlib + [deps.sigil]
@@ -98,19 +132,15 @@ jobs:
       - name: Verify ELF
         run: xxd -l 4 build/majra | grep -q "7f45 4c46"
 
-      - name: Cross-build aarch64 (best-effort)
-        # Best-effort: only when the toolchain bundle includes
-        # cc5_aarch64. Mirrors the agnosys/agnostik pattern — produces
-        # a second ELF for the release archive when supported.
-        run: |
-          if [ ! -x "$HOME/.cyrius/bin/cc5_aarch64" ]; then
-            echo "::warning::cc5_aarch64 not shipped with Cyrius $CYRIUS_VERSION — skipping aarch64 cross-build"
-            exit 0
-          fi
-          cyrius build --aarch64 src/main.cyr build/majra-aarch64
-          file build/majra-aarch64 | grep -q "aarch64" || {
-            echo "ERROR: majra-aarch64 is not aarch64 ELF"; exit 1; }
-          echo "majra-aarch64: $(wc -c < build/majra-aarch64) bytes"
+      # aarch64 cross-build is intentionally NOT wired up. Upstream
+      # `lib/agnosys.cyr:791` uses raw `syscall(SYS_OPEN, ...)` —
+      # SYS_OPEN is x86_64-only (aarch64 Linux uses SYS_OPENAT), so
+      # cc5_aarch64 errors on the symbol even though the call site is
+      # unreachable from majra's entry points. CYRIUS_DCE=1 doesn't
+      # mask it on the 5.10.34 toolchain. Re-enable this step when
+      # agnosys ships a portable replacement for the SYS_OPEN call
+      # site. majra consumers (daimon, AgnosAI, hoosh, sutra, stiva)
+      # are all x86_64-server-side, so no consumer is blocked.
 
       - name: Core tests
         run: ./build/majra
@@ -210,16 +240,25 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Cyrius toolchain
+        # See build-and-test job for the rationale on the source-archive
+        # fetch. Same installer body.
         run: |
           CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -E '^cyrius[[:space:]]*=' cyrius.cyml | sed -E 's/^cyrius[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')}"
           curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
+          curl -sL "https://github.com/MacCracken/cyrius/archive/refs/tags/$CYRIUS_VERSION.tar.gz" -o cyrius-src.tar.gz
+          tar xzf cyrius-src.tar.gz
+          CYRIUS_SRC="cyrius-$CYRIUS_VERSION"
           VERSIONED="$HOME/.cyrius/versions/$CYRIUS_VERSION"
           mkdir -p "$VERSIONED/bin" "$VERSIONED/lib"
           cp "$CYRIUS_DIR/bin/"* "$VERSIONED/bin/" 2>/dev/null || true
           cp "$CYRIUS_DIR/scripts/cyrius" "$VERSIONED/bin/cyrius" 2>/dev/null || true
-          cp -r "$CYRIUS_DIR/lib/"* "$VERSIONED/lib/" 2>/dev/null || true
+          cp -r "$CYRIUS_SRC/lib/"* "$VERSIONED/lib/"
+          if [ -d "$CYRIUS_DIR/deps" ]; then
+            mkdir -p "$HOME/.cyrius/deps"
+            cp -r "$CYRIUS_DIR/deps/"* "$HOME/.cyrius/deps/"
+          fi
           chmod +x "$VERSIONED/bin/"* 2>/dev/null || true
           ln -sfn "$VERSIONED/bin" "$HOME/.cyrius/bin"
           ln -sfn "$VERSIONED/lib" "$HOME/.cyrius/lib"

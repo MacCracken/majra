@@ -49,10 +49,24 @@ libro 3.0.1-track).
   time — without it, cyrius's deps-aware build can't validate
   the dep graph.
 - **`src/ipc.cyr` ported to `sys_unlink()`** (was raw
-  `syscall(SYS_UNLINK, ...)`). `SYS_UNLINK` is x86_64-only —
-  aarch64 Linux uses `SYS_UNLINKAT`. The stdlib helper picks the
-  right syscall per target arch; raw constants block cross-build.
-  Unblocks the aarch64 cross-compile in CI.
+  `syscall(SYS_UNLINK, ...)`). The portable helper picks the right
+  syscall per target arch; raw `SYS_UNLINK` is x86_64-only and
+  blocks cross-builds. Code-hygiene change — keep using the helpers
+  on either side of the syscall boundary so a future aarch64 build
+  isn't blocked by majra's own code.
+- **aarch64 cross-build is NOT wired into CI.** Tried it; blocked by
+  an unrelated upstream bug at `lib/agnosys.cyr:791` (transitive dep
+  via sigil) that uses raw `syscall(SYS_OPEN, ...)`. The 5.10.34
+  cc5_aarch64 errors on the undefined symbol even with `CYRIUS_DCE=1`.
+  Re-enable once agnosys ships a portable replacement for that call
+  site. All majra consumers run x86_64 server-side; no blocker for
+  shipping 2.4.2 without an aarch64 artifact.
+- **CI installer fetches the source archive at the version tag** for
+  `lib/` (the stdlib snapshot). 5.10.x release tarballs ship `bin/`
+  + `deps/` only — no `lib/`. The official `install.sh` covers this
+  via a source bootstrap (`git clone` + self-host build), but CI
+  doesn't need the bootstrap path; fetching the tagged source archive
+  and copying `lib/` from it is the minimal-cost equivalent.
 - **CI / release modernized.** Adopted the agnosys/agnostik pattern:
   versioned `~/.cyrius/versions/<V>/lib` toolchain layout (required
   by 5.10.9+ for arch-peer include resolution), `cyrius deps` step,

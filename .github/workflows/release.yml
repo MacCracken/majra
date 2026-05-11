@@ -15,6 +15,8 @@ env:
   # See ci.yml — `cyrius deps` shadows the version-pinned snapshot
   # with cwd lib (identical content); silence the informational note.
   CYRIUS_NO_WARN_SHADOW_LIB: "1"
+  # Whole-program dead-code elimination — smaller release binary.
+  CYRIUS_DCE: "1"
 
 jobs:
   ci:
@@ -42,18 +44,28 @@ jobs:
 
       - name: Install Cyrius toolchain
         # Version-pinned layout — cc5 5.10.9+ resolves arch-peer includes
-        # under ~/.cyrius/versions/<V>/lib.
+        # under ~/.cyrius/versions/<V>/lib. 5.10.x release tarballs ship
+        # bin/ + deps/ only, so we also pull the source archive at the
+        # version tag to get lib/ (the stdlib snapshot). See ci.yml for
+        # the rationale.
         run: |
           CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -E '^cyrius[[:space:]]*=' cyrius.cyml | sed -E 's/^cyrius[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')}"
           echo "Installing Cyrius $CYRIUS_VERSION"
           curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
+          curl -sL "https://github.com/MacCracken/cyrius/archive/refs/tags/$CYRIUS_VERSION.tar.gz" -o cyrius-src.tar.gz
+          tar xzf cyrius-src.tar.gz
+          CYRIUS_SRC="cyrius-$CYRIUS_VERSION"
           VERSIONED="$HOME/.cyrius/versions/$CYRIUS_VERSION"
           mkdir -p "$VERSIONED/bin" "$VERSIONED/lib"
           cp "$CYRIUS_DIR/bin/"* "$VERSIONED/bin/" 2>/dev/null || true
           cp "$CYRIUS_DIR/scripts/cyrius" "$VERSIONED/bin/cyrius" 2>/dev/null || true
-          cp -r "$CYRIUS_DIR/lib/"* "$VERSIONED/lib/" 2>/dev/null || true
+          cp -r "$CYRIUS_SRC/lib/"* "$VERSIONED/lib/"
+          if [ -d "$CYRIUS_DIR/deps" ]; then
+            mkdir -p "$HOME/.cyrius/deps"
+            cp -r "$CYRIUS_DIR/deps/"* "$HOME/.cyrius/deps/"
+          fi
           chmod +x "$VERSIONED/bin/"* 2>/dev/null || true
           ln -sfn "$VERSIONED/bin" "$HOME/.cyrius/bin"
           ln -sfn "$VERSIONED/lib" "$HOME/.cyrius/lib"
@@ -78,17 +90,8 @@ jobs:
           cyrius build src/main.cyr build/majra
           echo "majra: $(wc -c < build/majra) bytes"
 
-      - name: Cross-build aarch64 (best-effort)
-        # Produces build/majra-aarch64 when the toolchain bundle
-        # includes cc5_aarch64. Archive step ships both x86 + aarch64
-        # binaries when present.
-        run: |
-          if [ -x "$HOME/.cyrius/bin/cc5_aarch64" ]; then
-            cyrius build --aarch64 src/main.cyr build/majra-aarch64
-            echo "majra-aarch64: $(wc -c < build/majra-aarch64) bytes"
-          else
-            echo "::warning::cc5_aarch64 not in toolchain — aarch64 binary skipped in release"
-          fi
+      # aarch64 cross-build intentionally skipped — see ci.yml for the
+      # rationale (upstream lib/agnosys.cyr:791 SYS_OPEN bug).
 
       - name: Smoke test
         run: |
@@ -135,9 +138,6 @@ jobs:
           cp dist/majra-backends.cyr "majra-${TAG}-backends.cyr"
           if [ -f build/majra ]; then
             cp build/majra "majra-${TAG}-x86_64-linux"
-          fi
-          if [ -f build/majra-aarch64 ]; then
-            cp build/majra-aarch64 "majra-${TAG}-aarch64-linux"
           fi
           sha256sum majra-*.tar.gz majra-*.cyr majra-*-linux 2>/dev/null > SHA256SUMS
 
