@@ -12,8 +12,8 @@ permissions:
   contents: write
 
 env:
-  # See ci.yml — `cyrius deps` shadows the version-pinned snapshot
-  # with cwd lib (identical content); silence the informational note.
+  # See ci.yml — `cyrius lib sync` populates cwd ./lib/, which shadows
+  # the version-pinned snapshot (identical content); silence the note.
   CYRIUS_NO_WARN_SHADOW_LIB: "1"
   # Whole-program dead-code elimination — smaller release binary.
   CYRIUS_DCE: "1"
@@ -43,35 +43,20 @@ jobs:
           echo "Version verified: $TAG (cyrius.cyml pulls from VERSION via \${file:VERSION})"
 
       - name: Install Cyrius toolchain
-        # Version-pinned layout — cc5 5.10.9+ resolves arch-peer includes
-        # under ~/.cyrius/versions/<V>/lib. 5.10.x release tarballs ship
-        # bin/ + deps/ only, so we also pull the source archive at the
-        # version tag to get lib/ (the stdlib snapshot). See ci.yml for
-        # the rationale.
+        # Upstream installer — resolves the cyrius.cyml pin, fetches the
+        # OS-matched release tarball, and lays out
+        # ~/.cyrius/versions/<V>/{bin,lib} with the correct binary names
+        # (`cycc`; the `cc5` symlink was dropped at cyrius v6.1.0). The
+        # stdlib snapshot it installs under versions/<V>/lib is what
+        # `cyrius lib sync` reads. See ci.yml for the full rationale.
         run: |
-          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -E '^cyrius[[:space:]]*=' cyrius.cyml | sed -E 's/^cyrius[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')}"
+          set -e
+          CYRIUS_VERSION="$(grep -E '^cyrius[[:space:]]*=' cyrius.cyml | head -1 | sed -E 's/^cyrius[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
           echo "Installing Cyrius $CYRIUS_VERSION"
-          curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
-          curl -sL "https://github.com/MacCracken/cyrius/archive/refs/tags/$CYRIUS_VERSION.tar.gz" -o cyrius-src.tar.gz
-          tar xzf cyrius-src.tar.gz
-          CYRIUS_SRC="cyrius-$CYRIUS_VERSION"
-          VERSIONED="$HOME/.cyrius/versions/$CYRIUS_VERSION"
-          mkdir -p "$VERSIONED/bin" "$VERSIONED/lib"
-          cp "$CYRIUS_DIR/bin/"* "$VERSIONED/bin/" 2>/dev/null || true
-          cp "$CYRIUS_DIR/scripts/cyrius" "$VERSIONED/bin/cyrius" 2>/dev/null || true
-          cp -r "$CYRIUS_SRC/lib/"* "$VERSIONED/lib/"
-          if [ -d "$CYRIUS_DIR/deps" ]; then
-            mkdir -p "$HOME/.cyrius/deps"
-            cp -r "$CYRIUS_DIR/deps/"* "$HOME/.cyrius/deps/"
-          fi
-          chmod +x "$VERSIONED/bin/"* 2>/dev/null || true
-          ln -sfn "$VERSIONED/bin" "$HOME/.cyrius/bin"
-          ln -sfn "$VERSIONED/lib" "$HOME/.cyrius/lib"
-          echo "$CYRIUS_VERSION" > "$HOME/.cyrius/current"
-          echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
-          echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
+          "$HOME/.cyrius/bin/cyrius" --version
 
       - name: Resolve deps
         # Cyrius 6.x: `cyrius lib sync` provides the version-pinned

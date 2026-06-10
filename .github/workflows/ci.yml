@@ -32,56 +32,21 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Cyrius toolchain
-        # Lays out ~/.cyrius/versions/<VERSION>/{bin,lib} and symlinks
-        # ~/.cyrius/{bin,lib} -> versions/<VERSION>/{bin,lib}. Required
-        # by cc5 5.10.9+: arch-peer includes (syscalls_x86_64_linux.cyr
-        # etc.) are resolved against the version-pinned snapshot, so the
-        # flat ~/.cyrius/lib layout that worked under 5.4.x no longer
-        # finds the peer files.
-        #
-        # 5.10.x release tarballs ship `bin/` + `deps/` only — the
-        # `lib/` (stdlib snapshot) is NOT in the tarball, so we fetch
-        # the GitHub source-archive at the version tag and copy lib/
-        # from there. The official install.sh handles this via source
-        # bootstrap, but that requires a full git clone + self-host
-        # build cycle which is overkill for CI. Pulling the source
-        # archive's lib/ is the minimal path.
+        # Use the upstream installer — it resolves the cyrius.cyml pin,
+        # fetches the OS-matched release tarball, and lays out
+        # ~/.cyrius/versions/<VERSION>/{bin,lib} (+ the active symlinks)
+        # with the correct binary names. We do NOT hand-extract: the
+        # compiler binary is `cycc` (the `cc5` back-compat symlink was
+        # dropped at cyrius v6.1.0), and the stdlib snapshot the installer
+        # lays down under versions/<V>/lib is what `cyrius lib sync` reads.
         run: |
-          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -E '^cyrius[[:space:]]*=' cyrius.cyml | sed -E 's/^cyrius[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')}"
+          set -e
+          CYRIUS_VERSION="$(grep -E '^cyrius[[:space:]]*=' cyrius.cyml | head -1 | sed -E 's/^cyrius[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
           echo "Installing Cyrius $CYRIUS_VERSION"
-
-          # Release tarball — binaries + first-party deps cache
-          curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
-
-          # Source archive — stdlib (lib/) snapshot at the version tag
-          curl -sL "https://github.com/MacCracken/cyrius/archive/refs/tags/$CYRIUS_VERSION.tar.gz" -o cyrius-src.tar.gz
-          tar xzf cyrius-src.tar.gz
-          CYRIUS_SRC="cyrius-$CYRIUS_VERSION"
-
-          VERSIONED="$HOME/.cyrius/versions/$CYRIUS_VERSION"
-          mkdir -p "$VERSIONED/bin" "$VERSIONED/lib"
-          cp "$CYRIUS_DIR/bin/"* "$VERSIONED/bin/" 2>/dev/null || true
-          cp "$CYRIUS_DIR/scripts/cyrius" "$VERSIONED/bin/cyrius" 2>/dev/null || true
-          cp -r "$CYRIUS_SRC/lib/"* "$VERSIONED/lib/"
-          # Carry the prebuilt deps snapshot (sigil/sakshi/agnosys etc.)
-          # so `cyrius deps` doesn't have to git-clone on every CI run.
-          if [ -d "$CYRIUS_DIR/deps" ]; then
-            mkdir -p "$HOME/.cyrius/deps"
-            cp -r "$CYRIUS_DIR/deps/"* "$HOME/.cyrius/deps/"
-          fi
-          chmod +x "$VERSIONED/bin/"* 2>/dev/null || true
-          ln -sfn "$VERSIONED/bin" "$HOME/.cyrius/bin"
-          ln -sfn "$VERSIONED/lib" "$HOME/.cyrius/lib"
-          echo "$CYRIUS_VERSION" > "$HOME/.cyrius/current"
-          echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
-          echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
-
-          # Sanity check
-          test -f "$VERSIONED/lib/syscalls_x86_64_linux.cyr" || { echo "FAIL: stdlib lib/syscalls_x86_64_linux.cyr missing — source archive extraction failed"; exit 1; }
-          test -x "$VERSIONED/bin/cc5" || { echo "FAIL: bin/cc5 missing — release tarball extraction failed"; exit 1; }
-          echo "OK: stdlib + binaries installed under $VERSIONED"
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
+          "$HOME/.cyrius/bin/cyrius" --version
 
       - name: Resolve dependencies
         # Cyrius 6.x splits stdlib from git deps:
@@ -244,30 +209,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Cyrius toolchain
-        # See build-and-test job for the rationale on the source-archive
-        # fetch. Same installer body.
+        # Upstream installer — see build-and-test job for rationale.
         run: |
-          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -E '^cyrius[[:space:]]*=' cyrius.cyml | sed -E 's/^cyrius[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')}"
-          curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
-          curl -sL "https://github.com/MacCracken/cyrius/archive/refs/tags/$CYRIUS_VERSION.tar.gz" -o cyrius-src.tar.gz
-          tar xzf cyrius-src.tar.gz
-          CYRIUS_SRC="cyrius-$CYRIUS_VERSION"
-          VERSIONED="$HOME/.cyrius/versions/$CYRIUS_VERSION"
-          mkdir -p "$VERSIONED/bin" "$VERSIONED/lib"
-          cp "$CYRIUS_DIR/bin/"* "$VERSIONED/bin/" 2>/dev/null || true
-          cp "$CYRIUS_DIR/scripts/cyrius" "$VERSIONED/bin/cyrius" 2>/dev/null || true
-          cp -r "$CYRIUS_SRC/lib/"* "$VERSIONED/lib/"
-          if [ -d "$CYRIUS_DIR/deps" ]; then
-            mkdir -p "$HOME/.cyrius/deps"
-            cp -r "$CYRIUS_DIR/deps/"* "$HOME/.cyrius/deps/"
-          fi
-          chmod +x "$VERSIONED/bin/"* 2>/dev/null || true
-          ln -sfn "$VERSIONED/bin" "$HOME/.cyrius/bin"
-          ln -sfn "$VERSIONED/lib" "$HOME/.cyrius/lib"
-          echo "$CYRIUS_VERSION" > "$HOME/.cyrius/current"
-          echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
+          set -e
+          CYRIUS_VERSION="$(grep -E '^cyrius[[:space:]]*=' cyrius.cyml | head -1 | sed -E 's/^cyrius[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
 
       - name: Resolve deps
         # Cyrius 6.x: stdlib snapshot via `cyrius lib sync`, git deps via
