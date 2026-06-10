@@ -4,7 +4,7 @@
 
 Majra provides shared messaging primitives for the [AGNOS](https://github.com/MacCracken) ecosystem, eliminating duplicate pub/sub, queue, relay, and heartbeat implementations across [AgnosAI](https://github.com/MacCracken/agnosai), [Ifran](https://github.com/MacCracken/synapse), [SecureYeoman](https://github.com/MacCracken/secureyeoman), and [daimon](https://github.com/agnostos/daimon).
 
-**Written in [Cyrius](https://github.com/MacCracken/cyrius)** — compiles to a statically linked binary via `cyrius build`. Optional crypto surface (signed envelopes, encrypted IPC) pulls [sigil](https://github.com/MacCracken/sigil) ≥ 2.9.0; the core profile has no external deps.
+**Written in [Cyrius](https://github.com/MacCracken/cyrius)** — compiles to a statically linked binary via `cyrius build`. Optional crypto surface (signed envelopes, encrypted IPC) pulls [sigil](https://github.com/MacCracken/sigil) ≥ 3.7.8; the core profile has no external deps.
 
 ## Modules
 
@@ -151,22 +151,25 @@ majra (v2.4.x, ~5,500 lines across 22 modules)
 ## Building
 
 ```bash
-# Compile (core engine)
-cyrius build src/main.cyr build/majra
+# One-time setup (cyrius 6.x): stdlib snapshot, then git deps
+cyrius lib sync && cyrius deps
+
+# Compile (core engine) — --no-deps keeps the lib-synced ./lib/ intact
+cyrius build --no-deps src/main.cyr build/majra
 
 # Run core tests
 ./build/majra
 
 # Full test matrix (150 + 96 + 42 + 17 = 305 assertions)
-cyrius build tests/test_core.tcyr        build/test_core        && ./build/test_core
-cyrius build tests/test_backends.tcyr    build/test_backends    && ./build/test_backends
-cyrius build tests/test_patra_queue.tcyr build/test_patra_queue && ./build/test_patra_queue
+cyrius build --no-deps tests/test_core.tcyr        build/test_core        && ./build/test_core
+cyrius build --no-deps tests/test_backends.tcyr    build/test_backends    && ./build/test_backends
+cyrius build --no-deps tests/test_patra_queue.tcyr build/test_patra_queue && ./build/test_patra_queue
 
 # Benchmarks
-cyrius build benches/bench_all.bcyr build/bench_all && ./build/bench_all
+cyrius build --no-deps benches/bench_all.bcyr build/bench_all && ./build/bench_all
 
 # Soak tests (on-demand, not in CI)
-cyrius build tests/soak/soak_queue.cyr build/soak_queue && ./build/soak_queue
+cyrius build --no-deps tests/soak/soak_queue.cyr build/soak_queue && ./build/soak_queue
 
 # Full audit: self-host, test, fmt, lint, vet, deny, bench
 cyrius audit
@@ -193,7 +196,7 @@ modules = ["dist/majra-admin.cyr"]     # core + HTTP admin/metrics endpoint
 modules = ["dist/majra-backends.cyr"]  # everything: all profiles + redis/pg/ws/encrypted IPC/patra_queue
 ```
 
-`cyrius deps` resolves the tag, copies the chosen bundle into `lib/majra_majra.cyr`, and you `include` it from your entry point. `majra-signed` and `majra-backends` require sigil ≥ 2.9.0 as a sibling dep.
+`cyrius deps` resolves the tag, copies the chosen bundle into `lib/majra_majra.cyr`, and you `include` it from your entry point. `majra-signed` and `majra-backends` require sigil ≥ 3.7.8 as a sibling dep, plus the stdlib `lib/ct.cyr` (constant-time compare) and — for `majra-admin`/`majra-backends` — `lib/sandhi.cyr` (the `sandhi_server_*` HTTP surface).
 
 ## Ecosystem
 
@@ -214,7 +217,7 @@ Majra was originally a Rust library (v1.0.4, ~13,000 lines). It was ported to Cy
 | Source lines | 12,969 | ~5,500 |
 | Modules | 22 | 22 (QUIC deferred on sigil X25519) |
 | Dependencies | 25 crates | 0 core, 1 optional (sigil) |
-| Toolchain | cargo + rustc + LLVM | cyrius 5.10.44 |
+| Toolchain | cargo + rustc + LLVM | cyrius 6.1.24 |
 
 ## License
 

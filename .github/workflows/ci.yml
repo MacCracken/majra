@@ -12,20 +12,16 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # `cyrius deps` populates ./lib/ from the version-pinned snapshot,
+  # `cyrius lib sync` populates ./lib/ from the version-pinned snapshot,
   # which then shadows the global ~/.cyrius/versions/<V>/lib snapshot
   # on every subsequent `cyrius build` invocation. That's intentional
-  # (the cwd lib IS the version-pinned content cyrius deps just
-  # copied), but cyrius emits an informational note about it on every
-  # build. Silence it across all CI steps. Same pattern as agnosys CI
-  # post-5.10.x.
+  # (the cwd lib IS the version-pinned snapshot content), but cyrius
+  # emits an informational note about it on every build. Silence it
+  # across all CI steps. Same pattern as agnosys CI post-5.10.x.
   CYRIUS_NO_WARN_SHADOW_LIB: "1"
 
   # Whole-program dead-code elimination — keeps binaries lean and
-  # matches the agnosys/agnostik CI pattern. (Note: doesn't help
-  # the aarch64 cross-build hit the `lib/agnosys.cyr:791` SYS_OPEN
-  # symbol-resolution bug — that step is intentionally not wired
-  # up; see the block in build-and-test below.)
+  # matches the agnosys/agnostik CI pattern.
   CYRIUS_DCE: "1"
 
 jobs:
@@ -88,11 +84,20 @@ jobs:
           echo "OK: stdlib + binaries installed under $VERSIONED"
 
       - name: Resolve dependencies
-        # Populates ./lib/ from cyrius.cyml [deps] stdlib + [deps.sigil]
-        # at the pinned tags. ./lib/ is gitignored (see .gitignore) with
-        # the lone exception of lib/http_server.cyr, which is vendored
-        # in-tree until the admin/ws surface migrates onto sandhi.
-        run: cyrius deps
+        # Cyrius 6.x splits stdlib from git deps:
+        #   `cyrius lib sync` copies the version-pinned stdlib snapshot
+        #     (94 .cyr files incl slice/ct/chrono/async/sakshi/dynlib/
+        #     fdlopen — the modules sigil/sandhi/agnosys reach into) into
+        #     ./lib/. `cyrius deps` alone does NOT provide these toolchain
+        #     modules, and a partial ./lib/ makes agnosys's slice subscript
+        #     and sandhi's TLS_BACKEND_LIBSSL resolve to a `ud2` SIGILL.
+        #   `cyrius deps` then overlays the [deps.sigil] git dep + writes
+        #     cyrius.lock (94 entries) over the synced base.
+        # Build steps below pass --no-deps so `cyrius build`'s auto-deps
+        # doesn't re-resolve and perturb the synced lib's include order.
+        run: |
+          cyrius lib sync
+          cyrius deps
 
       - name: Verify dep hashes
         # Skip if cyrius.lock isn't in the tree yet — first push that
@@ -126,33 +131,32 @@ jobs:
       - name: Build
         run: |
           mkdir -p build
-          cyrius build src/main.cyr build/majra
+          cyrius build --no-deps src/main.cyr build/majra
           echo "majra: $(wc -c < build/majra) bytes"
 
       - name: Verify ELF
         run: xxd -l 4 build/majra | grep -q "7f45 4c46"
 
-      # aarch64 cross-build is intentionally NOT wired up. Upstream
-      # `lib/agnosys.cyr:791` uses raw `syscall(SYS_OPEN, ...)` —
-      # SYS_OPEN is x86_64-only (aarch64 Linux uses SYS_OPENAT), so
-      # cc5_aarch64 errors on the symbol even though the call site is
-      # unreachable from majra's entry points. CYRIUS_DCE=1 doesn't
-      # mask it on the 5.10.34 toolchain. Re-enable this step when
-      # agnosys ships a portable replacement for the SYS_OPEN call
-      # site. majra consumers (daimon, AgnosAI, hoosh, sutra, stiva)
-      # are all x86_64-server-side, so no consumer is blocked.
+      # aarch64 cross-build remains unwired, but the historical blocker
+      # is GONE: the upstream `lib/agnosys.cyr:791` raw SYS_OPEN bug was
+      # fixed long ago in agnosys mainline, and the cyrius 6.1.24 + sigil
+      # 3.7.8 bump rolls the transitive agnosys pin forward to 1.3.2
+      # (zero SYS_OPEN refs). Wiring the cross-build is now a verification
+      # task, not a blocked-on-upstream one — deferred to a follow-up.
+      # majra consumers (daimon, AgnosAI, hoosh, sutra, stiva) are all
+      # x86_64-server-side, so no consumer is blocked.
 
       - name: Core tests
         run: ./build/majra
 
       - name: Expanded tests
         run: |
-          cyrius build tests/test_core.tcyr build/test_core
+          cyrius build --no-deps tests/test_core.tcyr build/test_core
           ./build/test_core
 
       - name: Backend tests
         run: |
-          cyrius build tests/test_backends.tcyr build/test_backends
+          cyrius build --no-deps tests/test_backends.tcyr build/test_backends
           ./build/test_backends
 
       - name: Patra-queue tests
@@ -161,14 +165,14 @@ jobs:
         # cc3 line; under cc5 there's more headroom but the
         # split entry is documented architecture.
         run: |
-          cyrius build tests/test_patra_queue.tcyr build/test_patra_queue
+          cyrius build --no-deps tests/test_patra_queue.tcyr build/test_patra_queue
           ./build/test_patra_queue
 
       - name: Fuzz
         run: |
           for f in fuzz/*.fcyr; do
             name=$(basename "$f" .fcyr)
-            cyrius build "$f" "build/$name"
+            cyrius build --no-deps "$f" "build/$name"
             timeout 10 "build/$name" 500 || { echo "FUZZ CRASH: $name"; exit 1; }
             echo "  $name: ok"
           done
@@ -177,15 +181,15 @@ jobs:
         run: |
           for f in benches/*.bcyr; do
             name=$(basename "$f" .bcyr)
-            cyrius build "$f" "build/$name"
+            cyrius build --no-deps "$f" "build/$name"
             "build/$name"
           done
 
       - name: Examples
         run: |
-          cyrius build examples/managed_queue.cyr build/managed_queue
+          cyrius build --no-deps examples/managed_queue.cyr build/managed_queue
           ./build/managed_queue
-          cyrius build examples/pubsub_tiers.cyr build/pubsub_tiers
+          cyrius build --no-deps examples/pubsub_tiers.cyr build/pubsub_tiers
           ./build/pubsub_tiers
 
       - name: dist bundles are up-to-date
@@ -266,7 +270,11 @@ jobs:
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
 
       - name: Resolve deps
-        run: cyrius deps
+        # Cyrius 6.x: stdlib snapshot via `cyrius lib sync`, git deps via
+        # `cyrius deps`. See build-and-test "Resolve dependencies".
+        run: |
+          cyrius lib sync
+          cyrius deps
 
       - name: Configure PostgreSQL auth
         run: |
@@ -279,7 +287,7 @@ jobs:
       - name: Run live tests
         run: |
           mkdir -p build
-          cyrius build tests/test_live.tcyr build/test_live
+          cyrius build --no-deps tests/test_live.tcyr build/test_live
           ./build/test_live
 
   security:

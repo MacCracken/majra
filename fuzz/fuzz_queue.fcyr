@@ -16,6 +16,7 @@ include "lib/thread.cyr"
 include "src/error.cyr"
 include "src/counter.cyr"
 include "src/envelope.cyr"
+include "src/metrics.cyr"
 include "src/queue.cyr"
 
 var _fuzz_state = 12345;

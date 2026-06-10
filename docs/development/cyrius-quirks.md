@@ -5,7 +5,7 @@ description: Toolchain-side gotchas that affect how majra code is written. Refre
 
 # Cyrius compiler quirks
 
-> **Toolchain floor**: cyrius 5.10.x (see [`state.md`](state.md) for the current exact pin) | **Refresh cadence**: when the pin moves or a new quirk surfaces.
+> **Toolchain floor**: cyrius 6.1.x (see [`state.md`](state.md) for the current exact pin) | **Refresh cadence**: when the pin moves or a new quirk surfaces.
 
 Things about the cyrius compiler that affect how majra code is written. None of these are bug reports — they're *load-bearing facts about the toolchain*. If a pattern in `src/` looks weird, the answer is probably here.
 
@@ -52,13 +52,27 @@ Function-scoped `var buf[256]` looks like a stack allocation but is emitted as s
 
 Also why `var buf[256000]` bloats the binary by 256 KB — it lives in the data segment.
 
-### 5. Inline-asm parameter loads are fragile across cyrius minor lines
+### 5. Inline-asm parameter loads were fragile pre-6.x — `param_load` pseudo fixes it
 
-`mov rdi, [rbp-8]` -style byte-literal parameter loads inside `asm {}` blocks are tied to whatever stack-frame layout cc5 emits at the time. cyrius 5.10.x's expanded prologue shifts the parameter slots relative to pre-5.5; asm written against the old layout reads garbage and the next instruction faults with SIGILL.
+`mov rdi, [rbp-8]` -style byte-literal parameter loads inside `asm {}` blocks were tied to whatever stack-frame layout cc5 emitted; 5.10.x's expanded prologue shifted the slots and asm written against the old layout SIGILL'd. **cyrius 6.0.67+ exposes a `param_load(reg, idx)` asm pseudo** that resolves to the correct slot regardless of prologue shape, so this class is fixed at the toolchain.
 
-**Implication for new majra code**: we don't write inline asm today, and probably shouldn't until cyrius exposes a stable asm parameter ABI. If we ever need a hardware-acceleration hot path, load parameters into module-level globals *before* the asm block instead of decoding `[rbp-N]`.
+**Implication for new majra code**: we still don't write inline asm, but if we ever need a hardware-acceleration hot path, use `param_load` rather than decoding `[rbp-N]` by hand.
 
-**Implication for our deps**: this is why we hold sigil at 2.9.0 — 2.9.1+ has NI dispatch fns that hit this. Full story in [`dependency-watch.md § sigil`](dependency-watch.md).
+**Implication for our deps**: this is why sigil was held at 2.9.0 through the 2.4.x line. As of 2.4.5 (cyrius 6.1.24) sigil's NI dispatch uses `param_load`, so we track **latest (3.7.8)**. Full story in [`dependency-watch.md § sigil`](dependency-watch.md).
+
+### 6. Undefined symbols compile to a runtime `ud2`, not a build error (cyrius 6.1.x)
+
+**This reverses the cc5-era behavior** (an undefined function used to be a hard compile error — see the archived entry below). Under cyrius 6.1.x the compiler only emits a `warning: undefined function '<name>'` and lowers the call to a `ud2` instruction. The build *succeeds*; the program then **SIGILLs (exit 132) the instant that call executes**. Under gdb it looks like an asm fault until you notice the faulting instruction is `ud2`.
+
+**Implication**: a missing `include` is now a latent runtime crash, not a caught-at-build mistake. After any toolchain/dep bump, **audit every entry point's reachable `undefined function` warnings** (`cyrius build … 2>&1 | grep 'undefined function' | grep -v 'may be unreachable'`) and add the providing module. This is how the 2.4.5 migration surfaced `ct_eq` (→ `lib/ct.cyr`), the `http_*`→`sandhi_server_*` rename, and the mutex/`metrics_queue_*` include gaps.
+
+### 7. Cyrius 6.x splits stdlib (`lib sync`) from git deps (`deps`); build with `--no-deps`
+
+`cyrius deps` no longer provisions the stdlib — it only resolves `[deps.*]` git deps. The version-pinned stdlib snapshot (94 `.cyr` files, including the toolchain-internal `slice`/`ct`/`chrono`/`async`/`dynlib`/`fdlopen`/`tls` that agnosys/sandhi reach into) is copied into `./lib/` by **`cyrius lib sync`**. Run `lib sync` *before* `deps`.
+
+A `./lib/` that exists fully **shadows** the version snapshot (no per-file fallback), so a partial `./lib/` — e.g. one `cyrius deps` populated without a preceding `lib sync` — is missing `slice.cyr`, and agnosys 1.3.2's slice subscripts then hit quirk #6's `ud2`.
+
+Build with **`cyrius build --no-deps`**: a plain `cyrius build` auto-runs `deps`, which re-resolves and perturbs the synced lib's include order enough to re-break the agnosys/slice resolution even when `slice.cyr` is present. Canonical sequence: `cyrius lib sync && cyrius deps && cyrius build --no-deps <src> <out>`.
 
 ---
 
@@ -69,7 +83,7 @@ These were live quirks in earlier majra cycles. Listed for archaeological contex
 - ~~`\r` escape sequence broken~~ — works since cc4.x. Don't hand-emit byte 13 with `store8(buf, 13)`.
 - ~~Negative literals `-1`, `-N` broken~~ — work since 3.10.3. No need for `(0 - N)`.
 - ~~Compound assignment `+=`, `-=`, `*=` broken~~ — work since 3.10.3.
-- ~~Undefined functions silently produced NULL stubs~~ — now a compile-time error.
+- ~~Undefined functions silently produced NULL stubs~~ — became a compile-time error in cc5, **then reverted at cyrius 6.1.x to warn + runtime `ud2`** (see active quirk #6). Net: still not a NULL stub, but no longer build-fatal either — audit the warnings.
 - ~~256-initialized-global cap~~ — removed.
 - ~~Fixup table cap at 8192~~ — raised to 16384 (cap still exists; see active quirk #2).
 - ~~`map_get` after `map_set` corruption in deep call chains~~ — cc5 resolves.

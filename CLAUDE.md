@@ -33,12 +33,24 @@ This file (`CLAUDE.md`) is durable rules.
 ## Quick Start
 
 ```bash
-cyrius deps                                            # resolve lib/ from cyrius.cyml
-cyrius build src/main.cyr build/majra && ./build/majra # build + core tests
-cyrius build tests/test_backends.tcyr build/test_backends && ./build/test_backends
+cyrius lib sync                                        # copy version-pinned stdlib snapshot → ./lib/ (94 files)
+cyrius deps                                            # overlay sigil git dep + write cyrius.lock; run AFTER lib sync
+cyrius build --no-deps src/main.cyr build/majra && ./build/majra        # build + core tests
+cyrius build --no-deps tests/test_backends.tcyr build/test_backends && ./build/test_backends
 cyrius distlib && cyrius distlib signed && cyrius distlib admin && cyrius distlib backends  # regenerate 4 dist bundles
 cyrius audit                                           # full: self-host, test, fmt, lint, vet, deny, bench
 ```
+
+> **Cyrius 6.x build workflow (since 2.4.5).** Stdlib provisioning and
+> git-dep resolution are separate steps: `cyrius lib sync` populates
+> `./lib/` from the version-pinned snapshot (the toolchain modules
+> sigil/sandhi/agnosys reach into — `slice`, `tls`, `ct`, `chrono`,
+> `async`, `sakshi`, `dynlib`, `fdlopen`), then `cyrius deps` overlays
+> the sigil git dep. Build with `--no-deps` so the build's auto-`deps`
+> doesn't re-resolve and perturb the synced lib's include order. A bare
+> `cyrius deps` leaves a partial `./lib/`; cyrius 6.1.x compiles an
+> unresolved call to a runtime-trapping `ud2`, so a missing toolchain
+> module surfaces as a **SIGILL at runtime, not a build error**.
 
 Full test matrix + soak + fuzz + bench commands in [`docs/guides/testing.md`](docs/guides/testing.md).
 

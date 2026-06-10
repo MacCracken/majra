@@ -12,7 +12,7 @@ consumer's code.
 pinned in `[deps.sigil]`) is the sole crypto implementation. AES-256-GCM,
 Ed25519, HMAC-SHA256, HKDF all live there. sigil's own `docs/audit/` directory
 documents its crypto audit surface. See [`dependency-watch.md`](dependency-watch.md)
-for the rationale on the current sigil 2.9.0 pin.
+for the rationale on the current sigil 3.7.8 pin (latest, since the 2.4.5 cyrius 6.x migration).
 
 ## Attack Surface
 
@@ -30,7 +30,7 @@ for the rationale on the current sigil 2.9.0 pin.
 | ws | HTTP upgrade | Malformed headers | Fixed header parsing with length limits (4 KB) |
 | ws | SHA-1 | Collision attacks | SHA-1 used only for WebSocket handshake (RFC 6455 requirement, not security-critical) |
 | signed_envelope | Ed25519 verify on untrusted input | Forgery | sigil's `ed25519_verify` rejects non-canonical S; canonical encoding is deterministic — tamper causes verify to fail |
-| signed_envelope | Key storage | Key leakage | `expected_pk` comparison via `ct_eq` (constant-time); caller owns key lifetime |
+| signed_envelope | Key storage | Key leakage | `expected_pk` comparison via `ct_eq_bytes_lens` (stdlib `lib/ct.cyr`, constant-time); caller owns key lifetime |
 | admin | HTTP endpoint | Unauthorized access | **Localhost-only by design**. Binding 0.0.0.0 without fronting auth is a misuse — documented in `src/admin.cyr` header |
 | admin | HTTP endpoint | Mutation | Read-only — no PUT/POST/DELETE routes exist |
 | patra_queue | SQL injection via payload | Injection | Payloads go into patra INSERT via string concat — **consumer must sanitize payload strings** before enqueue (same contract as `postgres_backend`) |

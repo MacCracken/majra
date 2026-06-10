@@ -3,20 +3,25 @@
 ## Running Tests
 
 ```bash
+# One-time per checkout / after any toolchain or dep bump (cyrius 6.x):
+#   lib sync provisions the stdlib snapshot, deps overlays the sigil git dep.
+cyrius lib sync && cyrius deps
+
 # Full audit (test + fmt + lint + vet + deny + bench)
 cyrius audit
 
-# Individual test suites (manual)
-cyrius build src/main.cyr                build/majra            && ./build/majra
-cyrius build tests/test_core.tcyr        build/test_core        && ./build/test_core
-cyrius build tests/test_backends.tcyr    build/test_backends    && ./build/test_backends
-cyrius build tests/test_patra_queue.tcyr build/test_patra_queue && ./build/test_patra_queue
+# Individual test suites (manual) — build with --no-deps so the build's
+# auto-deps doesn't perturb the lib-synced ./lib/ (see CLAUDE.md § Quick Start).
+cyrius build --no-deps src/main.cyr                build/majra            && ./build/majra
+cyrius build --no-deps tests/test_core.tcyr        build/test_core        && ./build/test_core
+cyrius build --no-deps tests/test_backends.tcyr    build/test_backends    && ./build/test_backends
+cyrius build --no-deps tests/test_patra_queue.tcyr build/test_patra_queue && ./build/test_patra_queue
 
 # Live integration tests (requires Redis on :6379, PostgreSQL on :5432)
-cyrius build tests/test_live.tcyr build/test_live && ./build/test_live
+cyrius build --no-deps tests/test_live.tcyr build/test_live && ./build/test_live
 
 # Soak tests (on-demand, not in CI)
-cyrius build tests/soak/soak_queue.cyr build/soak_queue && ./build/soak_queue
+cyrius build --no-deps tests/soak/soak_queue.cyr build/soak_queue && ./build/soak_queue
 ```
 
 ## Test Suites
@@ -58,7 +63,7 @@ cyrius build tests/soak/soak_queue.cyr build/soak_queue && ./build/soak_queue
 cyrius bench
 
 # Manual run
-cyrius build benches/bench_all.cyr build/bench && ./build/bench
+cyrius build --no-deps benches/bench_all.cyr build/bench && ./build/bench
 ```
 
 17 benchmarks covering: envelope creation, priority queue, pattern matching (4 variants), pubsub publish, direct channel, heartbeat, fleet stats, rate limiting, relay send, barrier cycle, circuit breaker, counter increment.
@@ -89,7 +94,7 @@ docker exec majra-postgres su postgres -c \
    pg_ctl reload -D /var/lib/postgresql/data"
 
 # Run live tests
-cyrius build tests/test_live.tcyr build/test_live && ./build/test_live
+cyrius build --no-deps tests/test_live.tcyr build/test_live && ./build/test_live
 
 # Cleanup
 docker stop majra-redis majra-postgres && docker rm majra-redis majra-postgres

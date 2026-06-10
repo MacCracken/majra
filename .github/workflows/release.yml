@@ -74,7 +74,14 @@ jobs:
           echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
 
       - name: Resolve deps
-        run: cyrius deps
+        # Cyrius 6.x: `cyrius lib sync` provides the version-pinned
+        # stdlib snapshot (slice/ct/chrono/async/sakshi/dynlib/fdlopen —
+        # the modules sigil/sandhi/agnosys reach into); `cyrius deps`
+        # overlays the [deps.sigil] git dep. A bare `cyrius deps` leaves
+        # a partial ./lib/ that ud2-SIGILLs. See ci.yml for detail.
+        run: |
+          cyrius lib sync
+          cyrius deps
 
       - name: Verify dep hashes
         run: |
@@ -87,7 +94,7 @@ jobs:
       - name: Build
         run: |
           mkdir -p build
-          cyrius build src/main.cyr build/majra
+          cyrius build --no-deps src/main.cyr build/majra
           echo "majra: $(wc -c < build/majra) bytes"
 
       # aarch64 cross-build intentionally skipped — see ci.yml for the

@@ -16,6 +16,13 @@ include "lib/assert.cyr"
 include "lib/net.cyr"
 include "lib/io.cyr"
 include "lib/bigint.cyr"
+include "lib/ct.cyr"
+include "lib/chrono.cyr"
+include "lib/async.cyr"
+include "lib/sakshi.cyr"
+include "lib/dynlib.cyr"
+include "lib/fdlopen.cyr"
+include "lib/tls.cyr"
 include "lib/sandhi.cyr"
 
 # sigil (vendored dist, 2.8.4+) provides AES-256-GCM consumed by ipc_encrypted.

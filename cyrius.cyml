@@ -5,7 +5,7 @@ description = "Distributed queue & multiplex engine — pub/sub, queues, relay, 
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/majra"
 language = "cyrius"
-cyrius = "5.10.44"
+cyrius = "6.1.24"
 
 [build]
 entry = "src/main.cyr"
@@ -125,13 +125,18 @@ modules = [
 # here mirrors the top of src/main.cyr so the manifest stays
 # load-bearing for CI completeness checks.
 [deps]
-# Modules listed here mirror the union of `include "lib/<name>.cyr"`
-# lines across src/, tests/, fuzz/, benches/, and examples/. Keep
-# this list aligned with the actual include set — CI doesn't gate
-# on it, but `cyrius deps` only resolves what's listed.
+# Legacy stdlib hint list (cyrius 5.x model). Under cyrius 6.x the full
+# stdlib snapshot is provisioned by `cyrius lib sync` (94 files), so this
+# list is no longer the sole source of what lands in ./lib/ — it's kept
+# as a human-readable record of the stdlib surface majra's entry points
+# include. (Don't add toolchain-internal modules like `slice`/`ct` here:
+# they aren't separately resolvable as [deps] stdlib names — `cyrius deps`
+# errors with "cannot read ./lib/<name>.cyr". lib sync provides them.)
 # (`sandhi` ships the HTTP server surface — folded into the cyrius
 # stdlib post-M6. `src/admin.cyr` consumes `HTTP_BAD_REQUEST` /
-# `http_send_status` / `http_server_run` from there.)
+# `sandhi_server_send_status` / `sandhi_server_run` from there. The
+# pre-6.x `http_send_status` / `http_server_run` names were renamed to
+# the `sandhi_server_*` namespace in the cyrius 6.x stdlib reorg.)
 stdlib = [
     "assert",
     "alloc",
@@ -163,5 +168,5 @@ stdlib = [
 # surface. See lib/sigil.cyr (bundled dist, ~5.8k lines).
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"
-tag = "2.9.0"
+tag = "3.7.8"
 modules = ["dist/sigil.cyr"]

@@ -2,6 +2,12 @@
 
 Completed items live in [CHANGELOG.md](../../CHANGELOG.md).
 
+## Recently shipped (2.4.5)
+
+- **Cyrius 6.x migration** — toolchain pin 5.10.44 → 6.1.24. The major bump cleared the long-standing sigil crypto-NI blocker: **sigil 2.9.0 → 3.7.8 (latest)**, the first sigil bump since 2.4.0. Under cyrius 6.x the `[rbp-N]` asm-offset SIGILL is gone (sigil's NI asm moved onto the `param_load` pseudo), and transitive **agnosys → 1.3.2** (zero `SYS_OPEN`) resolves the dormant aarch64 cross-build blocker too.
+- **New cyrius-6 build workflow** — `cyrius lib sync` (stdlib snapshot) precedes `cyrius deps` (git deps); builds pass `--no-deps`. `cyrius.lock` grew 3 → 94 hashes. CI + release workflows updated. A bare `cyrius deps` now leaves a partial `./lib/` that ud2-SIGILLs at runtime (cyrius 6.1.x warns-then-`ud2` on undefined symbols).
+- **Stdlib-reorg ports** — `src/admin.cyr` migrated `http_*` → `sandhi_server_*`; `src/signed_envelope.cyr` migrated `ct_eq` → `ct_eq_bytes_lens` (stdlib `lib/ct.cyr`). Test/fuzz entry points gained the explicit ct/chrono/async/sakshi/dynlib/fdlopen/tls/thread/metrics includes the cyrius-6 split now requires. 305/305 + fuzz + soak clean.
+
 ## Recently shipped (2.4.4)
 
 - **Cyrius toolchain pin bumped 5.10.34 → 5.10.44** — ten patch-level cyrius releases. No source change; `cyrius.lock` byte-identical (sigil/sakshi/agnosys git tags unchanged); dist bundle bodies byte-identical (only the version banner moves). Full matrix re-ran clean: 305/305 CI assertions + 3/3 fuzz harnesses + 4/4 soak suites. Sigil held at 2.9.0 — [upstream P1](https://github.com/MacCracken/sigil/blob/main/docs/development/issues/2026-05-10-cyrius-510-asm-stack-frame-drift-breaks-ni-paths.md) still open at sigil 3.1.1 (the 5/11 sigil patch was the stdlib annotation pass, not the NI-path fix).
@@ -41,11 +47,14 @@ Completed items live in [CHANGELOG.md](../../CHANGELOG.md).
 ## Open Items
 
 ### Waiting on upstream
-- **QUIC transport + AES-NI hardware acceleration** — gated on **sigil emitting cyrius-stable asm**. Bisect against cyrius 5.10.34 (2026-05-10): sigil 2.9.0 = full pass; 2.9.1–3.0.1 = SIGILL on the ed25519-NI path; 3.1.0 = SIGILL earlier on aes_gcm-NI too. All the regressions trace to inline-asm blocks that hardcode `[rbp-N]` parameter offsets matching cyrius's pre-5.5 stack frame, which has shifted under 5.10.x's expanded prologue. We pinned at sigil 2.9.0 (asm-free reference paths) during the 2.4.2 toolchain bump. Filed upstream as P1 in sigil's v3.1 work arc: [`sigil/docs/development/issues/2026-05-10-cyrius-510-asm-stack-frame-drift-breaks-ni-paths.md`](https://github.com/MacCracken/sigil/blob/main/docs/development/issues/2026-05-10-cyrius-510-asm-stack-frame-drift-breaks-ni-paths.md). Once sigil ships the fix, bump the pin, regenerate the four dist bundles, and revisit QUIC (still needs X25519 from sigil too — same release).
-  - **Note on the transitive agnosys/SYS_OPEN observation:** during 2.4.2 work we noticed `lib/agnosys.cyr:791` uses raw `syscall(SYS_OPEN, ...)` which blocks aarch64 cross-builds. The resolved agnosys (1.0.4) is what sigil 2.9.0's deps pin transitively. agnosys mainline (1.2.4) has zero `SYS_OPEN` refs in its dist bundle — the bug was fixed upstream long ago. Bumping past sigil 2.9.0 rolls agnosys forward transitively, so this resolves automatically when the asm-drift fix lands. Not a separate upstream filing.
+- _(empty)_ — the two long-standing upstream blockers both cleared at 2.4.5:
+  - ~~**sigil asm-drift SIGILL**~~ — **RESOLVED** by the cyrius 6.x toolchain. sigil's NI asm moved onto the `param_load` pseudo (cyrius 6.0.67+), dissolving the `[rbp-N]` offset fragility. sigil now tracks latest (3.7.8) and AES-NI / SHA-NI / ed25519-NI acceleration is live for the `signed` + `backends` profiles.
+  - ~~**agnosys SYS_OPEN / aarch64**~~ — **RESOLVED** transitively: sigil 3.7.8 rolls agnosys to 1.3.2, which has zero `SYS_OPEN` refs.
 
 ### Engineering backlog
 
+- **QUIC transport** — now unblocked on the sigil side (X25519 available in 3.7.8); a real engineering item rather than waiting-on-upstream. Scope when a consumer needs it.
+- **aarch64 cross-build wiring** — the SYS_OPEN blocker is gone (agnosys 1.3.2); wiring + verifying the `cyrius build --aarch64` CI step is now a discrete task. majra consumers are all x86_64-server-side, so low priority.
 - **Shared-memory IPC transport** (mmap-based) — still deferred. Most workloads are fine with Unix-socket IPC; revisit when a consumer hits the syscall-per-message ceiling.
 
 ### Upstream cleanup (not majra work)

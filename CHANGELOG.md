@@ -5,6 +5,66 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.5] — 2026-06-10
+
+Cyrius 6.x migration. Toolchain pin **5.10.44 → 6.1.24**, and with the
+6.x compiler the long-standing sigil crypto-NI blocker finally clears:
+sigil moves **2.9.0 → 3.7.8** (latest), the first sigil bump since the
+2.4.0 line. No majra API, ABI, or wire-format drift; the four
+distribution profiles keep their public surface. All 305 CI assertions
++ 3 fuzz harnesses + 4 soak suites pass under the new toolchain.
+
+### Changed
+
+- **Cyrius toolchain pin 5.10.44 → 6.1.24** (`cyrius.cyml [package].cyrius`).
+- **sigil 2.9.0 → 3.7.8** (`[deps.sigil]`). The 2.9.0 pin existed solely
+  to dodge the AES-NI / Ed25519-NI `[rbp-N]` asm-offset SIGILL on cyrius
+  5.10.x. Under cyrius 6.x that whole failure class is gone — sigil's NI
+  asm migrated to the `param_load` pseudo (cyrius 6.0.67+), so the latest
+  release rides the toolchain cleanly. Transitively rolls **agnosys 1.0.4
+  → 1.3.2** (zero `SYS_OPEN` refs — the dormant aarch64 cross-build
+  blocker is resolved as a side effect).
+- **Build workflow: `cyrius lib sync` now precedes `cyrius deps`, and
+  builds pass `--no-deps`.** Cyrius 6.x split stdlib provisioning
+  (`cyrius lib sync` copies the version-pinned 94-file snapshot into
+  `./lib/`) from git-dep resolution (`cyrius deps`). A bare `cyrius deps`
+  leaves a partial `./lib/` that omits the toolchain modules
+  agnosys/sandhi reach into (`slice`, `tls`), and cyrius 6.1.x compiles
+  an unresolved call to a runtime-trapping `ud2` rather than failing the
+  build — so the omission surfaces as a SIGILL, not a link error.
+  `cyrius.lock` now carries 94 hashes (was 3). CI + release workflows
+  updated.
+
+### Migrated
+
+- **`src/admin.cyr` → sandhi server API.** The HTTP server surface was
+  renamed `http_*` → `sandhi_server_*` in the cyrius 6.x stdlib reorg
+  (`http_send_status` → `sandhi_server_send_status`, `http_server_run` →
+  `sandhi_server_run`, etc. — same signatures). The `HTTP_*` status
+  constants are unchanged. The admin/backends bundles carry the new
+  calls; consumers of those profiles must include `lib/sandhi.cyr`.
+- **`src/signed_envelope.cyr`: `ct_eq` → `ct_eq_bytes_lens`.** sigil
+  retired its bundled `ct_eq` at 3.0.2; the constant-time dual-length
+  compare now comes from the stdlib `lib/ct.cyr`. signed/backends
+  consumers must include `lib/ct.cyr`.
+- **Test/fuzz entry-point include surface widened** for the cyrius 6.x
+  stdlib split: `tests/test_backends.tcyr` adds ct/chrono/async/sakshi/
+  dynlib/fdlopen/tls; `tests/test_patra_queue.tcyr` and
+  `fuzz/fuzz_queue.fcyr` add the `thread` (mutex moved off `sync.cyr`'s
+  twin) / `src/metrics.cyr` includes they were transitively relying on.
+
+### Verified
+
+- Core (main.cyr smoke): **150/150**.
+- `tests/test_core.tcyr`: **96/96**.
+- `tests/test_backends.tcyr`: **42/42** — `aes_gcm_roundtrip`,
+  `encrypted_ipc`, `signed_envelope`, and `admin` all green on the
+  sigil 3.7.8 surface under cyrius 6.1.24 (these are exactly the paths
+  that ud2-SIGILL'd before the `ct_eq` / lib-sync fixes).
+- `tests/test_patra_queue.tcyr`: **17/17**.
+- Fuzz (heartbeat/pubsub/queue): clean. Soak (queue/pubsub/relay/
+  heartbeat): clean. All four dist bundles regenerated at v2.4.5.
+
 ## [2.4.4] — 2026-05-11
 
 Cyrius toolchain refresh. No source change; no API, ABI, or
