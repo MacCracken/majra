@@ -2,6 +2,11 @@
 
 Completed items live in [CHANGELOG.md](../../CHANGELOG.md).
 
+## Recently shipped (2.4.6)
+
+- **Cyrius toolchain pin 6.1.24 → 6.1.35** + routine **sigil 3.7.8 → 3.7.10** (latest). No source-logic change; the four dist bundle bodies stay byte-identical (only the version banner moves). agnosys holds at 1.3.2 (transitive via sigil). Full matrix re-ran clean: 305/305 CI + 3/3 fuzz + 4/4 soak under the new pin.
+- **`bigint` dropped from the stdlib surface** — cyrius 6.1.35's stdlib snapshot retired `lib/bigint.cyr` (94 → 88 files). majra never called it (sigil 3.x bundles its own `u256_*` field arithmetic), so the stale `include` in `tests/test_backends.tcyr` and the `[deps] stdlib` hint entry were removed. `cyrius.lock` now carries 88 hashes (was 94).
+
 ## Recently shipped (2.4.5)
 
 - **Cyrius 6.x migration** — toolchain pin 5.10.44 → 6.1.24. The major bump cleared the long-standing sigil crypto-NI blocker: **sigil 2.9.0 → 3.7.8 (latest)**, the first sigil bump since 2.4.0. Under cyrius 6.x the `[rbp-N]` asm-offset SIGILL is gone (sigil's NI asm moved onto the `param_load` pseudo), and transitive **agnosys → 1.3.2** (zero `SYS_OPEN`) resolves the dormant aarch64 cross-build blocker too.

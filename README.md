@@ -217,7 +217,7 @@ Majra was originally a Rust library (v1.0.4, ~13,000 lines). It was ported to Cy
 | Source lines | 12,969 | ~5,500 |
 | Modules | 22 | 22 (QUIC deferred on sigil X25519) |
 | Dependencies | 25 crates | 0 core, 1 optional (sigil) |
-| Toolchain | cargo + rustc + LLVM | cyrius 6.1.24 |
+| Toolchain | cargo + rustc + LLVM | cyrius 6.1.35 |
 
 ## License
 

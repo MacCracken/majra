@@ -58,7 +58,7 @@ Also why `var buf[256000]` bloats the binary by 256 KB — it lives in the data 
 
 **Implication for new majra code**: we still don't write inline asm, but if we ever need a hardware-acceleration hot path, use `param_load` rather than decoding `[rbp-N]` by hand.
 
-**Implication for our deps**: this is why sigil was held at 2.9.0 through the 2.4.x line. As of 2.4.5 (cyrius 6.1.24) sigil's NI dispatch uses `param_load`, so we track **latest (3.7.8)**. Full story in [`dependency-watch.md § sigil`](dependency-watch.md).
+**Implication for our deps**: this is why sigil was held at 2.9.0 through the 2.4.x line. Since 2.4.5 (cyrius 6.x) sigil's NI dispatch uses `param_load`, so we track **latest (3.7.10 as of 2.4.6)**. Full story in [`dependency-watch.md § sigil`](dependency-watch.md).
 
 ### 6. Undefined symbols compile to a runtime `ud2`, not a build error (cyrius 6.1.x)
 
@@ -68,7 +68,7 @@ Also why `var buf[256000]` bloats the binary by 256 KB — it lives in the data 
 
 ### 7. Cyrius 6.x splits stdlib (`lib sync`) from git deps (`deps`); build with `--no-deps`
 
-`cyrius deps` no longer provisions the stdlib — it only resolves `[deps.*]` git deps. The version-pinned stdlib snapshot (94 `.cyr` files, including the toolchain-internal `slice`/`ct`/`chrono`/`async`/`dynlib`/`fdlopen`/`tls` that agnosys/sandhi reach into) is copied into `./lib/` by **`cyrius lib sync`**. Run `lib sync` *before* `deps`.
+`cyrius deps` no longer provisions the stdlib — it only resolves `[deps.*]` git deps. The version-pinned stdlib snapshot (88 `.cyr` files under 6.1.35 — was 94 under 6.1.24; the count tracks the toolchain, e.g. `bigint` was dropped at 6.1.35 — including the toolchain-internal `slice`/`ct`/`chrono`/`async`/`dynlib`/`fdlopen`/`tls` that agnosys/sandhi reach into) is copied into `./lib/` by **`cyrius lib sync`**. Run `lib sync` *before* `deps`.
 
 A `./lib/` that exists fully **shadows** the version snapshot (no per-file fallback), so a partial `./lib/` — e.g. one `cyrius deps` populated without a preceding `lib sync` — is missing `slice.cyr`, and agnosys 1.3.2's slice subscripts then hit quirk #6's `ud2`.
 

@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.6] — 2026-06-11
+
+Cyrius toolchain refresh within the 6.1.x line. Pin **6.1.24 → 6.1.35**,
+and a routine dependency bump **sigil 3.7.8 → 3.7.10** (latest). No
+majra source-logic change; the four distribution bundle bodies are
+byte-identical to 2.4.5 (only the version banner moves). The one
+mechanical adjustment the toolchain forced: `bigint` was dropped from
+the cyrius 6.1.35 stdlib snapshot (94 → 88 files), and majra never
+called it — sigil 3.x bundles its own `u256_*` field arithmetic — so
+its lone stale `include` and the `[deps] stdlib` hint entry were
+removed. All 305 CI assertions + 3 fuzz harnesses + 4 soak suites pass
+under the new toolchain.
+
+### Changed
+
+- **Cyrius toolchain pin 6.1.24 → 6.1.35** (`cyrius.cyml [package].cyrius`).
+  Eleven patch-level cyrius releases of stdlib / codegen fixes pulled in
+  via `cyrius lib sync` + `cyrius deps`.
+- **sigil 3.7.8 → 3.7.10** (`[deps.sigil]`). Routine patch bump now that
+  sigil tracks latest under the cyrius 6.x toolchain (the 2.9.0 asm-NI
+  pin was retired at 2.4.5). Transitive **agnosys holds at 1.3.2**. The
+  four bundle bodies stay byte-identical — sigil's `signed`/`backends`
+  surface is unchanged across 3.7.8 → 3.7.10.
+- **`bigint` removed from the stdlib surface.** The cyrius 6.1.35 stdlib
+  snapshot dropped `lib/bigint.cyr` (snapshot 94 → 88 files). majra had
+  no `big_*` call sites — `tests/test_backends.tcyr` carried a stale
+  `include "lib/bigint.cyr"` (a leftover from before sigil 3.x bundled
+  its own `u256_*` ops) and `cyrius.cyml [deps] stdlib` listed `bigint`
+  as a hint. Both removed; `cyrius deps` no longer errors on the missing
+  module. `cyrius.lock` now carries **88** hashes (was 94).
+
+### Verified
+
+- Core (main.cyr smoke): **150/150**.
+- `tests/test_core.tcyr`: **96/96**.
+- `tests/test_backends.tcyr`: **42/42** — `aes_gcm_roundtrip`,
+  `encrypted_ipc`, `signed_envelope`, `admin` all green on the sigil
+  3.7.10 surface under cyrius 6.1.35.
+- `tests/test_patra_queue.tcyr`: **17/17**.
+- Fuzz (heartbeat/pubsub/queue): clean. Soak (queue/pubsub/relay/
+  heartbeat): clean. All four dist bundles regenerated at v2.4.6
+  (bodies byte-identical to 2.4.5; only the version banner moved).
+
 ## [2.4.5] — 2026-06-10
 
 Cyrius 6.x migration. Toolchain pin **5.10.44 → 6.1.24**, and with the
