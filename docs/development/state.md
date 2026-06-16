@@ -6,7 +6,7 @@ type: state
 
 # Current State — majra
 
-> **Last refresh**: 2026-06-11 (post-2.4.6) | **Refresh cadence**: every release (ideally bumped by the release post-hook).
+> **Last refresh**: 2026-06-15 (post-2.4.7) | **Refresh cadence**: every release (ideally bumped by the release post-hook).
 > **What this file is**: volatile state. The companion `CLAUDE.md` holds durable rules; this file holds whatever drifts release-to-release. Per [first-party-documentation § CLAUDE.md](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/first-party-documentation.md#claudemd), version numbers, test counts, consumer lists, and in-flight work all live here, not in `CLAUDE.md`.
 
 ---
@@ -15,20 +15,20 @@ type: state
 
 | File | Value | Source |
 |---|---|---|
-| `VERSION` | **2.4.6** | single source of truth |
+| `VERSION` | **2.4.7** | single source of truth |
 | `cyrius.cyml [package].version` | `${file:VERSION}` | reads `VERSION` |
-| Latest git tag | `2.4.6` | release workflow asserts `VERSION == tag` |
+| Latest git tag | `2.4.7` | release workflow asserts `VERSION == tag` |
 
 ## Toolchain
 
 | Pin | Value | Source |
 |---|---|---|
-| Cyrius | **6.1.35** | `cyrius.cyml [package].cyrius` |
+| Cyrius | **6.2.11** | `cyrius.cyml [package].cyrius` |
 | cc5_aarch64 cross-build | not wired (no longer blocked — agnosys 1.3.2 dropped the SYS_OPEN bug; now a verification task) |
 
 > **Cyrius 6.x build workflow**: stdlib provisioning split from git-dep
 > resolution. Run `cyrius lib sync` (copies the version-pinned snapshot —
-> 88 files under 6.1.35 — into `./lib/`) **before** `cyrius deps` (overlays the sigil
+> 97 files under 6.2.11 — into `./lib/`) **before** `cyrius deps` (overlays the sigil
 > git dep), and build with `cyrius build --no-deps` so the build's
 > auto-`deps` doesn't perturb the synced lib. A bare `cyrius deps` leaves
 > a partial `./lib/`; cyrius 6.1.x compiles unresolved calls to a
@@ -39,17 +39,17 @@ type: state
 
 | Dep | Resolved version | Pull path | Used by |
 |---|---|---|---|
-| `lib/sigil.cyr` | **3.7.10** (git tag) | `[deps.sigil]` in `cyrius.cyml` → `cyrius deps` | `src/ipc_encrypted.cyr` (AES-256-GCM), `src/signed_envelope.cyr` (Ed25519) |
+| `lib/sigil.cyr` | **3.7.14** (git tag) | `[deps.sigil]` in `cyrius.cyml` → `cyrius deps` | `src/ipc_encrypted.cyr` (AES-256-GCM), `src/signed_envelope.cyr` (Ed25519) |
 | `lib/sandhi.cyr` | (cyrius stdlib snapshot) | `cyrius lib sync` | `src/admin.cyr` (`HTTP_*` consts, `sandhi_server_*` server API) |
 | `lib/ct.cyr` | (cyrius stdlib snapshot) | `cyrius lib sync` | `src/signed_envelope.cyr` (`ct_eq_bytes_lens`); sigil 3.x (retired its bundled `ct_eq` at 3.0.2) |
 | `lib/tls.cyr` | (cyrius stdlib snapshot) | `cyrius lib sync` | transitive — sandhi references `TLS_BACKEND_LIBSSL` at parse time |
 | `lib/patra.cyr` | (cyrius stdlib snapshot) | `cyrius lib sync` | `src/patra_queue.cyr` (durable queue) |
 | `lib/sakshi.cyr` | (cyrius stdlib snapshot) | `cyrius lib sync` | structured logging (pulled by patra; also explicit in backend/patra entry points) |
-| `lib/agnosys.cyr` | **1.3.2** (transitive via sigil 3.7.10) | resolved by `cyrius deps` | not directly called from `src/` — pulled by the sigil dist concat (now uses slice subscripts → needs `lib/slice.cyr`) |
+| `lib/agnosys.cyr` | **1.4.3** (transitive via sigil 3.7.14) | resolved by `cyrius deps` | not directly called from `src/` — pulled by the sigil dist concat (now uses slice subscripts → needs `lib/slice.cyr`) |
 
-Lockfile (`cyrius.lock`) now carries SHA-256 over **88** resolved files (the lib-sync snapshot + the sigil/sakshi/agnosys git deps) — was 94 under 6.1.24, dropped to 88 because cyrius 6.1.35 retired `lib/bigint.cyr` from the stdlib snapshot (majra never called it). CI's `cyrius deps --verify` enforces match.
+Lockfile (`cyrius.lock`) now carries SHA-256 over **97** resolved files (the lib-sync snapshot + the sigil/sakshi/agnosys git deps) — was 88 under 6.1.35; the count grew to 97 because the cyrius 6.2.11 stdlib snapshot ships more `.cyr` files than 6.1.35 did. CI's `cyrius deps --verify` enforces match.
 
-The sigil pin is now **latest (3.7.10)**; the cyrius-5.10.x asm-offset SIGILL that pinned it at 2.9.0 is gone under cyrius 6.x. See [`dependency-watch.md`](dependency-watch.md) for the full bisect history.
+The sigil pin is now **latest (3.7.14)**, which rolls transitive agnosys to **1.4.3**; the cyrius-5.10.x asm-offset SIGILL that pinned sigil at 2.9.0 is gone under cyrius 6.x. See [`dependency-watch.md`](dependency-watch.md) for the full bisect history.
 
 ## Build footprint
 
@@ -73,7 +73,7 @@ The sigil pin is now **latest (3.7.10)**; the cyrius-5.10.x asm-offset SIGILL th
 | Live integration | `tests/test_live.tcyr` | 32 | requires Redis + PostgreSQL running |
 | Fuzz harnesses | `fuzz/*.fcyr` | 3 binaries | 500-iter run × 10s timeout per harness in CI |
 | Benchmarks | `benches/bench_all.bcyr` | 17 targets | history tracked via `bench-history.csv` (gitignored) |
-| Soak | `tests/soak/soak_*.cyr` (4 files) | queue 5k ops, pubsub 2k topics, relay dedup+evict, heartbeat 100×20 + auto-evict | on-demand; all 4 ran clean under 6.1.35 at the 2.4.6 bump |
+| Soak | `tests/soak/soak_*.cyr` (4 files) | queue 5k ops, pubsub 2k topics, relay dedup+evict, heartbeat 100×20 + auto-evict | on-demand; all 4 ran clean under 6.2.11 at the 2.4.7 bump |
 
 ## Distribution bundles (4 profiles)
 
@@ -102,6 +102,7 @@ The sigil pin is now **latest (3.7.10)**; the cyrius-5.10.x asm-offset SIGILL th
 
 | Tag | Date | Headline |
 |---|---|---|
+| 2.4.7 | 2026-06-15 | Cyrius pin 6.1.35 → 6.2.11 (first move onto 6.2.x), sigil 3.7.10 → 3.7.14 (latest). No source-logic change; the four bundle bodies stay byte-identical (only version banner moves). Transitive agnosys 1.3.2 → 1.4.3. The 6.2.x stdlib snapshot grew the lib-sync set 88 → 97 files; `cyrius.lock` now carries 97 hashes. 305/305 + fuzz + soak clean. |
 | 2.4.6 | 2026-06-11 | Cyrius pin 6.1.24 → 6.1.35, sigil 3.7.8 → 3.7.10 (latest). No source-logic change; the four bundle bodies stay byte-identical (only version banner moves). `bigint` retired from the cyrius 6.1.35 stdlib snapshot (94 → 88 files); majra never called it, so the stale `test_backends` include + `[deps] stdlib` hint were removed. agnosys holds 1.3.2. 305/305 + fuzz + soak clean. |
 | 2.4.5 | 2026-06-10 | Cyrius 6.x migration: pin 5.10.44 → 6.1.24, sigil 2.9.0 → 3.7.8 (asm-NI blocker cleared under cyrius 6.x), agnosys → 1.3.2 (aarch64 SYS_OPEN resolved). New `lib sync` + `--no-deps` build workflow. `admin.cyr` ported to `sandhi_server_*`; `signed_envelope.cyr` to `ct_eq_bytes_lens`. 305/305 + fuzz + soak clean. |
 | 2.4.4 | 2026-05-11 | Cyrius toolchain pin 5.10.34 → 5.10.44. No source change; bundle bodies byte-identical (only version banner moved). Sigil held at 2.9.0 — [upstream P1](https://github.com/MacCracken/sigil/blob/main/docs/development/issues/2026-05-10-cyrius-510-asm-stack-frame-drift-breaks-ni-paths.md) still open at sigil 3.1.1. |

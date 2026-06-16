@@ -2,6 +2,10 @@
 
 Completed items live in [CHANGELOG.md](../../CHANGELOG.md).
 
+## Recently shipped (2.4.7)
+
+- **Cyrius toolchain pin 6.1.35 → 6.2.11** (first move onto the 6.2.x line) + routine **sigil 3.7.10 → 3.7.14** (latest). No source-logic change; the four dist bundle bodies stay byte-identical (only the version banner moves). Transitive **agnosys 1.3.2 → 1.4.3** (via sigil). The 6.2.x stdlib snapshot grew the lib-sync set 88 → 97 files; `cyrius.lock` now carries 97 hashes (was 88). Full matrix re-ran clean: 305/305 CI + 3/3 fuzz + 4/4 soak under the new pin.
+
 ## Recently shipped (2.4.6)
 
 - **Cyrius toolchain pin 6.1.24 → 6.1.35** + routine **sigil 3.7.8 → 3.7.10** (latest). No source-logic change; the four dist bundle bodies stay byte-identical (only the version banner moves). agnosys holds at 1.3.2 (transitive via sigil). Full matrix re-ran clean: 305/305 CI + 3/3 fuzz + 4/4 soak under the new pin.

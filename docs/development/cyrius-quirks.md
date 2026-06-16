@@ -68,7 +68,7 @@ Also why `var buf[256000]` bloats the binary by 256 KB — it lives in the data 
 
 ### 7. Cyrius 6.x splits stdlib (`lib sync`) from git deps (`deps`); build with `--no-deps`
 
-`cyrius deps` no longer provisions the stdlib — it only resolves `[deps.*]` git deps. The version-pinned stdlib snapshot (88 `.cyr` files under 6.1.35 — was 94 under 6.1.24; the count tracks the toolchain, e.g. `bigint` was dropped at 6.1.35 — including the toolchain-internal `slice`/`ct`/`chrono`/`async`/`dynlib`/`fdlopen`/`tls` that agnosys/sandhi reach into) is copied into `./lib/` by **`cyrius lib sync`**. Run `lib sync` *before* `deps`.
+`cyrius deps` no longer provisions the stdlib — it only resolves `[deps.*]` git deps. The version-pinned stdlib snapshot (97 `.cyr` files under 6.2.11 — was 88 under 6.1.35, 94 under 6.1.24; the count tracks the toolchain — including the toolchain-internal `slice`/`ct`/`chrono`/`async`/`dynlib`/`fdlopen`/`tls` that agnosys/sandhi reach into) is copied into `./lib/` by **`cyrius lib sync`**. Run `lib sync` *before* `deps`.
 
 A `./lib/` that exists fully **shadows** the version snapshot (no per-file fallback), so a partial `./lib/` — e.g. one `cyrius deps` populated without a preceding `lib sync` — is missing `slice.cyr`, and agnosys 1.3.2's slice subscripts then hit quirk #6's `ud2`.
 

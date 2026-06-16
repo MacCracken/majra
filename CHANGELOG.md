@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.7] — 2026-06-15
+
+Cyrius toolchain minor bump **6.1.35 → 6.2.11** (first move onto the
+6.2.x line) plus a routine dependency bump **sigil 3.7.10 → 3.7.14**
+(latest). No majra source-logic change; the four distribution bundle
+bodies are byte-identical to 2.4.6 (only the version banner moves). The
+6.2.x stdlib snapshot grew the lib-sync set **88 → 97 files**, and
+sigil 3.7.14 rolls transitive **agnosys 1.3.2 → 1.4.3**. All 305 CI
+assertions + 3 fuzz harnesses + 4 soak suites pass under the new
+toolchain.
+
+### Changed
+
+- **Cyrius toolchain pin 6.1.35 → 6.2.11** (`cyrius.cyml [package].cyrius`).
+  First step onto the 6.2.x line; stdlib / codegen fixes pulled in via
+  `cyrius lib sync` + `cyrius deps`. The lib-sync snapshot is now 97
+  `.cyr` files (was 88 under 6.1.35).
+- **sigil 3.7.10 → 3.7.14** (`[deps.sigil]`). Routine patch bump tracking
+  latest. Transitive **agnosys 1.3.2 → 1.4.3**. The four bundle bodies
+  stay byte-identical — sigil's `signed`/`backends` surface is unchanged
+  across 3.7.10 → 3.7.14.
+- **`cyrius.lock`** now carries SHA-256 over **97** resolved files (was
+  88), reflecting the larger 6.2.x stdlib snapshot. CI's
+  `cyrius deps --verify` enforces the match.
+
 ## [2.4.6] — 2026-06-11
 
 Cyrius toolchain refresh within the 6.1.x line. Pin **6.1.24 → 6.1.35**,

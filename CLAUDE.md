@@ -33,7 +33,7 @@ This file (`CLAUDE.md`) is durable rules.
 ## Quick Start
 
 ```bash
-cyrius lib sync                                        # copy version-pinned stdlib snapshot → ./lib/ (88 files under 6.1.35)
+cyrius lib sync                                        # copy version-pinned stdlib snapshot → ./lib/ (97 files under 6.2.11)
 cyrius deps                                            # overlay sigil git dep + write cyrius.lock; run AFTER lib sync
 cyrius build --no-deps src/main.cyr build/majra && ./build/majra        # build + core tests
 cyrius build --no-deps tests/test_backends.tcyr build/test_backends && ./build/test_backends
