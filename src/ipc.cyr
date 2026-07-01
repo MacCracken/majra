@@ -25,7 +25,16 @@ fn _sockaddr_un(path) {
 }
 
 # IPC Server: bind to a Unix socket path, listen.
+# agnos has no AF_UNIX domain sockets — the whole ipc transport fail-closes
+# there (callers fall back to an in-process or network path). Guarding the
+# three connection-establishing fns keeps the raw Linux socket numbers
+# (41/42/43/49/50, which mean sleep_ms/kbscan/spawn_path/... on agnos) off
+# the agnos target.
 fn ipc_bind(path) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return Err(ERR_IPC);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
     var fd = syscall(_SYS_SOCKET, _AF_UNIX, _SOCK_STREAM, 0);
     if (fd < 0) { return Err(ERR_IPC); }
     sys_unlink(path);
@@ -35,23 +44,34 @@ fn ipc_bind(path) {
     ret = syscall(_SYS_LISTEN, fd, 128);
     if (ret < 0) { return Err(ERR_IPC); }
     return Ok(fd);
+    #endif
 }
 
 # Accept a connection. Returns client fd.
 fn ipc_accept(server_fd) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return Err(ERR_IPC);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
     var fd = syscall(_SYS_ACCEPT, server_fd, 0, 0);
     if (fd < 0) { return Err(ERR_IPC); }
     return Ok(fd);
+    #endif
 }
 
 # Connect to a Unix socket path. Returns fd.
 fn ipc_connect(path) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return Err(ERR_IPC);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
     var fd = syscall(_SYS_SOCKET, _AF_UNIX, _SOCK_STREAM, 0);
     if (fd < 0) { return Err(ERR_IPC); }
     var sa = _sockaddr_un(path);
     var ret = syscall(_SYS_CONNECT, fd, sa, 110);
     if (ret < 0) { return Err(ERR_IPC); }
     return Ok(fd);
+    #endif
 }
 
 # Send a length-prefixed frame.

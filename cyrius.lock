@@ -1,3 +1,6 @@
+commit	d3d04d920ca7f4cf2c2b6a4e90842ac7db3d0a4b	sigil	https://github.com/MacCracken/sigil.git	3.7.14
+commit	c64b4b6407dec88558305c410ed38bb6af6a2273	sakshi	https://github.com/MacCracken/sakshi.git	2.3.0
+commit	d3339e6a436f8b526cc0fe9d45368555eae19022	agnosys	https://github.com/MacCracken/agnosys.git	1.4.3
 d9f3b17ddbbe1bba48917c3a679807b01c39c4a1ce776efdbdfbb7a1680e86e4  lib/tagged.cyr
 b0d475d8facaa8ab281bba5d411add5af2bdb595d69f5da28db27cc847ae353a  lib/net.cyr
 e84c090fd0f8532700d967ca3190837780a52a42630f4c6a0a4567ad9a49ab6b  lib/cffi.cyr

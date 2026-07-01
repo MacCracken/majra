@@ -23,16 +23,28 @@ var SYS_GETRANDOM = 318;
 
 # Get current monotonic time in nanoseconds.
 fn time_now_ns() {
+    #ifdef CYRIUS_TARGET_AGNOS
+    # agnos: monotonic uptime in ms (#40); no clock_gettime (228 is out of
+    # the frozen 0-63 range). Coarse (100 Hz tick) but correct.
+    return sys_uptime_ms() * 1000000;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
     var ts[2];
     syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, &ts);
     return load64(&ts) * 1000000000 + load64(&ts + 8);
+    #endif
 }
 
 # Generate a pseudo-UUID (128 random bits) using getrandom syscall.
 # Returns two values: hi in rax, lo via rethi().
 fn uuid_generate() {
     var buf[2];
+    #ifdef CYRIUS_TARGET_AGNOS
+    sys_getrandom(&buf, 16, 0);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
     syscall(SYS_GETRANDOM, &buf, 16, 0);
+    #endif
     var hi = load64(&buf);
     var lo = load64(&buf + 8);
     # Set version 4 (bits 48-51 of hi) and variant 1 (bits 62-63 of lo)

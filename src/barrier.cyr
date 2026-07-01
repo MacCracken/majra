@@ -166,7 +166,11 @@ fn _cbarrier_check_release(state) {
     if (_set_is_superset(arrived, expected) == 1) {
         store64(state + 24, 1);
         store64(state + 32, load64(state + 32) + 1);
+        # agnos: no futex — cooperative waiters spin on the released flag +
+        # sched_yield, so the wake is a no-op (nothing parked to wake).
+        #ifndef CYRIUS_TARGET_AGNOS
         syscall(SYS_FUTEX, state + 32, FUTEX_WAKE, 1000, 0, 0, 0);
+        #endif
         return 1;
     }
     return 0;
@@ -255,7 +259,14 @@ fn cbarrier_arrive_and_wait(cbs, name, participant) {
 
     while (1) {
         if (load64(released_addr) == 1) { return 0; }
+        # agnos: no futex_wait — yield to the cooperative scheduler and
+        # re-check the released flag (spin-yield replaces the parked wait).
+        #ifdef CYRIUS_TARGET_AGNOS
+        sys_sched_yield();
+        #endif
+        #ifndef CYRIUS_TARGET_AGNOS
         syscall(SYS_FUTEX, futex_addr, FUTEX_WAIT, val, 0, 0, 0);
+        #endif
         if (load64(released_addr) == 1) { return 0; }
         val = load64(futex_addr);
     }

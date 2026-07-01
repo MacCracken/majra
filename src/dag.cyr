@@ -255,10 +255,15 @@ fn workflow_execute(def, executor_fn, input) {
                 attempt = attempt + 1;
                 if (attempt <= max_retries) {
                     # Backoff: sleep attempt * 10ms
+                    #ifdef CYRIUS_TARGET_AGNOS
+                    sys_sleep_ms(attempt * 10);
+                    #endif
+                    #ifndef CYRIUS_TARGET_AGNOS
                     var ts[2];
                     store64(&ts, 0);
                     store64(&ts + 8, attempt * 10000000);
                     syscall(35, &ts, 0);
+                    #endif
                 }
             }
 

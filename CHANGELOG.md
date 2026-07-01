@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] — 2026-06-30
+
+**agnos target support for the core pub/sub engine** (base-stack agnos-readiness
+migration, tier 1 — the shared blocker under bote/t-ron/hoosh). majra had **zero**
+`CYRIUS_TARGET_AGNOS` guards, so its core engine failed to compile on `--agnos`
+(`undefined variable SYS_FUTEX`). The core (`dist/majra.cyr`) is now agnos-clean:
+
+- **`barrier.cyr` / `queue.cyr`** — the `futex(FUTEX_WAIT/WAKE)` fast-path (no such
+  syscall on agnos, and `SYS_FUTEX`/`FUTEX_*` are Linux-only stdlib constants) is
+  now `#ifndef CYRIUS_TARGET_AGNOS`-guarded. On agnos the wait becomes a
+  `sys_sched_yield()` spin-yield (cooperative scheduler) and the wake is a no-op —
+  correct producer/consumer + barrier semantics on the single-core model.
+- **`envelope.cyr`** — `time_now_ns` uses `sys_uptime_ms()` (#40, monotonic) on
+  agnos instead of `clock_gettime` (#228, out of the frozen 0-63 range); UUID
+  generation uses `sys_getrandom` (#45) instead of the Linux `getrandom` (#318).
+- **`dag.cyr`** — retry backoff uses `sys_sleep_ms()` (#41) on agnos instead of
+  `nanosleep` (#35, = `sysinfo` on agnos → mis-dispatch).
+- **`ipc.cyr`** — AF_UNIX domain-socket transport (in the core bundle) fail-closes
+  on agnos (`ipc_bind`/`ipc_accept`/`ipc_connect` → `Err(ERR_IPC)`), keeping the raw
+  Linux socket numbers (41/42/43/49/50) off the agnos target.
+
+Toolchain pin `6.2.11` → `6.3.15`. Host build byte-identical (all changes are
+additive `#ifdef` branches). Core dist verified agnos-clean (`SYS_FUTEX`
+references are all `#ifndef`-guarded; no raw `228`/`318`/`35`).
+
+**Known residual (non-core):** `patra_queue.cyr` — the optional persistent-queue
+backend — pulls `patra`, whose `lib/patra.cyr` still references `SYS_LSEEK`
+unguarded on agnos. `patra_queue` is **excluded from the default `dist/majra.cyr`**
+(core) profile, so no consumer that pulls the core engine (bote/t-ron/hoosh) is
+affected; it only blocks a full `--agnos` build of the majra daemon + the
+`backends` profile. Tracked for the patra migration.
+
+### Added
+- agnos (`CYRIUS_TARGET_AGNOS`) support for the core engine (barrier/queue/
+  envelope/dag/ipc): futex→sched_yield, clock→uptime_ms, getrandom→#45,
+  nanosleep→sleep_ms, AF_UNIX IPC fail-closes.
+
+### Changed
+- Toolchain pin `6.2.11` → `6.3.15`.
+
 ## [2.4.7] — 2026-06-15
 
 Cyrius toolchain minor bump **6.1.35 → 6.2.11** (first move onto the

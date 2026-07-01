@@ -126,7 +126,10 @@ fn cpq_enqueue(cpq, item) {
     # Wake one waiter
     store64(cpq + 16, load64(cpq + 16) + 1);
     mutex_unlock(mtx);
+    # agnos: no futex — the cooperative dequeue-waiter spin-yields, so wake is a no-op.
+    #ifndef CYRIUS_TARGET_AGNOS
     syscall(SYS_FUTEX, cpq + 16, FUTEX_WAKE, 1, 0, 0, 0);
+    #endif
 }
 
 fn cpq_dequeue(cpq) {
@@ -149,8 +152,14 @@ fn cpq_dequeue_wait(cpq) {
         }
         var val = load64(cpq + 16);
         mutex_unlock(mtx);
-        # Wait for enqueue notification
+        # Wait for enqueue notification. agnos: no futex_wait — yield to the
+        # cooperative scheduler and re-check (spin-yield replaces the park).
+        #ifdef CYRIUS_TARGET_AGNOS
+        sys_sched_yield();
+        #endif
+        #ifndef CYRIUS_TARGET_AGNOS
         syscall(SYS_FUTEX, cpq + 16, FUTEX_WAIT, val, 0, 0, 0);
+        #endif
     }
 }
 
