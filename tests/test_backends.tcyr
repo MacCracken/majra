@@ -24,6 +24,11 @@ include "lib/fdlopen.cyr"
 include "lib/tls.cyr"
 include "lib/sandhi.cyr"
 
+# keccak / random precede sigil — sigil 3.9.8's ML-DSA + AES-GCM surface
+# references shake256 / `_keccak_*` and `random_bytes` (single-pass fwd-ref).
+include "lib/keccak.cyr"
+include "lib/random.cyr"
+
 # sigil (vendored dist, 2.8.4+) provides AES-256-GCM consumed by ipc_encrypted.
 include "lib/sigil.cyr"
 

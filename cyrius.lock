@@ -1,6 +1,4 @@
-commit	d3d04d920ca7f4cf2c2b6a4e90842ac7db3d0a4b	sigil	https://github.com/MacCracken/sigil.git	3.7.14
-commit	c64b4b6407dec88558305c410ed38bb6af6a2273	sakshi	https://github.com/MacCracken/sakshi.git	2.3.0
-commit	d3339e6a436f8b526cc0fe9d45368555eae19022	agnosys	https://github.com/MacCracken/agnosys.git	1.4.3
+commit	9b28746811cf7fff3dffd44f0b6d21391b1528b9	sakshi	https://github.com/MacCracken/sakshi.git	2.4.3
 d9f3b17ddbbe1bba48917c3a679807b01c39c4a1ce776efdbdfbb7a1680e86e4  lib/tagged.cyr
 d0e618655388c9d43c9927a9f5b306e61cb333546abc166f4f280a25993624f5  lib/net.cyr
 e84c090fd0f8532700d967ca3190837780a52a42630f4c6a0a4567ad9a49ab6b  lib/cffi.cyr
@@ -31,7 +29,7 @@ d5877d16113051fb95dae31717efc679c94b17a34667805b56e52a345bc48f8f  lib/freelist.c
 dc500d517e0896751699302f6d6033b765378576f8e9ac144480262ab4214348  lib/security.cyr
 a8ae4f1396d23bff31a4c22c53be396b4624dcd763f5a9de81d4933a07beae9e  lib/test.cyr
 ac55a4ff22d49ccf6c44893be077e1c824825aed845d82c04767f4f87c29d6da  lib/sync_macos.cyr
-28e06035578fbe26a2e7ab5c9935bc2f076a6c3be6827472720ffefbd72d8829  lib/sakshi.cyr
+8d9395d808648f3112e268086ea2f31e6b2248977b5c3d5fe9ac411c3f3edfb0  lib/sakshi.cyr
 096eabc580c807f3e378fbe56058780a28cdf95b9c70b44672bca0a71cf969f6  lib/ct.cyr
 4ee0e3020c92b50d9bf865bc3e29f6becf8dbcd6b3c83ff2e7638d8d26db055d  lib/log.cyr
 98d1536d5bb355549b7e7be257fb6a5620525f93b447a5a5759b04a0aa053191  lib/dxgi.cyr
@@ -41,7 +39,7 @@ ff14f0d7999956754937f612c0aa60719c138f0967a81019cf99e08aae088087  lib/string.cyr
 27775baa47ce93c372677e36c40cd4761433e724fbecb75c491b5c52d71e8b91  lib/process.cyr
 9a376aec4f3ff245f1ece0ea6f445c74dbbfdd6d8509c29a51d19f2ae3f12674  lib/niyama.cyr
 0d1dc162866327cdea376c2177090cfdfc4779227c15d2da0d04fffc058e738d  lib/alloc.cyr
-806902e333f108f7ff1a79d8d1b3f68ec456ca7f098f5b34b227ee03b3fb1d67  lib/sigil.cyr
+6042b52c3ea4a5cf770ba7c4f8a81eea1fef27d409313e140c1ae9c9526d3c8c  lib/sigil.cyr
 a919dcd91c8a6e572dd22fa52075abb00efa7981ea8d463aa20aa9d1baa9b560  lib/sandhi.cyr
 639aa6feb170319f983df4b39b827f29b26391b55de241c25e711f3880bce0a0  lib/flags.cyr
 e1a1fc06a604cf14c5bd2b5d21dec1e459897f3a8dceb03bcc66de6d178c01a2  lib/syscalls_x86_64_linux.cyr

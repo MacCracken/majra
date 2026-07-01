@@ -167,5 +167,6 @@ stdlib = [
 # surface. See lib/sigil.cyr (bundled dist, ~5.8k lines).
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"
-tag = "3.7.14"
+path = "../sigil"
+tag = "3.9.8"
 modules = ["dist/sigil.cyr"]
