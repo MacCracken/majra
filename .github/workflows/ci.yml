@@ -61,7 +61,7 @@ jobs:
         # Build steps below pass --no-deps so `cyrius build`'s auto-deps
         # doesn't re-resolve and perturb the synced lib's include order.
         run: |
-          cyrius lib sync
+          cyrius lib sync --full
           cyrius deps
 
       - name: Verify dep hashes
@@ -221,7 +221,7 @@ jobs:
         # Cyrius 6.x: stdlib snapshot via `cyrius lib sync`, git deps via
         # `cyrius deps`. See build-and-test "Resolve dependencies".
         run: |
-          cyrius lib sync
+          cyrius lib sync --full
           cyrius deps
 
       - name: Configure PostgreSQL auth

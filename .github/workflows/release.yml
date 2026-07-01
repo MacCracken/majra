@@ -65,7 +65,7 @@ jobs:
         # overlays the [deps.sigil] git dep. A bare `cyrius deps` leaves
         # a partial ./lib/ that ud2-SIGILLs. See ci.yml for detail.
         run: |
-          cyrius lib sync
+          cyrius lib sync --full
           cyrius deps
 
       - name: Verify dep hashes
