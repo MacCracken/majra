@@ -148,12 +148,12 @@ fn _ws_accept_key(client_key) {
 # Send a text frame (unmasked, server->client).
 fn ws_send_text(fd, data, len) {
     if (len < 126) {
-        var hdr[1];
+        var hdr[2];
         store8(&hdr, 0x81);
         store8(&hdr + 1, len);
         syscall(SYS_WRITE, fd, &hdr, 2);
     } elif (len < 65536) {
-        var hdr[2];
+        var hdr[4];
         store8(&hdr, 0x81);
         store8(&hdr + 1, 126);
         store8(&hdr + 2, (len >> 8) & 0xFF);
@@ -174,13 +174,13 @@ fn ws_recv_frame(fd) {
     var payload_len = load8(&hdr + 1) & 0x7F;
 
     if (payload_len == 126) {
-        var ext[1];
+        var ext[2];
         syscall(SYS_READ, fd, &ext, 2);
         payload_len = (load8(&ext) << 8) | load8(&ext + 1);
     }
 
     # Read mask key (4 bytes) if masked
-    var mask[1];
+    var mask[4];
     if (masked == 1) {
         syscall(SYS_READ, fd, &mask, 4);
     }
@@ -213,7 +213,7 @@ fn ws_recv_frame(fd) {
 
 # Send a close frame.
 fn ws_send_close(fd) {
-    var hdr[1];
+    var hdr[2];
     store8(&hdr, 0x88);
     store8(&hdr + 1, 0);
     syscall(SYS_WRITE, fd, &hdr, 2);
@@ -221,7 +221,7 @@ fn ws_send_close(fd) {
 
 # Send a pong frame.
 fn ws_send_pong(fd, data, len) {
-    var hdr[1];
+    var hdr[2];
     store8(&hdr, 0x8A);
     store8(&hdr + 1, len);
     syscall(SYS_WRITE, fd, &hdr, 2);

@@ -193,7 +193,11 @@ fn time_now_ns() {
     return sys_uptime_ms() * 1000000;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var ts[2];
+    # 16 bytes for a struct timespec (2×i64). Function-local `var X[N]` is
+    # N BYTES, so `var ts[2]` = 2 bytes — clock_gettime's 16-byte write
+    # overflowed it. Benign under the pre-6.3.13 shared-global-buffer local
+    # model; a stack smash under 6.3.13+ (locals are stack-allocated).
+    var ts[16];
     syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, &ts);
     return load64(&ts) * 1000000000 + load64(&ts + 8);
     #endif
@@ -202,7 +206,7 @@ fn time_now_ns() {
 # Generate a pseudo-UUID (128 random bits) using getrandom syscall.
 # Returns two values: hi in rax, lo via rethi().
 fn uuid_generate() {
-    var buf[2];
+    var buf[16];   # 16 bytes (128 random bits); `var X[N]` local is N bytes
     #ifdef CYRIUS_TARGET_AGNOS
     sys_getrandom(&buf, 16, 0);
     #endif
@@ -2529,7 +2533,7 @@ fn ipc_connect(path) {
 
 # Send a length-prefixed frame.
 fn ipc_send_frame(fd, data, len) {
-    var hdr[1];
+    var hdr[4];
     store8(&hdr, (len >> 24) & 0xFF);
     store8(&hdr + 1, (len >> 16) & 0xFF);
     store8(&hdr + 2, (len >> 8) & 0xFF);
@@ -2543,7 +2547,7 @@ fn ipc_send_frame(fd, data, len) {
 
 # Receive a length-prefixed frame.
 fn ipc_recv_frame(fd) {
-    var hdr[1];
+    var hdr[4];
     var r = syscall(SYS_READ, fd, &hdr, 4);
     if (r == 0) { return Err(ERR_IPC_CONN_CLOSED); }
     if (r != 4) { return Err(ERR_IPC); }
@@ -3120,7 +3124,7 @@ fn workflow_execute(def, executor_fn, input) {
                     sys_sleep_ms(attempt * 10);
                     #endif
                     #ifndef CYRIUS_TARGET_AGNOS
-                    var ts[2];
+                    var ts[16];   # struct timespec = 2×i64 = 16 bytes (local = N bytes)
                     store64(&ts, 0);
                     store64(&ts + 8, attempt * 10000000);
                     syscall(35, &ts, 0);

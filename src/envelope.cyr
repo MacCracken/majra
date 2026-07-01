@@ -29,7 +29,11 @@ fn time_now_ns() {
     return sys_uptime_ms() * 1000000;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var ts[2];
+    # 16 bytes for a struct timespec (2×i64). Function-local `var X[N]` is
+    # N BYTES, so `var ts[2]` = 2 bytes — clock_gettime's 16-byte write
+    # overflowed it. Benign under the pre-6.3.13 shared-global-buffer local
+    # model; a stack smash under 6.3.13+ (locals are stack-allocated).
+    var ts[16];
     syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, &ts);
     return load64(&ts) * 1000000000 + load64(&ts + 8);
     #endif
@@ -38,7 +42,7 @@ fn time_now_ns() {
 # Generate a pseudo-UUID (128 random bits) using getrandom syscall.
 # Returns two values: hi in rax, lo via rethi().
 fn uuid_generate() {
-    var buf[2];
+    var buf[16];   # 16 bytes (128 random bits); `var X[N]` local is N bytes
     #ifdef CYRIUS_TARGET_AGNOS
     sys_getrandom(&buf, 16, 0);
     #endif

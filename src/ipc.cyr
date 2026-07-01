@@ -76,7 +76,7 @@ fn ipc_connect(path) {
 
 # Send a length-prefixed frame.
 fn ipc_send_frame(fd, data, len) {
-    var hdr[1];
+    var hdr[4];
     store8(&hdr, (len >> 24) & 0xFF);
     store8(&hdr + 1, (len >> 16) & 0xFF);
     store8(&hdr + 2, (len >> 8) & 0xFF);
@@ -90,7 +90,7 @@ fn ipc_send_frame(fd, data, len) {
 
 # Receive a length-prefixed frame.
 fn ipc_recv_frame(fd) {
-    var hdr[1];
+    var hdr[4];
     var r = syscall(SYS_READ, fd, &hdr, 4);
     if (r == 0) { return Err(ERR_IPC_CONN_CLOSED); }
     if (r != 4) { return Err(ERR_IPC); }

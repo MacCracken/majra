@@ -79,7 +79,7 @@ fn _pg_startup() {
 
 # Read a single backend message. Returns {type, data_ptr, data_len} or 0.
 fn _pg_read_msg(fd) {
-    var hdr[2];
+    var hdr[8];
     var n = syscall(SYS_READ, fd, &hdr, 5);
     if (n < 5) { return 0; }
     var msg_type = load8(&hdr);
@@ -129,7 +129,7 @@ fn _pg_send_password(fd, password) {
 
 # Send terminate message
 fn _pg_terminate(fd) {
-    var msg[2];
+    var msg[8];
     store8(&msg, PG_MSG_TERMINATE);
     _pg_write_be32(&msg, 1, 4);
     syscall(SYS_WRITE, fd, &msg, 5);

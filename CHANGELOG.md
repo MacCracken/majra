@@ -37,6 +37,22 @@ unguarded on agnos. `patra_queue` is **excluded from the default `dist/majra.cyr
 affected; it only blocks a full `--agnos` build of the majra daemon + the
 `backends` profile. Tracked for the patra migration.
 
+### Fixed
+- **Undersized array-local buffer overflows (host crash under cyrius ≥ 6.3.13).**
+  Several `var X[N]` locals were too small for the bytes written into them:
+  `var ts[2]` (2 bytes) for a 16-byte `struct timespec` (`envelope.cyr`
+  `time_now_ns`, `dag.cyr` backoff, `main.cyr`), `var buf[2]` for 16 random bytes
+  (`envelope.cyr` `uuid_generate`), and 1-byte frame headers written 2–4 bytes
+  (`ipc.cyr`, `ws.cyr`, `postgres_backend.cyr`). A function-local `var X[N]` is
+  **N bytes**, so these overflowed. It was *latent* before cyrius **6.3.13**, when
+  local arrays lived in a shared global/BSS buffer (the overflow scribbled adjacent
+  globals harmlessly); 6.3.13 moved `var X[N]` locals onto the **thread stack**
+  (with a `PROT_NONE` guard page), so the same overflow now smashes the stack →
+  `SIGSEGV`. Surfaced as a `test_core` segfault in `test_relay_skip_routing` (it
+  calls `time_now_ns`) the moment the pin moved to 6.3.15. Every buffer is now
+  sized to the bytes actually written. `test_core` **96/96**, `test_patra_queue`
+  **17/17** green.
+
 ### Added
 - agnos (`CYRIUS_TARGET_AGNOS`) support for the core engine (barrier/queue/
   envelope/dag/ipc): futex→sched_yield, clock→uptime_ms, getrandom→#45,

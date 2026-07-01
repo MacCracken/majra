@@ -260,7 +260,7 @@ fn test_heartbeat_eviction() {
     hb_register(ht, "n1", 0);
 
     # Sleep 30ms to go offline (offline_after = 20ms)
-    var ts[2];
+    var ts[16];
     store64(&ts, 0);
     store64(&ts + 8, 30000000);
     syscall(35, &ts, 0);
