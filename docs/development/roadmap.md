@@ -2,6 +2,19 @@
 
 Completed items live in [CHANGELOG.md](../../CHANGELOG.md).
 
+## Recently shipped (2.5.1)
+
+- **Cyrius toolchain pin 6.3.15 → 6.4.62** + **sigil 3.9.8 → 3.11.1** (latest). No source-logic change; the four dist bundle bodies stay byte-identical (only the version banner + re-subsetted `.deps` sidecars move). Full matrix re-ran clean: 305/305 CI + 3/3 fuzz + 4/4 soak.
+- **`cyrius lib sync --full` is now load-bearing.** cyrius 6.4.x made bare `lib sync` copy only the declared `[deps].stdlib` subset (40 files); `--full` provisions the whole 99-file snapshot the sigil/sandhi surface needs. CI + release + CLAUDE.md quick-start already/now use `--full`. `cyrius.lock` carries 99 hashes (was 97).
+- **agnosys dropped from the dependency graph** — sigil 3.8.1 internalized its whole trust stack (agnosys → agnodrm), so sigil 3.11.x resolves with no external agnosys dep.
+- **Sigil-footprint review.** majra's entire sigil surface is 6 symbols (`ed25519_*` + `aes_gcm_*`); `core`/`admin` pull none. Evaluated sigil 3.11.0's per-primitive `[lib.<type>]` profiles: kept the full `dist/sigil.cyr` (majra's combined-primitive test needs both, and the narrow ed25519+aes closures overlap on 121 fns), and documented the profiles as the recommendation for single-primitive consumers. Banked sigil 3.9.9's crypto-bank thread-local-slot fix (matters for the sigil+patra `backends` profile). See [`dependency-watch.md`](dependency-watch.md).
+- **Fixed latent undersized `var X[N]` buffers in the test/soak harnesses** — the 2.5.0 audit fixed `src/` but missed the non-CI files. `soak_heartbeat` phase B was silently failing (`var ts[2]` holding a 16-byte timespec); resized `ts`/`key`/`nonce`/`buf` in `soak_heartbeat.cyr`, `test_core.tcyr`, `test_backends.tcyr`. Soak now 4/4 (was 3/4).
+
+## Recently shipped (2.5.0)
+
+- **agnos-target support for the core pub/sub engine** — `barrier`/`queue`/`envelope`/`dag`/`ipc` gained `#ifdef CYRIUS_TARGET_AGNOS` guards (futex→sched_yield, clock→uptime_ms, getrandom→#45, nanosleep→sleep_ms, AF_UNIX IPC fail-closes). Core `dist/majra.cyr` is agnos-clean. Cyrius pin 6.2.11 → 6.3.15.
+- **Fixed undersized array-local buffer overflows in `src/`** (host crash under cyrius ≥ 6.3.13, which moved `var X[N]` locals onto the guarded thread stack) — `envelope.cyr`/`dag.cyr`/`main.cyr` timespecs, `ipc.cyr`/`ws.cyr`/`postgres_backend.cyr` frame headers. *(The 2.5.1 fix above closes the sibling test/soak-file instances this pass missed.)*
+
 ## Recently shipped (2.4.7)
 
 - **Cyrius toolchain pin 6.1.35 → 6.2.11** (first move onto the 6.2.x line) + routine **sigil 3.7.10 → 3.7.14** (latest). No source-logic change; the four dist bundle bodies stay byte-identical (only the version banner moves). Transitive **agnosys 1.3.2 → 1.4.3** (via sigil). The 6.2.x stdlib snapshot grew the lib-sync set 88 → 97 files; `cyrius.lock` now carries 97 hashes (was 88). Full matrix re-ran clean: 305/305 CI + 3/3 fuzz + 4/4 soak under the new pin.

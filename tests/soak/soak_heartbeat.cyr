@@ -106,7 +106,7 @@ fn main() {
         return 1;
     }
     # Sleep 30ms to go offline
-    var ts[2];
+    var ts[16];   # struct timespec = 2×i64 = 16 bytes (local var[N] is N bytes)
     store64(&ts, 0);
     store64(&ts + 8, 30000000);
     syscall(35, &ts, 0);

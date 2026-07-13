@@ -91,7 +91,7 @@ fn test_sha1() {
 }
 
 fn test_encrypted_ipc() {
-    var key[4];
+    var key[32];   # AES-256 key = 32 bytes (local var[N] is N bytes)
     memset(&key, 42, 32);
     var eipc = encrypted_ipc_new(0, &key);
     assert_eq(encrypted_ipc_messages_sent(eipc), 0, "eipc 0 msgs");
@@ -163,9 +163,9 @@ fn test_aes_gcm_roundtrip() {
     # This is the crypto path used by encrypted_ipc_send/recv.
     aes_gcm_global_init();
 
-    var key[4];
+    var key[32];   # AES-256 key = 32 bytes (local var[N] is N bytes)
     memset(&key, 0x42, 32);
-    var nonce[2];
+    var nonce[12];   # AES-GCM nonce = 12 bytes
     memset(&nonce, 0x55, 12);
 
     var pt = "hello majra encrypted ipc";
@@ -245,7 +245,7 @@ fn test_redis_resp() {
 }
 
 fn test_pg_wire() {
-    var buf[2];
+    var buf[4];   # be32 write = 4 bytes (local var[N] is N bytes)
     _pg_write_be32(&buf, 0, 0x01020304);
     assert_eq(_pg_read_be32(&buf, 0), 0x01020304, "pg be32 roundtrip");
 

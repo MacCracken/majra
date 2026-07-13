@@ -490,7 +490,7 @@ fn test_circuit_breaker_lifecycle() {
     assert_eq(circuit_state(cb), CIRCUIT_OPEN, "cb open after 3 failures");
 
     # Wait for cooldown (50ms)
-    var ts[2];
+    var ts[16];   # struct timespec = 2×i64 = 16 bytes (local var[N] is N bytes)
     store64(&ts, 0); store64(&ts + 8, 60000000);
     syscall(35, &ts, 0);
 

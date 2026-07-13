@@ -44,13 +44,16 @@ cyrius 5.4.14+ added `map_new_str()` + content-derived `hash_str_v` to fix a `St
 
 Picking the wrong one compiles cleanly but corrupts at runtime via silent collisions. Match the key type at the call site.
 
-### 4. `var buf[N]` inside fns is static, not stack
+### 4. `var buf[N]` sizing: **locals are N bytes, globals are N×8 bytes**
 
-Function-scoped `var buf[256]` looks like a stack allocation but is emitted as static data — consecutive calls share the backing memory. Any `Str` or pointer returned from the fn that borrows into `buf` is invalidated by the next call.
+Two different rules — this asymmetry bit the 2.5.0 + 2.5.1 buffer audits and misleads first-read reviewers (verified empirically, cyrius 6.4.62):
 
-**Pattern**: heap-allocate (`fl_alloc(N)` or `alloc(N)`) anything you intend to return out of the fn. Use `var buf[N]` only for true scratch consumed before the next call could happen.
+- **Function-local `var buf[N]` = N bytes.** A byte-sized scratch buffer. A 16-byte `struct timespec` needs `var ts[16]`, not `var ts[2]` (= 2 bytes → overflow). Confirmed: `soak_heartbeat` phase B silently corrupted its node count until `var ts[2]`→`var ts[16]` (CHANGELOG 2.5.1); likewise `key[32]` (AES-256), `nonce[12]` (GCM IV), `buf[4]` (be32).
+- **Module-level / global `var buf[N]` = N × 8 bytes** (N `i64` slots in the data segment). So a global `var _resp_buf[512]` genuinely holds **4096** bytes and `var _err_msg_buf[64]` holds 512 — byte-indexed access (`store8(&buf + pos, …)`) up to those larger bounds is in-range. **Compute a global's real capacity as `N*8` before "fixing" it**: `redis_backend.cyr`'s `while (pos < 4088)` loop over global `var _resp_buf[512]` (= 4096 B) is correct, *not* an overflow — a naive N-bytes reading flags a false positive here.
 
-Also why `var buf[256000]` bloats the binary by 256 KB — it lives in the data segment.
+**Location (since cyrius 6.3.13):** function-local `var buf[N]` now lives on the **guarded thread stack** — an overflow SIGSEGVs against a `PROT_NONE` guard page instead of silently scribbling adjacent globals (pre-6.3.13 locals were static data; that's why the undersized-buffer class went latent for so long, then turned into hard crashes at the 6.3.13 pin). Module-level `var buf[N]` is still static data-segment storage shared across the program.
+
+**Pattern**: heap-allocate (`fl_alloc(N)` / `alloc(N)`) anything you return out of a fn; a `Str`/pointer borrowing into a **global** scratch buffer is invalidated by the next writer, so use `var buf[N]` only for scratch consumed before the next write.
 
 ### 5. Inline-asm parameter loads were fragile pre-6.x — `param_load` pseudo fixes it
 

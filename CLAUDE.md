@@ -33,7 +33,7 @@ This file (`CLAUDE.md`) is durable rules.
 ## Quick Start
 
 ```bash
-cyrius lib sync                                        # copy version-pinned stdlib snapshot → ./lib/ (97 files under 6.2.11)
+cyrius lib sync --full                                 # copy full version-pinned stdlib snapshot → ./lib/ (99 files under 6.4.62; --full is load-bearing since 6.4.x — bare `lib sync` copies only the [deps].stdlib subset)
 cyrius deps                                            # overlay sigil git dep + write cyrius.lock; run AFTER lib sync
 cyrius build --no-deps src/main.cyr build/majra && ./build/majra        # build + core tests
 cyrius build --no-deps tests/test_backends.tcyr build/test_backends && ./build/test_backends
@@ -42,15 +42,16 @@ cyrius audit                                           # full: self-host, test, 
 ```
 
 > **Cyrius 6.x build workflow (since 2.4.5).** Stdlib provisioning and
-> git-dep resolution are separate steps: `cyrius lib sync` populates
+> git-dep resolution are separate steps: `cyrius lib sync --full` populates
 > `./lib/` from the version-pinned snapshot (the toolchain modules
-> sigil/sandhi/agnosys reach into — `slice`, `tls`, `ct`, `chrono`,
-> `async`, `sakshi`, `dynlib`, `fdlopen`), then `cyrius deps` overlays
-> the sigil git dep. Build with `--no-deps` so the build's auto-`deps`
-> doesn't re-resolve and perturb the synced lib's include order. A bare
-> `cyrius deps` leaves a partial `./lib/`; cyrius 6.1.x compiles an
-> unresolved call to a runtime-trapping `ud2`, so a missing toolchain
-> module surfaces as a **SIGILL at runtime, not a build error**.
+> sigil/sandhi reach into — `slice`, `tls`, `ct`, `chrono`, `async`,
+> `sakshi`, `dynlib`, `fdlopen`, `keccak`, `random`), then `cyrius deps`
+> overlays the sigil git dep. **`--full` is load-bearing since cyrius 6.4.x**:
+> a bare `cyrius lib sync` copies only the declared `[deps].stdlib` subset
+> and omits those toolchain modules. Build with `--no-deps` so the build's
+> auto-`deps` doesn't re-resolve and perturb the synced lib's include order.
+> A missing toolchain module compiles to a runtime-trapping `ud2`, so it
+> surfaces as a **SIGILL at runtime, not a build error**.
 
 Full test matrix + soak + fuzz + bench commands in [`docs/guides/testing.md`](docs/guides/testing.md).
 
@@ -113,7 +114,7 @@ Subset of P(-1) — same shape, lighter touch:
 4. Doc sync — CHANGELOG stanza, roadmap "Recently shipped" update, state.md refresh, doc-health.md sweep.
 5. Bundle regen — all four `cyrius distlib` profiles.
 6. Version verify — `VERSION`, `cyrius.cyml`, CHANGELOG header, intended git tag all match.
-7. Clean build — `rm -rf build lib && cyrius deps && cyrius build src/main.cyr build/majra` passes from cold.
+7. Clean build — `rm -rf build lib && cyrius lib sync --full && cyrius deps && cyrius build --no-deps src/main.cyr build/majra` passes from cold.
 
 ### Distribution Contract
 

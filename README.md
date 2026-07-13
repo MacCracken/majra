@@ -4,7 +4,7 @@
 
 Majra provides shared messaging primitives for the [AGNOS](https://github.com/MacCracken) ecosystem, eliminating duplicate pub/sub, queue, relay, and heartbeat implementations across [AgnosAI](https://github.com/MacCracken/agnosai), [Ifran](https://github.com/MacCracken/synapse), [SecureYeoman](https://github.com/MacCracken/secureyeoman), and [daimon](https://github.com/agnostos/daimon).
 
-**Written in [Cyrius](https://github.com/MacCracken/cyrius)** — compiles to a statically linked binary via `cyrius build`. Optional crypto surface (signed envelopes, encrypted IPC) pulls [sigil](https://github.com/MacCracken/sigil) ≥ 3.7.8; the core profile has no external deps.
+**Written in [Cyrius](https://github.com/MacCracken/cyrius)** — compiles to a statically linked binary via `cyrius build`. Optional crypto surface (signed envelopes, encrypted IPC) pulls [sigil](https://github.com/MacCracken/sigil) ≥ 3.11.1; the core profile has no external deps.
 
 ## Modules
 
@@ -196,7 +196,7 @@ modules = ["dist/majra-admin.cyr"]     # core + HTTP admin/metrics endpoint
 modules = ["dist/majra-backends.cyr"]  # everything: all profiles + redis/pg/ws/encrypted IPC/patra_queue
 ```
 
-`cyrius deps` resolves the tag, copies the chosen bundle into `lib/majra_majra.cyr`, and you `include` it from your entry point. `majra-signed` and `majra-backends` require sigil ≥ 3.7.8 as a sibling dep, plus the stdlib `lib/ct.cyr` (constant-time compare) and — for `majra-admin`/`majra-backends` — `lib/sandhi.cyr` (the `sandhi_server_*` HTTP surface).
+`cyrius deps` resolves the tag, copies the chosen bundle into `lib/majra_majra.cyr`, and you `include` it from your entry point. `majra-signed` and `majra-backends` require sigil ≥ 3.11.1 as a sibling dep, plus the stdlib `lib/ct.cyr` (constant-time compare) and — for `majra-admin`/`majra-backends` — `lib/sandhi.cyr` (the `sandhi_server_*` HTTP surface). A `signed`-only consumer can pull sigil's per-primitive `dist/sigil-ed25519.cyr` profile (~2k lines) instead of the full crypto bundle.
 
 ## Ecosystem
 
@@ -217,7 +217,7 @@ Majra was originally a Rust library (v1.0.4, ~13,000 lines). It was ported to Cy
 | Source lines | 12,969 | ~5,500 |
 | Modules | 22 | 22 (QUIC deferred on sigil X25519) |
 | Dependencies | 25 crates | 0 core, 1 optional (sigil) |
-| Toolchain | cargo + rustc + LLVM | cyrius 6.2.11 |
+| Toolchain | cargo + rustc + LLVM | cyrius 6.4.62 |
 
 ## License
 

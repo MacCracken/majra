@@ -5,6 +5,75 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.1] — 2026-07-13
+
+**Toolchain pin `6.3.15` → `6.4.62` + sigil `3.9.8` → `3.11.1` (latest) + a
+sigil-footprint review.** No majra source-logic change: the four dist bundle
+**bodies stay byte-identical** (only the version banner moves 2.5.0 → 2.5.1).
+Full matrix re-ran clean under the new pin — **305/305 CI** (150 core + 96
+expanded + 42 backends + 17 patra_queue) + **3/3 fuzz** + **4/4 soak**.
+
+The cyrius 6.3.15 → 6.4.62 span is almost entirely agnos syscall wrappers,
+the async-runtime target split, and DX diagnostics — nothing touching majra's
+surface. Two toolchain changes are visible in-tree:
+- **`cyrius lib sync` default is now the declared `[deps].stdlib` *subset*
+  (40 files); the whole snapshot is `--full` (99 files).** CI + release
+  already invoke `cyrius lib sync --full`; the CLAUDE.md quick-start was
+  corrected to match. `cyrius.lock` carries **99** resolved-file hashes.
+- **Per-profile `distlib` `.deps` sidecars re-subsetted** (cyrius 6.4.48 fix +
+  the 6.3.32 built-in `std` group). The three profile sidecars drop `fmt`/
+  `syscalls` (now implied by the always-resolved `std` group) and `assert`
+  (test-only, unreferenced by the bundles); `signed`/`admin` additionally drop
+  `alloc`, while `backends` keeps `alloc` (referenced directly by its extra
+  modules). The `.cyr` bodies are unchanged; regeneration is idempotent, so
+  the CI freshness gate stays green.
+
+### Sigil-footprint review (`[lib.<type>]` per-primitive profiles)
+sigil 3.11.0 added twelve per-primitive `[lib.<type>]` distlib profiles
+("pull only the crypto you need"). majra's **entire** sigil surface is six
+symbols — `ed25519_{init,sign,verify}` (`src/signed_envelope.cyr`) and
+`aes_gcm_{global_init,encrypt,decrypt}` (`src/ipc_encrypted.cyr`); the
+constant-time pk compare is stdlib `ct_eq_bytes_lens`, **not** sigil. The
+`core` and `admin` profiles correctly pull **no** sigil.
+- **majra keeps the full `dist/sigil.cyr`.** Its only local sigil consumer
+  (`tests/test_backends.tcyr`) exercises *both* primitives, and the two narrow
+  closures `sigil-ed25519.cyr` + `sigil-aes.cyr` (~2k lines each) **overlap on
+  121 functions** (Ed25519 uses SHA-512 internally; both share sigil's u256
+  field arithmetic + crypto-scratch + random floor). Combined they emit 121
+  "last-definition-wins" duplicate-fn warnings — noisier and more fragile than
+  the full bundle's single *deduplicated* closure (which resolves clean). sigil
+  publishes no `dist/sigil/index.cyml`, so the clean `modular = [...]` dedup
+  path is unavailable. The per-primitive win is real only for a **single**-
+  primitive consumer — a `signed`-only downstream (e.g. secureyeoman) should
+  pull `dist/sigil-ed25519.cyr` (~2k lines) instead of the full 25,391-line
+  bundle. Recorded in [`dependency-watch.md`](docs/development/dependency-watch.md).
+- The bump also banks sigil **3.9.9**'s crypto-bank thread-local-slot fix
+  (`_SIGIL_CBANK_SLOT` moved 0 → 8): slot 0 collided with **patra**'s SQL
+  scratch slot, corrupting state in a process that links *both* — exactly the
+  `backends` profile (sigil crypto + `patra_queue`).
+
+### Fixed
+- **Undersized `var X[N]` buffers in the test/soak harnesses (same class the
+  2.5.0 audit fixed in `src/`, missed in the non-CI files).** A function-local
+  `var X[N]` is **N bytes**, so a 16-byte `struct timespec` written into
+  `var ts[2]` (2 bytes) overflows. Since cyrius 6.3.13 moved `var X[N]` locals
+  onto the guarded thread stack, `tests/soak/soak_heartbeat.cyr`'s phase-B
+  offline-eviction sleep was silently corrupting its own node count →
+  **`FAIL B: nodes prematurely evicted after cycle 1`** (the soak set is not in
+  the default CI pass, so it went uncaught at 2.5.0 despite already being live
+  at 6.3.15). Every over-written buffer is now sized to the bytes it holds:
+  `soak_heartbeat.cyr` + `test_core.tcyr` `ts[2]→ts[16]`; `test_backends.tcyr`
+  `key[4]→key[32]` (×2), `nonce[2]→nonce[12]`, `buf[2]→buf[4]`. All four soak
+  suites now pass (was 3/4). An adversarial review pass empirically pinned the
+  underlying rule and corrected [`cyrius-quirks.md`](docs/development/cyrius-quirks.md) §4:
+  a **function-local** `var buf[N]` is **N bytes**, but a **module-level/global**
+  `var buf[N]` is **N × 8 bytes** (N `i64` slots) — so the shipped globals
+  (`redis_backend.cyr` `_resp_buf[512]` = 4096 B, `error.cyr` `_err_msg_buf[64]`
+  = 512 B) are correctly sized and were *not* touched.
+
+### Changed
+- Toolchain pin `6.3.15` → `6.4.62`; `[deps.sigil]` tag `3.9.8` → `3.11.1`.
+
 ## [2.5.0] — 2026-06-30
 
 **agnos target support for the core pub/sub engine** (base-stack agnos-readiness
