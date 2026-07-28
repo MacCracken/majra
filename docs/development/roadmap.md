@@ -2,6 +2,21 @@
 
 Completed items live in [CHANGELOG.md](../../CHANGELOG.md).
 
+## Recently shipped (2.5.3)
+
+- **Two silent data-loss races fixed, both rooted in `fl_alloc` being unsynchronized while `alloc` is not** (see [`cyrius-quirks.md`](cyrius-quirks.md) §8). Concurrent `pubsub_subscribe` handed 1-7 callers per 800 a channel that no subscriber entry pointed at — their `chan_recv` blocked forever, and the delivered count hid it. Concurrent `mq_enqueue` lost 4-12 jobs per 800 to duplicate job keys (`_next_job_key()` did an unlocked read-modify-write). Both fixed by taking the object's mutex *before* allocating; both now have regression tests.
+- **Head-of-line blocking fixed.** `pubsub_publish` held the hub mutex across a blocking `chan_send`, so a single lagging consumer froze publishes to every other topic and blocked `pubsub_subscribe` outright (4.7us → 213ms worst on an unrelated, empty topic). Publish now snapshots each subscriber list under one short lock and sends unlocked. `hashed_channel_send` had the same shape.
+- **Wildcard matching is level-aligned (security).** `#`/`+` were honored mid-token, so `"tenant-a#"` matched `"tenant-a-evil/secret"` — a namespace-isolation bypass, since `namespace_wildcard()` builds `"<prefix>/#"`. Also made `"<prefix>/#"` match the bare `"<prefix>"` per MQTT-3.1.1 §4.7.1.2. **Behavior change** — see the CHANGELOG's semver note.
+- **Expanded suite 96 → 112 assertions**; CI total 305 → 321. The new tests are the probes that reproduced each bug, kept in-tree.
+- **No perf regression >10%** after two optimization passes — the naive correct version cost +110% on `pattern_exact` and +40% on `pubsub_publish_nosub`.
+
+## Recently shipped (2.5.2)
+
+- **Cyrius toolchain pin 6.4.62 → 6.4.83** + **sigil 3.11.1 → 3.12.1** (latest). No source-logic change; the four dist bundle bodies stay byte-identical (the whole `dist/` diff is four banner lines — the `.deps` sidecars regenerate unchanged). Full matrix re-ran clean: 305/305 CI + 3/3 fuzz + 4/4 soak + 17/17 bench. The lib-sync snapshot holds at 99 files and `cyrius.lock` at 99 hashes + 1 commit-pin across the span.
+- **sakshi pinned forward 2.4.3 → 2.4.6 via a new explicit `[deps.sakshi]` block.** sakshi is transitive (patra + sigil reach it; majra's `src/` never calls it), but sigil's own manifest pins `2.4.3` and `cyrius deps` overlays that *on top of* the snapshot's 2.4.6 — a silent downgrade whose only signal was the `./lib/ shadows version-pinned …` warning. Declaring it at the top level pins the resolution forward. Picks up sakshi 2.4.4's additive 128-bit W3C trace-id API and 2.4.5's agnos `_sk_open` `O_RDWR` read-path fix. See [`dependency-watch.md`](dependency-watch.md).
+- **Fixed `cyrius bench` / `cyrius audit` on `benches/bench_all.bcyr`.** Both inject the manifest `[deps].stdlib` set (which includes `tls`/`sandhi`) into the unit, but the bench entry point included neither `fdlopen` (called by `lib/tls.cyr`) nor `async` (called by sandhi) — so the driver refused to emit, and `cyrius bench` reported `0 passed, 1 failed` without running anything. Added the same explicit toolchain includes the test entry points carry. Pre-existing, not a 6.4.83 regression (reproduced at the 2.5.1 state under `CYRIUS_HOME=6.4.62`); CI was unaffected because it builds benches with `--no-deps`.
+- **Benchmark regression check, done properly.** 17 targets × 7 trials on each pin, compared on min *and* median: every delta within ±3.4%, none over the 10% flag threshold. Single-run comparison had suggested +24% / +13% outliers that were pure noise.
+
 ## Recently shipped (2.5.1)
 
 - **Cyrius toolchain pin 6.3.15 → 6.4.62** + **sigil 3.9.8 → 3.11.1** (latest). No source-logic change; the four dist bundle bodies stay byte-identical (only the version banner + re-subsetted `.deps` sidecars move). Full matrix re-ran clean: 305/305 CI + 3/3 fuzz + 4/4 soak.

@@ -12,7 +12,8 @@ consumer's code.
 pinned in `[deps.sigil]`) is the sole crypto implementation. AES-256-GCM,
 Ed25519, HMAC-SHA256, HKDF all live there. sigil's own `docs/audit/` directory
 documents its crypto audit surface. See [`dependency-watch.md`](dependency-watch.md)
-for the rationale on the current sigil 3.7.8 pin (latest, since the 2.4.5 cyrius 6.x migration).
+for the rationale on the current sigil 3.12.1 pin (latest, and tracking latest since the
+2.4.5 cyrius 6.x migration cleared the asm-offset blocker).
 
 ## Attack Surface
 
@@ -50,7 +51,7 @@ Mitigations:
 ## Supply Chain
 
 - **Zero external dependencies for the core profile** — `dist/majra.cyr` uses only the Cyrius stdlib (resolved into `lib/` by `cyrius deps` from the version pinned in `cyrius.cyml`; `lib/` itself is gitignored, repopulated on every CI run + every developer build)
-- **One first-party dep for the richer profiles** — `sigil` (resolved into `lib/sigil.cyr` via `[deps.sigil]` in `cyrius.cyml`; `cyrius.lock` carries a SHA-256 over the resolved file and CI's `cyrius deps --verify` enforces hash match). sigil is in the same organization, bootstrapped from the same compiler, audited as part of the AGNOS crypto boundary
+- **Two first-party deps for the richer profiles** — `sigil` (the crypto boundary, resolved into `lib/sigil.cyr` via `[deps.sigil]`) and `sakshi` (structured logging, resolved into `lib/sakshi.cyr` via `[deps.sakshi]`; declared since 2.5.2 to pin a resolution that would otherwise be inherited — and silently downgraded — from sigil's own manifest). `cyrius.lock` carries a SHA-256 over every resolved file plus a commit-pin for sakshi, and CI's `cyrius deps --verify` enforces hash match. Both are in the same organization, bootstrapped from the same compiler; sigil is audited as part of the AGNOS crypto boundary. **Version-pinning note**: a transitive dep whose version is inherited from another dep's manifest is not pinned by majra — declaring it top-level is what makes the resolved bytes reviewable here
 - **No package manager** — no supply chain attack vector via crate registries
 - **Compiler is self-hosting** — Cyrius bootstraps from a 29 KB seed binary
 - **Byte-identical verification** — compiler self-compilation produces identical output

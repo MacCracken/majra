@@ -5,6 +5,230 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.3] — 2026-07-28
+
+**Two silent data-loss races and a namespace-isolation bypass in the routing
+core.** This is the first release in the 2.5 line to change `src/` logic — all
+four dist bundle bodies move. Every fix below was reproduced with a probe
+before the change and re-run after: the probes are the acceptance criteria, and
+the durable ones are now in-tree as regression assertions. **321/321 CI**
+(150 core + **112** expanded, up from 96 + 42 backends + 17 patra_queue) +
+3/3 fuzz + 4/4 soak + **36/36 live**.
+
+The trigger was a third-party report that "majra's pubsub subscribe path is
+broken", filed with no repro. It was right, for a reason the reporter didn't
+identify — and the same root cause was also eating queue jobs.
+
+### Fixed
+- **`pubsub_subscribe` could hand a caller a channel that was never registered
+  (silent, ~0.1-0.9% under contention).** All three subscribe entry points ran
+  `chan_new` + `_sub_new` **before** taking the hub mutex. `chan_new` is safe —
+  it uses `alloc`, which carries a CAS spinlock — but `_sub_new` uses
+  `fl_alloc`, and `lib/freelist.cyr` pops its size-class free list with a plain
+  load/store pair and **no lock at all**. Two concurrent subscribers could
+  therefore be handed the *same* 16-byte subscriber block; both wrote it, the
+  vec received the same pointer twice, and one caller walked away with a live
+  channel that no subscriber entry pointed at. That caller's `chan_recv` blocks
+  **forever**, and `pubsub_publish` counted the aliased subscriber twice so the
+  delivered count concealed it. Measured: **1-7 orphaned channels per 800**
+  concurrent subscribes, 5 of 8 runs affected; **0 across 10 runs** after
+  moving the lock above the allocations. Regression test:
+  `test_pubsub_concurrent_subscribe`.
+- **`mq_enqueue` silently lost jobs under concurrency — the same class, worse
+  blast radius.** It performed `queue_item_new` (an `fl_alloc`), `_next_job_key()`,
+  and `fl_alloc(72)` all before locking, and `_next_job_key()` increments the
+  `_mq_next_job_id` global with a plain read-modify-write. Two enqueues could
+  take the **same job key**, and the second `map_set` overwrote the first job
+  with no error anywhere. Measured: **788-796 of 800** jobs surviving, 3 of 6
+  runs affected; **800/800 across 6 runs** after extending the existing mutex to
+  cover key generation and both allocations. Regression test:
+  `test_managed_queue_concurrent_enqueue`.
+- **A lagging subscriber froze the entire hub, including unrelated topics and
+  `pubsub_subscribe` itself.** `pubsub_publish` held the hub mutex across
+  `chan_send`, which **blocks** when a subscriber's 64-slot channel is full — so
+  the publisher parked inside the critical section. Publishes to other topics
+  with empty channels blocked; `pubsub_subscribe` on a brand-new topic blocked.
+  Measured behind a single slow-but-well-behaved consumer: publish latency on an
+  unrelated, always-empty topic went **4.7us → 10.7ms avg / 213ms worst**, versus
+  the ~1us/op in `docs/architecture/overview.md`. Publish now snapshots each
+  subscriber list as a `(data, len)` pair under one short lock and walks it
+  unlocked — safe because `vec_push` grows into a *new* bump-allocated buffer
+  and never frees the old one, and pushes only append. `hashed_channel_send` had
+  the identical shape and got the same treatment. Regression test:
+  `test_pubsub_no_head_of_line_block` (it hangs rather than fails if this
+  regresses — the honest signal for a liveness bug).
+- **`pubsub_publish` over-reported `delivered` on closed channels.**
+  `chan_send` returns −1 for a closed channel; the count incremented anyway.
+  Now only a `chan_send` returning 0 counts.
+
+### Changed — pattern matching (behavior change, read this)
+- **`#` and `+` are now honored only when they occupy a whole level.**
+  Previously both were matched anywhere in a token, so a pattern could escape
+  its namespace prefix: **`"tenant-a#"` matched `"tenant-a-evil/secret"`** and
+  `"sensors/temp+"` matched `"sensors/temperature"`. `namespace_wildcard(ns)`
+  builds exactly `"<prefix>/#"`, so a single dropped `/` turned tenant isolation
+  into a prefix scan over other tenants. `#` must additionally be the final
+  character (MQTT-3.1.1 §4.7.1.2); anywhere else it is now a literal byte.
+- **`"<prefix>/#"` now also matches the bare topic `"<prefix>"`**, per
+  MQTT-3.1.1 §4.7.1.2 ("`sport/#` also matches the singular `sport`, since `#`
+  includes the parent level"). Previously it did not.
+- These two items **change matching semantics**, which `docs/development/semver.md`
+  treats as off-limits for a PATCH. They ship in a patch anyway because the old
+  behavior is a defect against the module's own documented "MQTT-style" contract
+  and the first item is a security bug — but a consumer that (deliberately or
+  accidentally) relied on mid-token wildcards will see subscriptions stop
+  matching. 8 new assertions in `test_pubsub_pattern_matching_extended` pin the
+  new semantics.
+
+### Performance
+- **Net neutral after two optimization passes; no regression >10%.** 17 targets
+  × 7 trials, pre-fix vs post-fix, compared on min *and* median. The naive
+  correct version cost **+110% on `pattern_exact`** and **+40% on
+  `pubsub_publish_nosub`** — the former from computing wildcard alignment on
+  every character, the latter from a `map_get` (string hash) per loop iteration.
+  Both were restructured: alignment is checked inside each wildcard branch so a
+  literal byte costs what it always did, and publish snapshots once instead of
+  re-resolving the map per subscriber. Final: `pattern_exact` **−2.4%**,
+  `pubsub_publish_nosub` **+0.3%**, `pubsub_1sub_publish` **+0.3%**. The one
+  residual is `pattern_wildcard_#` at **+4ns** (+8.9% min / +11.1% median) —
+  that is the level-alignment check itself, and it is the price of the
+  isolation fix.
+
+### Distribution
+- All four bundle **bodies** change (first `src/` logic change in the 2.5 line):
+  `majra.cyr` 3,187 → **3,284** lines, `majra-signed.cyr` 3,333 → **3,430**,
+  `majra-admin.cyr` 3,320 → **3,417**, `majra-backends.cyr` 4,788 → **4,885**.
+  The `signed` and `admin` `.deps` sidecars gain `alloc`, which those profiles
+  now reference directly.
+
+## [2.5.2] — 2026-07-28
+
+**Toolchain pin `6.4.62` → `6.4.83` + sigil `3.11.1` → `3.12.1` (latest) +
+sakshi pinned forward `2.4.3` → `2.4.6`, and a `cyrius bench` repair.** No
+majra source-logic change: the four dist bundle **bodies stay byte-identical**
+(the whole `git diff dist/` is four banner lines, 2.5.1 → 2.5.2; the `.deps`
+sidecars regenerate identically). Full matrix re-ran clean under the new pin —
+**305/305 CI** (150 core + 96 expanded + 42 backends + 17 patra_queue) +
+**3/3 fuzz** + **4/4 soak** + **17/17 bench** targets.
+
+The 6.4.62 → 6.4.83 span leaves majra's surface alone: the `lib sync --full`
+snapshot holds at **99 files**, `cyrius.lock` holds at **99 hashes + 1
+commit-pin**, and `cyrius lint` output is byte-identical across all 23 `src/`
+files under the two toolchains (both linters run against the same tree, 104
+lines of output, zero diff). One toolchain change is visible in-tree, via the
+stdlib snapshot's bundled sakshi — see below.
+
+### Changed
+- Toolchain pin `6.4.62` → `6.4.83`; `[deps.sigil]` tag `3.11.1` → `3.12.1`.
+  sigil's `dist/sigil.cyr` grows 25,391 → **26,254 lines**. majra's sigil
+  footprint is unchanged at six symbols — `ed25519_{init,sign,verify}`
+  (`src/signed_envelope.cyr`) + `aes_gcm_{global_init,encrypt,decrypt}`
+  (`src/ipc_encrypted.cyr`); the constant-time pk compare is still stdlib
+  `ct_eq_bytes_lens`. `core` and `admin` pull no sigil.
+- **The two pins are an atomic move: the crypto profiles now floor at cyrius
+  ≥ 6.4.64.** sigil 3.12.1 stopped hardcoding its crypto-bank thread-local slot
+  (`_SIGIL_CBANK_SLOT = 8` at 3.11.1) and now allocates it dynamically —
+  `_SIGIL_CBANK_SLOT = -1` plus a CAS-gated `thread_local_alloc()`. That symbol
+  does not exist in the 6.4.62 stdlib snapshot (`TLOCAL_MAX_SLOTS = 16`, no
+  allocator); it first appears in **6.4.64** (`TLOCAL_MAX_SLOTS = 128`).
+  Verified by building the same consumer against both sigil bundles on both
+  snapshots. So **sigil 3.12.1 cannot be paired with cyrius 6.4.62** — the build
+  fails with `refusing to emit binary with N reachable undefined function(s)`.
+  sigil's own comment says "requires cyrius >= 6.4.65"; 6.4.64 is where the
+  symbol lands, so 6.4.65 is conservative-safe. majra's builds were never at
+  risk (`tests/test_backends.tcyr` pulls `lib/tls.cyr` → `lib/thread_local.cyr`
+  ahead of sigil), but **downstream consumers of `majra-signed` /
+  `majra-backends` are** — see the README note below.
+- **README's consumer include contract was incomplete, and is now verified
+  rather than asserted.** The dist bundles are pure `src/` concatenation with
+  **zero `include "lib/…"` lines**, so the consumer supplies every stdlib module
+  both majra *and sigil* reach into — but the README only ever named `lib/ct.cyr`
+  and (for admin/backends) `lib/sandhi.cyr`. Building a clean consumer against
+  each shipped bundle shows `signed` additionally needs `thread_local`, `io`,
+  `fs`, `chrono`, `bayan`, `keccak`, `random`; `admin` needs `net`, `io`,
+  `chrono`, `async`, `dynlib`, `fdlopen`, `sakshi`, `random` + `tls` before
+  `sandhi`; `backends` needs the union. README now carries the per-profile table.
+  **`lib/thread_local.cyr` was already required at sigil 3.11.1** (for
+  `thread_local_{init,get,set}`) — that gap is pre-existing, not new here.
+- **New explicit `[deps.sakshi]` block, pinned to the published latest
+  (`2.4.6`).** sakshi reaches majra's compilation unit only transitively (patra
+  for the durable queue, sigil for its logging floor) — but sigil's own manifest
+  declares `[deps.sakshi] tag = "2.4.3"`, and `cyrius deps` overlays that
+  resolution *on top of* the `lib sync --full` snapshot, which ships 2.4.6 under
+  the 6.4.83 pin. Left implicit, every build **downgraded** `lib/sakshi.cyr` and
+  printed `./lib/ shadows version-pinned … sakshi 2.4.3 (pinned: 2.4.6)`.
+  Declaring it at the top level pins the resolution forward and the warning is
+  gone. The span is backward-compatible for majra: 2.4.4 is purely additive
+  (128-bit W3C trace-id), 2.4.5 fixes the agnos `_sk_open` `O_RDWR`→`AO_WRONLY`
+  fold (a real read-path bug on the agnos target), 2.4.6 is a pin catch-up.
+  `cyrius.lock`'s commit-pin moves `2.4.3` → `2.4.6`; the hash count is unchanged.
+
+### Fixed
+- **`cyrius bench` / `cyrius audit` could not compile `benches/bench_all.bcyr`.**
+  Both resolve the manifest `[deps].stdlib` list into the compilation unit —
+  which includes `tls` and `sandhi` — while the bench entry point included
+  neither `fdlopen` (called by `lib/tls.cyr`) nor `async` (called by sandhi). The
+  driver stopped at `error: refusing to emit binary with 4 reachable undefined
+  function(s)`, so `cyrius bench` reported `0 passed, 1 failed` without running a
+  single benchmark. The entry point now carries the same explicit toolchain
+  includes the test entry points already had (`async`, `dynlib`, `fdlopen` — see
+  `tests/test_backends.tcyr`). **This was pre-existing, not a 6.4.83
+  regression** — reproduced identically at the 2.5.1 state with
+  `CYRIUS_HOME` pinned to 6.4.62. CI was unaffected because it builds benches
+  via `cyrius build --no-deps benches/*.bcyr`, which never injects the manifest
+  stdlib set; the breakage was confined to the `bench`/`audit` convenience path
+  the release process actually leans on.
+
+### Docs
+- **[`cyrius-quirks.md`](docs/development/cyrius-quirks.md) §6 rewritten — it was
+  describing 6.1.x behavior that no longer holds.** The entry claimed an
+  undefined symbol is *always* a warning + runtime `ud2`. The toolchain now
+  splits on reachability: a **reachable** call site is a hard `error: refusing
+  to emit binary with N reachable undefined function(s)` and **no binary is
+  written**, while an **unreachable** one still warns and emits the `ud2`.
+  Verified empirically at both 6.4.62 and 6.4.83 — this is a stale-doc fix, not
+  a 6.4.83 change. The entry also now records that reachability is computed over
+  whatever the *driver* injects, so a green CI (`--no-deps`) does not imply
+  `cyrius audit` compiles — the trap this release's bench fix walked into.
+- §7 gained the snapshot-shadowing rule (a `lib sync --full` copy can be
+  silently downgraded by a `cyrius deps` overlay carrying an inherited tag) and
+  its stale `cyrius lib sync` invocations were corrected to `--full`; same
+  correction in [`testing.md`](docs/guides/testing.md), which still had the
+  pre-6.4.x form. §5's "latest sigil" reference caught up 3.7.10 → 3.12.1.
+- [`threat-model.md`](docs/development/threat-model.md) had two pre-existing
+  stale claims: the Crypto-trust-boundary line still cited the **sigil 3.7.8**
+  pin (four bumps behind) and Supply Chain still said "one first-party dep".
+  Both corrected; the latter now also notes that a transitive dep whose version
+  is inherited from another manifest is not a version majra controls.
+- `state.md` / `dependency-watch.md` / `roadmap.md` / `doc-health.md` /
+  `README.md` / `CLAUDE.md` refreshed for the new pins.
+
+### Verified
+- 150 core + 96 expanded + 42 backends + 17 patra_queue = **305/305, 0 failed**.
+- 3/3 fuzz harnesses (500 iters × 10s timeout), 4/4 soak suites.
+- **Live integration: 36/36, 0 failed** — 7 Redis + 4 PostgreSQL categories
+  against `redis:7-alpine` + `postgres:16-alpine`. (`state.md` had recorded 32
+  for this suite; `docs/guides/testing.md` had the correct 36. Corrected.)
+- Clean-consumer builds against all four shipped bundles (`core`, `signed`,
+  `admin`, `backends`) — each compiles and runs from an entry point that has
+  only the documented include set, which is how the README table above was
+  derived rather than asserted.
+- `cyrius vet src/main.cyr` → 27 deps, 0 untrusted, 0 missing;
+  `cyrius deny src/main.cyr` → 27 deps, 0 violations; `cyrius fmt --check`
+  clean across `src/` + `tests/` + `fuzz/` + `benches/`.
+- Cold rebuild from scratch (`rm -rf build lib && lib sync --full && deps &&
+  build --no-deps`) passes, and `cyrius deps --verify` reports **99 verified,
+  0 failed** against the committed lockfile. The sakshi commit-pin
+  (`bfc127f8…`) matches GitHub's `2.4.6` tag object, and the resolved
+  `lib/sigil.cyr` hashes identical to `dist/sigil.cyr` at sigil's `3.12.1` tag
+  — so the local `path = "../sigil"` resolution and CI's git resolution agree.
+- **Benchmarks: no regression.** 17 targets × 7 trials on each pin (6.4.62
+  baseline vs 6.4.83), compared on both min and median: every delta lands
+  within **±3.4%**, none over the 10% flag threshold. The eye-catching
+  single-run swings (`pattern_wildcard_+` "+24%", `barrier_cycle` "+13%") were
+  run-to-run noise — the same 6.4.83 binary produced both 85 ns and 118 ns for
+  `pattern_exact` — which is why the comparison is distribution-based.
+
 ## [2.5.1] — 2026-07-13
 
 **Toolchain pin `6.3.15` → `6.4.62` + sigil `3.9.8` → `3.11.1` (latest) + a

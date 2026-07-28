@@ -4,8 +4,12 @@
 
 ```bash
 # One-time per checkout / after any toolchain or dep bump (cyrius 6.x):
-#   lib sync provisions the stdlib snapshot, deps overlays the sigil git dep.
-cyrius lib sync && cyrius deps
+#   lib sync provisions the stdlib snapshot, deps overlays the git deps
+#   (sigil + sakshi). `--full` is load-bearing since cyrius 6.4.x — a bare
+#   `lib sync` copies only the declared `[deps].stdlib` subset and omits the
+#   toolchain modules sigil/sandhi reach into, which compile to a runtime
+#   `ud2` (SIGILL at runtime, not a build error).
+cyrius lib sync --full && cyrius deps
 
 # Full audit (test + fmt + lint + vet + deny + bench)
 cyrius audit
@@ -29,11 +33,11 @@ cyrius build --no-deps tests/soak/soak_queue.cyr build/soak_queue && ./build/soa
 | Suite | File | Assertions | Coverage |
 |-------|------|-----------|----------|
 | Core | `src/main.cyr` | 150 | All 15 core modules + revived relay dedup |
-| Expanded | `tests/test_core.tcyr` | 96 | Deep: queue lifecycle, pubsub patterns, DAG retry, fleet routing, circuit breaker, integration, multi-threaded barrier |
+| Expanded | `tests/test_core.tcyr` | 112 | Deep: queue lifecycle, pubsub patterns, DAG retry, fleet routing, circuit breaker, integration, multi-threaded barrier, plus the 2.5.3 concurrency + wildcard-alignment regressions |
 | Backends | `tests/test_backends.tcyr` | 42 | base64, SHA-1, AES-256-GCM, signed envelopes, admin endpoint, WebSocket, RESP, PG wire |
 | Patra queue | `tests/test_patra_queue.tcyr` | 17 | Durable enqueue / priority dequeue / complete / counts / reopen persistence |
 | Live | `tests/test_live.tcyr` | 36 | 7 Redis + 4 PostgreSQL categories (see below) |
-| **Total** | | **341** (305 CI + 36 live) | |
+| **Total** | | **357** (321 CI + 36 live) | |
 
 `test_patra_queue` is a separate entry point because adding it to `test_backends` blows the cc5 16384 fixup-table cap (patra pulls sakshi + io + fs transitively).
 

@@ -13,6 +13,17 @@ include "lib/fnptr.cyr"
 include "lib/thread.cyr"
 include "lib/bench.cyr"
 
+# Toolchain modules the manifest-injected stdlib set reaches into. `cyrius
+# build --no-deps` (what CI runs) never pulls `tls`/`sandhi`, but `cyrius
+# bench` / `cyrius audit` resolve the manifest `[deps].stdlib` list, which
+# does — and `lib/tls.cyr` calls `fdlopen_*` while sandhi calls `async_*`.
+# Without these the driver stops at "refusing to emit binary with 4
+# reachable undefined function(s)". Same explicit-include pattern the test
+# entry points carry (see tests/test_backends.tcyr).
+include "lib/async.cyr"
+include "lib/dynlib.cyr"
+include "lib/fdlopen.cyr"
+
 include "src/error.cyr"
 include "src/counter.cyr"
 include "src/envelope.cyr"

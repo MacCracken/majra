@@ -5,7 +5,7 @@ description = "Distributed queue & multiplex engine — pub/sub, queues, relay, 
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/majra"
 language = "cyrius"
-cyrius = "6.4.62"
+cyrius = "6.4.83"
 
 [build]
 entry = "src/main.cyr"
@@ -168,5 +168,19 @@ stdlib = [
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"
 path = "../sigil"
-tag = "3.11.1"
+tag = "3.12.1"
 modules = ["dist/sigil.cyr"]
+
+# sakshi is a *transitive* requirement: sigil's own manifest declares
+# `[deps.sakshi] tag = "2.4.3"`, and `cyrius deps` overlays that resolution
+# on top of the `lib sync --full` snapshot — which ships 2.4.6 under the
+# 6.4.83 pin. Left implicit, the overlay silently *downgrades* lib/sakshi.cyr
+# and every build prints a shadow warning. Declaring it here pins the
+# resolution forward to the published latest (2.4.6: additive 128-bit
+# trace-id + the agnos `_sk_open` O_RDWR read fix), matching the toolchain
+# snapshot. majra's own `src/` never calls sakshi — it reaches the
+# compilation unit via patra (durable queue) and sigil.
+[deps.sakshi]
+git = "https://github.com/MacCracken/sakshi.git"
+tag = "2.4.6"
+modules = ["dist/sakshi.cyr"]

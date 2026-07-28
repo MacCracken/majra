@@ -130,7 +130,161 @@ fn test_pubsub_pattern_matching_extended() {
     assert(matches_pattern("", "") == 1, "pm empty match");
     assert(matches_pattern("a", "b") == 0, "pm single no match");
 
+    # --- Wildcard level-alignment (regression, 2.5.3) ---
+    # A wildcard is only a wildcard when it occupies a whole level. Before
+    # 2.5.3 '#' and '+' were honored mid-token, which let a namespace prefix
+    # be escaped: namespace_wildcard(ns) builds "<prefix>/#", and one dropped
+    # '/' turned it into a prefix-match over a DIFFERENT tenant.
+    assert(matches_pattern("tenant-a-evil/secret", "tenant-a#") == 0, "pm # mid-token is literal");
+    assert(matches_pattern("sensors/temperature", "sensors/temp+") == 0, "pm + mid-token is literal");
+    assert(matches_pattern("anything/at/all", "#/never/matches") == 0, "pm # must terminate pattern");
+    assert(matches_pattern("tenant-a/secret", "tenant-a/#") == 1, "pm aligned # still matches");
+    assert(matches_pattern("tenant-ab/secret", "tenant-a/#") == 0, "pm aligned # does not cross tenants");
+
+    # --- '#' includes the parent level (MQTT-3.1.1 §4.7.1.2, regression 2.5.3) ---
+    assert(matches_pattern("sport", "sport/#") == 1, "pm # matches bare parent");
+    assert(matches_pattern("sport/tennis", "sport/#") == 1, "pm # matches child");
+    assert(matches_pattern("sportx", "sport/#") == 0, "pm # parent match is level-exact");
+
     println("  pubsub_pattern_matching_extended: ok");
+}
+
+# --- Concurrency regressions (2.5.3) ---
+# Both of these reproduced reliably before the fix and are deterministic after
+# it. They exist because majra's own mutexes were taken AFTER an unsynchronized
+# fl_alloc — see CHANGELOG 2.5.3 and cyrius-quirks.md §8.
+
+var _cs_ps  = 0;
+var _cs_n   = 0;
+var _cs_chs = 0;
+var _cs_mtx = 0;
+
+fn _cs_worker(arg) {
+    var i = 0;
+    while (i < _cs_n) {
+        var ch = pubsub_subscribe(_cs_ps, "concurrent/topic");
+        mutex_lock(_cs_mtx);
+        vec_push(_cs_chs, ch);
+        mutex_unlock(_cs_mtx);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn test_pubsub_concurrent_subscribe() {
+    _cs_ps  = pubsub_new();
+    _cs_n   = 100;
+    _cs_chs = vec_new();
+    _cs_mtx = mutex_new();
+
+    var t1 = thread_create(&_cs_worker, "1");
+    var t2 = thread_create(&_cs_worker, "2");
+    var t3 = thread_create(&_cs_worker, "3");
+    var t4 = thread_create(&_cs_worker, "4");
+    thread_join(t1); thread_join(t2); thread_join(t3); thread_join(t4);
+
+    var handed = vec_len(_cs_chs);
+    assert_eq(handed, 4 * _cs_n, "concurrent subscribe: every call returned a channel");
+
+    # Every channel handed to a caller must actually be registered. Before the
+    # fix, concurrent subscribers were handed aliased subscriber blocks and
+    # 1-7 per 800 walked away with a channel that never received anything —
+    # their chan_recv would block forever.
+    var delivered = pubsub_publish(_cs_ps, "concurrent/topic", 777);
+    var orphaned = 0;
+    var i = 0;
+    while (i < handed) {
+        if (load64(vec_get(_cs_chs, i) + 32) == 0) { orphaned = orphaned + 1; }
+        i = i + 1;
+    }
+    assert_eq(orphaned, 0, "concurrent subscribe: no orphaned channels");
+    assert_eq(delivered, handed, "concurrent subscribe: delivered matches subscriber count");
+
+    println("  pubsub_concurrent_subscribe: ok");
+}
+
+var _ce_mq = 0;
+var _ce_n  = 0;
+
+fn _ce_worker(arg) {
+    var i = 0;
+    while (i < _ce_n) {
+        mq_enqueue(_ce_mq, 1, 1000 + i);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn test_managed_queue_concurrent_enqueue() {
+    _ce_mq = mq_new("concurrent", 4);
+    _ce_n  = 100;
+
+    var t1 = thread_create(&_ce_worker, "1");
+    var t2 = thread_create(&_ce_worker, "2");
+    var t3 = thread_create(&_ce_worker, "3");
+    var t4 = thread_create(&_ce_worker, "4");
+    thread_join(t1); thread_join(t2); thread_join(t3); thread_join(t4);
+
+    # Before the fix, _next_job_key()'s unsynchronized global increment handed
+    # two enqueues the same key and the second map_set overwrote the first —
+    # 788-796 of 800 jobs survived, with no error anywhere.
+    assert_eq(mq_job_count(_ce_mq), 4 * _ce_n, "concurrent enqueue: no jobs lost");
+
+    println("  managed_queue_concurrent_enqueue: ok");
+}
+
+# Liveness: a publisher blocked on a FULL subscriber channel must not hold the
+# hub mutex. Before 2.5.3 it did, so one lagging consumer froze publishes to
+# every other topic (and pubsub_subscribe outright). If this regresses, the
+# test does not fail — it HANGS, which is the honest signal for a liveness bug.
+var _hol_ps     = 0;
+var _hol_filled = 0;
+var _hol_done   = 0;
+
+fn _hol_worker(arg) {
+    var i = 0;
+    # 64 fills the channel; the 65th parks until the main thread drains.
+    while (i < 65) {
+        if (i == 64) { _hol_filled = 1; }
+        pubsub_publish(_hol_ps, "slow/topic", i);
+        i = i + 1;
+    }
+    _hol_done = 1;
+    return 0;
+}
+
+fn test_pubsub_no_head_of_line_block() {
+    _hol_ps     = pubsub_new();
+    _hol_filled = 0;
+    _hol_done   = 0;
+
+    var ch_slow = pubsub_subscribe(_hol_ps, "slow/topic");
+    var ch_fast = pubsub_subscribe(_hol_ps, "fast/topic");
+
+    var th = thread_create(&_hol_worker, "hol");
+    assert(th != 0, "hol worker spawned");
+
+    # Wait for the worker to reach its blocking send, then spin a little longer
+    # so it is genuinely parked inside chan_send.
+    while (_hol_filled == 0) { }
+    var spin = 0;
+    while (spin < 2000000) { spin = spin + 1; }
+
+    # An unrelated topic with an empty channel must still be publishable.
+    var d = pubsub_publish(_hol_ps, "fast/topic", 999);
+    assert_eq(d, 1, "unrelated topic still publishable while another is full");
+    assert_eq(chan_recv(ch_fast), 999, "unrelated topic payload intact");
+
+    # Drain the full channel to release the parked publisher.
+    var i = 0;
+    while (i < 65) {
+        chan_recv(ch_slow);
+        i = i + 1;
+    }
+    thread_join(th);
+    assert_eq(_hol_done, 1, "blocked publisher completed after drain");
+
+    println("  pubsub_no_head_of_line_block: ok");
 }
 
 fn test_pubsub_multiple_subscribers() {
@@ -596,12 +750,15 @@ fn main() {
     test_queue_fifo_within_tier();
     test_managed_queue_lifecycle();
     test_managed_queue_cancel();
+    test_managed_queue_concurrent_enqueue();
 
     # PubSub
     test_pubsub_pattern_matching_extended();
     test_pubsub_multiple_subscribers();
     test_pubsub_no_match();
     test_pubsub_wildcard_patterns();
+    test_pubsub_concurrent_subscribe();
+    test_pubsub_no_head_of_line_block();
     test_direct_channel();
     test_hashed_channel();
 

@@ -221,7 +221,20 @@ fn _next_job_key() {
     return str_from_int(id);
 }
 
+# The queue mutex covers key generation and BOTH allocations, not just the
+# map_set. Two concurrent enqueues previously raced twice over:
+#   1. `_next_job_key()` increments the `_mq_next_job_id` global with a plain
+#      read-modify-write, so both callers could take the same key and the
+#      second map_set silently overwrote the first job.
+#   2. `queue_item_new` / `fl_alloc(72)` pop lib/freelist.cyr's free list with
+#      no lock (unlike `alloc`, which has a CAS spinlock), so both callers
+#      could be handed the same block.
+# Either way jobs vanished with no error: measured 788-796 of 800 surviving
+# across concurrent enqueues before the fix. See CHANGELOG 2.5.3.
 fn mq_enqueue(mq, priority, payload) {
+    var mtx = load64(mq + 16);
+    mutex_lock(mtx);
+
     var item = queue_item_new(priority, payload);
     var key = _next_job_key();
     store64(item + 32, key);
@@ -238,8 +251,6 @@ fn mq_enqueue(mq, priority, payload) {
     store64(mi + 56, 0);
     store64(mi + 64, 0);
 
-    var mtx = load64(mq + 16);
-    mutex_lock(mtx);
     map_set(load64(mq + 8), key, mi);
     mutex_unlock(mtx);
 
