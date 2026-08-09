@@ -373,6 +373,158 @@ fn test_relay_send_subscribe() {
     println("  relay_send_subscribe: ok");
 }
 
+# --- 2.6.0: the four relay fixes ----------------------------------------
+
+# 2.6.0: relay_receive is REENTRANT. Before it, the function stashed its
+# arguments and dedup state in file-scope globals and took no lock, while every
+# other mutating entry point locked `r + 40`. Two threads receiving concurrently
+# raced both.
+#
+# The invariant: a message whose sequence strictly exceeds its own sender's last
+# is ALWAYS accepted. Each worker uses its own sender id, so with correct
+# per-call state there is no interaction at all and every receive must succeed.
+var _rr_relay = 0;
+var _rr_iters = 400;
+var _rr_a_ok = 0;
+var _rr_b_ok = 0;
+var _rr_go = 0;
+
+fn _rr_worker(sender, counter_ptr) {
+    while (atomic_load(&_rr_go) == 0) { }
+    var i = 1;
+    var ok = 0;
+    while (i <= _rr_iters) {
+        var m = fl_alloc(64);
+        store64(m, i);
+        store64(m + 8, sender);
+        store64(m + 16, 0);
+        store64(m + 24, "t");
+        if (relay_receive(_rr_relay, m) != 0) { ok = ok + 1; }
+        i = i + 1;
+    }
+    store64(counter_ptr, ok);
+    return 0;
+}
+
+fn _rr_worker_a(arg) { return _rr_worker("sender-a", &_rr_a_ok); }
+fn _rr_worker_b(arg) { return _rr_worker("sender-b", &_rr_b_ok); }
+
+fn test_relay_receive_is_reentrant() {
+    _rr_relay = relay_new("node-1");
+    _rr_a_ok = 0;
+    _rr_b_ok = 0;
+    _rr_go = 0;
+
+    var t1 = thread_create(&_rr_worker_a, 0);
+    var t2 = thread_create(&_rr_worker_b, 0);
+    atomic_store(&_rr_go, 1);
+    thread_join(t1);
+    thread_join(t2);
+
+    assert(_rr_a_ok == _rr_iters, "every strictly-increasing message from sender-a is accepted");
+    assert(_rr_b_ok == _rr_iters, "every strictly-increasing message from sender-b is accepted");
+    assert(relay_last_seq(_rr_relay, "sender-a") == _rr_iters, "sender-a's last seq is intact");
+    assert(relay_last_seq(_rr_relay, "sender-b") == _rr_iters, "sender-b's last seq is intact");
+    assert(load64(relay_stats(_rr_relay) + 16) == 0, "no message was wrongly dropped as a duplicate");
+
+    println("  relay_receive_is_reentrant: ok");
+}
+
+fn test_relay_incoming_broadcast_flag() {
+    var r = relay_new("node-1");
+
+    # A message with no explicit target is a broadcast.
+    var m1 = fl_alloc(64);
+    store64(m1, 1); store64(m1 + 8, "node-2"); store64(m1 + 16, 0); store64(m1 + 24, "ann");
+    var inc1 = relay_receive_ex(r, m1);
+    assert(inc1 != 0, "relay_receive_ex accepts a broadcast");
+    assert(incoming_is_broadcast(inc1) == 1, "and flags it as a broadcast");
+    assert(incoming_msg(inc1) == m1, "and carries the original message");
+
+    # A message addressed to this node is NOT a broadcast. Before 2.6.0 this
+    # distinction was computed and then discarded.
+    var m2 = fl_alloc(64);
+    store64(m2, 2); store64(m2 + 8, "node-2"); store64(m2 + 16, "node-1"); store64(m2 + 24, "cmd");
+    var inc2 = relay_receive_ex(r, m2);
+    assert(inc2 != 0, "relay_receive_ex accepts a targeted message");
+    assert(incoming_is_broadcast(inc2) == 0, "and flags it as NOT a broadcast");
+
+    # An empty-string target is a broadcast too, matching _recv_check_target.
+    var m3 = fl_alloc(64);
+    store64(m3, 3); store64(m3 + 8, "node-2"); store64(m3 + 16, ""); store64(m3 + 24, "ann");
+    assert(incoming_is_broadcast(relay_receive_ex(r, m3)) == 1,
+    "an empty target string is a broadcast");
+
+    # relay_receive stays backward compatible: same accept/drop decision, and it
+    # answers the bare message rather than the wrapper.
+    var m4 = fl_alloc(64);
+    store64(m4, 4); store64(m4 + 8, "node-2"); store64(m4 + 16, 0); store64(m4 + 24, "ann");
+    assert(relay_receive(r, m4) == m4, "relay_receive still returns the message itself");
+
+    println("  relay_incoming_broadcast_flag: ok");
+}
+
+fn test_relay_last_seq_and_gaps() {
+    var r = relay_new("node-1");
+
+    assert(relay_last_seq(r, "node-2") == 0 - 1, "an unknown sender has no last seq");
+
+    var m1 = fl_alloc(64);
+    store64(m1, 1); store64(m1 + 8, "node-2"); store64(m1 + 16, 0); store64(m1 + 24, "t");
+    relay_receive(r, m1);
+    assert(relay_last_seq(r, "node-2") == 1, "last seq tracks the first message");
+    assert(load64(relay_stats(r) + 40) == 0, "a first message at seq 1 is not a gap");
+
+    # Contiguous: no gap.
+    var m2 = fl_alloc(64);
+    store64(m2, 2); store64(m2 + 8, "node-2"); store64(m2 + 16, 0); store64(m2 + 24, "t");
+    relay_receive(r, m2);
+    assert(relay_last_seq(r, "node-2") == 2, "last seq advances");
+    assert(load64(relay_stats(r) + 40) == 0, "a contiguous sequence records no gap");
+
+    # Jump from 2 to 5: messages 3 and 4 were lost.
+    var m5 = fl_alloc(64);
+    store64(m5, 5); store64(m5 + 8, "node-2"); store64(m5 + 16, 0); store64(m5 + 24, "t");
+    assert(relay_receive(r, m5) != 0, "a gapped message is still DELIVERED");
+    assert(load64(relay_stats(r) + 40) == 1, "but the gap is counted");
+    assert(relay_last_seq(r, "node-2") == 5, "and last seq jumps to the new value");
+
+    # A first message from a NEW sender at seq > 1 also skipped messages.
+    var m9 = fl_alloc(64);
+    store64(m9, 9); store64(m9 + 8, "node-7"); store64(m9 + 16, 0); store64(m9 + 24, "t");
+    relay_receive(r, m9);
+    assert(load64(relay_stats(r) + 40) == 2, "a new sender starting past seq 1 is a gap");
+
+    # A duplicate is dropped and is NOT a gap.
+    var dup = fl_alloc(64);
+    store64(dup, 5); store64(dup + 8, "node-2"); store64(dup + 16, 0); store64(dup + 24, "t");
+    assert(relay_receive(r, dup) == 0, "a replayed sequence is dropped");
+    assert(load64(relay_stats(r) + 40) == 2, "and a duplicate is not counted as a gap");
+    assert(load64(relay_stats(r) + 16) == 1, "it is counted as a duplicate instead");
+
+    println("  relay_last_seq_and_gaps: ok");
+}
+
+fn test_relay_stats_layout_unchanged() {
+    # 2.6.0 APPENDED sequence_gaps at offset 40, so every pre-existing offset
+    # must still mean what it did. A reader compiled against 2.5.x keeps working.
+    var r = relay_new("node-1");
+    relay_send(r, "node-2", "t", 1);
+    var m = fl_alloc(64);
+    store64(m, 1); store64(m + 8, "node-2"); store64(m + 16, 0); store64(m + 24, "t");
+    relay_receive(r, m);
+
+    var st = relay_stats(r);
+    assert(load64(st) == 1, "offset 0 is still messages_sent");
+    assert(load64(st + 8) == 1, "offset 8 is still messages_received");
+    assert(load64(st + 16) == 0, "offset 16 is still duplicates_dropped");
+    assert(load64(st + 24) == 0, "offset 24 is still dedup_evicted");
+    assert(load64(st + 32) == 1, "offset 32 is still dedup_table_size");
+    assert(load64(st + 40) == 0, "offset 40 is the new sequence_gaps");
+
+    println("  relay_stats_layout_unchanged: ok");
+}
+
 fn test_relay_skip_routing() {
     var r = relay_new("node-1");
 
@@ -765,6 +917,10 @@ fn main() {
     # Relay
     test_relay_send_subscribe();
     test_relay_skip_routing();
+    test_relay_incoming_broadcast_flag();
+    test_relay_last_seq_and_gaps();
+    test_relay_stats_layout_unchanged();
+    test_relay_receive_is_reentrant();
 
     # Barrier
     test_barrier_duplicate_arrival();

@@ -5,7 +5,7 @@ description = "Distributed queue & multiplex engine — pub/sub, queues, relay, 
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/majra"
 language = "cyrius"
-cyrius = "6.5.10"
+cyrius = "6.5.14"
 
 [build]
 entry = "src/main.cyr"
@@ -171,7 +171,7 @@ stdlib = [
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"
 path = "../sigil"
-tag = "3.12.1"
+tag = "3.12.6"
 modules = ["dist/sigil.cyr"]
 
 # sakshi is a *transitive* requirement: sigil's own manifest declares

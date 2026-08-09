@@ -12,3 +12,13 @@ tagged
 fnptr
 thread
 assert
+io
+net
+bench
+fs
+patra
+tls
+dynlib
+fdlopen
+async
+sandhi

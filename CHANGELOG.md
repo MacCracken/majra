@@ -5,6 +5,102 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] — 2026-08-08
+
+**`relay_receive` was not reentrant, and three smaller relay defects alongside
+it.** All four were reported by agnosai, which drives majra's relay from a
+100-worker `sandhi_server_run_pooled` pool. Minor bump rather than patch: two
+new public functions and one appended stats field.
+
+### Fixed — `relay_receive` raced itself (Critical for threaded consumers)
+
+Two independent problems, either one sufficient to corrupt a dedup decision:
+
+- **It stashed its arguments and dedup state in FILE-SCOPE globals** —
+  `_recv_r`, `_recv_msg`, `_dedup_map`, `_dedup_key`, `_dedup_seq`. Their own
+  comment said they "predate cc5", were a cc3 local-clobbering workaround, and
+  were kept because removing them "would require a structural refactor". That
+  refactor is this release: they are parameters, and the globals are gone.
+- **It took no lock at all**, while every other mutating entry point
+  (`relay_send`, `relay_subscribe`, `relay_evict_stale_dedup`) locked `r + 40`.
+  So the `seen` map was mutated unsynchronised even setting the globals aside.
+
+`relay_receive` now holds the mutex across the dedup decision, the eviction
+sweep and the counter updates, then **releases it before the subscriber
+fan-out** — the same shape 2.5.3 gave `pubsub_publish`, so a slow or full
+subscriber channel cannot block an unrelated receive.
+
+**Verified by a threaded test, not by inspection.** `test_relay_receive_is_reentrant`
+runs two workers with distinct sender ids, 400 messages each, strictly
+increasing sequences — so with correct per-call state there is no interaction
+and every receive must be accepted. Against the pre-fix code it fails
+reproducibly (3/3 runs) on `no message was wrongly dropped as a duplicate`:
+the race made real messages look like replays.
+
+Also removed: `_relay_check_dedup`, dead since `relay_receive` inlined its
+logic — referenced only by the comment that justified the globals.
+
+### Fixed — `is_broadcast` was computed and thrown away
+
+`relay_receive` derived whether a message was a broadcast and then returned the
+bare message, so a consumer could not tell a broadcast from a direct message
+without re-inspecting the envelope.
+
+**Added `relay_receive_ex`**, returning an `IncomingMessage` (16 B:
+`incoming_is_broadcast`, `incoming_msg`). `relay_receive` is unchanged in
+behaviour and return type — it now delegates and drops the flag — so existing
+consumers keep working.
+
+### Added — sequence-gap detection
+
+A gap means at least one message from a sender was lost in transit. The message
+is still delivered; the gap is what a caller needs to request a resend.
+
+- **`relay_last_seq(r, from)`** — the last sequence seen from a sender, or `-1`
+  if unknown. Taken under the lock.
+- **`sequence_gaps`** in `relay_stats`, counted when `seq != last + 1`, and also
+  when a *first* message from a new sender arrives at `seq != 1`.
+- A duplicate is **not** counted as a gap — it increments `duplicates_dropped`,
+  as before.
+
+⚠ **`relay_stats` grew from 40 to 48 bytes, with `sequence_gaps` APPENDED at
+offset 40.** Offsets 0–32 are unchanged, so a reader built against 2.5.x still
+reads the right fields; `test_relay_stats_layout_unchanged` pins each one.
+
+### Documented — bounded dedup opens a replay window
+
+`relay_set_max_dedup` evicts the least-recently-seen sender when the table
+overflows, and evicting a sender forgets its last-seen sequence — so that
+sender's already-delivered messages become acceptable again and are fanned out a
+second time. This is **off by default** (`relay_new` sets `0` = unbounded) and
+that default is correct for a strict deliver-once contract; the behaviour is now
+stated at the call site rather than left to be discovered.
+
+### Changed — toolchain and dependencies
+
+- `cyrius` **6.5.10 → 6.5.14**. Three-step resolve, 107 files.
+- `[deps.sigil]` **3.12.1 → 3.12.6** — five releases of RSA fixes, including the
+  PKCS#1 v1.5 and PSS **authentication bypasses** (a forged signature verifying)
+  that 3.12.3–3.12.6 closed. majra reaches sigil through `ipc_encrypted` and the
+  TLS path, so this is not optional.
+- `[deps.sakshi]` stays 2.4.8 — already what the 6.5.14 fold carries
+  (hash-verified identical).
+
+### Verification
+
+`test_core` **142 passed / 0 failed** (was 112 — 30 new assertions), plus
+`test_backends` 42/42 and `test_patra_queue` 17/17. The **full soak set** was run
+because this touches relay dedup: `soak_relay` (dedup correct, eviction
+bounded), `soak_queue`, `soak_pubsub`, `soak_heartbeat` — all OK. All four dist
+profiles regenerated and verified to carry the new API.
+
+⚠ **Pre-existing and NOT fixed here:** `cyrius distlib`'s self-check reports
+`undefined variable 'CLOCK_MONOTONIC'` in the generated bundles
+(`src/envelope.cyr:37` uses it; `lib/syscalls.cyr:40` includes the platform file
+that defines it). This is **not** a consumer-visible defect — a program that
+includes `dist/majra.cyr` builds and links fine, verified — and it reproduces on
+2.5.3 with 8 errors, so it predates this release. Worth its own investigation.
+
 ## [2.5.3] — 2026-07-28
 
 **Two silent data-loss races and a namespace-isolation bypass in the routing
