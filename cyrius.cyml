@@ -5,7 +5,7 @@ description = "Distributed queue & multiplex engine — pub/sub, queues, relay, 
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/majra"
 language = "cyrius"
-cyrius = "6.4.83"
+cyrius = "6.5.10"
 
 [build]
 entry = "src/main.cyr"
@@ -156,6 +156,9 @@ stdlib = [
     "fs",
     "patra",
     "tls",
+    "dynlib",
+    "fdlopen",
+    "async",
     "sandhi",
 ]
 
@@ -182,5 +185,5 @@ modules = ["dist/sigil.cyr"]
 # compilation unit via patra (durable queue) and sigil.
 [deps.sakshi]
 git = "https://github.com/MacCracken/sakshi.git"
-tag = "2.4.6"
+tag = "2.4.8"
 modules = ["dist/sakshi.cyr"]
