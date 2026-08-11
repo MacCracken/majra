@@ -5,7 +5,7 @@ description = "Distributed queue & multiplex engine — pub/sub, queues, relay, 
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/majra"
 language = "cyrius"
-cyrius = "6.5.14"
+cyrius = "6.5.18"
 
 [build]
 entry = "src/main.cyr"
@@ -160,6 +160,7 @@ stdlib = [
     "fdlopen",
     "async",
     "sandhi",
+    "sakshi",
 ]
 
 # External first-party deps. Vendored into lib/ for reproducibility;
@@ -171,19 +172,26 @@ stdlib = [
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"
 path = "../sigil"
-tag = "3.12.6"
+tag = "3.12.7"
 modules = ["dist/sigil.cyr"]
 
-# sakshi is a *transitive* requirement: sigil's own manifest declares
-# `[deps.sakshi] tag = "2.4.3"`, and `cyrius deps` overlays that resolution
-# on top of the `lib sync --full` snapshot — which ships 2.4.6 under the
-# 6.4.83 pin. Left implicit, the overlay silently *downgrades* lib/sakshi.cyr
-# and every build prints a shadow warning. Declaring it here pins the
-# resolution forward to the published latest (2.4.6: additive 128-bit
-# trace-id + the agnos `_sk_open` O_RDWR read fix), matching the toolchain
-# snapshot. majra's own `src/` never calls sakshi — it reaches the
-# compilation unit via patra (durable queue) and sigil.
-[deps.sakshi]
-git = "https://github.com/MacCracken/sakshi.git"
-tag = "2.4.8"
-modules = ["dist/sakshi.cyr"]
+# sakshi moved from `[deps.sakshi]` into `[deps].stdlib` at the 6.5.18 pin.
+#
+# This was a *defensive* git pin, and its whole reason has gone away. It existed
+# because **sigil's own manifest declared `[deps.sakshi]`**, and `cyrius deps`
+# overlays a git dep's resolution on top of the `lib sync --full` snapshot — so
+# left implicit, sigil silently downgraded `lib/sakshi.cyr` on every build and
+# printed an unnamed "1 bundled lib(s) differ" shadow warning. Pinning it here
+# forward was the counter-move.
+#
+# **sigil 3.12.7 dropped its `[deps.sakshi]`** (sakshi is folded into the
+# toolchain stdlib now), so there is nothing left to counteract: `patra` reaches
+# majra as a stdlib module from the snapshot, not as a git dep, so its manifest
+# is never consulted. majra's own `src/` calls no sakshi symbol and none of the
+# four `dist/` bundles reference one.
+#
+# Declaring it in `[deps].stdlib` instead means it simply tracks the toolchain.
+# ⚠ Do NOT re-add a `[deps.sakshi]` here to "pin" it: on a library that
+# publishes bundles, a git dep makes `distlib` reclassify the module out of the
+# **stdlib leaves**, dropping it from the `.deps` sidecars and breaking
+# clean-room consumers. kavach hit exactly that.
