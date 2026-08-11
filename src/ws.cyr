@@ -58,7 +58,10 @@ fn sha1(data, len) {
         var wi = 0;
         while (wi < 16) {
             var off = block + wi * 4;
-            var word = ((load8(padded+off) & 0xFF) << 24) | ((load8(padded+off+1) & 0xFF) << 16) | ((load8(padded+off+2) & 0xFF) << 8) | (load8(padded+off+3) & 0xFF);
+            var word = ((load8(padded+off) & 0xFF) << 24)
+            | ((load8(padded+off+1) & 0xFF) << 16)
+            | ((load8(padded+off+2) & 0xFF) << 8)
+            | (load8(padded+off+3) & 0xFF);
             store64(w +wi * 8, word & 0xFFFFFFFF);
             wi = wi + 1;
         }
@@ -111,11 +114,26 @@ fn sha1(data, len) {
 
     # Output 20-byte digest in big-endian
     var digest = fl_alloc(20);
-    store8(digest, (h0>>24)&0xFF); store8(digest+1, (h0>>16)&0xFF); store8(digest+2, (h0>>8)&0xFF); store8(digest+3, h0&0xFF);
-    store8(digest+4, (h1>>24)&0xFF); store8(digest+5, (h1>>16)&0xFF); store8(digest+6, (h1>>8)&0xFF); store8(digest+7, h1&0xFF);
-    store8(digest+8, (h2>>24)&0xFF); store8(digest+9, (h2>>16)&0xFF); store8(digest+10, (h2>>8)&0xFF); store8(digest+11, h2&0xFF);
-    store8(digest+12, (h3>>24)&0xFF); store8(digest+13, (h3>>16)&0xFF); store8(digest+14, (h3>>8)&0xFF); store8(digest+15, h3&0xFF);
-    store8(digest+16, (h4>>24)&0xFF); store8(digest+17, (h4>>16)&0xFF); store8(digest+18, (h4>>8)&0xFF); store8(digest+19, h4&0xFF);
+    store8(digest, (h0>>24)&0xFF);
+    store8(digest+1, (h0>>16)&0xFF);
+    store8(digest+2, (h0>>8)&0xFF);
+    store8(digest+3, h0&0xFF);
+    store8(digest+4, (h1>>24)&0xFF);
+    store8(digest+5, (h1>>16)&0xFF);
+    store8(digest+6, (h1>>8)&0xFF);
+    store8(digest+7, h1&0xFF);
+    store8(digest+8, (h2>>24)&0xFF);
+    store8(digest+9, (h2>>16)&0xFF);
+    store8(digest+10, (h2>>8)&0xFF);
+    store8(digest+11, h2&0xFF);
+    store8(digest+12, (h3>>24)&0xFF);
+    store8(digest+13, (h3>>16)&0xFF);
+    store8(digest+14, (h3>>8)&0xFF);
+    store8(digest+15, h3&0xFF);
+    store8(digest+16, (h4>>24)&0xFF);
+    store8(digest+17, (h4>>16)&0xFF);
+    store8(digest+18, (h4>>8)&0xFF);
+    store8(digest+19, h4&0xFF);
     return digest;
 }
 
@@ -255,7 +273,9 @@ fn _ws_accept_upgrade(fd) {
         var n = syscall(SYS_READ, fd, buf + total, 1);
         if (n <= 0) { return 0; }
         total = total + 1;
-        if (total >= 4 && load8(buf+total-4) == 13 && load8(buf+total-3) == 10 && load8(buf+total-2) == 13 && load8(buf+total-1) == 10) {
+        # CR LF CR LF — the end of the HTTP header block.
+        if (total >= 4 && load8(buf+total-4) == 13 && load8(buf+total-3) == 10
+        && load8(buf+total-2) == 13 && load8(buf+total-1) == 10) {
             break;
         }
     }
@@ -288,7 +308,9 @@ fn _ws_accept_upgrade(fd) {
 
     # Send 101 Switching Protocols
     var sb = str_builder_new();
-    str_builder_add_cstr(sb, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ");
+    str_builder_add_cstr(sb, "HTTP/1.1 101 Switching Protocols\r\n");
+    str_builder_add_cstr(sb, "Upgrade: websocket\r\nConnection: Upgrade\r\n");
+    str_builder_add_cstr(sb, "Sec-WebSocket-Accept: ");
     str_builder_add_cstr(sb, accept_key);
     str_builder_add_cstr(sb, "\r\n\r\n");
     var resp = str_builder_build(sb);

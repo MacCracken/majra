@@ -5,6 +5,115 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.2] — 2026-08-11 — the priority queue: O(n²) drain, and an unguarded negative index
+
+### Performance — a pop is now O(1) amortised, and 6,000x faster at depth
+
+`pq_dequeue` took the front of a tier with `vec_get(tier, 0)` followed by
+`vec_remove(tier, 0)`. `vec_remove` shifts every remaining element down a slot, so
+**one pop cost O(n) in the tier depth and draining a queue of n cost O(n²)**.
+
+Measured, mean cost of a single `pq_dequeue` while draining a tier of that depth:
+
+| depth | before | after |
+|---|---|---|
+| 2,000 | 2.00 µs | **34 ns** |
+| 4,000 | 4.02 µs | **34 ns** |
+| 8,000 | 7.92 µs | **33 ns** |
+| 16,000 | 15.56 µs | **34 ns** |
+| 200,000 | 198.70 µs | **33 ns** |
+
+Before, doubling the depth doubled the per-pop cost — the signature of a linear pop
+rather than cache noise; at 200,000 a full drain was roughly **40 seconds of memmove**.
+After, the cost is flat across a 100x range, which is what O(1) looks like.
+
+⚠ **This was never the pathological case — it is the DESIGN case.** A priority queue
+exists so that low-priority work is *allowed* to accumulate behind high-priority work,
+so the deep-tier path is precisely the one that has to stay cheap. Reported by a
+consumer (agnosai) whose `llm/inference_queue` puts background summarisation behind
+interactive crew tasks.
+
+**How.** Each tier gains a read index; a pop advances it instead of moving the
+survivors, and the consumed prefix is reclaimed once the head passes the midpoint —
+so each surviving item is copied at most once per doubling of the head, amortised
+O(1). A fully drained tier costs nothing to reclaim: length and head both reset with
+no copying, which is the common shape for a queue that empties between bursts.
+
+⚠ **Swap-with-last was NOT used**, though it is the other obvious O(1) trick. It
+destroys FIFO within a priority level, which `queue_item_new`'s monotonic id and
+`ManagedQueue`'s semantics both depend on.
+
+### Changed
+
+- `PriorityQueue` is **88 bytes**, was 48 — five read heads at offsets 48-87. The
+  tier pointers (0-39) and the total (40) keep their offsets, so `pq_len` and
+  `pq_is_empty` are untouched. Nothing outside `src/queue.cyr` reads the struct
+  directly; verified by grep before the layout change.
+
+### Fixed — `pq_enqueue` clamped only ONE end, and the missing end was memory-unsafe
+
+The over-range clamp (`pri >= NUM_PRIORITIES`) had always been there. A **negative**
+priority went straight through to `load64(pq + pri * 8)`, which for `pri = -1` reads
+eight bytes **before** the struct and then `vec_push`es onto whatever that decoded to.
+An out-of-bounds read followed by a write through the result — not a wrong answer, a
+memory-safety bug.
+
+Reachable from anything that computes a priority rather than naming one:
+`queue_item_new(priority, payload)` stores the caller's value verbatim, so a consumer
+mapping its own enum onto this one is a single arithmetic slip from `-1`.
+
+Both ends now clamp to `PRIORITY_NORMAL`.
+
+⚠ **Without the guard the suite does not fail an assertion — it dies mid-test.** The
+three preceding queue tests print `ok`, then the process is gone: no assertion message,
+no summary line. Verified by removing the guard and running.
+
+`test_queue_priority_clamping` covers `-1`, a far-negative, and an over-range value;
+asserts all three land in NORMAL **in arrival order** (clamping must not reorder), and
+that a real `PRIORITY_CRITICAL` still preempts a clamped item.
+
+### Changed — lint is clean across `src/`, was 13 warnings in two files
+
+All 13 were `line exceeds 120 characters`, pre-existing and untouched by the
+queue work: 8 in `src/ws.cyr`, 5 in `src/postgres_backend.cyr`.
+
+⚠ **`src/postgres_backend.cyr`'s were long SQL literals, and the emitted SQL is
+byte-identical** — verified by reassembling every `pg_exec` / `str_builder`
+string from `git show HEAD:` and from the new file and comparing the two sets:
+**8 strings, identical**. The three `CREATE TABLE` statements now build through
+`str_builder`, which is the idiom `pg_save_workflow_def` in the same file already
+used; the splits fall on `, ` boundaries inside the column list.
+
+⚠ **A `\`-continued string literal was NOT used**, in either file.
+`cyrius fmt` reindents inside multi-line literals and the leading spaces land
+**in the string** — which for a SQL statement means silently corrupted DDL. The
+`ws.cyr` HTTP/101 response is split into three `add_cstr` calls at header
+boundaries for the same reason.
+
+`ws.cyr`'s other seven were the SHA-1 big-endian word assembly and the 20-byte
+digest spill; both are now one operation per line and read better for it.
+
+### Added
+
+- `test_queue_deep_fifo_and_compaction` — the existing FIFO test used **three**
+  items, too shallow to reach the interesting states. This drains 500 at one
+  priority across ~9 compactions, refills after a full drain (the head-reset
+  branch), and runs 400 interleaved push/pops so the head advances while the tier
+  never empties.
+
+  ⚠ It asserts the **backing vec length**, not just order. Deleting `_pq_compact`
+  outright leaves every ordering assertion passing — order is correct either way —
+  while the tier grows to hold all 400 pushes forever. That is a memory defect an
+  order test structurally cannot see. Both mutants (compaction removed; head not
+  reset after compacting) are verified to fail this suite.
+
+**Gate:** 4 suites, **159 + 42 + 36 assertions, 0 failures**, with live Redis and
+PostgreSQL. `cyrius lint` clean across every file in `src/`, `cyrius fmt` clean
+across `src/`, `tests/` and `benches/`, `vet` 27 deps / 0 untrusted, `deny` 0
+violations, `deps --verify` 107/107, all four `dist/` bundles regenerated and
+idempotent. Toolchain and deps were already current: cyrius **6.5.18**, sigil
+**3.12.7**; `lib/` diffs clean against the pinned snapshot.
+
 ## [2.6.1] — 2026-08-10 — `relay_receive` raced the ALLOCATOR, not the relay
 
 ### Fixed — a concurrent `relay_receive` could be handed another sender's message

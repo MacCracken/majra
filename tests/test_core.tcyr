@@ -62,6 +62,108 @@ fn test_queue_fifo_within_tier() {
     println("  queue_fifo_within_tier: ok");
 }
 
+# Deep FIFO + the compaction path, added 2.6.2 alongside the O(1) dequeue.
+#
+# The three-item test above is too shallow to be a guard for it: `pq_dequeue`
+# now advances a read head and only reclaims the consumed prefix once the head
+# passes the midpoint, so the interesting states — compaction firing repeatedly,
+# and a tier that never fully empties because pushes keep arriving — need depth
+# and interleaving to reach. If the head/compaction arithmetic is wrong this is
+# where it shows: as a skipped item, a repeat, or a lost count.
+fn test_queue_deep_fifo_and_compaction() {
+    var pq = pq_new();
+
+    # 500 at one priority, drained in order. Compaction fires ~9 times.
+    for (var i = 0; i < 500; i = i + 1) {
+        pq_enqueue(pq, queue_item_new(PRIORITY_NORMAL, i));
+    }
+    assert_eq(pq_len(pq), 500, "500 queued at one priority");
+    var ok = 1;
+    for (var j = 0; j < 500; j = j + 1) {
+        if (queue_item_payload(pq_dequeue(pq)) != j) { ok = 0; }
+    }
+    assert_eq(ok, 1, "500 items come back in FIFO order across every compaction");
+    assert_eq(pq_len(pq), 0, "and the queue is empty");
+    assert_eq(pq_dequeue(pq), 0, "a drained queue answers 0");
+
+    # Refill after a full drain — exercises the head >= len reset branch, where
+    # the tier is truncated to 0 and the head goes back to 0 with no copying.
+    pq_enqueue(pq, queue_item_new(PRIORITY_NORMAL, 777));
+    assert_eq(queue_item_payload(pq_dequeue(pq)), 777, "a refilled tier reads from the front again");
+
+    # Steady state: interleaved push/pop so the head advances while the tier
+    # keeps growing and never empties. This is the shape a live worker produces,
+    # and the one an unbounded head would leak on.
+    var pq2 = pq_new();
+    for (var s = 0; s < 20; s = s + 1) {
+        pq_enqueue(pq2, queue_item_new(PRIORITY_HIGH, s));
+    }
+    var expect = 0;
+    var steady = 1;
+    for (var t = 20; t < 400; t = t + 1) {
+        pq_enqueue(pq2, queue_item_new(PRIORITY_HIGH, t));
+        if (queue_item_payload(pq_dequeue(pq2)) != expect) { steady = 0; }
+        expect = expect + 1;
+    }
+    assert_eq(steady, 1, "interleaved push/pop stays FIFO with the head advancing");
+    assert_eq(pq_len(pq2), 20, "and the depth is conserved — nothing lost or duplicated");
+
+    # ⚠ **The compaction assertion, and it needs the BACKING VEC, not pq_len.**
+    # Removing `_pq_compact` entirely leaves every ordering assertion above
+    # passing — order is correct either way — while the tier's vec grows to hold
+    # all 400 pushes forever. That is a memory bug an order test structurally
+    # cannot see, so this reads the tier directly: after 400 pushes and 380 pops
+    # the live depth is 20, and the backing vec must be near that rather than
+    # near 400.
+    var hi_tier = load64(pq2 + PRIORITY_HIGH * 8);
+    assert_eq(vec_len(hi_tier) <= 64, 1,
+    "the consumed prefix is reclaimed — an uncompacted tier would hold all 400");
+
+    # Priority still wins over arrival order once several tiers are occupied.
+    pq_enqueue(pq2, queue_item_new(PRIORITY_CRITICAL, 9999));
+    assert_eq(queue_item_payload(pq_dequeue(pq2)), 9999,
+    "a later CRITICAL still preempts the 20 HIGH items already waiting");
+
+    println("  queue_deep_fifo_and_compaction: ok");
+}
+
+# Out-of-range priorities are clamped at BOTH ends — 2.6.2.
+#
+# The over-range clamp was always there. A negative went straight to
+# `load64(pq + pri * 8)`, reading before the struct and then pushing onto
+# whatever that decoded to: an OOB read plus a write through the result. Reached
+# by any consumer that computes a priority instead of naming one.
+fn test_queue_priority_clamping() {
+    var pq = pq_new();
+
+    # -1 used to index one slot BEFORE the tier array.
+    pq_enqueue(pq, queue_item_new(0 - 1, 111));
+    assert_eq(pq_len(pq), 1, "a negative priority enqueues instead of corrupting memory");
+
+    # Far negative, in case -1 happened to land somewhere harmless.
+    pq_enqueue(pq, queue_item_new(0 - 9999, 222));
+    assert_eq(pq_len(pq), 2, "and so does a far-negative one");
+
+    # Over-range, the end that already worked.
+    pq_enqueue(pq, queue_item_new(NUM_PRIORITIES + 7, 333));
+    assert_eq(pq_len(pq), 3, "an over-range priority still enqueues");
+
+    # All three landed in NORMAL, in arrival order — clamping must not reorder.
+    assert_eq(queue_item_payload(pq_dequeue(pq)), 111, "clamped to NORMAL, FIFO preserved");
+    assert_eq(queue_item_payload(pq_dequeue(pq)), 222, "second");
+    assert_eq(queue_item_payload(pq_dequeue(pq)), 333, "third");
+    assert_eq(pq_len(pq), 0, "and nothing is left behind");
+
+    # A real priority still outranks the clamped ones.
+    var pq2 = pq_new();
+    pq_enqueue(pq2, queue_item_new(0 - 1, 1));
+    pq_enqueue(pq2, queue_item_new(PRIORITY_CRITICAL, 2));
+    assert_eq(queue_item_payload(pq_dequeue(pq2)), 2,
+    "a clamped item sits at NORMAL, so CRITICAL still preempts it");
+
+    println("  queue_priority_clamping: ok");
+}
+
 fn test_managed_queue_lifecycle() {
     var mq = mq_new("lifecycle", 2);
     var j1 = mq_enqueue(mq, PRIORITY_NORMAL, 100);
@@ -925,6 +1027,8 @@ fn main() {
     # Queue
     test_queue_priority_ordering();
     test_queue_fifo_within_tier();
+    test_queue_deep_fifo_and_compaction();
+    test_queue_priority_clamping();
     test_managed_queue_lifecycle();
     test_managed_queue_cancel();
     test_managed_queue_concurrent_enqueue();
