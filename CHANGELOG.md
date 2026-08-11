@@ -5,10 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.6.1] — 2026-08-10 — toolchain + deps; the sakshi defensive pin is no longer needed
+## [2.6.1] — 2026-08-10 — `relay_receive` raced the ALLOCATOR, not the relay
 
-Maintenance only: **no `src/` file changed**, and all four `dist/` bundles regenerate with
-their version line as the sole difference.
+### Fixed — a concurrent `relay_receive` could be handed another sender's message
+
+`relay_receive_ex` allocated its result struct with `fl_alloc(16)` **after** releasing its
+mutex. **`fl_alloc` is not thread-safe** — `lib/freelist.cyr` manipulates the global
+`_fl_heads` free lists with plain loads and stores, no mutex and no atomics — so two
+threads in that window could be handed the **same block**.
+
+The symptom was not a crash at the allocation. It was wrong data in the dedup table: a
+message arriving under another sender's sequence number and correctly rejected as a
+duplicate, surfacing as an intermittent
+
+```
+FAIL: every strictly-increasing message from sender-a is accepted
+FAIL: no message was wrongly dropped as a duplicate
+```
+
+— which reads like a defect in the dedup logic, the one part of this path 2.6.0 had just
+audited. Under heavier contention it **faulted** instead of failing an assertion.
+
+⚠ **2.6.0's reentrancy fix was correct and is untouched.** It made the dedup table's
+mutation safe. This is a second, independent race in the same function, in an allocation
+that happens *after* that mutex is dropped — which is why auditing the locking again
+would never have found it. The fix allocates the 16 bytes inside the critical section, a
+section that already walks the subscriber list.
+
+Measured, 40 concurrent instances of `tests/test_core.tcyr`:
+
+| build | failures |
+|---|---|
+| before | **4 / 40**, one a core dump |
+| after | **0 / 40** |
+
+A single run passes either way; only contention separates them, which is why this reached
+CI rather than a local test sweep.
+
+### Fixed — the reentrancy test was measuring the allocator, not the relay
+
+`test_relay_receive_is_reentrant` built its 400 messages per worker **inside** the worker
+threads, with `fl_alloc`. The two workers therefore raced the allocator, and the test
+could fail for a reason unrelated to `relay_receive`'s reentrancy. Messages are now built
+up front on the calling thread and the workers only read them, so the test measures the
+invariant it names.
+
+Filed upstream as
+`cyrius/docs/development/issues/2026-08-10-fl-alloc-is-not-thread-safe-and-says-nothing.md`:
+`lib/freelist.cyr` documents neither the constraint nor a safe variant, and it ships
+beside `thread.cyr`.
 
 ### Changed
 
@@ -40,8 +85,8 @@ their version line as the sole difference.
 - All four `dist/` bundles regenerated — umbrella **and** the `backends` / `admin` /
   `signed` profiles. ⚠ A bare `cyrius distlib` writes only `dist/majra.cyr`; each profile
   needs its own `cyrius distlib <name>`, and skipping them ships a bundle stamped with the
-  previous version. Regeneration verified **idempotent**, and every bundle's diff is the
-  version line alone.
+  previous version.
+- **40 concurrent instances of `test_core`, 0 failures**, against 4/40 before the fix.
 - `lib/sakshi.cyr` holds at **2.4.10 through a build**, with no shadow warning.
 
 ## [2.6.0] — 2026-08-08
@@ -952,45 +997,6 @@ refresh libro did in its 1.1.0 → 2.0 arc, catching majra up.
 - Cyrius toolchain pinned to v3.2.5 (cc3 compiler, minimum version)
 
 ## [Unreleased]
-
-## [2.6.1] — 2026-08-10 — toolchain + deps; the sakshi defensive pin is no longer needed
-
-Maintenance only: **no `src/` file changed**, and all four `dist/` bundles regenerate with
-their version line as the sole difference.
-
-### Changed
-
-- **Toolchain pin 6.5.14 → 6.5.18.**
-- **`[deps.sigil]` 3.12.6 → 3.12.7.**
-- **`sakshi` moved from `[deps.sakshi]` into `[deps].stdlib`, at 2.4.10.**
-
-  That git pin was **defensive**, and the thing it defended against is gone. It existed
-  because sigil's own manifest declared `[deps.sakshi]`, and `cyrius deps` overlays a git
-  dep's resolution on top of the `lib sync --full` snapshot — so left implicit, sigil
-  silently downgraded `lib/sakshi.cyr` on every build behind an unnamed "1 bundled lib(s)
-  differ" warning. **sigil 3.12.7 dropped that dep**, so there is nothing to counteract:
-  `patra` reaches majra as a *stdlib* module from the snapshot, not as a git dep, so its
-  manifest is never consulted. majra's `src/` calls no sakshi symbol and none of the four
-  bundles reference one.
-
-  ⚠ **Do not re-add a `[deps.sakshi]` here to "pin" it.** On a library that publishes
-  bundles, a git dep makes `distlib` reclassify the module out of the **stdlib leaves**,
-  dropping it from the `.deps` sidecars and breaking clean-room consumers — kavach hit
-  exactly that and had to revert it.
-
-### Verified
-
-- **241 assertions, 0 failures** across all four suites, including `tests/test_live.tcyr`
-  (36) run against **real Redis and PostgreSQL** in Docker rather than skipped — the
-  containers, and the `pg_hba.conf` rewrite the CI job performs, were stood up locally so
-  the live path was actually exercised.
-- `cyrius bench` clean.
-- All four `dist/` bundles regenerated — umbrella **and** the `backends` / `admin` /
-  `signed` profiles. ⚠ A bare `cyrius distlib` writes only `dist/majra.cyr`; each profile
-  needs its own `cyrius distlib <name>`, and skipping them ships a bundle stamped with the
-  previous version. Regeneration verified **idempotent**, and every bundle's diff is the
-  version line alone.
-- `lib/sakshi.cyr` holds at **2.4.10 through a build**, with no shadow warning.
 
 ## [2.1.0] — 2026-04-09
 

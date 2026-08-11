@@ -2216,6 +2216,20 @@ fn relay_receive_ex(r, msg) {
         vec_push(snapshot, vec_get(subs, si));
         si = si + 1;
     }
+    # ⚠ The result struct is allocated **under the lock**, not after it.
+    # `fl_alloc` is not thread-safe — `lib/freelist.cyr` reads and writes the
+    # global `_fl_heads` free lists with plain loads and stores, no mutex and no
+    # atomics — so two threads calling `relay_receive` concurrently could be
+    # handed the SAME block. That is not a theoretical hazard: it corrupted the
+    # dedup table (a message arriving under another sender's sequence, then
+    # rejected as a duplicate) and, under real contention, faulted.
+    #
+    # Allocating before the unlock costs nothing — it is 16 bytes of fixed work
+    # already inside a critical section that walks the subscriber list.
+    var inc = fl_alloc(16);
+    store64(inc, is_broadcast);
+    store64(inc + 8, msg);
+
     mutex_unlock(mtx);
 
     var j = 0;
@@ -2225,9 +2239,6 @@ fn relay_receive_ex(r, msg) {
         j = j + 1;
     }
 
-    var inc = fl_alloc(16);
-    store64(inc, is_broadcast);
-    store64(inc + 8, msg);
     return inc;
 }
 

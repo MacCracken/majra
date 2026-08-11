@@ -389,31 +389,56 @@ var _rr_a_ok = 0;
 var _rr_b_ok = 0;
 var _rr_go = 0;
 
-fn _rr_worker(sender, counter_ptr) {
+# ⚠ Every message is allocated BEFORE the worker starts, and the worker only
+# reads from that pre-built array.
+#
+# `fl_alloc` is not thread-safe: `lib/freelist.cyr` manipulates the global
+# `_fl_heads` free lists with plain loads and stores. Allocating inside the loop
+# meant the two workers raced the ALLOCATOR, not the relay — they could be
+# handed the same block, so a sender-a message would arrive carrying sender-b's
+# sequence and be rejected as a duplicate. That is what this test was actually
+# catching, intermittently, and it is not what it is for: the invariant under
+# test is that `relay_receive` is reentrant.
+fn _rr_worker(msgs, counter_ptr) {
     while (atomic_load(&_rr_go) == 0) { }
-    var i = 1;
+    var i = 0;
     var ok = 0;
-    while (i <= _rr_iters) {
-        var m = fl_alloc(64);
-        store64(m, i);
-        store64(m + 8, sender);
-        store64(m + 16, 0);
-        store64(m + 24, "t");
-        if (relay_receive(_rr_relay, m) != 0) { ok = ok + 1; }
+    while (i < _rr_iters) {
+        if (relay_receive(_rr_relay, vec_get(msgs, i)) != 0) { ok = ok + 1; }
         i = i + 1;
     }
     store64(counter_ptr, ok);
     return 0;
 }
 
-fn _rr_worker_a(arg) { return _rr_worker("sender-a", &_rr_a_ok); }
-fn _rr_worker_b(arg) { return _rr_worker("sender-b", &_rr_b_ok); }
+# Build `_rr_iters` messages for `sender`, sequences 1..n, on the calling thread.
+fn _rr_build(sender) {
+    var v = vec_new();
+    var i = 1;
+    while (i <= _rr_iters) {
+        var m = fl_alloc(64);
+        store64(m, i);
+        store64(m + 8, sender);
+        store64(m + 16, 0);
+        store64(m + 24, "t");
+        vec_push(v, m);
+        i = i + 1;
+    }
+    return v;
+}
+
+var _rr_msgs_a = 0;
+var _rr_msgs_b = 0;
+fn _rr_worker_a(arg) { return _rr_worker(_rr_msgs_a, &_rr_a_ok); }
+fn _rr_worker_b(arg) { return _rr_worker(_rr_msgs_b, &_rr_b_ok); }
 
 fn test_relay_receive_is_reentrant() {
     _rr_relay = relay_new("node-1");
     _rr_a_ok = 0;
     _rr_b_ok = 0;
     _rr_go = 0;
+    _rr_msgs_a = _rr_build("sender-a");
+    _rr_msgs_b = _rr_build("sender-b");
 
     var t1 = thread_create(&_rr_worker_a, 0);
     var t2 = thread_create(&_rr_worker_b, 0);
