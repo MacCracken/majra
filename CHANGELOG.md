@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.3] — 2026-08-12 — the `fl_alloc` stopgap is retired; upstream fixed it properly
+
+### Changed
+
+- **Toolchain pinned to cyrius 6.5.20** (was 6.5.18), which makes **`fl_alloc`
+  thread-safe** — the defect majra reported from `test_relay_receive_is_reentrant`
+  on 2026-08-10. The fix landed in 6.5.19; 6.5.20 is taken because it re-folds
+  **patra 1.13.0**, and patra reaches majra as a stdlib module. patra 1.12.12 —
+  what every earlier snapshot folded — carried its own `[deps.sakshi]` at
+  **2.4.2** against the 2.4.10 the same snapshot shipped, and `cyrius deps`
+  overlays a git dep's resolution on top of the `lib sync --full` snapshot on
+  **every `cyrius build`**, recursing through sibling manifests. majra was never
+  hit (it consults no patra manifest — patra arrives from the fold, and majra's
+  `src/` calls no sakshi symbol), but the pin should name a snapshot without the
+  hazard in it.
+
+  The filing described **one** race: two threads popping the same block off
+  `_fl_heads[cls]`. Upstream found **five** and locked all of them behind a
+  process-wide CAS spinlock — `fl_init`'s check-then-set, the pop, the push, the
+  arena bump, and an arena refill whose `mmap` left a **~2 µs unlocked window**
+  (roughly 1,000× wider than the pop) that could return a block **running off the
+  end of its mapping**. The large (>4096) path stays lock-free; it touches no
+  shared state. The lock costs nothing until threads exist (a `_threads_active`
+  gate).
+
+- **`relay_receive_ex` allocates its result struct AFTER the unlock again.**
+
+  2.6.1 pulled the 16-byte `fl_alloc` *inside* the critical section as a
+  stopgap, because an unsynchronised `fl_alloc` could hand two concurrent
+  `relay_receive` callers the same block — which corrupted the dedup table (a
+  message arriving under another sender's sequence, then rejected as a
+  duplicate) and, under real contention, faulted.
+
+  ⚠ **That stopgap was never a complete fix**, and the header said so: it
+  serialised majra against *majra* while any other thread in the process calling
+  `fl_alloc` still raced it. With the allocator fixed upstream, the block goes
+  back outside the lock, which is where it belongs — it is private to the call
+  and nothing under the lock reads it. **The lock is held across a
+  subscriber-list walk on a hot pub/sub path**, so shortening it is the point of
+  undoing the workaround, not a cosmetic tidy.
+
+  No API change; `relay_receive` / `relay_receive_ex` return the same struct.
+
 ## [2.6.2] — 2026-08-11 — the priority queue: O(n²) drain, and an unguarded negative index
 
 ### Performance — a pop is now O(1) amortised, and 6,000x faster at depth
