@@ -73,8 +73,8 @@ fn _admin_ratelimit_json(a, key) {
         ret2(empty, strlen(empty));
     }
     # ratelimit_stats returns global stats (total_allowed, total_rejected,
-    # active_keys) — per-key stats would need a new helper. Good enough
-    # for v1; per-key lookup is a follow-up.
+    # active_keys, total_evicted) — per-key stats would need a new helper.
+    # Good enough for v1; per-key lookup is a follow-up.
     var s = ratelimit_stats(rl);
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "{\"allowed\":");
@@ -83,6 +83,8 @@ fn _admin_ratelimit_json(a, key) {
     str_builder_add_int(sb, load64(s + 8));
     str_builder_add_cstr(sb, ",\"active_keys\":");
     str_builder_add_int(sb, load64(s + 16));
+    str_builder_add_cstr(sb, ",\"evicted\":");
+    str_builder_add_int(sb, load64(s + 24));
     str_builder_add_cstr(sb, "}");
     var body = str_builder_build(sb);
     ret2(str_data(body), str_len(body));

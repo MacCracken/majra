@@ -801,6 +801,157 @@ fn test_ratelimit_separate_keys() {
     println("  ratelimit_separate_keys: ok");
 }
 
+# Build a fresh, independently-allocated cstr holding `text`.
+#
+# ⚠ A string literal in the tests above is ONE pooled address reused at every
+# call site, so a limiter that keyed on the pointer rather than the bytes would
+# still pass `test_ratelimit_separate_keys` — which is exactly how that defect
+# survived. Every test below keys on bytes that live at a different address each
+# time, the way a key parsed out of a request does.
+fn _t_fresh_key(text) {
+    var n = strlen(text);
+    var p = fl_alloc(n + 1);
+    memcpy(p, text, n);
+    store8(p + n, 0);
+    return p;
+}
+
+# Same bytes, different addresses, must share ONE bucket.
+#
+# Regression for 2.6.4: a caller whose key is built per request got a new
+# full-burst bucket every time, so the limiter never refused anything. Measured
+# through agnosai's HTTP handler as 3 identical requests -> 3 keys, 0 rejections.
+fn test_ratelimit_key_is_content_not_pointer() {
+    var rl = ratelimit_new(1000000, 2);
+    assert(ratelimit_check(rl, _t_fresh_key("1.2.3.4")) == 1, "rl fresh allow1");
+    assert(ratelimit_check(rl, _t_fresh_key("1.2.3.4")) == 1, "rl fresh allow2");
+    assert(ratelimit_check(rl, _t_fresh_key("1.2.3.4")) == 0, "rl fresh reject3");
+    assert_eq(ratelimit_key_count(rl), 1, "rl fresh keys share one bucket");
+    println("  ratelimit_key_is_content_not_pointer: ok");
+}
+
+# The limiter must not borrow the caller's key.
+#
+# ⚠ Asserting "two keys produce two buckets" does NOT test this — under a borrow
+# the count still reaches two, just by the wrong route. The borrow is only
+# visible by making the caller's block change CONTENT underneath the map: free
+# the key, let the allocator hand the same block back for different bytes, then
+# look the ORIGINAL content up again. Owned, it still resolves to its bucket;
+# borrowed, the map's stored pointer now reads the new bytes and the original
+# key misses and mints a second bucket.
+#
+# This is the real-world shape: a key built into a per-request arena that is
+# reset and reused by the next request.
+#
+# 40-byte keys (41 with terminator) sit in freelist class 2, clear of the
+# 16-byte bucket's class 0, so the block really is reused — asserted, not
+# assumed, by the precondition below.
+fn test_ratelimit_key_is_owned() {
+    var rl = ratelimit_new(1000000, 100);
+    var key_a = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    var key_b = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+
+    var ka = _t_fresh_key(key_a);
+    assert(ratelimit_check(rl, ka) == 1, "rl owned: first check allowed");
+    assert_eq(ratelimit_key_count(rl), 1, "rl owned: one bucket");
+
+    fl_free(ka);
+    var kb = _t_fresh_key(key_b);
+    assert_eq(kb, ka, "rl owned precondition: freed key block was handed back");
+
+    assert(ratelimit_check(rl, _t_fresh_key(key_a)) == 1, "rl owned: re-check allowed");
+    assert_eq(ratelimit_key_count(rl), 1, "rl owned: original key still finds its bucket");
+    println("  ratelimit_key_is_owned: ok");
+}
+
+# Eviction returns the key and bucket to the freelist rather than leaking them.
+#
+# Before 2.6.4 `map_delete` dropped the entry and leaked both halves, so the one
+# mechanism built to bound a limiter's memory grew it instead. `key_count`
+# cannot see that — it reads the map, and the map is correct either way — so
+# this asserts on the ALLOCATOR: the freelist is LIFO per size class, so the
+# next same-class request must hand back the exact block eviction released.
+#
+# The key is 40 bytes (41 with the terminator) to land in class 2, well clear of
+# the 16-byte bucket's class 0; nothing else in this test touches class 2, so
+# the address comparison is exact rather than incidental.
+fn test_ratelimit_evict_reclaims() {
+    var rl = ratelimit_new(1000000, 2);
+    var long_key = "0123456789012345678901234567890123456789";
+    ratelimit_check(rl, _t_fresh_key(long_key));
+
+    # Read the map's OWN copy of the key, and the bucket it points at, before
+    # eviction frees them.
+    var buckets = load64(rl + 16);
+    var owned_key = vec_get(map_keys(buckets), 0);
+    var owned_bucket = map_get(buckets, owned_key);
+    assert(owned_key != 0, "evict: owned key present");
+    assert(owned_bucket != 0, "evict: owned bucket present");
+
+    assert_eq(ratelimit_evict_stale(rl, 0), 1, "evict removes the idle key");
+    assert_eq(ratelimit_key_count(rl), 0, "evict leaves 0 keys");
+
+    # No allocation between the evict and these probes.
+    var reused_key = fl_alloc(41);
+    var reused_bucket = fl_alloc(16);
+    assert_eq(reused_key, owned_key, "evict returned the key block to the freelist");
+    assert_eq(reused_bucket, owned_bucket, "evict returned the bucket to the freelist");
+    assert_eq(load64(ratelimit_stats(rl) + 24), 1, "evict is counted in stats");
+    println("  ratelimit_evict_reclaims: ok");
+}
+
+# A sweep must leave live entries alone, and must count what it removed.
+#
+# The rewritten sweep walks the entries array itself rather than materialising
+# a key vec, so the "skip this slot" arm is new code and needs its own cover:
+# with a threshold no bucket can meet, nothing is removed and nothing is
+# counted, and every key still resolves afterwards.
+fn test_ratelimit_evict_spares_live_keys() {
+    var rl = ratelimit_new(1000000, 5);
+    ratelimit_check(rl, _t_fresh_key("p.p.p.p"));
+    ratelimit_check(rl, _t_fresh_key("q.q.q.q"));
+    ratelimit_check(rl, _t_fresh_key("r.r.r.r"));
+    assert_eq(ratelimit_key_count(rl), 3, "spare: 3 keys before");
+
+    # One hour of idle required; these buckets are microseconds old.
+    assert_eq(ratelimit_evict_stale(rl, 3600000000000), 0, "spare: nothing is stale yet");
+    assert_eq(ratelimit_key_count(rl), 3, "spare: all 3 survive");
+    assert_eq(load64(ratelimit_stats(rl) + 24), 0, "spare: nothing counted as evicted");
+
+    # And the survivors are still reachable by content, not merely counted.
+    assert(ratelimit_check(rl, _t_fresh_key("q.q.q.q")) == 1, "spare: survivor still resolves");
+    assert_eq(ratelimit_key_count(rl), 3, "spare: survivor did not mint a new bucket");
+    println("  ratelimit_evict_spares_live_keys: ok");
+}
+
+fn test_sliding_window_key_is_content_not_pointer() {
+    var sw = sliding_window_new(1, 1000000000);
+    assert(sliding_window_check(sw, _t_fresh_key("z.z.z.z")) == 1, "sw fresh allow");
+    assert(sliding_window_check(sw, _t_fresh_key("z.z.z.z")) == 0, "sw fresh reject");
+    assert_eq(sliding_window_key_count(sw), 1, "sw fresh one key");
+    println("  sliding_window_key_is_content_not_pointer: ok");
+}
+
+# The sliding window borrows nothing either — same shape as
+# `test_ratelimit_key_is_owned`, which carries the reasoning.
+fn test_sliding_window_key_is_owned() {
+    var sw = sliding_window_new(100, 1000000000);
+    var key_a = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+    var key_b = "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
+
+    var ka = _t_fresh_key(key_a);
+    assert(sliding_window_check(sw, ka) == 1, "sw owned: first check allowed");
+    assert_eq(sliding_window_key_count(sw), 1, "sw owned: one window");
+
+    fl_free(ka);
+    var kb = _t_fresh_key(key_b);
+    assert_eq(kb, ka, "sw owned precondition: freed key block was handed back");
+
+    assert(sliding_window_check(sw, _t_fresh_key(key_a)) == 1, "sw owned: re-check allowed");
+    assert_eq(sliding_window_key_count(sw), 1, "sw owned: original key still finds its window");
+    println("  sliding_window_key_is_owned: ok");
+}
+
 fn test_sliding_window_separate_keys() {
     var sw = sliding_window_new(1, 1000000000);
     assert(sliding_window_check(sw, "a") == 1, "sw a allow");
@@ -1062,6 +1213,12 @@ fn main() {
     # RateLimit
     test_ratelimit_separate_keys();
     test_sliding_window_separate_keys();
+    test_ratelimit_key_is_content_not_pointer();
+    test_ratelimit_key_is_owned();
+    test_ratelimit_evict_reclaims();
+    test_ratelimit_evict_spares_live_keys();
+    test_sliding_window_key_is_content_not_pointer();
+    test_sliding_window_key_is_owned();
 
     # Fleet
     test_fleet_routing();

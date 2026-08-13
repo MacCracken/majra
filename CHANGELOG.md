@@ -5,6 +5,78 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.4] — 2026-08-13 — the rate limiter never refused anything
+
+### Fixed
+
+- **ratelimit** — **a key built per request got a fresh full-burst bucket every
+  time, so neither limiter refused anything.** `ratelimit_check` and
+  `sliding_window_check` store the caller's key pointer directly
+  (`map_set` is `store64(ep, key)` — a borrow, not a copy), and the entry lives
+  until eviction. Every real caller derives its key per request — a header, a
+  peer address, a token — so the map was holding a pointer the caller was free
+  to reuse or release, and once it did, the bucket became unreachable under its
+  own key. Both limiters now own their key (`_ratelimit_key_own`, an `fl_alloc`
+  copy on the same freelist as the bucket).
+
+  ⚠ **It passed the obvious test.** A string literal is one pooled address
+  reused at every call site, so `ratelimit_check(rl, "k1")` in a loop shares a
+  bucket and looks correct — which is how this survived since the module was
+  written. The regression tests build every key at a fresh address.
+
+  Reported by agnosai on 2026-08-13, measured through its HTTP handler: three
+  identical requests produced **3 active keys and 0 rejections**.
+
+- **ratelimit** — **the eviction sweep leaked its own scratch on every run.**
+  `map_keys` builds a vec and `to_remove` was a second one; both come from
+  `vec_new_a(default_alloc())` — the global **no-free** bump — and `vec_push`
+  growth abandons each old buffer there as well. A 100k-key sweep burned well
+  over a megabyte that never came back, so the routine whose entire purpose is
+  bounding a limiter's memory consumed more of it the better it worked. The
+  sweep now **allocates nothing**: it walks the entries array through the map's
+  own public accessors (`map_entries` / `map_cap`), the same iteration
+  `map_keys` and `map_iter` do internally. Deleting during the walk is safe
+  because `map_delete` only tombstones the slot it finds — it never moves,
+  reallocs or rehashes.
+
+- **ratelimit** — **eviction leaked both halves of every bucket it removed.**
+  `ratelimit_evict_stale` called `map_delete` and dropped the key and the
+  16-byte bucket on the floor, so the one mechanism built to bound a limiter's
+  memory grew it instead — unbounded under churning keys. Both are now returned
+  with `fl_free`, after the `map_delete` that needs the key to find the entry.
+  Safe because `_map_find` never key-compares a tombstone and `_map_grow_a`
+  rehashes only live entries, so the stale pointer left in the slot is never
+  dereferenced.
+
+### Notes
+
+- ⚠ **`ratelimit_check`/`sliding_window_check` take a cstr, not a `Str`.** The
+  bucket map is `KeyTypeCstr` — it hashes with `hash_str` and compares with
+  `streq`, both reading bytes from the pointer. A `Str` VALUE passed instead is
+  read as its header, whose first eight bytes are the data pointer, so identical
+  content at two addresses hashes two ways. That mismatch is what agnosai hit.
+  Callers holding a `Str` must pass `str_cstr(s)`. Documented at both entry
+  points; the signatures are unchanged.
+- ⚠ `sliding_window_*` still has **no eviction sweep**, so its entries live for
+  the process. That predates this release and is unchanged by it; only
+  `ratelimit_*` is bounded in time.
+
+### Added
+
+- **ratelimit** — `total_evicted` in `ratelimit_stats` (offset 24) is now wired
+  to a real counter, cumulative across sweeps, and surfaced by
+  `_admin_ratelimit_json`. It had been hardcoded `0` with an "unused for now"
+  note; with eviction now reclaiming memory, the churn it measures is worth
+  seeing. `RateLimiter` grows 48 -> 56 bytes, which is the same freelist class.
+- 6 ratelimit/sliding-window regression tests — `test_core` **159 → 189
+  assertions**, plus one in `test_backends` for the new `evicted` field (**242 →
+  249** across the three runnable suites). Every one keys on bytes at a fresh
+  address, because a string literal is one pooled address reused at every call
+  site and a pointer-keyed limiter passes happily under literals.
+  Mutation-verified, 7 probes / 7 kills: borrowing the key in either limiter,
+  dropping either `fl_free` in the sweep, swapping the map to `map_new_str`, and
+  a sweep that ignores its idle threshold are all caught.
+
 ## [2.6.3] — 2026-08-12 — the `fl_alloc` stopgap is retired; upstream fixed it properly
 
 ### Changed

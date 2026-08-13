@@ -223,6 +223,7 @@ fn test_admin() {
     assert(rl_len > 0, "ratelimit json non-empty");
     var rl_s = str_new(rl_body, rl_len);
     assert(str_contains_cstr(rl_s, "allowed") == 1, "ratelimit json has 'allowed'");
+    assert(str_contains_cstr(rl_s, "evicted") == 1, "ratelimit json has 'evicted'");
 
     println("  admin: ok");
 }
