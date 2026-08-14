@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.6] — 2026-08-13 — the relay's fan-out could wedge its sender
+
+### Fixed
+
+- **relay** — **a full subscriber ring blocked the SENDER, forever.** Both
+  fan-out paths pushed with `chan_send`, which futex-waits for space; Rust's
+  `Relay` is a `tokio::sync::broadcast` and `Relay::send` is
+  `let _ = self.tx.send(..)` (`fleet/relay.rs:133`) — it **never blocks**. A full
+  ring overwrites its oldest slot and the lagging receiver observes
+  `RecvError::Lagged`. Now `chan_try_send`, so a full ring drops rather than
+  waits.
+
+  ⚠ **2.6.5 is what made this reachable.** Before it, every subscriber channel
+  was 256 deep regardless of the capacity asked for, so wedging needed 256
+  undrained messages; honouring the capacity made it reachable at whatever depth
+  the caller names — `relay_with_capacity(id, 2)` deadlocked on the **third**
+  send. Reproduced directly: three sends against a depth-2 relay never returned,
+  killed by `timeout`. majra has no unsubscribe, so the wedge is permanent
+  rather than transient, and an agnosai caller wedges a pooled worker thread.
+
+  Found by an adversarial review of the 2.6.5 change set, not by the suite —
+  the 2.6.5 capacity test filled the ring with `chan_try_send` **directly on the
+  channel**, routing around `relay_send` and so around the blocking call.
+
+### Added
+
+- A deadlock guard: a depth-2 relay takes a third and fourth `relay_send` and
+  both return. Mutation-verified — restoring `chan_send` hangs the suite
+  (`timeout` rc 124) rather than failing an assertion.
+
 ## [2.6.5] — 2026-08-13 — the relay's capacity was discarded and its timestamp was unportable
 
 ### Fixed

@@ -812,6 +812,20 @@ fn test_relay_capacity_is_applied() {
     var zero = relay_with_capacity("n3", 0);
     assert_eq(relay_capacity(zero), 256,
     "and a non-positive capacity falls back rather than building a dead channel");
+    # ⚠ **A full subscriber ring must NOT wedge the sender.** Rust's
+    # `broadcast::send` never blocks — a lagging receiver gets `Lagged`, the
+    # sender proceeds. `chan_send` futex-waits for space, so honouring the
+    # capacity (2.6.5) turned a latent divergence into a real deadlock at
+    # whatever depth the caller names: with a depth of 2, the THIRD send never
+    # returned. Verified by repro before the fix; this is the guard.
+    var wedge = relay_with_capacity("wedge", 2);
+    relay_subscribe(wedge);
+    relay_send(wedge, "b", "t", 0);
+    relay_send(wedge, "b", "t", 0);
+    assert_eq(relay_send(wedge, "b", "t", 0), 3,
+    "the third send RETURNS with the ring full — a hang here is the 2.6.5 deadlock");
+    assert_eq(relay_send(wedge, "b", "t", 0), 4, "and so does the fourth");
+
     println("  relay_capacity_is_applied: ok");
 }
 
