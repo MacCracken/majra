@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.5] — 2026-08-13 — the relay's capacity was discarded and its timestamp was unportable
+
+### Fixed
+
+- **relay** — **`capacity` was accepted and thrown away.** `relay_subscribe`
+  hardcoded `chan_new(256)`, so a relay built asking for 4 and one asking for
+  4096 behaved identically; Rust's `Relay::new` sizes its `broadcast::channel`
+  from the argument. New `relay_with_capacity(node_id, capacity)` and
+  `relay_capacity(r)`; `relay_new` delegates with the 256 default, so nothing
+  that does not ask for a depth changes. A non-positive capacity falls back
+  rather than building a channel nothing could be sent through.
+
+- **relay** — **the message timestamp was CLOCK_MONOTONIC.** A RelayMessage is
+  serialised and sent to another node, and Rust stamps it `DateTime<Utc>` — a
+  portable instant. `time_now_ns()` measures from an arbitrary per-boot zero, so
+  the number carried on the wire was meaningless outside the emitting process:
+  two nodes could not order each other's messages by it, and a persisted one
+  could not be read back after a reboot. Now `clock_epoch_ns()`.
+
+  ⚠ **This changes what the field MEANS, not any decision majra makes.** Dedup
+  and ordering are by `seq`, and nothing in the module compares timestamps.
+
+  ⚠ **The wall-clock reader is majra's own `time_epoch_ns` (`src/envelope.cyr`),
+  NOT the stdlib's `clock_epoch_ns`.** `chrono` is not among the modules a
+  `--no-deps` build prepends, and `--no-deps` is exactly what CI passes — so the
+  stdlib call compiled locally, where a full `lib sync` had put `chrono.cyr` on
+  disk, and failed in CI with `undefined function 'clock_epoch_ns'`. Adding
+  `chrono` to `[deps] stdlib` does **not** fix it; that list controls
+  provisioning, not what a `--no-deps` build has in scope. `time_epoch_ns` sits
+  beside the `time_now_ns` that already does this dance and differs only in the
+  clock id (`CLOCK_REALTIME` rather than `CLOCK_MONOTONIC`), so majra's time
+  sources stay in one place and no dependency is added.
+
+  Both reported by agnosai 2026-08-13, which had carried them in
+  `src/fleet/relay.cyr` as "owed to majra".
+
+### Added
+
+- `relay_msg_timestamp(m)` — there was no accessor for offset 40 at all.
+- `RELAY_DEFAULT_CAPACITY` (256), named rather than repeated.
+- 9 relay regression tests (`test_core` **189 -> 198**). Mutation-verified:
+  restoring the hardcoded `chan_new(256)` and reverting to `time_now_ns()` each
+  fail loudly. A depth of 2 is the capacity discriminator — the third send with
+  nobody draining must be refused, where 256 swallows it.
+
+### Changed
+
+- The `Relay` struct grows **96 -> 104 bytes**; `capacity` is **appended**, so no
+  existing field offset moves.
+
 ## [2.6.4] — 2026-08-13 — the rate limiter never refused anything
 
 ### Fixed

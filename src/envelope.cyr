@@ -39,6 +39,33 @@ fn time_now_ns() {
     #endif
 }
 
+# Get current WALL-CLOCK time in epoch nanoseconds.
+#
+# ⚠ **A sibling of `time_now_ns`, not a call into `chrono`.** `clock_epoch_ns`
+# exists in the stdlib, but `chrono` is not among the modules a `--no-deps`
+# build prepends — which is what CI runs — so reaching for it built fine locally
+# and failed there with `undefined function 'clock_epoch_ns'`. Rolling it here,
+# beside the monotonic reader that already does this dance, keeps majra's time
+# sources in one place and adds no dependency.
+#
+# The only difference from `time_now_ns` is the clock id: `CLOCK_REALTIME` (0)
+# rather than `CLOCK_MONOTONIC`. Used by `relay_msg_new`, whose stamp crosses
+# process boundaries and so must be a portable instant.
+fn time_epoch_ns() {
+    #ifdef CYRIUS_TARGET_AGNOS
+    # agnos exposes whole-second wall clock only (#46); the low nine digits are
+    # always zero, which is the same limitation `lib/chrono.cyr` documents.
+    return sys_time_unix() * 1000000000;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    # 16 bytes for a struct timespec — see `time_now_ns` for why `var ts[2]`
+    # would be a stack smash rather than two slots.
+    var ts[16];
+    syscall(SYS_CLOCK_GETTIME, 0, &ts);
+    return load64(&ts) * 1000000000 + load64(&ts + 8);
+    #endif
+}
+
 # Generate a pseudo-UUID (128 random bits) using getrandom syscall.
 # Returns two values: hi in rax, lo via rethi().
 fn uuid_generate() {

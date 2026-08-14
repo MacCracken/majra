@@ -790,6 +790,50 @@ fn test_heartbeat_metadata() {
 # RateLimit — expanded tests (Rust: 13 tests)
 # =============================================================================
 
+# ⚠ **`capacity` must actually reach the channel.** `relay_subscribe` hardcoded
+# `chan_new(256)`, so a relay built asking for 4 and one asking for 4096 behaved
+# identically — the parameter Rust's `broadcast::channel(capacity)` honours was
+# accepted and discarded. Reported by agnosai, which carried it as "owed to
+# majra" in `fleet/relay.cyr`.
+#
+# A depth of 2 is the discriminator: the third send with nobody draining must be
+# refused, where 256 would swallow it.
+fn test_relay_capacity_is_applied() {
+    var r = relay_with_capacity("n1", 2);
+    assert_eq(relay_capacity(r), 2, "the relay reports the depth it was built with");
+    var sub = relay_subscribe(r);
+    assert_eq(chan_try_send(sub, 1), 0, "first send fits");
+    assert_eq(chan_try_send(sub, 2), 0, "second send fits");
+    assert_eq(chan_try_send(sub, 3), 0 - 2,
+    "the THIRD is refused as full — a 0 here means the capacity never reached chan_new");
+
+    var d = relay_new("n2");
+    assert_eq(relay_capacity(d), 256, "relay_new still defaults to 256");
+    var zero = relay_with_capacity("n3", 0);
+    assert_eq(relay_capacity(zero), 256,
+    "and a non-positive capacity falls back rather than building a dead channel");
+    println("  relay_capacity_is_applied: ok");
+}
+
+# ⚠ **The message timestamp is WALL CLOCK, not monotonic.** A RelayMessage is
+# serialised and sent to another node, and Rust stamps it `DateTime<Utc>`.
+# `time_now_ns()` is CLOCK_MONOTONIC — an arbitrary per-boot zero — so the value
+# was meaningless outside the emitting process.
+fn test_relay_timestamp_is_wall_clock() {
+    var m = relay_msg_new(1, "a", "b", "t", 0);
+    var ts = relay_msg_timestamp(m);
+    # ⚠ majra's OWN reader, not the stdlib's `clock_epoch_ns` — `chrono` is not
+    # prepended by a `--no-deps` build, and CI builds these tests that way.
+    var now = time_epoch_ns();
+    # Epoch nanoseconds for 2020-01-01 — a monotonic reading (seconds since
+    # boot) is orders of magnitude below this.
+    assert(ts > 1577836800000000000,
+    "the stamp is an EPOCH instant, not seconds-since-boot");
+    assert(ts <= now, "and it is not in the future");
+    assert(now - ts < 60000000000, "and it is within a minute of now");
+    println("  relay_timestamp_is_wall_clock: ok");
+}
+
 fn test_ratelimit_separate_keys() {
     var rl = ratelimit_new(1000000, 2);
     assert(ratelimit_check(rl, "k1") == 1, "rl k1 allow");
@@ -1211,6 +1255,8 @@ fn main() {
     test_heartbeat_metadata();
 
     # RateLimit
+    test_relay_capacity_is_applied();
+    test_relay_timestamp_is_wall_clock();
     test_ratelimit_separate_keys();
     test_sliding_window_separate_keys();
     test_ratelimit_key_is_content_not_pointer();
