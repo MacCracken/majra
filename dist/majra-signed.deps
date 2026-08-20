@@ -6,6 +6,7 @@ freelist
 vec
 str
 hashmap
+syscalls
 tagged
 fnptr
 thread

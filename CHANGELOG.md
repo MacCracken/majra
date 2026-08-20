@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.7] — 2026-08-20 — the last folded-module pin that lagged the toolchain
+
+**410** assertions green across four suites (core 150, expanded 200, backend 43,
+patra-queue 17), 0 failed. Dep hashes 108 verified / 0 failed. Fuzz, benchmarks
+and examples clean.
+
+### Changed — `[deps.sigil]` 3.12.7 → 3.12.9
+
+**This is the fix.** sigil is a *folded* stdlib module, and `cyrius deps`
+applies a declared dep's copy on top of the `lib sync --full` snapshot on every
+resolve. A `[deps.sigil]` behind the fold therefore downgrades `lib/sigil.cyr`
+for every transitive consumer — and majra sits under both **agnosai** and
+**bote**.
+
+It was never actually observed downgrading anything: agnosai pins sigil 3.12.9
+directly and libro pins 3.12.9, so in practice one of those won and
+`lib/sigil.cyr` resolved to 3.12.9 everywhere checked. But that is resolution
+*order* doing the work, not correctness — the identical shape, in patra, is what
+broke agnosai's CI at 2.0.2 and took four repos to trace.
+
+Found by sweeping the whole dependency closure — every `[deps.X]` where X is a
+folded stdlib module, compared against what the pinned toolchain ships. This was
+the only remaining mismatch of five such declarations.
+
+### Changed — Cyrius pin 6.5.20 → 6.5.31
+
+Eleven minors behind. Picks up the folds shipped since (sakshi 2.4.11, patra
+1.13.9, yukti 2.3.8, niyama 1.0.7, mabda 4.1.0, ganita 1.1.4, yantra 1.0.3).
+
+`src/ws.cyr` reformatted for 6.5.31's canonical continuation indent — 0/23 files
+were unformatted under 6.5.20, 1/23 under 6.5.31, so this is the formatter
+moving, not drift. `git diff -w -- src/` is empty. Only `dist/majra-backends.cyr`
+changed as a result, since the base/signed/admin profiles deliberately exclude
+the backend modules.
+
+### Fixed — `version-bump.sh` told you to regenerate 2 of 4 bundles
+
+Its next-steps line read `cyrius distlib && cyrius distlib backends`, omitting
+`signed` and `admin`. The CI gate checks all four and fails on any stale bundle,
+so following the script's own instructions produced a red build. Corrected to
+list every profile.
+
 ## [2.6.6] — 2026-08-13 — the relay's fan-out could wedge its sender
 
 ### Fixed

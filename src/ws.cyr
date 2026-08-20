@@ -275,7 +275,7 @@ fn _ws_accept_upgrade(fd) {
         total = total + 1;
         # CR LF CR LF — the end of the HTTP header block.
         if (total >= 4 && load8(buf+total-4) == 13 && load8(buf+total-3) == 10
-        && load8(buf+total-2) == 13 && load8(buf+total-1) == 10) {
+          && load8(buf+total-2) == 13 && load8(buf+total-1) == 10) {
             break;
         }
     }
