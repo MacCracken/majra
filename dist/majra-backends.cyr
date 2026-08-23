@@ -565,6 +565,10 @@ fn namespace_prefix(ns) {
 
 # Prefix a topic with / delimiter.
 fn namespace_topic(ns, topic_cstr) {
+    # namespace_new returns 0 for an invalid prefix, and the module's own usage
+    # recipes feed its result straight in here. Guard rather than dereference:
+    # a caller that skipped the check gets 0 back instead of a segfault.
+    if (ns == 0 || topic_cstr == 0) { return 0; }
     var sb = str_builder_new();
     str_builder_add(sb, ns);
     str_builder_add_cstr(sb, "/");
@@ -574,6 +578,7 @@ fn namespace_topic(ns, topic_cstr) {
 
 # Prefix a key with : delimiter.
 fn namespace_key(ns, key_cstr) {
+    if (ns == 0 || key_cstr == 0) { return 0; }
     var sb = str_builder_new();
     str_builder_add(sb, ns);
     str_builder_add_cstr(sb, ":");
@@ -593,6 +598,7 @@ fn namespace_pattern(ns, pattern_cstr) {
 
 # Build wildcard pattern: {prefix}/#
 fn namespace_wildcard(ns) {
+    if (ns == 0) { return 0; }
     var sb = str_builder_new();
     str_builder_add(sb, ns);
     str_builder_add_cstr(sb, "/#");
@@ -602,6 +608,7 @@ fn namespace_wildcard(ns) {
 # Strip namespace prefix from a topic (/ delimiter).
 # Returns the bare topic as a Str, or 0 if topic doesn't belong to this namespace.
 fn namespace_strip_topic(ns, topic) {
+    if (ns == 0 || topic == 0) { return 0; }
     var prefix_len = str_len(ns);
     var topic_len = str_len(topic);
     # Must be longer than prefix + "/"
@@ -629,6 +636,7 @@ fn namespace_strip_topic(ns, topic) {
 # Strip namespace prefix from a key (: delimiter).
 # Returns the bare key as a Str, or 0 if key doesn't belong to this namespace.
 fn namespace_strip_key(ns, key) {
+    if (ns == 0 || key == 0) { return 0; }
     var prefix_len = str_len(ns);
     var key_len = str_len(key);
     if (key_len <= prefix_len + 1) {
@@ -931,12 +939,31 @@ fn ratelimit_check(rl, key) {
     # the fractional credit on every call. A limiter polled in a tight loop
     # therefore refilled at ZERO no matter how much wall time passed. Advancing
     # only by the consumed whole-token time keeps the remainder for next call.
-    if (refill > 0 && rate_x1000 > 0) {
+    # ⚠ ORDER MATTERS, and the guard on `refill` is load-bearing.
+    #
+    # 2.6.9 computed `refill * 1000000000` FIRST and unconditionally. `refill`
+    # is bounded by nothing — only `tokens` is clamped to burst above — so a
+    # bucket idle long enough overflows i64, `consumed_ns` comes back NEGATIVE,
+    # and `last_ns + consumed_ns` moves the clock BACKWARD. Every later call
+    # then sees an even larger elapsed_ns, refills to full burst, and returns
+    # allowed. That is a permanent, silent bypass of the limiter for that key —
+    # a security control failing open, introduced by the fix for a starvation
+    # bug. For a 1000 req/s limiter it needs roughly 2.6 hours idle, i.e. a
+    # reconnecting tenant reaches it on its own.
+    #
+    # A full bucket carries nothing, so it takes the clock outright and never
+    # reaches the multiply. Below that, refill is bounded by construction (a
+    # larger refill would have clamped tokens to burst), and the explicit cap
+    # keeps that reasoning from silently breaking if burst grows.
+    if (tokens >= burst_x1000) {
+        store64(bucket_ptr + 8, now);
+    } elif (refill > 0 && rate_x1000 > 0 && refill < 9000000000) {
         var consumed_ns = refill * 1000000000 / rate_x1000;
-        if (consumed_ns > elapsed_ns) { consumed_ns = elapsed_ns; }
+        if (consumed_ns < 0 || consumed_ns > elapsed_ns) { consumed_ns = elapsed_ns; }
         store64(bucket_ptr + 8, last_ns + consumed_ns);
-    } elif (tokens >= burst_x1000) {
-        # Already full — nothing to carry, so don't accumulate unbounded debt.
+    } elif (refill > 0) {
+        # Refill too large to convert back safely; the bucket is effectively
+        # full anyway, so take the clock rather than risk the multiply.
         store64(bucket_ptr + 8, now);
     }
 
@@ -1335,29 +1362,36 @@ fn hb_update_statuses(ht) {
     var now = time_now_ns();
     var transitions = vec_new();
 
-    var keys = map_keys(nodes);
+    # Walks the hashmap slot array directly. map_keys builds a vec from the
+    # BUMP allocator on every call and this runs on every sweep, twice — the
+    # same never-reclaimed-allocation class 2.6.9 removed from fleet, pubsub
+    # and relay and did not apply here.
+    var entries = map_entries(nodes);
+    var cap = map_cap(nodes);
     var i = 0;
-    var len = vec_len(keys);
-    while (i < len) {
-        var id = vec_get(keys, i);
-        var ns = map_get(nodes, id);
-        var elapsed = now - load64(ns + 8);
-        var prev = load64(ns);
-        var new_status = _classify_status(elapsed, cfg);
+    while (i < cap) {
+        var ep = entries + i * 24;
+        if (load64(ep + 16) == 1) {
+            var id = load64(ep);
+            var ns = load64(ep + 8);
+            var elapsed = now - load64(ns + 8);
+            var prev = load64(ns);
+            var new_status = _classify_status(elapsed, cfg);
 
-        if (new_status == STATUS_OFFLINE) {
-            store64(ns + 32, load64(ns + 32) + 1);
-        } else {
-            store64(ns + 32, 0);
-        }
+            if (new_status == STATUS_OFFLINE) {
+                store64(ns + 32, load64(ns + 32) + 1);
+            } else {
+                store64(ns + 32, 0);
+            }
 
-        if (new_status != prev) {
-            store64(ns, new_status);
-            # Store transition as pair: push id then status
-            var pair = fl_alloc(16);
-            store64(pair, id);
-            store64(pair + 8, new_status);
-            vec_push(transitions, pair);
+            if (new_status != prev) {
+                store64(ns, new_status);
+                # Store transition as pair: push id then status
+                var pair = fl_alloc(16);
+                store64(pair, id);
+                store64(pair + 8, new_status);
+                vec_push(transitions, pair);
+            }
         }
         i = i + 1;
     }
@@ -1365,27 +1399,34 @@ fn hb_update_statuses(ht) {
     # Handle eviction
     var eviction_cycles = load64(cfg + 16);
     if (eviction_cycles > 0) {
-        var to_evict = vec_new();
-        keys = map_keys(nodes);
+        # Two-pass, but over an fl_alloc'd array rather than two bump vecs.
+        # The collect pass is separate because map_delete during a slot walk is
+        # safe only for the entry being deleted; sizing by map_size bounds it.
+        var nlive = map_size(nodes);
+        var to_evict = 0;
+        var nev = 0;
+        if (nlive > 0) { to_evict = fl_alloc(nlive * 8); }
         i = 0;
-        len = vec_len(keys);
-        while (i < len) {
-            var id = vec_get(keys, i);
-            var ns = map_get(nodes, id);
-            if (load64(ns + 32) >= eviction_cycles) {
-                vec_push(to_evict, id);
+        while (i < cap && to_evict != 0) {
+            var ep2 = entries + i * 24;
+            if (load64(ep2 + 16) == 1) {
+                var ns2 = load64(ep2 + 8);
+                if (load64(ns2 + 32) >= eviction_cycles && nev < nlive) {
+                    store64(to_evict + nev * 8, load64(ep2));
+                    nev = nev + 1;
+                }
             }
             i = i + 1;
         }
         i = 0;
-        len = vec_len(to_evict);
-        while (i < len) {
-            var ev_id = vec_get(to_evict, i);
+        while (i < nev) {
+            var ev_id = load64(to_evict + i * 8);
             var ev_ns = map_get(nodes, ev_id);
             map_delete(nodes, ev_id);
             if (ev_ns != 0) { fl_free(ev_ns); }
             i = i + 1;
         }
+        if (to_evict != 0) { fl_free(to_evict); }
     }
 
     return transitions;
@@ -1455,11 +1496,15 @@ fn chb_register(cht, id, metadata) {
 }
 
 fn chb_register_with_telemetry(cht, id, metadata, gpu_vec) {
+    # Same re-registration leak chb_register closes: replacing an existing
+    # entry abandoned the previous NodeState. 2.6.9 fixed only chb_register.
     var mtx = load64(cht + 16);
     mutex_lock(mtx);
+    var prev = map_get(load64(cht), id);
     var ns = _node_state_new(metadata);
     store64(ns + 24, gpu_vec);
     map_set(load64(cht), id, ns);
+    if (prev != 0) { fl_free(prev); }
     mutex_unlock(mtx);
 }
 
@@ -1529,28 +1574,32 @@ fn chb_update_statuses(cht) {
     var now = time_now_ns();
     var transitions = vec_new();
 
-    var keys = map_keys(nodes);
+    # Slot-array walk — see the note on the non-concurrent sweep above.
+    var entries = map_entries(nodes);
+    var cap = map_cap(nodes);
     var i = 0;
-    var len = vec_len(keys);
-    while (i < len) {
-        var id = vec_get(keys, i);
-        var ns = map_get(nodes, id);
-        var elapsed = now - load64(ns + 8);
-        var prev = load64(ns);
-        var new_status = _classify_status(elapsed, cfg);
+    while (i < cap) {
+        var ep = entries + i * 24;
+        if (load64(ep + 16) == 1) {
+            var id = load64(ep);
+            var ns = load64(ep + 8);
+            var elapsed = now - load64(ns + 8);
+            var prev = load64(ns);
+            var new_status = _classify_status(elapsed, cfg);
 
-        if (new_status == STATUS_OFFLINE) {
-            store64(ns + 32, load64(ns + 32) + 1);
-        } else {
-            store64(ns + 32, 0);
-        }
+            if (new_status == STATUS_OFFLINE) {
+                store64(ns + 32, load64(ns + 32) + 1);
+            } else {
+                store64(ns + 32, 0);
+            }
 
-        if (new_status != prev) {
-            store64(ns, new_status);
-            var pair = fl_alloc(16);
-            store64(pair, id);
-            store64(pair + 8, new_status);
-            vec_push(transitions, pair);
+            if (new_status != prev) {
+                store64(ns, new_status);
+                var pair = fl_alloc(16);
+                store64(pair, id);
+                store64(pair + 8, new_status);
+                vec_push(transitions, pair);
+            }
         }
         i = i + 1;
     }
@@ -1558,39 +1607,68 @@ fn chb_update_statuses(cht) {
     # Handle eviction
     var eviction_cycles = load64(cfg + 16);
     if (eviction_cycles > 0) {
-        var to_evict = vec_new();
-        keys = map_keys(nodes);
+        # Two-pass, but over an fl_alloc'd array rather than two bump vecs.
+        # The collect pass is separate because map_delete during a slot walk is
+        # safe only for the entry being deleted; sizing by map_size bounds it.
+        var nlive = map_size(nodes);
+        var to_evict = 0;
+        var nev = 0;
+        if (nlive > 0) { to_evict = fl_alloc(nlive * 8); }
         i = 0;
-        len = vec_len(keys);
-        while (i < len) {
-            var id = vec_get(keys, i);
-            var ns = map_get(nodes, id);
-            if (load64(ns + 32) >= eviction_cycles) {
-                vec_push(to_evict, id);
+        while (i < cap && to_evict != 0) {
+            var ep2 = entries + i * 24;
+            if (load64(ep2 + 16) == 1) {
+                var ns2 = load64(ep2 + 8);
+                if (load64(ns2 + 32) >= eviction_cycles && nev < nlive) {
+                    store64(to_evict + nev * 8, load64(ep2));
+                    nev = nev + 1;
+                }
             }
             i = i + 1;
         }
         i = 0;
-        len = vec_len(to_evict);
-        while (i < len) {
-            var ev_id = vec_get(to_evict, i);
+        while (i < nev) {
+            var ev_id = load64(to_evict + i * 8);
             var ev_ns = map_get(nodes, ev_id);
             map_delete(nodes, ev_id);
             if (ev_ns != 0) { fl_free(ev_ns); }
             i = i + 1;
         }
+        if (to_evict != 0) { fl_free(to_evict); }
     }
 
     mutex_unlock(mtx);
     return transitions;
 }
 
+# Returns a CALLER-OWNED COPY of the node's state, or 0. Release with
+# chb_node_free.
+#
+# This used to hand back the tracker's internal NodeState pointer after
+# dropping the mutex. That was merely racy until 2.6.9 added fl_free on every
+# removal path — at which point it became a USE-AFTER-FREE: an eviction sweep
+# or a deregister on another thread can recycle the block while the caller is
+# still reading it, and the freelist will hand those 40 bytes to the next
+# allocation. Copying under the lock is the only way to hand out a value that
+# stays valid without refcounting.
 fn chb_get(cht, id) {
+    if (cht == 0) { return 0; }
     var mtx = load64(cht + 16);
     mutex_lock(mtx);
     var ns = map_get(load64(cht), id);
+    var copy = 0;
+    if (ns != 0) {
+        copy = fl_alloc(40);
+        if (copy != 0) { memcpy(copy, ns, 40); }
+    }
     mutex_unlock(mtx);
-    return ns;
+    return copy;
+}
+
+# Release a NodeState copy returned by chb_get.
+fn chb_node_free(ns) {
+    if (ns != 0) { fl_free(ns); }
+    return 0;
 }
 
 fn chb_get_gpu_telemetry(cht, id) {
@@ -1734,6 +1812,13 @@ fn queue_item_new(priority, payload) {
     store64(item + 24, payload);
     store64(item + 32, 0);
     return item;
+}
+
+# Release a QueueItem. Only for items the caller owns outright — an item
+# handed to mq_enqueue is owned by the queue until it terminates.
+fn queue_item_free(item) {
+    if (item != 0) { fl_free(item); }
+    return 0;
 }
 
 fn queue_item_id_hi(item) { return load64(item); }
@@ -2059,14 +2144,25 @@ fn mq_dequeue(mq) {
                     fl_free(mi);
                     mutex_unlock(mtx);
                 } else {
+                    # The increment stays INSIDE the mi guard. 2.6.9 moved it
+                    # out, but both decrement sites (mq_complete, mq_fail)
+                    # still require mi != 0 — so delivering a job whose
+                    # tracking entry was already removed consumed a
+                    # concurrency slot that nothing could ever give back, and
+                    # the queue ratcheted toward its cap and stopped
+                    # dequeuing. Skip such an item rather than deliver it: it
+                    # has no tracking entry, so it can never be completed.
                     if (mi != 0) {
                         store64(mi + 32, JOB_RUNNING);
                         store64(mi + 48, time_now_ns());
+                        store64(mq + 32, load64(mq + 32) + 1);
+                        mutex_unlock(mtx);
+                        out = item;
+                        searching = 0;
+                    } else {
+                        mutex_unlock(mtx);
+                        queue_item_free(item);
                     }
-                    store64(mq + 32, load64(mq + 32) + 1);
-                    mutex_unlock(mtx);
-                    out = item;
-                    searching = 0;
                 }
             }
         }
@@ -2077,6 +2173,53 @@ fn mq_dequeue(mq) {
     var vt = load64(mq + 48);
     if (vt != 0) {
         metrics_queue_dequeued(vt, load64(mq + 24), load64(out + 16));
+    }
+    return out;
+}
+
+# Remove the next QUEUED job without treating it as an execution.
+#
+# Returns the QueueItem, or 0 if nothing is queued. The caller owns the item
+# and should release it with queue_item_free once it has copied what it needs.
+#
+# This exists because a steal or a drain is NOT a dequeue. `mq_dequeue` marks
+# the job RUNNING, increments running_count, and — critically — REFUSES once
+# running_count reaches max_concurrent. Using it to move work therefore
+# (a) inflated the source's running_count, and (b) silently gave up on a queue
+# whose jobs were already at the cap, which is precisely the state a rebalance
+# or a deregister needs to act on. fleet.cyr used mq_dequeue + a compensating
+# mq_fail for both; this is the primitive it actually wanted.
+#
+# Cancelled jobs are dropped rather than handed back, matching mq_dequeue.
+fn mq_take_queued(mq) {
+    var mtx = load64(mq + 16);
+    var jobs = load64(mq + 8);
+
+    var out = 0;
+    var searching = 1;
+    while (searching == 1) {
+        mutex_lock(mtx);
+        var item = cpq_dequeue(load64(mq));
+        if (item == 0) {
+            mutex_unlock(mtx);
+            searching = 0;
+        } else {
+            var key = load64(item + 32);
+            var mi = map_get(jobs, key);
+            var cancelled = 0;
+            if (mi != 0 && load64(mi + 32) == JOB_CANCELLED) { cancelled = 1; }
+            if (mi != 0) {
+                map_delete(jobs, key);
+                fl_free(mi);
+            }
+            mutex_unlock(mtx);
+            if (cancelled == 1) {
+                queue_item_free(item);
+            } else {
+                out = item;
+                searching = 0;
+            }
+        }
     }
     return out;
 }
@@ -2098,10 +2241,13 @@ fn mq_complete(mq, item) {
 
     mutex_lock(mtx);
     var mi = map_get(jobs, key);
-    if (mi != 0) {
-        if (load64(mi + 32) == JOB_RUNNING) {
-            store64(mq + 32, load64(mq + 32) - 1);
-        }
+    # Only a job that actually reached RUNNING is terminated here. 2.6.9
+    # deleted and freed the ManagedItem for ANY resolvable key, including one
+    # still JOB_QUEUED — leaving its QueueItem sitting in the priority queue
+    # with no tracking entry, which mq_dequeue would later pop and (before the
+    # guard above) hand out as an untrackable job.
+    if (mi != 0 && load64(mi + 32) == JOB_RUNNING) {
+        store64(mq + 32, load64(mq + 32) - 1);
         store64(mi + 32, JOB_COMPLETED);
         store64(mi + 56, time_now_ns());
         counter_inc(load64(mq + 56));
@@ -2119,10 +2265,8 @@ fn mq_fail(mq, item) {
 
     mutex_lock(mtx);
     var mi = map_get(jobs, key);
-    if (mi != 0) {
-        if (load64(mi + 32) == JOB_RUNNING) {
-            store64(mq + 32, load64(mq + 32) - 1);
-        }
+    if (mi != 0 && load64(mi + 32) == JOB_RUNNING) {
+        store64(mq + 32, load64(mq + 32) - 1);
         store64(mi + 32, JOB_FAILED);
         store64(mi + 56, time_now_ns());
         map_delete(jobs, key);
@@ -2937,23 +3081,34 @@ fn relay_evict_stale_dedup(r, max_idle_ns) {
     var now = time_now_ns();
     var mtx = load64(r + 40);
     mutex_lock(mtx);
+    # Carries both defects 2.6.9 fixed in the sibling eviction path inside
+    # relay_receive_ex and did not apply here: it built TWO bump-allocated vecs
+    # per sweep (map_keys plus to_remove, neither reclaimable), and it deleted
+    # DedupEntry blocks without freeing them — so the routine whose whole job
+    # is bounding the dedup table's memory leaked a block per eviction.
+    #
+    # Now allocation-free, walking the slot array directly. Deleting during the
+    # walk is safe because map_delete leaves a tombstone rather than
+    # reshuffling: _map_find skips st == 2 and _map_grow_a rehashes only live
+    # entries, so no slot this loop has yet to visit moves.
     var seen = load64(r + 16);
-    var keys = map_keys(seen);
-    var to_remove = vec_new();
+    var entries = map_entries(seen);
+    var cap = map_cap(seen);
+    var count = 0;
     var i = 0;
-    var len = vec_len(keys);
-    while (i < len) {
-        var k = vec_get(keys, i);
-        var e = map_get(seen, k);
-        if (now - load64(e + 8) > max_idle_ns) {
-            vec_push(to_remove, k);
+    while (i < cap) {
+        var sp = entries + i * 24;
+        if (load64(sp + 16) == 1) {
+            var e = load64(sp + 8);
+            if (now - load64(e + 8) > max_idle_ns) {
+                var k = load64(sp);
+                map_delete(seen, k);
+                # Free strictly AFTER the delete, which needs the key to find
+                # the entry — same ordering rule as ratelimit_evict_stale.
+                fl_free(e);
+                count = count + 1;
+            }
         }
-        i = i + 1;
-    }
-    var count = vec_len(to_remove);
-    i = 0;
-    while (i < count) {
-        map_delete(seen, vec_get(to_remove, i));
         i = i + 1;
     }
     if (count > 0) {
@@ -3059,9 +3214,24 @@ fn _set_is_superset(arrived, expected) {
 #   offset  8: arrived (i64) — vec of participant name strings
 #   offset 16: was_forced (i64)
 
+# Takes a COPY of the participants vec.
+#
+# barrier_force mutates the expected set in place via _set_remove, so storing
+# the caller's vec by reference let two barriers built from one shared list
+# corrupt each other's membership, and silently modified the caller's own vec.
+# 2.6.9 fixed exactly this in _cbarrier_state_new and left the non-concurrent
+# twin alone.
 fn _barrier_state_new(participants_vec) {
     var bs = fl_alloc(24);
-    store64(bs, participants_vec);
+    var owned = vec_new();
+    var pi = 0;
+    var pn = 0;
+    if (participants_vec != 0) { pn = vec_len(participants_vec); }
+    while (pi < pn) {
+        vec_push(owned, vec_get(participants_vec, pi));
+        pi = pi + 1;
+    }
+    store64(bs, owned);
     store64(bs + 8, vec_new());
     store64(bs + 16, 0);
     return bs;
@@ -3422,18 +3592,32 @@ fn ipc_bind(path) {
     if (sa == 0) { return Err(ERR_IPC); }
     var fd = syscall(_SYS_SOCKET, _AF_UNIX, _SOCK_STREAM, 0);
     if (fd < 0) { fl_free(sa); return Err(ERR_IPC); }
+
+    # ⚠ fchmod MUST happen BEFORE bind, and 2.6.9 had it after.
+    #
+    # bind(2) on AF_UNIX creates the filesystem inode from the SOCKFS inode's
+    # mode masked by the ambient umask, and connect(2) permission-checks THAT
+    # inode. fchmod after bind changes only the sockfs inode, which nothing
+    # consults again — it returns success and accomplishes nothing. Verified on
+    # this machine under umask 022: fchmod-after-bind leaves the path at 0755
+    # (world-connectable) while fstat on the fd reports 0600; fchmod-before-bind
+    # yields 0600 on the path.
+    #
+    # That made 2.6.9 strictly worse than the gap it replaced: the module header
+    # began promising owner-only access, and majra performs no peer-credential
+    # check, so a consumer trusting that promise got a world-connectable
+    # endpoint where connecting IS authenticating.
+    if (syscall(_SYS_FCHMOD, fd, 384) < 0) {
+        syscall(SYS_CLOSE, fd);
+        fl_free(sa);
+        return Err(ERR_IPC);
+    }
+
     sys_unlink(path);
     var ret = syscall(_SYS_BIND, fd, sa, _sockaddr_un_len(path));
     fl_free(sa);
     # Every one of these paths used to leak both the fd and the sockaddr.
     if (ret < 0) { syscall(SYS_CLOSE, fd); return Err(ERR_IPC); }
-    # Owner-only: without this the mode is whatever the ambient umask allows,
-    # and any local user can connect to an endpoint that has no auth of its own.
-    if (syscall(_SYS_FCHMOD, fd, 384) < 0) {
-        syscall(SYS_CLOSE, fd);
-        sys_unlink(path);
-        return Err(ERR_IPC);
-    }
     ret = syscall(_SYS_LISTEN, fd, 128);
     if (ret < 0) { syscall(SYS_CLOSE, fd); sys_unlink(path); return Err(ERR_IPC); }
     return Ok(fd);
@@ -3611,7 +3795,7 @@ enum CircuitState {
 #   offset 16: failure_threshold (i64)
 #   offset 24: cooldown_ns (i64)
 #   offset 32: mutex (i64)
-#   offset 40: probe_inflight (i64) — 1 once a half-open probe has been handed out
+#   offset 40: probe_at_ns (i64) — when the outstanding half-open probe was issued (0 = none)
 #
 # The mutex and probe_inflight slots were added at 2.6.9. Before them
 # `circuit_record_failure` did an unsynchronised read-modify-write on the
@@ -3656,8 +3840,18 @@ fn circuit_state(cb) {
     }
     var elapsed = time_now_ns() - load64(cb + 8);
     if (elapsed >= load64(cb + 24)) {
-        if (load64(cb + 40) == 0) {
-            store64(cb + 40, 1);
+        # A probe is only allowed to hold the gate for one cooldown window.
+        #
+        # 2.6.9 stored a bare in-flight FLAG, cleared only by
+        # circuit_record_success / _failure / _reset. A caller that took a
+        # probe and then never reported — it crashed, it was cancelled, it
+        # simply forgot — left the flag set forever, so circuit_state returned
+        # CIRCUIT_OPEN for the life of the process even after the endpoint
+        # recovered. The breaker latched open, which is the same availability
+        # failure it exists to prevent, just inverted.
+        var probe_at = load64(cb + 40);
+        if (probe_at == 0 || time_now_ns() - probe_at >= load64(cb + 24)) {
+            store64(cb + 40, time_now_ns());
             mutex_unlock(mtx);
             return CIRCUIT_HALF_OPEN;
         }
@@ -3820,19 +4014,22 @@ fn fleet_deregister_node(fq, node_id) {
     if (mq == 0) { mutex_unlock(mtx); return 0; }
     map_delete(nodes, node_id);
 
+    # mq_take_queued, NOT mq_dequeue. mq_dequeue refuses once running_count
+    # reaches max_concurrent, so a node with jobs already running would have
+    # dropped out of this loop immediately and discarded every QUEUED job —
+    # the same silent job loss deregister was supposed to stop.
     var orphaned = 0;
     var draining = 1;
     while (draining == 1) {
-        var item = mq_dequeue(mq);
+        var item = mq_take_queued(mq);
         if (item == 0) { draining = 0; }
         else {
-            # mq_dequeue marked it running on a queue that is going away.
-            mq_fail(mq, item);
             var tid = _fleet_select_node(fq);
             if (tid == 0) { orphaned = orphaned + 1; }
             else {
                 mq_enqueue(map_get(nodes, tid), queue_item_priority(item), queue_item_payload(item));
             }
+            queue_item_free(item);
         }
     }
     mutex_unlock(mtx);
@@ -3937,18 +4134,17 @@ fn fleet_rebalance(fq) {
                         # configured.
                         var taking = 1;
                         while (taking == 1 && to_steal > 0 && mq_queued_count(tmq) < threshold) {
-                            var item = mq_dequeue(mq);
+                            # mq_take_queued, NOT mq_dequeue. A steal is not an
+                            # execution: mq_dequeue would mark the job RUNNING,
+                            # inflate the source's running_count, and — worse —
+                            # REFUSE outright once that count hit
+                            # max_concurrent, which is exactly the saturated
+                            # node a rebalance most needs to relieve.
+                            var item = mq_take_queued(mq);
                             if (item == 0) { taking = 0; }
                             else {
-                                # mq_dequeue marks the job RUNNING and bumps
-                                # the source's running_count. A steal is not
-                                # an execution, and nothing reversed that
-                                # transition — so every rebalance inflated the
-                                # source's running_count permanently, and once
-                                # it reached max_concurrent that node stopped
-                                # dequeuing anything at all.
-                                mq_fail(mq, item);
                                 mq_enqueue(tmq, queue_item_priority(item), queue_item_payload(item));
+                                queue_item_free(item);
                                 stolen = stolen + 1;
                                 to_steal = to_steal - 1;
                             }
@@ -4244,6 +4440,18 @@ fn _compute_tiers(def) {
     return tiers;
 }
 
+# Release a workflow context.
+#
+# workflow_execute still leaks its tier vecs and StepResults (both from the
+# bump allocator, which cannot free), so this is not a complete teardown — it
+# covers the context block itself, which is the one thing the malformed-DAG
+# early return can cleanly reclaim. Full run teardown needs the tier
+# structures to move off the bump allocator; tracked on the roadmap.
+fn workflow_context_free(ctx) {
+    if (ctx != 0) { fl_free(ctx); }
+    return 0;
+}
+
 # Execute a workflow definition with a given executor function and input.
 # executor_fn(step_ptr, ctx_ptr) -> StepResult ptr
 # Returns: RUN_COMPLETED, or RUN_FAILED (including for a malformed DAG).
@@ -4258,7 +4466,12 @@ fn workflow_execute(def, executor_fn, input) {
     # _compute_tiers returns 0 for a malformed DAG (a dependency cycle, a
     # dangling dependency id, or duplicate step ids). Running the schedulable
     # prefix and reporting success is exactly the failure this guards.
-    if (tiers == 0) { return RUN_FAILED; }
+    if (tiers == 0) {
+        # The context was allocated above; release it rather than abandon it on
+        # the one path that returns before the run starts.
+        workflow_context_free(ctx);
+        return RUN_FAILED;
+    }
     var num_tiers = vec_len(tiers);
     var final_status = RUN_COMPLETED;
 
@@ -4410,6 +4623,7 @@ fn _sb_crlf(sb) {
 # cmd is a vec of C strings (command + arguments).
 # Returns 0 on success, -1 on failure.
 fn _resp_send_cmd(fd, cmd) {
+    if (fd < 0) { return -1; }
     var sb = str_builder_new();
     # Array header
     str_builder_add_cstr(sb, "*");
@@ -4472,45 +4686,84 @@ fn _resp_read_line(fd) {
 #   For integers: the integer value
 #   For bulk strings: Str or 0 (nil)
 #   For arrays: vec of reply values
-fn _resp_read_reply(fd) {
-    return _resp_read_reply_d(fd, 0);
+# Takes the CONNECTION, not a bare fd, so it can poison a stream it can no
+# longer parse.
+#
+# Every abort below — a cap exceeded, a read failure, an unrecognised type
+# byte — leaves bytes the server already committed to sending sitting in the
+# socket. Returning without marking the connection meant the next command read
+# those leftovers as its own reply and every result from then on was
+# misattributed, silently. A caller cannot detect that; the only safe move is
+# to make the connection unusable so it fails loudly instead.
+#
+# A nil bulk string (`$-1`) and the integer `:0` are NOT failures — they also
+# return 0, which is why the connection state, not the return value, is what
+# distinguishes them.
+fn _resp_read_reply(rc) {
+    return _resp_read_reply_d(rc, 0);
 }
 
-fn _resp_read_reply_d(fd, depth) {
-    if (depth > RESP_MAX_DEPTH) { return 0; }
+# Mark a connection's framing untrustworthy. Subsequent commands fail fast.
+fn _resp_poison(rc) {
+    if (rc == 0) { return 0; }
+    var fd = load64(rc);
+    if (fd >= 0) { syscall(SYS_CLOSE, fd); }
+    store64(rc, -1);
+    return 0;
+}
+
+fn redis_is_alive(rc) {
+    if (rc == 0) { return 0; }
+    if (load64(rc) < 0) { return 0; }
+    return 1;
+}
+
+fn _resp_read_reply_d(rc, depth) {
+    if (rc == 0) { return 0; }
+    var fd = load64(rc);
+    if (fd < 0) { return 0; }
+    if (depth > RESP_MAX_DEPTH) { _resp_poison(rc); return 0; }
     var line = _resp_read_line(fd);
-    if (line == 0) { return 0; }
+    if (line == 0) { _resp_poison(rc); return 0; }
     var data = str_data(line);
     var type_byte = load8(data);
 
+    # NOTE ON OWNERSHIP: `line` borrows an fl_alloc'd copy made by
+    # _resp_read_line. The simple-string and error cases hand a Str over it
+    # back to the caller, so those must NOT free it — the caller owns it and
+    # releases it with resp_reply_free. The integer and length-header cases
+    # consume it here and free it.
     if (type_byte == 43) {
-        # +simple string
+        # +simple string — caller owns the buffer
         return str_new(data + 1, str_len(line) - 1);
     }
     if (type_byte == 45) {
-        # -error
+        # -error — caller owns the buffer
         return str_new(data + 1, str_len(line) - 1);
     }
     if (type_byte == 58) {
-        # :integer
-        return str_to_int(str_new(data + 1, str_len(line) - 1));
+        # :integer — the line is fully consumed here
+        var iv = str_to_int(str_new(data + 1, str_len(line) - 1));
+        fl_free(data);
+        return iv;
     }
     if (type_byte == 36) {
         # $bulk string
         var blen = str_to_int(str_new(data + 1, str_len(line) - 1));
-        if (blen < 0) { return 0; }
+        if (blen < 0) { fl_free(data); return 0; }
         # Without this cap, `$9223372036854775807` makes `blen + 2` WRAP
         # NEGATIVE; _fl_class sends any negative size down the size<=16 path,
         # so fl_alloc hands back a 16-byte block which str_new then labels
         # with a length of INT64_MAX. The first str_eq on that reply walks the
         # entire address space.
-        if (blen > RESP_MAX_BULK) { return 0; }
+        fl_free(data);
+        if (blen > RESP_MAX_BULK) { _resp_poison(rc); return 0; }
         var buf = fl_alloc(blen + 2);
         if (buf == 0) { return 0; }
         var total = 0;
         while (total < blen + 2) {
             var n = syscall(SYS_READ, fd, buf + total, blen + 2 - total);
-            if (n <= 0) { fl_free(buf); return 0; }
+            if (n <= 0) { fl_free(buf); _resp_poison(rc); return 0; }
             total = total + n;
         }
         return str_new(buf, blen);
@@ -4518,21 +4771,46 @@ fn _resp_read_reply_d(fd, depth) {
     if (type_byte == 42) {
         # *array
         var count = str_to_int(str_new(data + 1, str_len(line) - 1));
+        fl_free(data);
         if (count < 0) { return 0; }
         # An oversized count spins this loop growing `arr` long after the
         # socket has stopped producing, and unbounded nesting turns
         # server-controlled depth into call-stack depth.
-        if (count > RESP_MAX_ARRAY) { return 0; }
+        if (count > RESP_MAX_ARRAY) { _resp_poison(rc); return 0; }
         var arr = vec_new();
         var j = 0;
         while (j < count) {
-            var elem = _resp_read_reply_d(fd, depth + 1);
-            if (elem == 0) { return arr; }
-            vec_push(arr, elem);
+            # ⚠ Do NOT treat a 0 element as a parse failure.
+            #
+            # 2.6.9 added `if (elem == 0) { return arr; }` here, but this
+            # function returns 0 for THREE different things: a read failure, a
+            # nil bulk string (`$-1`, which this module's own doc comment
+            # documents as 0), and an integer reply of `:0`. So an ordinary
+            # Redis reply — a rate-limiter Lua script returning
+            # `*2\r\n:0\r\n:1\r\n`, or an MGET with a missing key — was
+            # truncated to an empty array, and the elements it did not consume
+            # stayed queued on the socket. The next command on that connection
+            # then read the leftovers as its own reply and the stream was
+            # permanently offset by one. Push every element; a genuine socket
+            # failure is caught by the read loop above, which cannot produce
+            # more elements anyway.
+            vec_push(arr, _resp_read_reply_d(rc, depth + 1));
             j = j + 1;
         }
         return arr;
     }
+    # Unrecognised type byte — nothing else will consume the line, and we no
+    # longer know where the next reply starts.
+    fl_free(data);
+    _resp_poison(rc);
+    return 0;
+}
+
+# Release a Str reply returned by _resp_read_reply for a simple string, an
+# error, or a bulk string. Integers are values, arrays are vecs from the bump
+# allocator; neither needs this.
+fn resp_reply_free(reply) {
+    if (reply != 0) { fl_free(str_data(reply)); }
     return 0;
 }
 
@@ -4574,13 +4852,18 @@ fn redis_set_prefix(rc, prefix) {
     store64(rc + 8, prefix);
 }
 
+# Closes the socket and releases the handle. The handle is INVALID afterwards —
+# do not call anything else with it.
+#
+# 2.6.9's comment claimed the `store64(rc, -1)` poison made a second close
+# safe. It did not: the very next line frees the block, so the poison survives
+# only until the freelist reuses those bytes, and a double close would then
+# read whatever the new owner wrote. The poison is kept for the window before
+# the free, but the real contract is the one stated above.
 fn redis_close(rc) {
     if (rc == 0) { return 0; }
     var fd = load64(rc);
-    if (fd < 0) { return 0; }
-    syscall(SYS_CLOSE, fd);
-    # Poison the fd so a second close cannot hit a descriptor the kernel has
-    # since handed to something else, and release the handle.
+    if (fd >= 0) { syscall(SYS_CLOSE, fd); }
     store64(rc, -1);
     fl_free(rc);
     return 0;
@@ -4604,7 +4887,7 @@ fn redis_set(rc, key, value) {
     vec_push(cmd, _redis_pkey(rc, key));
     vec_push(cmd, value);
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 fn redis_get(rc, key) {
@@ -4612,7 +4895,7 @@ fn redis_get(rc, key) {
     vec_push(cmd, "GET");
     vec_push(cmd, _redis_pkey(rc, key));
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 fn redis_del(rc, key) {
@@ -4620,7 +4903,7 @@ fn redis_del(rc, key) {
     vec_push(cmd, "DEL");
     vec_push(cmd, _redis_pkey(rc, key));
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 fn redis_exists(rc, key) {
@@ -4628,7 +4911,7 @@ fn redis_exists(rc, key) {
     vec_push(cmd, "EXISTS");
     vec_push(cmd, _redis_pkey(rc, key));
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 # SET with EX (expire in seconds)
@@ -4641,7 +4924,7 @@ fn redis_setex(rc, key, value, ttl_secs) {
     var ttl_str = str_data(str_from_int(ttl_secs));
     vec_push(cmd, ttl_str);
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 # --- Sorted Set (Queue) ---
@@ -4653,7 +4936,7 @@ fn redis_zadd(rc, key, member, score) {
     vec_push(cmd, str_data(str_from_int(score)));
     vec_push(cmd, member);
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 fn redis_zpopmin(rc, key) {
@@ -4662,7 +4945,7 @@ fn redis_zpopmin(rc, key) {
     vec_push(cmd, _redis_pkey(rc, key));
     vec_push(cmd, "1");
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 fn redis_zcard(rc, key) {
@@ -4670,7 +4953,7 @@ fn redis_zcard(rc, key) {
     vec_push(cmd, "ZCARD");
     vec_push(cmd, _redis_pkey(rc, key));
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 # --- Pub/Sub (publish only — subscribe requires dedicated connection) ---
@@ -4681,7 +4964,7 @@ fn redis_publish(rc, channel, message) {
     vec_push(cmd, _redis_pkey(rc, channel));
     vec_push(cmd, message);
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 # --- Hash (for rate limiter) ---
@@ -4693,7 +4976,7 @@ fn redis_hset(rc, key, field, value) {
     vec_push(cmd, field);
     vec_push(cmd, value);
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 fn redis_hget(rc, key, field) {
@@ -4702,7 +4985,7 @@ fn redis_hget(rc, key, field) {
     vec_push(cmd, _redis_pkey(rc, key));
     vec_push(cmd, field);
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 fn redis_expire(rc, key, seconds) {
@@ -4711,7 +4994,7 @@ fn redis_expire(rc, key, seconds) {
     vec_push(cmd, _redis_pkey(rc, key));
     vec_push(cmd, str_data(str_from_int(seconds)));
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 # --- KEYS (for heartbeat list_online) ---
@@ -4721,7 +5004,7 @@ fn redis_keys(rc, pattern) {
     vec_push(cmd, "KEYS");
     vec_push(cmd, _redis_pkey(rc, pattern));
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 # --- EVAL (for rate limiter Lua script) ---
@@ -4736,7 +5019,7 @@ fn redis_eval(rc, script, num_keys, key, arg1, arg2, arg3) {
     vec_push(cmd, arg2);
     vec_push(cmd, arg3);
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 # --- PING (connection test) ---
@@ -4745,7 +5028,7 @@ fn redis_ping(rc) {
     var cmd = vec_new();
     vec_push(cmd, "PING");
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 # --- postgres_backend.cyr ---
@@ -4844,7 +5127,9 @@ fn _pg_read_full(fd, buf, want) {
     var total = 0;
     while (total < want) {
         var r = syscall(SYS_READ, fd, buf + total, want - total);
-        if (r <= 0) { return -1; }
+        # EINTR (-4) retries; see the note in src/ws.cyr's _ws_read_full.
+        if (r == -4) { r = 0; }
+        elif (r <= 0) { return -1; }
         total = total + r;
     }
     return total;
@@ -4855,7 +5140,8 @@ fn _pg_write_full(fd, buf, len) {
     var total = 0;
     while (total < len) {
         var w = syscall(SYS_WRITE, fd, buf + total, len - total);
-        if (w <= 0) { return -1; }
+        if (w == -4) { w = 0; }
+        elif (w <= 0) { return -1; }
         total = total + w;
     }
     return total;
@@ -4875,9 +5161,36 @@ var _pg_db_g = 0;
 var _pg_pw_g = 0;
 var _pg_connect_mtx = 0;
 
+# Initialised eagerly at module load rather than lazily.
+#
+# The lazy `if (_pg_connect_mtx == 0) { _pg_connect_mtx = mutex_new(); }` was
+# itself unsynchronised, so the first two concurrent pg_connect calls could
+# each observe 0, each build a mutex, and each lock a DIFFERENT one — leaving
+# the connect globals unprotected in exactly the window the mutex exists for.
+var _pg_connect_mtx_init = _pg_connect_mtx_bootstrap();
+
+fn _pg_connect_mtx_bootstrap() {
+    _pg_connect_mtx = mutex_new();
+    return 1;
+}
+
 fn _pg_connect_lock() {
-    if (_pg_connect_mtx == 0) { _pg_connect_mtx = mutex_new(); }
     mutex_lock(_pg_connect_mtx);
+    return 0;
+}
+
+# Release a message struct returned by _pg_read_msg, and its body.
+#
+# Nothing freed these: pg_query's main loop, pg_connect's handshake and its
+# ReadyForQuery loop, and the ErrorResponse drain all dropped both the 24-byte
+# descriptor and its body on the floor. A long-lived connection leaked one of
+# each per message received, which for a query returning many DataRows is per
+# row.
+fn _pg_msg_free(m) {
+    if (m == 0) { return 0; }
+    var d = load64(m + 8);
+    if (d != 0) { fl_free(d); }
+    fl_free(m);
     return 0;
 }
 
@@ -4931,6 +5244,37 @@ fn _pg_read_msg(fd) {
     store64(result + 8, data);
     store64(result + 16, data_len);
     return result;
+}
+
+# Append `s` to `sb` as a QUOTED, ESCAPED SQL string literal, including the
+# surrounding single quotes.
+#
+# majra's PostgreSQL client speaks the simple query protocol and implements no
+# prepared statements, so every value reaches the server inside a literal and
+# escaping is the only defence available. Standard SQL: a single quote inside a
+# literal is written twice. PostgreSQL has defaulted standard_conforming_strings
+# to on since 9.1, so a backslash is an ordinary character and needs no
+# treatment; majra never emits E'' strings, where that would not hold.
+#
+# Returns 0 on success, -1 if `s` is null.
+fn _pg_add_literal(sb, s) {
+    if (s == 0) { return -1; }
+    str_builder_add_cstr(sb, "'");
+    var n = strlen(s);
+    var i = 0;
+    while (i < n) {
+        var c = load8(s + i);
+        if (c == 39) { str_builder_add_cstr(sb, "''"); }
+        else {
+            var one[2];
+            store8(&one, c);
+            store8(&one + 1, 0);
+            str_builder_add_cstr(sb, &one);
+        }
+        i = i + 1;
+    }
+    str_builder_add_cstr(sb, "'");
+    return 0;
 }
 
 # Send a simple query
@@ -5007,15 +5351,17 @@ fn pg_connect(host, port, user, database, password) {
         # A message whose declared length is exactly 4 carries no body, so
         # load64(msg + 8) is 0 — reading the auth type straight off it was a
         # null dereference on a malformed (or hostile) server reply.
-        if (load64(msg + 16) < 4) { syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
+        if (load64(msg + 16) < 4) { _pg_msg_free(msg); syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
         var auth_type = _pg_read_be32(load64(msg + 8), 0);
         if (auth_type == PG_AUTH_CLEARTEXT) {
+            _pg_msg_free(msg);
             if (_pg_send_password(fd, _pg_pw_g) < 0) { syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
             msg = _pg_read_msg(fd);
             if (msg == 0) { syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
-            if (load64(msg + 16) < 4) { syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
+            if (load64(msg + 16) < 4) { _pg_msg_free(msg); syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
             auth_type = _pg_read_be32(load64(msg + 8), 0);
         }
+        _pg_msg_free(msg);
         if (auth_type != PG_AUTH_OK) {
             # Includes SASL/SCRAM-SHA-256 (type 10), which majra does not
             # implement — fail closed rather than proceed unauthenticated.
@@ -5023,6 +5369,8 @@ fn pg_connect(host, port, user, database, password) {
             mutex_unlock(_pg_connect_mtx);
             return 0;
         }
+    } else {
+        _pg_msg_free(msg);
     }
 
     # Read until ReadyForQuery. A _pg_read_msg failure is NOT equivalent to
@@ -5039,6 +5387,7 @@ fn pg_connect(host, port, user, database, password) {
             return 0;
         }
         if (load64(msg) == PG_MSG_READY) { done = 1; }
+        _pg_msg_free(msg);
     }
 
     var conn = fl_alloc(16);
@@ -5065,9 +5414,10 @@ fn pg_query(conn, sql) {
         var msg = _pg_read_msg(fd);
         if (msg == 0) { break; }
         var mtype = load64(msg);
+        var stop = 0;
 
         if (mtype == PG_MSG_ROW_DESC) {
-            if (load64(msg + 8) == 0 || load64(msg + 16) < 2) { break; }
+            if (load64(msg + 8) == 0 || load64(msg + 16) < 2) { _pg_msg_free(msg); break; }
             num_cols = _pg_read_be16(load64(msg + 8), 0);
         }
         elif (mtype == PG_MSG_DATA_ROW) {
@@ -5075,10 +5425,10 @@ fn pg_query(conn, sql) {
             var data_len = load64(msg + 16);
             # Every offset below is derived from the wire, so each one is
             # bounded against the message body the server actually sent.
-            if (data == 0 || data_len < 2) { break; }
+            if (data == 0 || data_len < 2) { _pg_msg_free(msg); break; }
             var col_count = _pg_read_be16(data, 0);
             # Each column costs at least its own 4-byte length prefix.
-            if (col_count > (data_len - 2) / 4) { break; }
+            if (col_count > (data_len - 2) / 4) { _pg_msg_free(msg); break; }
             var row = vec_new();
             var pos = 2;
             var ci = 0;
@@ -5109,7 +5459,7 @@ fn pg_query(conn, sql) {
                     ci = ci + 1;
                 }
             }
-            if (bad == 1) { break; }
+            if (bad == 1) { _pg_msg_free(msg); break; }
             vec_push(rows, row);
         }
         elif (mtype == PG_MSG_CMD_COMPLETE) {
@@ -5125,13 +5475,18 @@ fn pg_query(conn, sql) {
             while (draining == 1) {
                 var m2 = _pg_read_msg(fd);
                 if (m2 == 0) { draining = 0; }
-                elif (load64(m2) == PG_MSG_READY) { draining = 0; }
+                else {
+                    if (load64(m2) == PG_MSG_READY) { draining = 0; }
+                    _pg_msg_free(m2);
+                }
             }
-            break;
+            stop = 1;
         }
         elif (mtype == PG_MSG_READY) {
-            break;
+            stop = 1;
         }
+        _pg_msg_free(msg);
+        if (stop == 1) { break; }
     }
 
     return rows;
@@ -5182,28 +5537,28 @@ fn pg_init_workflow_tables(conn) {
 fn pg_save_workflow_def(conn, def_id, name, steps_json) {
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "INSERT INTO majra_workflow_definitions ");
-    str_builder_add_cstr(sb, "(id, name, steps_json, created_at, updated_at) VALUES ('");
-    str_builder_add_cstr(sb, def_id);
-    str_builder_add_cstr(sb, "', '");
-    str_builder_add_cstr(sb, name);
-    str_builder_add_cstr(sb, "', '");
-    str_builder_add_cstr(sb, steps_json);
+    str_builder_add_cstr(sb, "(id, name, steps_json, created_at, updated_at) VALUES (");
+    if (_pg_add_literal(sb, def_id) < 0) { return -1; }
+    str_builder_add_cstr(sb, ", ");
+    if (_pg_add_literal(sb, name) < 0) { return -1; }
+    str_builder_add_cstr(sb, ", ");
+    if (_pg_add_literal(sb, steps_json) < 0) { return -1; }
     var now = time_now_ns() / 1000000;
-    str_builder_add_cstr(sb, "', ");
+    str_builder_add_cstr(sb, ", ");
     str_builder_add_int(sb, now);
     str_builder_add_cstr(sb, ", ");
     str_builder_add_int(sb, now);
     str_builder_add_cstr(sb, ") ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, ");
     str_builder_add_cstr(sb, "steps_json = EXCLUDED.steps_json, updated_at = EXCLUDED.updated_at");
     pg_exec(conn, str_data(str_builder_build(sb)));
+    return 0;
 }
 
 # Get a workflow definition by ID. Returns first row or 0.
 fn pg_get_workflow_def(conn, def_id) {
     var sb = str_builder_new();
-    str_builder_add_cstr(sb, "SELECT id, name, steps_json FROM majra_workflow_definitions WHERE id = '");
-    str_builder_add_cstr(sb, def_id);
-    str_builder_add_cstr(sb, "'");
+    str_builder_add_cstr(sb, "SELECT id, name, steps_json FROM majra_workflow_definitions WHERE id = ");
+    if (_pg_add_literal(sb, def_id) < 0) { return 0; }
     var rows = pg_query(conn, str_data(str_builder_build(sb)));
     if (vec_len(rows) == 0) { return 0; }
     return vec_get(rows, 0);
@@ -5212,10 +5567,10 @@ fn pg_get_workflow_def(conn, def_id) {
 # Delete a workflow definition.
 fn pg_delete_workflow_def(conn, def_id) {
     var sb = str_builder_new();
-    str_builder_add_cstr(sb, "DELETE FROM majra_workflow_definitions WHERE id = '");
-    str_builder_add_cstr(sb, def_id);
-    str_builder_add_cstr(sb, "'");
+    str_builder_add_cstr(sb, "DELETE FROM majra_workflow_definitions WHERE id = ");
+    if (_pg_add_literal(sb, def_id) < 0) { return -1; }
     pg_exec(conn, str_data(str_builder_build(sb)));
+    return 0;
 }
 
 # --- ipc_encrypted.cyr ---
@@ -5358,6 +5713,16 @@ var ENCRYPTED_IPC_RESPONDER = 1;
 #   offset 40: role (i64) — ENCRYPTED_IPC_INITIATOR | ENCRYPTED_IPC_RESPONDER
 #   offset 48: peer_counter (i64) — highest peer counter accepted, -1 initially
 #   offset 56: closed (i64) — 1 once encrypted_ipc_close has run
+#   offset 64: recv_mutex (i64) — guards the receive half INDEPENDENTLY
+#
+# ⚠ TWO mutexes, deliberately. 2.6.9 put send and recv under ONE, then held it
+# across ipc_recv_frame — a BLOCKING read(2). A receiver parked waiting for a
+# peer that sends nothing therefore blocked every send on the same handle
+# indefinitely, which for a request/response protocol is a self-deadlock: the
+# reply can never arrive because the request can never be written. Splitting
+# them keeps each half internally serialised (nonce counter and write ordering
+# on one side, replay window and read ordering on the other) without coupling
+# the two directions.
 #
 # ⚠ THE ROLE ARGUMENT IS LOAD-BEARING AES-GCM SAFETY, NOT BOOKKEEPING.
 #
@@ -5375,7 +5740,7 @@ var ENCRYPTED_IPC_RESPONDER = 1;
 fn encrypted_ipc_new(ipc_fd, key_ptr, role) {
     if (role != ENCRYPTED_IPC_INITIATOR && role != ENCRYPTED_IPC_RESPONDER) { return 0; }
     aes_gcm_global_init();
-    var e = fl_alloc(64);
+    var e = fl_alloc(72);
     if (e == 0) { return 0; }
     store64(e, ipc_fd);
     var kcopy = fl_alloc(32);
@@ -5388,6 +5753,7 @@ fn encrypted_ipc_new(ipc_fd, key_ptr, role) {
     store64(e + 40, role);
     store64(e + 48, -1);
     store64(e + 56, 0);
+    store64(e + 64, mutex_new());
     return e;
 }
 
@@ -5446,10 +5812,25 @@ fn encrypted_ipc_needs_rekey(e) {
 # mistake to make on a reconnect path.
 fn encrypted_ipc_rekey(e, new_key_ptr) {
     if (e == 0 || new_key_ptr == 0) { return Err(ERR_IPC); }
+    # Touches both halves (key, send counter, replay window), so it takes both
+    # locks. Order is always send -> recv; nothing takes them the other way.
     var mtx = load64(e + 24);
+    var rmtx = load64(e + 64);
     mutex_lock(mtx);
+    mutex_lock(rmtx);
+    if (load64(e + 56) == 1) {
+        mutex_unlock(rmtx);
+        mutex_unlock(mtx);
+        return Err(ERR_IPC);
+    }
     var cur = load64(e + 8);
+    if (cur == 0) {
+        mutex_unlock(rmtx);
+        mutex_unlock(mtx);
+        return Err(ERR_IPC);
+    }
     if (ct_eq_bytes_lens(cur, AES_256_KEY_SIZE, new_key_ptr, AES_256_KEY_SIZE) == 1) {
+        mutex_unlock(rmtx);
         mutex_unlock(mtx);
         return Err(ERR_IPC);
     }
@@ -5459,6 +5840,7 @@ fn encrypted_ipc_rekey(e, new_key_ptr) {
     # The peer restarts its counter too, so the replay window must reopen or
     # every post-rekey frame would look like a replay.
     store64(e + 48, -1);
+    mutex_unlock(rmtx);
     mutex_unlock(mtx);
     return Ok(0);
 }
@@ -5521,7 +5903,8 @@ fn _encrypted_ipc_kill(e) {
 
 fn encrypted_ipc_recv(e) {
     if (e == 0) { return Err(ERR_IPC); }
-    var mtx = load64(e + 24);
+    # The RECEIVE mutex — never the send mutex. See the struct note.
+    var mtx = load64(e + 64);
     mutex_lock(mtx);
     if (load64(e + 56) == 1) { mutex_unlock(mtx); return Err(ERR_IPC); }
 
@@ -5618,8 +6001,10 @@ fn encrypted_ipc_payload_free(r) {
 fn encrypted_ipc_close(e) {
     if (e == 0) { return 0; }
     var mtx = load64(e + 24);
+    var rmtx = load64(e + 64);
     mutex_lock(mtx);
-    if (load64(e + 56) == 1) { mutex_unlock(mtx); return 0; }
+    mutex_lock(rmtx);
+    if (load64(e + 56) == 1) { mutex_unlock(rmtx); mutex_unlock(mtx); return 0; }
     store64(e + 56, 1);
     # Zeroize the key buffer, then actually release it. Previously the key was
     # wiped but never freed and the handle stayed usable, so a post-close send
@@ -5635,7 +6020,17 @@ fn encrypted_ipc_close(e) {
     var fd = load64(e);
     if (fd >= 0) { ipc_close(fd); }
     store64(e, -1);
+    mutex_unlock(rmtx);
     mutex_unlock(mtx);
+    return 0;
+}
+
+# Release the EncryptedIpc handle itself. Call AFTER encrypted_ipc_close —
+# 2.6.9's close freed the key and closed the fd but never released the struct,
+# and exported no teardown that did.
+fn encrypted_ipc_free(e) {
+    if (e == 0) { return 0; }
+    fl_free(e);
     return 0;
 }
 
@@ -5669,10 +6064,6 @@ var _sha1_h2 = 0x98BADCFE;
 var _sha1_h3 = 0x10325476;
 var _sha1_h4 = 0xC3D2E1F0;
 
-# 80-entry SHA-1 message schedule (global var[N] is N x 8 bytes = 640).
-# Scratch only — consumed within a single sha1() call.
-var _sha1_w[80];
-
 fn _sha1_rotl32(x, n) {
     x = x & 0xFFFFFFFF;
     return ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF;
@@ -5705,13 +6096,18 @@ fn sha1(data, len) {
 
     # Process each 64-byte block.
     #
-    # The 80-entry message schedule used to come from alloc() — the BUMP
-    # allocator, which never reclaims — so every sha1() call, i.e. every
-    # WebSocket handshake, leaked 640 bytes permanently. An unauthenticated
-    # peer could exhaust memory by reconnecting. It is now a module-level
-    # scratch buffer: sha1 is a leaf function that consumes the schedule
-    # entirely before returning, so a single shared buffer is sufficient.
-    var w = &_sha1_w;
+    # The 80-entry message schedule comes from the FREELIST, per call.
+    #
+    # Originally it came from alloc() — the BUMP allocator, which never
+    # reclaims — so every handshake leaked 640 bytes and an unauthenticated
+    # peer could exhaust memory by reconnecting. 2.6.9 fixed that leak by
+    # switching to a module-level scratch buffer, which fixed the leak and
+    # broke REENTRANCY: sha1 is exported in all four dist bundles, so two
+    # consumer threads hashing concurrently interleaved writes into one
+    # schedule and both received a digest of neither message. fl_alloc fixes
+    # both — it is per-call like the original, and reclaimable unlike alloc.
+    var w = fl_alloc(640);
+    if (w == 0) { fl_free(padded); return 0; }
     var block = 0;
     while (block < padded_len) {
         # Prepare message schedule (32-bit words stored in 64-bit slots)
@@ -5773,6 +6169,7 @@ fn sha1(data, len) {
     }
 
     fl_free(padded);
+    fl_free(w);
 
     # Output 20-byte digest in big-endian
     var digest = fl_alloc(20);
@@ -5818,7 +6215,11 @@ fn _ws_read_full(fd, buf, want) {
     var total = 0;
     while (total < want) {
         var r = syscall(SYS_READ, fd, buf + total, want - total);
-        if (r <= 0) { return -1; }
+        # EINTR (-4) is a retry, not a failure. 2.6.9 taught _ipc_read_full
+        # this and left the WebSocket and PostgreSQL helpers treating a signal
+        # as a dead connection.
+        if (r == -4) { r = 0; }
+        elif (r <= 0) { return -1; }
         total = total + r;
     }
     return total;
@@ -5829,7 +6230,8 @@ fn _ws_write_full(fd, buf, len) {
     var total = 0;
     while (total < len) {
         var w = syscall(SYS_WRITE, fd, buf + total, len - total);
-        if (w <= 0) { return -1; }
+        if (w == -4) { w = 0; }
+        elif (w <= 0) { return -1; }
         total = total + w;
     }
     return total;
@@ -6177,6 +6579,21 @@ var ADMIN_TRACKER_BASIC = 1;
 # treats whatever is there as a mutex pointer, then atomically writes to it.
 # The kind is now recorded and checked.
 
+# ⚠ REQUIRES a CONCURRENT tracker (chb_tracker_new). Passing a basic
+# hb_tracker here is a contract violation with a memory-safety consequence, not
+# merely a wrong answer: chb_fleet_stats reads a mutex pointer at offset 16,
+# which is 8 bytes PAST an hb_tracker's 16-byte allocation, and then locks it.
+#
+# Use majra_admin_new_ex(t, ADMIN_TRACKER_BASIC, rl) for a basic tracker; /fleet
+# then returns an explanatory error instead of reading out of bounds.
+#
+# The tracker_kind field cannot be inferred, because the two tracker types are
+# not distinguishable from their pointers — hb_tracker is fl_alloc(16) and
+# chb_tracker fl_alloc(24), with no type tag in either. Making them
+# distinguishable means adding a tag to both layouts, which is 2.7.0 work
+# (roadmap § 2.7.0), not a patch. Until then this default trusts the
+# documented contract: defaulting to BASIC instead would keep incorrect callers
+# safe at the cost of silently removing /fleet from every CORRECT one.
 fn majra_admin_new(fleet_tracker, ratelimiter) {
     return majra_admin_new_ex(fleet_tracker, ADMIN_TRACKER_CONCURRENT, ratelimiter);
 }
@@ -6493,17 +6910,34 @@ fn patra_queue_dequeue(pq) {
             # would hand back a pointer to that REFERENCE STRUCT, and strlen
             # over it walks raw page-pointer bytes — a garbage length driving
             # a garbage memcpy. TEXT needs the length/read pair.
+            # patra_result_get_text_len returns -1 when the column is NOT
+            # TEXT — which is exactly what a .patra file written before 2.6.9
+            # has, since the payload column was STR then. 2.6.9 clamped that
+            # -1 to 0, so every job in an existing file dequeued with an EMPTY
+            # payload and was still marked running: silent, total data loss on
+            # upgrade, for the one file format majra promises to persist.
+            # Fall back to the STR reader so old files keep working.
             var pay_len = patra_result_get_text_len(rs, 0, 2);
-            if (pay_len < 0) { pay_len = 0; }
+            var is_text = 1;
+            if (pay_len < 0) {
+                is_text = 0;
+                var legacy = patra_result_get_str(rs, 0, 2);
+                pay_len = 0;
+                if (legacy != 0) { pay_len = strlen(legacy); }
+            }
             var pay_copy = fl_alloc(pay_len + 1);
             if (pay_copy == 0) { patra_result_free(rs); searching = 0; }
             else {
                 if (pay_len > 0) {
-                    if (patra_result_read_text(db, rs, 0, 2, pay_copy) != PATRA_OK) {
-                        fl_free(pay_copy);
-                        patra_result_free(rs);
-                        mutex_unlock(mtx);
-                        return 0;
+                    if (is_text == 1) {
+                        if (patra_result_read_text(db, rs, 0, 2, pay_copy) != PATRA_OK) {
+                            fl_free(pay_copy);
+                            patra_result_free(rs);
+                            mutex_unlock(mtx);
+                            return 0;
+                        }
+                    } else {
+                        memcpy(pay_copy, patra_result_get_str(rs, 0, 2), pay_len);
                     }
                 }
                 store8(pay_copy + pay_len, 0);

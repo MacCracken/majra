@@ -5,6 +5,123 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.10] — 2026-08-22 — repairing 115 findings introduced 50 new ones
+
+**560** assertions green across four suites (core 150, expanded 252, backend
+130, patra-queue 28), 0 failed. Fuzz 3/3, soak 4/4, benchmarks 17/17, examples
+2/2, `cyrius deny` 0 violations.
+
+The second P(-1) pass required by [`CLAUDE.md`](CLAUDE.md) step 10 — *"repeat
+if heavy"*. 2.6.9 rewrote roughly 7,000 lines repairing the first audit's 115
+findings, and **those repairs had never been audited**.
+
+**68 confirmed, 10 refuted — and 50 of the 68 were introduced by 2.6.9 itself.**
+Full write-up in
+[`docs/audit/2026-08-22-audit-pass2.md`](docs/audit/2026-08-22-audit-pass2.md).
+
+That number is the point of this release. Every 2.6.9 fix was individually
+reasonable and the suite was green at every step, and it still shipped a
+critical security-control bypass, a memory-safety fix that was a verified
+no-op, a self-deadlock, and a use-after-free it created out of a merely-racy
+read.
+
+### CRITICAL — the rate limiter fails open after an idle period
+
+To stop fast polling discarding fractional credit, 2.6.9 replaced an
+unconditional clock reset with `consumed_ns = refill * 1000000000 / rate_x1000`.
+`refill` is bounded by nothing — only `tokens` is clamped to burst — so a bucket
+idle long enough overflows i64, `consumed_ns` comes back NEGATIVE, and
+`last_ns + consumed_ns` drives the clock **backward**. Every later call then
+sees a larger elapsed time, refills to full burst, and returns allowed: a
+permanent, silent bypass for that key. For a 1000 req/s limiter that is ~2.6
+hours idle, i.e. a reconnecting tenant reaches it unaided.
+
+### The socket-permission fix was a no-op, and the header promised otherwise
+
+2.6.9 called `fchmod(fd, 0600)` **after** `bind(2)`. `bind` creates the
+filesystem inode from the sockfs mode masked by umask and `connect(2)` checks
+*that* inode; `fchmod` afterwards touches only the sockfs inode. Reproduced
+under umask 022: the path stays at **0755** while `fstat` reports 0600.
+
+This made 2.6.9 worse than the gap it replaced, because the module header began
+asserting owner-only access and majra checks no peer credentials — so a
+consumer trusting it got a world-connectable endpoint where connecting *is*
+authenticating. `ipc_bind` had no test at all; it has one now, mutation-verified.
+
+### Other high-severity 2.6.9 regressions
+
+- **The RESP parser truncated ordinary Redis replies.** `if (elem == 0) {
+  return arr; }` cannot tell a read failure from a nil bulk string or the
+  integer `:0`, so a rate-limiter reply or an `MGET` with a missing key came
+  back empty with its remaining elements still queued — offsetting the
+  connection permanently. No hostile server needed.
+- **Encrypted IPC could self-deadlock.** `recv` was put under the same mutex as
+  `send` and held across a blocking `read(2)`, so a receiver waiting on a silent
+  peer blocked every send on that handle. Split into independent send/recv
+  mutexes.
+- **The circuit breaker latched OPEN forever** if a half-open probe never
+  reported back.
+- **`sha1` stopped being reentrant** — the leak fix moved its schedule to
+  module scope, so concurrent callers got a digest of neither message.
+- **An existing `.patra` file lost every job on upgrade** — the `STR` → `TEXT`
+  change was not detected on reopen, so jobs dequeued with empty payloads and
+  were still marked running.
+- **`chb_get` became a use-after-free** — it returns the internal `NodeState`
+  pointer, and 2.6.9 started freeing those on eviction. Now returns a
+  caller-owned copy.
+- **`namespace_new`'s new 0 return had no guards behind it.**
+- **`mq_dequeue` consumed concurrency slots nothing could return**, ratcheting
+  a queue toward its cap until it stopped dequeuing.
+
+### Pre-existing, missed by the first pass
+
+**SQL injection in the PostgreSQL workflow API.** `pg_save_workflow_def`,
+`pg_get_workflow_def` and `pg_delete_workflow_def` spliced caller strings into
+single-quoted literals with no escaping. Pass 1 found and fixed exactly this
+shape in `patra_queue` and did not look here — a lens gap: its `syscall-fs-sql`
+lens was pointed at `patra_queue` and `main.cyr`, so `postgres_backend`'s
+storage API fell between that lens and the wire-protocol one.
+
+Also: no inbound PostgreSQL message was ever freed (one leak per row on a
+multi-row query), and `_barrier_state_new` / `chb_register_with_telemetry` /
+`relay_evict_stale_dedup` each still carried the exact defect 2.6.9 fixed in
+their twin.
+
+### Tests that could not fail
+
+The pass audited 2.6.9's own new assertions and found tautologies — which is
+how the first audit's bugs shipped. `test_ws_framing` ran everything against
+`fd = -1`, where the guard path and the failure path both return -1.
+`test_resp_limits` asserted only that constants were positive. Nothing anywhere
+exercised `transport_send`/`_recv` or the malformed-DAG rejection.
+
+All four are real now, and the two most load-bearing are **mutation-verified**:
+dropping `_resp_poison` turns the RESP test red, and restoring `fncall2` makes
+the transport test observe `len` as a stack value instead of 7.
+
+### New
+
+- `docs/guides/migration-2.6.9.md` — the consumer migration guide for both
+  releases, covering all three signature changes, the behavioural changes, and
+  the `.patra` format change.
+- `redis_is_alive`, and a RESP parser that poisons a connection it can no
+  longer parse rather than letting the caller keep using a desynced stream.
+- `mq_take_queued` — removing a queued job without treating it as an execution.
+  `fleet_rebalance` and `fleet_deregister_node` were using `mq_dequeue`, which
+  refuses at the concurrency cap, so a saturated node could neither be
+  rebalanced nor drained.
+- Teardown functions for everything majra hands out; see the migration guide.
+
+### Not fixed, deliberately
+
+`majra_admin_new`'s two-argument default still trusts its contract — the two
+tracker types are not distinguishable from their pointers, and flipping the
+default keeps incorrect callers safe only by silently removing `/fleet` from
+every correct one (verified: it turns two legitimate assertions red). The real
+fix, a type tag in both layouts, is filed as 2.7.0 work. Full `workflow_execute`
+teardown and `_resp_buf`'s process-global line buffer are likewise structural.
+The four deliberate deferrals from pass 1 stand unchanged.
+
 ## [2.6.9] — 2026-08-22 — the first P(-1) hardening pass
 
 **515** assertions green across four suites (core 150, expanded 236, backend

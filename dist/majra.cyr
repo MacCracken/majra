@@ -388,6 +388,10 @@ fn namespace_prefix(ns) {
 
 # Prefix a topic with / delimiter.
 fn namespace_topic(ns, topic_cstr) {
+    # namespace_new returns 0 for an invalid prefix, and the module's own usage
+    # recipes feed its result straight in here. Guard rather than dereference:
+    # a caller that skipped the check gets 0 back instead of a segfault.
+    if (ns == 0 || topic_cstr == 0) { return 0; }
     var sb = str_builder_new();
     str_builder_add(sb, ns);
     str_builder_add_cstr(sb, "/");
@@ -397,6 +401,7 @@ fn namespace_topic(ns, topic_cstr) {
 
 # Prefix a key with : delimiter.
 fn namespace_key(ns, key_cstr) {
+    if (ns == 0 || key_cstr == 0) { return 0; }
     var sb = str_builder_new();
     str_builder_add(sb, ns);
     str_builder_add_cstr(sb, ":");
@@ -416,6 +421,7 @@ fn namespace_pattern(ns, pattern_cstr) {
 
 # Build wildcard pattern: {prefix}/#
 fn namespace_wildcard(ns) {
+    if (ns == 0) { return 0; }
     var sb = str_builder_new();
     str_builder_add(sb, ns);
     str_builder_add_cstr(sb, "/#");
@@ -425,6 +431,7 @@ fn namespace_wildcard(ns) {
 # Strip namespace prefix from a topic (/ delimiter).
 # Returns the bare topic as a Str, or 0 if topic doesn't belong to this namespace.
 fn namespace_strip_topic(ns, topic) {
+    if (ns == 0 || topic == 0) { return 0; }
     var prefix_len = str_len(ns);
     var topic_len = str_len(topic);
     # Must be longer than prefix + "/"
@@ -452,6 +459,7 @@ fn namespace_strip_topic(ns, topic) {
 # Strip namespace prefix from a key (: delimiter).
 # Returns the bare key as a Str, or 0 if key doesn't belong to this namespace.
 fn namespace_strip_key(ns, key) {
+    if (ns == 0 || key == 0) { return 0; }
     var prefix_len = str_len(ns);
     var key_len = str_len(key);
     if (key_len <= prefix_len + 1) {
@@ -754,12 +762,31 @@ fn ratelimit_check(rl, key) {
     # the fractional credit on every call. A limiter polled in a tight loop
     # therefore refilled at ZERO no matter how much wall time passed. Advancing
     # only by the consumed whole-token time keeps the remainder for next call.
-    if (refill > 0 && rate_x1000 > 0) {
+    # ⚠ ORDER MATTERS, and the guard on `refill` is load-bearing.
+    #
+    # 2.6.9 computed `refill * 1000000000` FIRST and unconditionally. `refill`
+    # is bounded by nothing — only `tokens` is clamped to burst above — so a
+    # bucket idle long enough overflows i64, `consumed_ns` comes back NEGATIVE,
+    # and `last_ns + consumed_ns` moves the clock BACKWARD. Every later call
+    # then sees an even larger elapsed_ns, refills to full burst, and returns
+    # allowed. That is a permanent, silent bypass of the limiter for that key —
+    # a security control failing open, introduced by the fix for a starvation
+    # bug. For a 1000 req/s limiter it needs roughly 2.6 hours idle, i.e. a
+    # reconnecting tenant reaches it on its own.
+    #
+    # A full bucket carries nothing, so it takes the clock outright and never
+    # reaches the multiply. Below that, refill is bounded by construction (a
+    # larger refill would have clamped tokens to burst), and the explicit cap
+    # keeps that reasoning from silently breaking if burst grows.
+    if (tokens >= burst_x1000) {
+        store64(bucket_ptr + 8, now);
+    } elif (refill > 0 && rate_x1000 > 0 && refill < 9000000000) {
         var consumed_ns = refill * 1000000000 / rate_x1000;
-        if (consumed_ns > elapsed_ns) { consumed_ns = elapsed_ns; }
+        if (consumed_ns < 0 || consumed_ns > elapsed_ns) { consumed_ns = elapsed_ns; }
         store64(bucket_ptr + 8, last_ns + consumed_ns);
-    } elif (tokens >= burst_x1000) {
-        # Already full — nothing to carry, so don't accumulate unbounded debt.
+    } elif (refill > 0) {
+        # Refill too large to convert back safely; the bucket is effectively
+        # full anyway, so take the clock rather than risk the multiply.
         store64(bucket_ptr + 8, now);
     }
 
@@ -1158,29 +1185,36 @@ fn hb_update_statuses(ht) {
     var now = time_now_ns();
     var transitions = vec_new();
 
-    var keys = map_keys(nodes);
+    # Walks the hashmap slot array directly. map_keys builds a vec from the
+    # BUMP allocator on every call and this runs on every sweep, twice — the
+    # same never-reclaimed-allocation class 2.6.9 removed from fleet, pubsub
+    # and relay and did not apply here.
+    var entries = map_entries(nodes);
+    var cap = map_cap(nodes);
     var i = 0;
-    var len = vec_len(keys);
-    while (i < len) {
-        var id = vec_get(keys, i);
-        var ns = map_get(nodes, id);
-        var elapsed = now - load64(ns + 8);
-        var prev = load64(ns);
-        var new_status = _classify_status(elapsed, cfg);
+    while (i < cap) {
+        var ep = entries + i * 24;
+        if (load64(ep + 16) == 1) {
+            var id = load64(ep);
+            var ns = load64(ep + 8);
+            var elapsed = now - load64(ns + 8);
+            var prev = load64(ns);
+            var new_status = _classify_status(elapsed, cfg);
 
-        if (new_status == STATUS_OFFLINE) {
-            store64(ns + 32, load64(ns + 32) + 1);
-        } else {
-            store64(ns + 32, 0);
-        }
+            if (new_status == STATUS_OFFLINE) {
+                store64(ns + 32, load64(ns + 32) + 1);
+            } else {
+                store64(ns + 32, 0);
+            }
 
-        if (new_status != prev) {
-            store64(ns, new_status);
-            # Store transition as pair: push id then status
-            var pair = fl_alloc(16);
-            store64(pair, id);
-            store64(pair + 8, new_status);
-            vec_push(transitions, pair);
+            if (new_status != prev) {
+                store64(ns, new_status);
+                # Store transition as pair: push id then status
+                var pair = fl_alloc(16);
+                store64(pair, id);
+                store64(pair + 8, new_status);
+                vec_push(transitions, pair);
+            }
         }
         i = i + 1;
     }
@@ -1188,27 +1222,34 @@ fn hb_update_statuses(ht) {
     # Handle eviction
     var eviction_cycles = load64(cfg + 16);
     if (eviction_cycles > 0) {
-        var to_evict = vec_new();
-        keys = map_keys(nodes);
+        # Two-pass, but over an fl_alloc'd array rather than two bump vecs.
+        # The collect pass is separate because map_delete during a slot walk is
+        # safe only for the entry being deleted; sizing by map_size bounds it.
+        var nlive = map_size(nodes);
+        var to_evict = 0;
+        var nev = 0;
+        if (nlive > 0) { to_evict = fl_alloc(nlive * 8); }
         i = 0;
-        len = vec_len(keys);
-        while (i < len) {
-            var id = vec_get(keys, i);
-            var ns = map_get(nodes, id);
-            if (load64(ns + 32) >= eviction_cycles) {
-                vec_push(to_evict, id);
+        while (i < cap && to_evict != 0) {
+            var ep2 = entries + i * 24;
+            if (load64(ep2 + 16) == 1) {
+                var ns2 = load64(ep2 + 8);
+                if (load64(ns2 + 32) >= eviction_cycles && nev < nlive) {
+                    store64(to_evict + nev * 8, load64(ep2));
+                    nev = nev + 1;
+                }
             }
             i = i + 1;
         }
         i = 0;
-        len = vec_len(to_evict);
-        while (i < len) {
-            var ev_id = vec_get(to_evict, i);
+        while (i < nev) {
+            var ev_id = load64(to_evict + i * 8);
             var ev_ns = map_get(nodes, ev_id);
             map_delete(nodes, ev_id);
             if (ev_ns != 0) { fl_free(ev_ns); }
             i = i + 1;
         }
+        if (to_evict != 0) { fl_free(to_evict); }
     }
 
     return transitions;
@@ -1278,11 +1319,15 @@ fn chb_register(cht, id, metadata) {
 }
 
 fn chb_register_with_telemetry(cht, id, metadata, gpu_vec) {
+    # Same re-registration leak chb_register closes: replacing an existing
+    # entry abandoned the previous NodeState. 2.6.9 fixed only chb_register.
     var mtx = load64(cht + 16);
     mutex_lock(mtx);
+    var prev = map_get(load64(cht), id);
     var ns = _node_state_new(metadata);
     store64(ns + 24, gpu_vec);
     map_set(load64(cht), id, ns);
+    if (prev != 0) { fl_free(prev); }
     mutex_unlock(mtx);
 }
 
@@ -1352,28 +1397,32 @@ fn chb_update_statuses(cht) {
     var now = time_now_ns();
     var transitions = vec_new();
 
-    var keys = map_keys(nodes);
+    # Slot-array walk — see the note on the non-concurrent sweep above.
+    var entries = map_entries(nodes);
+    var cap = map_cap(nodes);
     var i = 0;
-    var len = vec_len(keys);
-    while (i < len) {
-        var id = vec_get(keys, i);
-        var ns = map_get(nodes, id);
-        var elapsed = now - load64(ns + 8);
-        var prev = load64(ns);
-        var new_status = _classify_status(elapsed, cfg);
+    while (i < cap) {
+        var ep = entries + i * 24;
+        if (load64(ep + 16) == 1) {
+            var id = load64(ep);
+            var ns = load64(ep + 8);
+            var elapsed = now - load64(ns + 8);
+            var prev = load64(ns);
+            var new_status = _classify_status(elapsed, cfg);
 
-        if (new_status == STATUS_OFFLINE) {
-            store64(ns + 32, load64(ns + 32) + 1);
-        } else {
-            store64(ns + 32, 0);
-        }
+            if (new_status == STATUS_OFFLINE) {
+                store64(ns + 32, load64(ns + 32) + 1);
+            } else {
+                store64(ns + 32, 0);
+            }
 
-        if (new_status != prev) {
-            store64(ns, new_status);
-            var pair = fl_alloc(16);
-            store64(pair, id);
-            store64(pair + 8, new_status);
-            vec_push(transitions, pair);
+            if (new_status != prev) {
+                store64(ns, new_status);
+                var pair = fl_alloc(16);
+                store64(pair, id);
+                store64(pair + 8, new_status);
+                vec_push(transitions, pair);
+            }
         }
         i = i + 1;
     }
@@ -1381,39 +1430,68 @@ fn chb_update_statuses(cht) {
     # Handle eviction
     var eviction_cycles = load64(cfg + 16);
     if (eviction_cycles > 0) {
-        var to_evict = vec_new();
-        keys = map_keys(nodes);
+        # Two-pass, but over an fl_alloc'd array rather than two bump vecs.
+        # The collect pass is separate because map_delete during a slot walk is
+        # safe only for the entry being deleted; sizing by map_size bounds it.
+        var nlive = map_size(nodes);
+        var to_evict = 0;
+        var nev = 0;
+        if (nlive > 0) { to_evict = fl_alloc(nlive * 8); }
         i = 0;
-        len = vec_len(keys);
-        while (i < len) {
-            var id = vec_get(keys, i);
-            var ns = map_get(nodes, id);
-            if (load64(ns + 32) >= eviction_cycles) {
-                vec_push(to_evict, id);
+        while (i < cap && to_evict != 0) {
+            var ep2 = entries + i * 24;
+            if (load64(ep2 + 16) == 1) {
+                var ns2 = load64(ep2 + 8);
+                if (load64(ns2 + 32) >= eviction_cycles && nev < nlive) {
+                    store64(to_evict + nev * 8, load64(ep2));
+                    nev = nev + 1;
+                }
             }
             i = i + 1;
         }
         i = 0;
-        len = vec_len(to_evict);
-        while (i < len) {
-            var ev_id = vec_get(to_evict, i);
+        while (i < nev) {
+            var ev_id = load64(to_evict + i * 8);
             var ev_ns = map_get(nodes, ev_id);
             map_delete(nodes, ev_id);
             if (ev_ns != 0) { fl_free(ev_ns); }
             i = i + 1;
         }
+        if (to_evict != 0) { fl_free(to_evict); }
     }
 
     mutex_unlock(mtx);
     return transitions;
 }
 
+# Returns a CALLER-OWNED COPY of the node's state, or 0. Release with
+# chb_node_free.
+#
+# This used to hand back the tracker's internal NodeState pointer after
+# dropping the mutex. That was merely racy until 2.6.9 added fl_free on every
+# removal path — at which point it became a USE-AFTER-FREE: an eviction sweep
+# or a deregister on another thread can recycle the block while the caller is
+# still reading it, and the freelist will hand those 40 bytes to the next
+# allocation. Copying under the lock is the only way to hand out a value that
+# stays valid without refcounting.
 fn chb_get(cht, id) {
+    if (cht == 0) { return 0; }
     var mtx = load64(cht + 16);
     mutex_lock(mtx);
     var ns = map_get(load64(cht), id);
+    var copy = 0;
+    if (ns != 0) {
+        copy = fl_alloc(40);
+        if (copy != 0) { memcpy(copy, ns, 40); }
+    }
     mutex_unlock(mtx);
-    return ns;
+    return copy;
+}
+
+# Release a NodeState copy returned by chb_get.
+fn chb_node_free(ns) {
+    if (ns != 0) { fl_free(ns); }
+    return 0;
 }
 
 fn chb_get_gpu_telemetry(cht, id) {
@@ -1557,6 +1635,13 @@ fn queue_item_new(priority, payload) {
     store64(item + 24, payload);
     store64(item + 32, 0);
     return item;
+}
+
+# Release a QueueItem. Only for items the caller owns outright — an item
+# handed to mq_enqueue is owned by the queue until it terminates.
+fn queue_item_free(item) {
+    if (item != 0) { fl_free(item); }
+    return 0;
 }
 
 fn queue_item_id_hi(item) { return load64(item); }
@@ -1882,14 +1967,25 @@ fn mq_dequeue(mq) {
                     fl_free(mi);
                     mutex_unlock(mtx);
                 } else {
+                    # The increment stays INSIDE the mi guard. 2.6.9 moved it
+                    # out, but both decrement sites (mq_complete, mq_fail)
+                    # still require mi != 0 — so delivering a job whose
+                    # tracking entry was already removed consumed a
+                    # concurrency slot that nothing could ever give back, and
+                    # the queue ratcheted toward its cap and stopped
+                    # dequeuing. Skip such an item rather than deliver it: it
+                    # has no tracking entry, so it can never be completed.
                     if (mi != 0) {
                         store64(mi + 32, JOB_RUNNING);
                         store64(mi + 48, time_now_ns());
+                        store64(mq + 32, load64(mq + 32) + 1);
+                        mutex_unlock(mtx);
+                        out = item;
+                        searching = 0;
+                    } else {
+                        mutex_unlock(mtx);
+                        queue_item_free(item);
                     }
-                    store64(mq + 32, load64(mq + 32) + 1);
-                    mutex_unlock(mtx);
-                    out = item;
-                    searching = 0;
                 }
             }
         }
@@ -1900,6 +1996,53 @@ fn mq_dequeue(mq) {
     var vt = load64(mq + 48);
     if (vt != 0) {
         metrics_queue_dequeued(vt, load64(mq + 24), load64(out + 16));
+    }
+    return out;
+}
+
+# Remove the next QUEUED job without treating it as an execution.
+#
+# Returns the QueueItem, or 0 if nothing is queued. The caller owns the item
+# and should release it with queue_item_free once it has copied what it needs.
+#
+# This exists because a steal or a drain is NOT a dequeue. `mq_dequeue` marks
+# the job RUNNING, increments running_count, and — critically — REFUSES once
+# running_count reaches max_concurrent. Using it to move work therefore
+# (a) inflated the source's running_count, and (b) silently gave up on a queue
+# whose jobs were already at the cap, which is precisely the state a rebalance
+# or a deregister needs to act on. fleet.cyr used mq_dequeue + a compensating
+# mq_fail for both; this is the primitive it actually wanted.
+#
+# Cancelled jobs are dropped rather than handed back, matching mq_dequeue.
+fn mq_take_queued(mq) {
+    var mtx = load64(mq + 16);
+    var jobs = load64(mq + 8);
+
+    var out = 0;
+    var searching = 1;
+    while (searching == 1) {
+        mutex_lock(mtx);
+        var item = cpq_dequeue(load64(mq));
+        if (item == 0) {
+            mutex_unlock(mtx);
+            searching = 0;
+        } else {
+            var key = load64(item + 32);
+            var mi = map_get(jobs, key);
+            var cancelled = 0;
+            if (mi != 0 && load64(mi + 32) == JOB_CANCELLED) { cancelled = 1; }
+            if (mi != 0) {
+                map_delete(jobs, key);
+                fl_free(mi);
+            }
+            mutex_unlock(mtx);
+            if (cancelled == 1) {
+                queue_item_free(item);
+            } else {
+                out = item;
+                searching = 0;
+            }
+        }
     }
     return out;
 }
@@ -1921,10 +2064,13 @@ fn mq_complete(mq, item) {
 
     mutex_lock(mtx);
     var mi = map_get(jobs, key);
-    if (mi != 0) {
-        if (load64(mi + 32) == JOB_RUNNING) {
-            store64(mq + 32, load64(mq + 32) - 1);
-        }
+    # Only a job that actually reached RUNNING is terminated here. 2.6.9
+    # deleted and freed the ManagedItem for ANY resolvable key, including one
+    # still JOB_QUEUED — leaving its QueueItem sitting in the priority queue
+    # with no tracking entry, which mq_dequeue would later pop and (before the
+    # guard above) hand out as an untrackable job.
+    if (mi != 0 && load64(mi + 32) == JOB_RUNNING) {
+        store64(mq + 32, load64(mq + 32) - 1);
         store64(mi + 32, JOB_COMPLETED);
         store64(mi + 56, time_now_ns());
         counter_inc(load64(mq + 56));
@@ -1942,10 +2088,8 @@ fn mq_fail(mq, item) {
 
     mutex_lock(mtx);
     var mi = map_get(jobs, key);
-    if (mi != 0) {
-        if (load64(mi + 32) == JOB_RUNNING) {
-            store64(mq + 32, load64(mq + 32) - 1);
-        }
+    if (mi != 0 && load64(mi + 32) == JOB_RUNNING) {
+        store64(mq + 32, load64(mq + 32) - 1);
         store64(mi + 32, JOB_FAILED);
         store64(mi + 56, time_now_ns());
         map_delete(jobs, key);
@@ -2760,23 +2904,34 @@ fn relay_evict_stale_dedup(r, max_idle_ns) {
     var now = time_now_ns();
     var mtx = load64(r + 40);
     mutex_lock(mtx);
+    # Carries both defects 2.6.9 fixed in the sibling eviction path inside
+    # relay_receive_ex and did not apply here: it built TWO bump-allocated vecs
+    # per sweep (map_keys plus to_remove, neither reclaimable), and it deleted
+    # DedupEntry blocks without freeing them — so the routine whose whole job
+    # is bounding the dedup table's memory leaked a block per eviction.
+    #
+    # Now allocation-free, walking the slot array directly. Deleting during the
+    # walk is safe because map_delete leaves a tombstone rather than
+    # reshuffling: _map_find skips st == 2 and _map_grow_a rehashes only live
+    # entries, so no slot this loop has yet to visit moves.
     var seen = load64(r + 16);
-    var keys = map_keys(seen);
-    var to_remove = vec_new();
+    var entries = map_entries(seen);
+    var cap = map_cap(seen);
+    var count = 0;
     var i = 0;
-    var len = vec_len(keys);
-    while (i < len) {
-        var k = vec_get(keys, i);
-        var e = map_get(seen, k);
-        if (now - load64(e + 8) > max_idle_ns) {
-            vec_push(to_remove, k);
+    while (i < cap) {
+        var sp = entries + i * 24;
+        if (load64(sp + 16) == 1) {
+            var e = load64(sp + 8);
+            if (now - load64(e + 8) > max_idle_ns) {
+                var k = load64(sp);
+                map_delete(seen, k);
+                # Free strictly AFTER the delete, which needs the key to find
+                # the entry — same ordering rule as ratelimit_evict_stale.
+                fl_free(e);
+                count = count + 1;
+            }
         }
-        i = i + 1;
-    }
-    var count = vec_len(to_remove);
-    i = 0;
-    while (i < count) {
-        map_delete(seen, vec_get(to_remove, i));
         i = i + 1;
     }
     if (count > 0) {
@@ -2882,9 +3037,24 @@ fn _set_is_superset(arrived, expected) {
 #   offset  8: arrived (i64) — vec of participant name strings
 #   offset 16: was_forced (i64)
 
+# Takes a COPY of the participants vec.
+#
+# barrier_force mutates the expected set in place via _set_remove, so storing
+# the caller's vec by reference let two barriers built from one shared list
+# corrupt each other's membership, and silently modified the caller's own vec.
+# 2.6.9 fixed exactly this in _cbarrier_state_new and left the non-concurrent
+# twin alone.
 fn _barrier_state_new(participants_vec) {
     var bs = fl_alloc(24);
-    store64(bs, participants_vec);
+    var owned = vec_new();
+    var pi = 0;
+    var pn = 0;
+    if (participants_vec != 0) { pn = vec_len(participants_vec); }
+    while (pi < pn) {
+        vec_push(owned, vec_get(participants_vec, pi));
+        pi = pi + 1;
+    }
+    store64(bs, owned);
     store64(bs + 8, vec_new());
     store64(bs + 16, 0);
     return bs;
@@ -3245,18 +3415,32 @@ fn ipc_bind(path) {
     if (sa == 0) { return Err(ERR_IPC); }
     var fd = syscall(_SYS_SOCKET, _AF_UNIX, _SOCK_STREAM, 0);
     if (fd < 0) { fl_free(sa); return Err(ERR_IPC); }
+
+    # ⚠ fchmod MUST happen BEFORE bind, and 2.6.9 had it after.
+    #
+    # bind(2) on AF_UNIX creates the filesystem inode from the SOCKFS inode's
+    # mode masked by the ambient umask, and connect(2) permission-checks THAT
+    # inode. fchmod after bind changes only the sockfs inode, which nothing
+    # consults again — it returns success and accomplishes nothing. Verified on
+    # this machine under umask 022: fchmod-after-bind leaves the path at 0755
+    # (world-connectable) while fstat on the fd reports 0600; fchmod-before-bind
+    # yields 0600 on the path.
+    #
+    # That made 2.6.9 strictly worse than the gap it replaced: the module header
+    # began promising owner-only access, and majra performs no peer-credential
+    # check, so a consumer trusting that promise got a world-connectable
+    # endpoint where connecting IS authenticating.
+    if (syscall(_SYS_FCHMOD, fd, 384) < 0) {
+        syscall(SYS_CLOSE, fd);
+        fl_free(sa);
+        return Err(ERR_IPC);
+    }
+
     sys_unlink(path);
     var ret = syscall(_SYS_BIND, fd, sa, _sockaddr_un_len(path));
     fl_free(sa);
     # Every one of these paths used to leak both the fd and the sockaddr.
     if (ret < 0) { syscall(SYS_CLOSE, fd); return Err(ERR_IPC); }
-    # Owner-only: without this the mode is whatever the ambient umask allows,
-    # and any local user can connect to an endpoint that has no auth of its own.
-    if (syscall(_SYS_FCHMOD, fd, 384) < 0) {
-        syscall(SYS_CLOSE, fd);
-        sys_unlink(path);
-        return Err(ERR_IPC);
-    }
     ret = syscall(_SYS_LISTEN, fd, 128);
     if (ret < 0) { syscall(SYS_CLOSE, fd); sys_unlink(path); return Err(ERR_IPC); }
     return Ok(fd);
@@ -3434,7 +3618,7 @@ enum CircuitState {
 #   offset 16: failure_threshold (i64)
 #   offset 24: cooldown_ns (i64)
 #   offset 32: mutex (i64)
-#   offset 40: probe_inflight (i64) — 1 once a half-open probe has been handed out
+#   offset 40: probe_at_ns (i64) — when the outstanding half-open probe was issued (0 = none)
 #
 # The mutex and probe_inflight slots were added at 2.6.9. Before them
 # `circuit_record_failure` did an unsynchronised read-modify-write on the
@@ -3479,8 +3663,18 @@ fn circuit_state(cb) {
     }
     var elapsed = time_now_ns() - load64(cb + 8);
     if (elapsed >= load64(cb + 24)) {
-        if (load64(cb + 40) == 0) {
-            store64(cb + 40, 1);
+        # A probe is only allowed to hold the gate for one cooldown window.
+        #
+        # 2.6.9 stored a bare in-flight FLAG, cleared only by
+        # circuit_record_success / _failure / _reset. A caller that took a
+        # probe and then never reported — it crashed, it was cancelled, it
+        # simply forgot — left the flag set forever, so circuit_state returned
+        # CIRCUIT_OPEN for the life of the process even after the endpoint
+        # recovered. The breaker latched open, which is the same availability
+        # failure it exists to prevent, just inverted.
+        var probe_at = load64(cb + 40);
+        if (probe_at == 0 || time_now_ns() - probe_at >= load64(cb + 24)) {
+            store64(cb + 40, time_now_ns());
             mutex_unlock(mtx);
             return CIRCUIT_HALF_OPEN;
         }
@@ -3643,19 +3837,22 @@ fn fleet_deregister_node(fq, node_id) {
     if (mq == 0) { mutex_unlock(mtx); return 0; }
     map_delete(nodes, node_id);
 
+    # mq_take_queued, NOT mq_dequeue. mq_dequeue refuses once running_count
+    # reaches max_concurrent, so a node with jobs already running would have
+    # dropped out of this loop immediately and discarded every QUEUED job —
+    # the same silent job loss deregister was supposed to stop.
     var orphaned = 0;
     var draining = 1;
     while (draining == 1) {
-        var item = mq_dequeue(mq);
+        var item = mq_take_queued(mq);
         if (item == 0) { draining = 0; }
         else {
-            # mq_dequeue marked it running on a queue that is going away.
-            mq_fail(mq, item);
             var tid = _fleet_select_node(fq);
             if (tid == 0) { orphaned = orphaned + 1; }
             else {
                 mq_enqueue(map_get(nodes, tid), queue_item_priority(item), queue_item_payload(item));
             }
+            queue_item_free(item);
         }
     }
     mutex_unlock(mtx);
@@ -3760,18 +3957,17 @@ fn fleet_rebalance(fq) {
                         # configured.
                         var taking = 1;
                         while (taking == 1 && to_steal > 0 && mq_queued_count(tmq) < threshold) {
-                            var item = mq_dequeue(mq);
+                            # mq_take_queued, NOT mq_dequeue. A steal is not an
+                            # execution: mq_dequeue would mark the job RUNNING,
+                            # inflate the source's running_count, and — worse —
+                            # REFUSE outright once that count hit
+                            # max_concurrent, which is exactly the saturated
+                            # node a rebalance most needs to relieve.
+                            var item = mq_take_queued(mq);
                             if (item == 0) { taking = 0; }
                             else {
-                                # mq_dequeue marks the job RUNNING and bumps
-                                # the source's running_count. A steal is not
-                                # an execution, and nothing reversed that
-                                # transition — so every rebalance inflated the
-                                # source's running_count permanently, and once
-                                # it reached max_concurrent that node stopped
-                                # dequeuing anything at all.
-                                mq_fail(mq, item);
                                 mq_enqueue(tmq, queue_item_priority(item), queue_item_payload(item));
+                                queue_item_free(item);
                                 stolen = stolen + 1;
                                 to_steal = to_steal - 1;
                             }
@@ -4067,6 +4263,18 @@ fn _compute_tiers(def) {
     return tiers;
 }
 
+# Release a workflow context.
+#
+# workflow_execute still leaks its tier vecs and StepResults (both from the
+# bump allocator, which cannot free), so this is not a complete teardown — it
+# covers the context block itself, which is the one thing the malformed-DAG
+# early return can cleanly reclaim. Full run teardown needs the tier
+# structures to move off the bump allocator; tracked on the roadmap.
+fn workflow_context_free(ctx) {
+    if (ctx != 0) { fl_free(ctx); }
+    return 0;
+}
+
 # Execute a workflow definition with a given executor function and input.
 # executor_fn(step_ptr, ctx_ptr) -> StepResult ptr
 # Returns: RUN_COMPLETED, or RUN_FAILED (including for a malformed DAG).
@@ -4081,7 +4289,12 @@ fn workflow_execute(def, executor_fn, input) {
     # _compute_tiers returns 0 for a malformed DAG (a dependency cycle, a
     # dangling dependency id, or duplicate step ids). Running the schedulable
     # prefix and reporting success is exactly the failure this guards.
-    if (tiers == 0) { return RUN_FAILED; }
+    if (tiers == 0) {
+        # The context was allocated above; release it rather than abandon it on
+        # the one path that returns before the run starts.
+        workflow_context_free(ctx);
+        return RUN_FAILED;
+    }
     var num_tiers = vec_len(tiers);
     var final_status = RUN_COMPLETED;
 

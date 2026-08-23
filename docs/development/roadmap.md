@@ -12,7 +12,6 @@ names the version it is aimed at and the condition that would move it.
 
 | Target | Theme |
 |---|---|
-| **2.6.10** | Hardening. Second P(-1) pass and its repairs. PATCH — no API changes. |
 | **2.7.0** | Finish what the audit deferred — the additive APIs 2.6.9 declined to invent mid-repair. |
 | **2.7 line** | Larger capabilities, each taking the next MINOR as its trigger fires. |
 | **Waiting on upstream** | Blocked outside this repo. Names the blocker. |
@@ -23,7 +22,7 @@ names the version it is aimed at and the condition that would move it.
 > anything adding a public function takes the next MINOR. "The 2.7.x line"
 > below is therefore a *development line*, not a run of patch numbers:
 > `pubsub_unsubscribe` and PostgreSQL SCRAM cannot share one. 2.7.0 batches the
-> three small additive items so they cost a single version between them.
+> four small additive items so they cost a single version between them.
 
 An item moves when its **trigger** fires — a consumer need, a dependency
 landing, or a measurement crossing a threshold. Triggers are written down so
@@ -31,62 +30,11 @@ promotion is a decision rather than a mood.
 
 ---
 
-## 2.6.10 — hardening
-
-### Second P(-1) pass and repairs
-
-[`CLAUDE.md`](../../CLAUDE.md) P(-1) step 10 says *"repeat if heavy — keep
-drilling until the pass is genuinely clean, not just no errors."* The
-[2026-08-22 pass](../audit/2026-08-22-audit.md) returned **115 confirmed
-findings**, which is heavy on any reading, and it rewrote enough code that the
-rewrites themselves are unaudited.
-
-**Done when**: a second pass over the modules 2.6.9 changed most heavily
-returns no new high-severity findings, and its own write-up lands in
-`docs/audit/`.
-
-**Re-examine specifically** — all introduced by 2.6.9, none yet audited:
-
-- **Ownership.** 2.6.9 added a large number of `fl_free` calls to code that
-  previously just leaked. A leak is a far safer bug than a double-free, so every
-  new free needs both of its sites traced.
-- The replay window in `encrypted_ipc_recv`: counter monotonicity across a
-  rekey, and whether a peer can wedge it.
-- The new bounds arithmetic in the DataRow and RESP parsers — bounds checks are
-  themselves a classic source of off-by-one and sign errors, and that is exactly
-  where the previous bugs lived.
-- `relay_send` and `relay_receive_ex` now hold the relay mutex across the
-  fan-out, and `encrypted_ipc_send` now holds the connection mutex across
-  `ipc_send_frame` — a socket write. Each is safe *only* if that path genuinely
-  never blocks.
-- Loops 2.6.9 added: `mq_dequeue`'s cancelled-job skip, `patra_queue_dequeue`'s
-  claim-retry, `pg_query`'s ErrorResponse drain, `fleet_deregister_node`'s
-  drain. Each needs a termination argument.
-
-**Scope note**: repairs that require an API change do not belong in a PATCH.
-If the pass surfaces one, it moves to 2.7.0 and the reason is recorded here.
-
-### Consumer migration guide for the 2.6.9 breaking changes
-
-Documentation, so it ships inside the PATCH without affecting its
-classification.
-
-**Done when** it covers, in the shape of the existing
-`docs/guides/migration-*.md` files: `encrypted_ipc_new` (new required role
-argument), `majra_admin_serve` (address is now a parsed dotted-quad string),
-`transport_send`/`transport_recv` (all three arguments now forwarded),
-`namespace_new` (now rejects `/`, `:`, `#`, `+`, control bytes), and the
-`patra_queue` `STR` → `TEXT` schema change — which needs an explicit "delete or
-migrate the existing `.patra` file" step, since an old file silently keeps its
-255-byte cap.
-
----
-
 ## 2.7.0 — finish what the audit deferred
 
-The additive APIs 2.6.9 declined to invent while it was repairing 115 findings.
-Batched into one MINOR because each adds a public function and each is
-individually small.
+The additive APIs the two hardening passes deferred — 2.6.9 declined to invent
+them mid-repair, and 2.6.10 found one more. Batched into one MINOR because each
+adds a public function and each is individually small.
 
 ### pubsub unsubscribe + per-subscriber lag policy
 
