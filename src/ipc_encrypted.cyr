@@ -21,8 +21,16 @@ var NONCE_HARD_LIMIT = 4294967296;
 
 # --- Base64 helpers ---
 # Kept here (not moved to lib/base64.cyr) because ws.cyr's WebSocket
-# accept-key path depends on base64_encode being in scope via the
+# accept-key path depends on majra_base64_encode being in scope via the
 # include order established by tests/test_backends.tcyr. Trim carefully.
+#
+# The `majra_` prefix is load-bearing: lib/bayan.cyr also defines
+# `base64_encode` / `base64_decode` (thin wrappers over `bayan_base64_*`)
+# and the return contracts disagree — bayan's decode returns a scalar
+# i64, ours returns a 16-byte {ptr, len} struct. Unprefixed, whichever
+# definition the consumer's include order puts last silently wins, so a
+# bayan-last consumer would have our own decode path misread the return
+# value. Do not drop the prefix.
 
 var _b64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -39,7 +47,7 @@ fn _b64_decode_byte(ch) {
     return 0;
 }
 
-fn base64_encode(data, len) {
+fn majra_base64_encode(data, len) {
     var out_len = ((len + 2) / 3) * 4;
     var out = fl_alloc(out_len + 1);
     var si = 0;
@@ -70,7 +78,7 @@ fn base64_encode(data, len) {
     return out;
 }
 
-fn base64_decode(data, len) {
+fn majra_base64_decode(data, len) {
     var out_len = len / 4 * 3;
     var out = fl_alloc(out_len + 1);
     var si = 0;

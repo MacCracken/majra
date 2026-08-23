@@ -68,22 +68,70 @@ suggested a +6.4% `pattern_wildcard_+` regression and a −28%
 noise on every target (`pq_enqueue` 567–587ns both, `pattern_wildcard_+` 100–111
 vs 101–102ns). The first-run spread was warm-up, not codegen.
 
-### Unchanged
+### Fixed — `base64_encode` / `base64_decode` → `majra_base64_encode` / `majra_base64_decode`
 
-All four bundle bodies stay byte-identical — the whole `dist/*.cyr` diff is four
-banner lines. Only the `.deps` sidecars move, and only to gain `sigil`.
+`src/ipc_encrypted.cyr` defined `base64_encode` and `base64_decode`, and so does
+`lib/bayan.cyr` — as thin wrappers over `bayan_base64_encode` /
+`bayan_base64_decode`. `cyrius distlib backends` had been reporting it for as
+long as bayan has carried those aliases:
 
-### Known — `base64_encode` / `base64_decode` collide with `lib/bayan.cyr`
+```
+warning:dist/majra-backends.cyr:4396:1: duplicate fn 'base64_encode' (last definition wins; first defined in lib/bayan.cyr)
+warning:dist/majra-backends.cyr:4427:1: duplicate fn 'base64_decode' (last definition wins; first defined in lib/bayan.cyr)
+```
 
-`cyrius distlib backends` warns `duplicate fn 'base64_encode' (last definition
-wins; first defined in lib/bayan.cyr)`. **Pre-existing and not introduced here** —
-reproduced identically under 6.5.31. It matters more than a duplicate-symbol
-warning usually would, because the two contracts disagree: majra's
-`base64_decode` (`src/ipc_encrypted.cyr`) returns a 16-byte `{ptr, len}` struct,
-while bayan's returns a scalar. A consumer whose include order lets bayan win
-would misread that return. Filed for a follow-up rename rather than fixed here,
-since renaming a symbol carried in the `backends` bundle is a distribution-
-contract change and this release is a toolchain bump.
+The usual duplicate-symbol warning is benign — two definitions that agree, one
+of them wins, nobody notices. **These two do not agree.** majra's
+`base64_decode` allocates a 16-byte `{ptr, len}` struct and returns a pointer to
+it; bayan's returns a scalar `i64`. Under `last definition wins`, a consumer of
+`dist/majra-backends.cyr` whose include order puts bayan after majra silently
+retargets *majra's own* decode call sites at bayan's implementation, and the
+`load64(dec)` / `load64(dec + 8)` unpacking reads whatever happens to sit at
+that address. Not a wrong answer — a wild read.
+
+It was never observed corrupting anything in-tree, because
+`tests/test_backends.tcyr` establishes an include order that puts majra last and
+the bundle is emitted in that same order. But that is ordering doing the work,
+not correctness, and the ordering belongs to the *consumer*, not to us.
+
+Renamed with the `majra_` prefix already used for the other cross-cutting public
+surface (`majra_admin_*`, `majra_err`). Both warnings are gone — confirmed
+against this release's manifest, not just the one the fix was written on, since
+the sigil stdlib-leaf move above changes how `distlib` classifies leaves. The
+private helpers `_b64_encode_byte` / `_b64_decode_byte` / `_b64_chars` were
+already underscore-scoped and don't collide, so they keep their names.
+
+Only `dist/majra-backends.cyr` moves — the base, signed, and admin profiles
+deliberately exclude `src/ipc_encrypted.cyr` and `src/ws.cyr`.
+
+**Why this ships in a PATCH.** A name whose meaning was decided by the
+consumer's include order was never covered by the API promise, so renaming out
+of the collision isn't an API change to break. Recorded in
+[`docs/development/semver.md`](docs/development/semver.md) § Documented
+exceptions, which this release also adds, along with the two conditions that
+gate it — the definitions must genuinely disagree, and the rename must produce a
+compile error at every affected call site.
+
+**Consumer migration.** A consumer calling majra's `base64_encode` /
+`base64_decode` gets a compile error, not a silent behaviour change. Two ways
+out:
+
+- **Want majra's `{ptr, len}` decode** — rename the call to
+  `majra_base64_encode` / `majra_base64_decode`.
+- **Only ever wanted a base64** — call bayan's `base64_encode` /
+  `base64_decode` (or `bayan_base64_*` directly) and drop the majra dependency
+  for that call. Note the different decode contract: scalar, not `{ptr, len}`.
+
+### Bundle movement, in full
+
+Three of the four bundle bodies stay byte-identical — for `majra`,
+`majra-signed` and `majra-admin` the whole `dist/*.cyr` diff is a banner line,
+because those profiles deliberately exclude `src/ipc_encrypted.cyr` and
+`src/ws.cyr`. **`dist/majra-backends.cyr` moves**, and only by the rename: two
+`fn` definitions and one call site.
+
+All four `.deps` sidecars are regenerated; `majra`, `majra-signed` and
+`majra-backends` gain `sigil`.
 
 ## [2.6.7] — 2026-08-20 — the last folded-module pin that lagged the toolchain
 

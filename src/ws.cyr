@@ -158,7 +158,7 @@ fn _ws_accept_key(client_key) {
     str_builder_add_cstr(sb, WS_MAGIC_GUID);
     var combined = str_builder_build(sb);
     var digest = sha1(str_data(combined), str_len(combined));
-    return base64_encode(digest, 20);
+    return majra_base64_encode(digest, 20);
 }
 
 # --- WebSocket Frame ---

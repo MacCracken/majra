@@ -79,12 +79,13 @@ Lockfile (`cyrius.lock`) carries SHA-256 over **108** resolved files — the who
 | `dist/majra.cyr` (core) | 3,565 | 106 KB |
 | `dist/majra-signed.cyr` | 3,711 | 112 KB |
 | `dist/majra-admin.cyr` | 3,700 | 111 KB |
-| `dist/majra-backends.cyr` | 5,217 | 158 KB |
-| `src/` total | 5,805 lines across 23 files | — |
+| `dist/majra-backends.cyr` | 5,225 | 159 KB |
+| `src/` total | 5,813 lines across 23 files | — |
 
-> **Bundle bodies did not move at 2.6.8** — the whole `dist/*.cyr` diff is four
-> banner lines. The `.deps` sidecars did move: `majra-signed`, `majra-backends`
-> and `majra` each gained `sigil`.
+> **At 2.6.8** three of the four bundle bodies stay byte-identical (banner line
+> only); `dist/majra-backends.cyr` moves by the `majra_base64_*` rename alone —
+> two `fn` definitions and one call site. The `.deps` sidecars also move:
+> `majra`, `majra-signed` and `majra-backends` each gained `sigil`.
 
 ## Test surface
 
@@ -160,7 +161,7 @@ Full history in [`../../CHANGELOG.md`](../../CHANGELOG.md).
 
 | Item | Status | Where to look |
 |---|---|---|
-| **`base64_*` collides with `lib/bayan.cyr`** | **Open.** `src/ipc_encrypted.cyr` defines `base64_encode` / `base64_decode`; so does the folded `bayan`. `distlib backends` warns "last definition wins". The contracts disagree — majra's `base64_decode` returns a 16-byte `{ptr, len}` struct, bayan's a scalar — so include order can silently change behavior. Pre-existing (reproduced under 6.5.31), deferred from 2.6.8 because renaming a symbol in the `backends` bundle is a distribution-contract change | CHANGELOG 2.6.8 "Known" |
+| ~~**`base64_*` collides with `lib/bayan.cyr`**~~ | **RESOLVED** at 2.6.8 — renamed to `majra_base64_encode` / `majra_base64_decode`. All four profiles emit zero duplicate-fn warnings | CHANGELOG 2.6.8 · [`semver.md`](semver.md) § Documented exceptions |
 | **Shared-memory IPC transport** | engineering backlog, parked until a consumer hits the syscall-per-message ceiling | [`roadmap.md`](roadmap.md) "Engineering backlog" |
 | **agnos `--agnos` full build (non-core)** | `src/patra_queue.cyr` pulls patra, whose `lib/patra.cyr` still references `SYS_LSEEK` unguarded on agnos. Core (`dist/majra.cyr`) is agnos-clean since 2.5.0; only the `backends` profile + daemon `--agnos` build is blocked | CHANGELOG 2.5.0 "Known residual" |
 | **aarch64 cross-build** | unblocked since 2.4.5; wiring the CI step is a verification task, not blocked-on-upstream | [`roadmap.md`](roadmap.md) "Engineering backlog" |
