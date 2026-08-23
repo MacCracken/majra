@@ -128,10 +128,24 @@ fn relay_node_id(r) {
 # Send a message to a specific node. Returns sequence number.
 fn relay_send(r, to, topic, payload) {
     var mtx = load64(r + 40);
+    # The whole send is one critical section.
+    #
+    # The sequence number used to be claimed under the mutex and the fan-out
+    # done after releasing it, so two concurrent senders could interleave:
+    # thread A takes seq 1, thread B takes seq 2, B fans out first, and every
+    # subscriber sees 2 before 1. Subscribers use the sequence for ordering and
+    # dedup, so an out-of-order pair is indistinguishable from a replay.
+    #
+    # Holding the lock across the fan-out is safe precisely BECAUSE the fan-out
+    # is chan_try_send (see below) — it never blocks, so this cannot reproduce
+    # the head-of-line class 2.5.3 fixed in pubsub.
+    #
+    # The subscriber vec is also read under the lock now; relay_subscribe
+    # mutates it under the same mutex, so iterating it unlocked could observe a
+    # reallocated backing buffer mid-push.
     mutex_lock(mtx);
     var seq = load64(r + 8);
     store64(r + 8, seq + 1);
-    mutex_unlock(mtx);
 
     var msg = relay_msg_new(seq, load64(r), to, topic, payload);
 
@@ -155,6 +169,7 @@ fn relay_send(r, to, topic, payload) {
         chan_try_send(vec_get(subs, i), msg);
         i = i + 1;
     }
+    mutex_unlock(mtx);
 
     counter_inc(load64(r + 48));
     return seq;
@@ -295,39 +310,48 @@ fn relay_receive_ex(r, msg) {
     # why this is off by default.
     var max_dedup = load64(r + 80);
     if (max_dedup > 0 && map_size(seen) > max_dedup) {
-        var keys = map_keys(seen);
+        # Iterate the slot array rather than map_keys, which allocates a vec
+        # from the never-freeing bump allocator on every eviction pass.
+        var dent = map_entries(seen);
+        var dcap = map_cap(seen);
         var oldest_key = 0;
+        var oldest_entry = 0;
         var oldest_time = 0;
         var i = 0;
-        var len = vec_len(keys);
-        while (i < len) {
-            var k = vec_get(keys, i);
-            var e = map_get(seen, k);
-            var t = load64(e + 8);
-            if (oldest_key == 0 || t < oldest_time) {
-                oldest_key = k;
-                oldest_time = t;
+        while (i < dcap) {
+            var sp = dent + i * 24;
+            if (load64(sp + 16) == 1) {
+                var e = load64(sp + 8);
+                var t = load64(e + 8);
+                if (oldest_key == 0 || t < oldest_time) {
+                    oldest_key = load64(sp);
+                    oldest_entry = e;
+                    oldest_time = t;
+                }
             }
             i = i + 1;
         }
         if (oldest_key != 0) {
             map_delete(seen, oldest_key);
+            # The DedupEntry block itself was never released, so the mechanism
+            # added to BOUND the dedup table's memory leaked one block per
+            # eviction — it bounded the map and not the memory.
+            if (oldest_entry != 0) { fl_free(oldest_entry); }
             counter_inc(load64(r + 72));
         }
     }
 
     counter_inc(load64(r + 56));
 
-    # Snapshot the subscriber list under the lock, walk it unlocked.
+    # The fan-out happens UNDER the lock and walks the subscriber vec directly.
+    #
+    # This used to build a per-message `vec_new()` snapshot so the walk could
+    # happen unlocked. The snapshot came from the BUMP allocator, which never
+    # reclaims, so the relay's hot path leaked a vec per received message —
+    # agnosai drives this from a 100-worker pool. Walking under the lock is
+    # safe here for the same reason as relay_send: the fan-out is
+    # chan_try_send and never blocks.
     var subs = load64(r + 24);
-    var snapshot = vec_new();
-    var si = 0;
-    var slen = vec_len(subs);
-    while (si < slen) {
-        vec_push(snapshot, vec_get(subs, si));
-        si = si + 1;
-    }
-    mutex_unlock(mtx);
 
     # ✅ The result struct is allocated AFTER the unlock, which is where it
     # belongs — the block is private to this call and nothing under the lock
@@ -350,19 +374,26 @@ fn relay_receive_ex(r, msg) {
     # calling `fl_alloc` still raced it, which is why the real fix had to be
     # upstream. Shortening the critical section back is the point of undoing it:
     # this lock is held across a subscriber-list walk on a hot pub/sub path.
-    var inc = fl_alloc(16);
-    store64(inc, is_broadcast);
-    store64(inc + 8, msg);
-
     var j = 0;
-    var jlen = vec_len(snapshot);
+    var jlen = vec_len(subs);
     # Same never-block contract as `relay_send` — see the note there.
     while (j < jlen) {
-        chan_try_send(vec_get(snapshot, j), msg);
+        chan_try_send(vec_get(subs, j), msg);
         j = j + 1;
     }
+    mutex_unlock(mtx);
 
+    var inc = fl_alloc(16);
+    if (inc == 0) { return 0; }
+    store64(inc, is_broadcast);
+    store64(inc + 8, msg);
     return inc;
+}
+
+# Release an IncomingMessage returned by relay_receive_ex.
+fn incoming_msg_free(inc) {
+    if (inc != 0) { fl_free(inc); }
+    return 0;
 }
 
 # Process an incoming message. Returns the message if it passes dedup, or 0.
@@ -372,7 +403,11 @@ fn relay_receive_ex(r, msg) {
 fn relay_receive(r, msg) {
     var inc = relay_receive_ex(r, msg);
     if (inc == 0) { return 0; }
-    return incoming_msg(inc);
+    # The wrapper used to drop `inc` on the floor, leaking the freelist block
+    # relay_receive_ex allocated for every received message.
+    var m = incoming_msg(inc);
+    fl_free(inc);
+    return m;
 }
 
 # How many senders the dedup table currently tracks.

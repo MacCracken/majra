@@ -82,16 +82,44 @@ fn ratelimit_check(rl, key) {
     var tokens = load64(bucket_ptr);
 
     # refill = elapsed_ns * rate_x1000 / 1_000_000_000
-    # To avoid overflow: split into seconds and remainder
+    # To avoid overflow: split into seconds and remainder.
+    #
+    # elapsed_rem is up to 999,999,999, so `elapsed_rem * rate_x1000` still
+    # overflows i64 once rate_x1000 exceeds ~9.2e9 (a rate around 9.2M/sec).
+    # Divide first in that case: the precision loss is irrelevant at a rate
+    # that high, whereas the wrap produced a NEGATIVE refill and starved the
+    # bucket permanently.
     var elapsed_sec = elapsed_ns / 1000000000;
     var elapsed_rem = elapsed_ns - elapsed_sec * 1000000000;
-    var refill = elapsed_sec * rate_x1000 + elapsed_rem * rate_x1000 / 1000000000;
+    var rem_refill = 0;
+    if (rate_x1000 > 9000000000) {
+        rem_refill = elapsed_rem / 1000000000 * rate_x1000;
+    } else {
+        rem_refill = elapsed_rem * rate_x1000 / 1000000000;
+    }
+    var refill = elapsed_sec * rate_x1000 + rem_refill;
 
     tokens = tokens + refill;
     if (tokens > burst_x1000) {
         tokens = burst_x1000;
     }
-    store64(bucket_ptr + 8, now);
+
+    # Only consume the elapsed time we actually converted into tokens.
+    #
+    # last_access_ns used to be advanced to `now` unconditionally. The refill
+    # is integer-truncated, so a caller polling faster than one token-period
+    # computed refill == 0 every time and still reset the clock — discarding
+    # the fractional credit on every call. A limiter polled in a tight loop
+    # therefore refilled at ZERO no matter how much wall time passed. Advancing
+    # only by the consumed whole-token time keeps the remainder for next call.
+    if (refill > 0 && rate_x1000 > 0) {
+        var consumed_ns = refill * 1000000000 / rate_x1000;
+        if (consumed_ns > elapsed_ns) { consumed_ns = elapsed_ns; }
+        store64(bucket_ptr + 8, last_ns + consumed_ns);
+    } elif (tokens >= burst_x1000) {
+        # Already full — nothing to carry, so don't accumulate unbounded debt.
+        store64(bucket_ptr + 8, now);
+    }
 
     var result = 0;
     if (tokens >= 1000) {
@@ -185,7 +213,9 @@ fn ratelimit_stats(rl) {
 #   offset  8: curr_count (i64)
 #   offset 16: window_start_ns (i64)
 
-# SlidingWindowLimiter struct (40 bytes):
+# SlidingWindowLimiter struct (48 bytes):
+# (The comment said 40 while listing six 8-byte fields at offsets 0..40, which
+# needs 48 — and sliding_window_new has always allocated 48. Comment corrected.)
 #   offset  0: windows       (i64) — hashmap ptr
 #   offset  8: max_requests  (i64)
 #   offset 16: window_ns     (i64) — window duration in nanoseconds
@@ -193,7 +223,10 @@ fn ratelimit_stats(rl) {
 #   offset 32: total_allowed (i64) — counter ptr
 #   offset 40: total_rejected(i64) — counter ptr
 
+# window_ns must be > 0: sliding_window_check divides by it, and a zero-length
+# window is a SIGFPE that kills the process. Returns 0 for an invalid config.
 fn sliding_window_new(max_requests, window_ns) {
+    if (window_ns <= 0) { return 0; }
     var sw = fl_alloc(48);
     store64(sw, map_new());
     store64(sw + 8, max_requests);
@@ -204,7 +237,59 @@ fn sliding_window_new(max_requests, window_ns) {
     return sw;
 }
 
+# Evict sliding-window entries whose window has not advanced in max_idle_ns.
+# Returns the number evicted.
+#
+# The sliding-window limiter had NO eviction sweep, so every distinct key ever
+# seen retained an owned key copy plus a 24-byte WindowCounter for the life of
+# the process — unbounded growth driven by whatever the caller keys on (an IP,
+# a tenant, a request id). The token-bucket limiter grew this sweep at 2.6.4;
+# this is the same shape, and likewise allocation-free: it walks the hashmap
+# slot array directly rather than calling map_keys.
+fn sliding_window_evict_stale(sw, max_idle_ns) {
+    if (sw == 0) { return 0; }
+    var now = time_now_ns();
+    var windows = load64(sw);
+    var mtx = load64(sw + 24);
+
+    mutex_lock(mtx);
+
+    var entries = map_entries(windows);
+    var cap = map_cap(windows);
+    var evicted = 0;
+    var i = 0;
+    while (i < cap) {
+        var ep = entries + i * 24;
+        if (load64(ep + 16) == 1) {
+            var wc_ptr = load64(ep + 8);
+            if (now - load64(wc_ptr + 16) >= max_idle_ns) {
+                var k = load64(ep);
+                map_delete(windows, k);
+                # Free strictly AFTER the delete — same ordering rule as
+                # ratelimit_evict_stale, which needs the key to find the entry.
+                fl_free(wc_ptr);
+                fl_free(k);
+                evicted = evicted + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    mutex_unlock(mtx);
+    return evicted;
+}
+
+fn sliding_window_table_size(sw) {
+    if (sw == 0) { return 0; }
+    var mtx = load64(sw + 24);
+    mutex_lock(mtx);
+    var n = map_size(load64(sw));
+    mutex_unlock(mtx);
+    return n;
+}
+
 fn sliding_window_check(sw, key) {
+    if (sw == 0) { return 0; }
     var now = time_now_ns();
     var windows = load64(sw);
     var max_req = load64(sw + 8);

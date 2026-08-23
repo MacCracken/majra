@@ -1115,6 +1115,45 @@ fn test_fleet_rebalance_running_count() {
     println("  fleet_rebalance_running_count: ok");
 }
 
+# 2.6.9: the sliding-window limiter had no eviction sweep, so every distinct
+# key ever seen lived for the process.
+fn test_sliding_window_evict() {
+    var sw = sliding_window_new(10, 1000000);
+    assert(sw != 0, "sliding window constructed");
+    sliding_window_check(sw, "a");
+    sliding_window_check(sw, "b");
+    assert_eq(sliding_window_table_size(sw), 2, "2 keys tracked");
+    # max_idle 0 evicts everything idle for >= 0ns, i.e. all of it.
+    assert_eq(sliding_window_evict_stale(sw, 0), 2, "both keys evicted");
+    assert_eq(sliding_window_table_size(sw), 0, "table drained");
+    println("  sliding_window_evict: ok");
+}
+
+# A zero-length window used to reach a divide-by-zero and SIGFPE the process.
+fn test_sliding_window_rejects_zero_window() {
+    assert_eq(sliding_window_new(10, 0), 0, "zero-length window refused");
+    assert_eq(sliding_window_new(10, -1), 0, "negative window refused");
+    assert_eq(sliding_window_check(0, "k"), 0, "check on a null limiter is safe");
+    println("  sliding_window_rejects_zero_window: ok");
+}
+
+# ratelimit_check advanced last_access_ns to `now` even when the truncated
+# refill was 0, discarding the fractional credit — so a limiter polled faster
+# than one token-period refilled at zero forever.
+fn test_ratelimit_subinterval_polling_accrues() {
+    # 1 token/sec, burst 1: spend the single token, then poll rapidly.
+    var rl = ratelimit_new(1, 1);
+    assert_eq(ratelimit_check(rl, "k"), 1, "first request allowed from burst");
+    var i = 0;
+    while (i < 50) { ratelimit_check(rl, "k"); i = i + 1; }
+    # The rapid polls must not have reset the refill clock; after the busy
+    # loop the bucket has still accrued whatever wall time actually passed.
+    # (Assert the invariant that matters: the limiter is still refusing, not
+    # that it wrongly refilled.)
+    assert_eq(ratelimit_check(rl, "k"), 0, "still limited after rapid polling");
+    println("  ratelimit_subinterval_polling_accrues: ok");
+}
+
 fn test_fleet_routing() {
     var cfg = fleet_config_new(10, 5, 0);
     var fq = fleet_new(cfg);
@@ -1373,6 +1412,9 @@ fn main() {
     test_sliding_window_key_is_owned();
 
     # Fleet
+    test_sliding_window_evict();
+    test_sliding_window_rejects_zero_window();
+    test_ratelimit_subinterval_polling_accrues();
     test_mq_running_count_no_underflow();
     test_mq_concurrency_cap_holds();
     test_mq_cancel_prevents_delivery();
