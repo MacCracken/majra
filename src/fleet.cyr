@@ -29,46 +29,100 @@ fn fleet_new(config) {
 }
 
 # Register a node. Creates a per-node ManagedQueue.
+#
+# Re-registering an existing node_id is now a NO-OP that returns 0. It used to
+# map_set a fresh ManagedQueue over the existing entry, silently discarding
+# every job already queued or running on that node and leaking the old queue —
+# and a re-register on reconnect is exactly what a flapping node does.
+# Returns 1 if a node was created, 0 if it already existed.
 fn fleet_register_node(fq, node_id) {
-    var cfg = load64(fq + 8);
-    var max_c = load64(cfg + 16);
-    var mq = mq_new(node_id, max_c);
     var mtx = load64(fq + 16);
     mutex_lock(mtx);
+    if (map_get(load64(fq), node_id) != 0) {
+        mutex_unlock(mtx);
+        return 0;
+    }
+    var cfg = load64(fq + 8);
+    var mq = mq_new(node_id, load64(cfg + 16));
     map_set(load64(fq), node_id, mq);
     mutex_unlock(mtx);
+    return 1;
 }
 
-# Deregister a node.
+# Deregister a node, redistributing whatever it still holds.
+#
+# This used to drop the map entry and walk away, discarding every queued job on
+# that node and leaking the ManagedQueue. Queued work is now moved to the
+# least-loaded remaining node; if the node was the last one, the jobs are
+# genuinely undeliverable and the count is returned so the caller can react.
+# Returns the number of jobs that could NOT be rehomed.
 fn fleet_deregister_node(fq, node_id) {
     var mtx = load64(fq + 16);
     mutex_lock(mtx);
-    map_delete(load64(fq), node_id);
+    var nodes = load64(fq);
+    var mq = map_get(nodes, node_id);
+    if (mq == 0) { mutex_unlock(mtx); return 0; }
+    map_delete(nodes, node_id);
+
+    var orphaned = 0;
+    var draining = 1;
+    while (draining == 1) {
+        var item = mq_dequeue(mq);
+        if (item == 0) { draining = 0; }
+        else {
+            # mq_dequeue marked it running on a queue that is going away.
+            mq_fail(mq, item);
+            var tid = _fleet_select_node(fq);
+            if (tid == 0) { orphaned = orphaned + 1; }
+            else {
+                mq_enqueue(map_get(nodes, tid), queue_item_priority(item), queue_item_payload(item));
+            }
+        }
+    }
     mutex_unlock(mtx);
+    return orphaned;
 }
 
 # Get the ManagedQueue for a node.
+#
+# Reads of the node map now take the mutex. fleet_node_queue and fleet_stats
+# read it while register/deregister mutate it under the lock, so a concurrent
+# rehash could hand back a stale bucket pointer.
 fn fleet_node_queue(fq, node_id) {
-    return map_get(load64(fq), node_id);
+    var mtx = load64(fq + 16);
+    mutex_lock(mtx);
+    var mq = map_get(load64(fq), node_id);
+    mutex_unlock(mtx);
+    return mq;
 }
 
 # Select the least-loaded node. Returns node_id string or 0.
+#
+# Iterates the hashmap slot array directly (24-byte slots: key@0, value@8,
+# occupied@16) rather than calling map_keys. map_keys builds a vec from the
+# BUMP allocator, which never reclaims — and this runs on every fleet_submit,
+# so a long-lived fleet leaked a vec per submitted job. Same change in
+# fleet_rebalance and fleet_stats.
+#
+# Caller must hold the fleet mutex.
 fn _fleet_select_node(fq) {
     var nodes = load64(fq);
-    var keys = map_keys(nodes);
+    var entries = map_entries(nodes);
+    var cap = map_cap(nodes);
     var best_id = 0;
-    var best_load = 999999999;
-    var i = 0;
-    var len = vec_len(keys);
-    while (i < len) {
-        var nid = vec_get(keys, i);
-        var mq = map_get(nodes, nid);
-        var load = mq_queued_count(mq) + mq_running_count(mq);
-        if (load < best_load) {
-            best_load = load;
-            best_id = nid;
+    var best_load = 0;
+    var ki = 0;
+    while (ki < cap) {
+        var ep = entries + ki * 24;
+        if (load64(ep + 16) == 1) {
+            var mq = load64(ep + 8);
+            var load = mq_queued_count(mq) + mq_running_count(mq);
+            if (best_id == 0 || load < best_load) {
+                best_load = load;
+                best_id = load64(ep);
+            }
         }
-        i = i + 1;
+        ki = ki + 1;
     }
     return best_id;
 }
@@ -97,39 +151,55 @@ fn fleet_rebalance(fq) {
     mutex_lock(mtx);
 
     var nodes = load64(fq);
-    var keys = map_keys(nodes);
-    var len = vec_len(keys);
+    var entries = map_entries(nodes);
+    var cap = map_cap(nodes);
     var stolen = 0;
 
     # Find overloaded and underloaded nodes
     var i = 0;
-    while (i < len) {
-        var nid = vec_get(keys, i);
-        var mq = map_get(nodes, nid);
-        var queued = mq_queued_count(mq);
+    while (i < cap) {
+        var ep = entries + i * 24;
+        if (load64(ep + 16) == 1) {
+            var mq = load64(ep + 8);
+            var queued = mq_queued_count(mq);
 
-        if (queued > threshold) {
-            # This node is overloaded — try to steal
-            var to_steal = queued - threshold;
-            if (to_steal > max_batch) { to_steal = max_batch; }
+            if (queued > threshold) {
+                # This node is overloaded — try to steal
+                var to_steal = queued - threshold;
+                if (to_steal > max_batch) { to_steal = max_batch; }
 
-            # Find underloaded target
-            var j = 0;
-            while (j < len && to_steal > 0) {
-                if (j != i) {
-                    var tid = vec_get(keys, j);
-                    var tmq = map_get(nodes, tid);
-                    var tqueued = mq_queued_count(tmq);
-                    if (tqueued < threshold) {
-                        var item = mq_dequeue(mq);
-                        if (item != 0) {
-                            mq_enqueue(tmq, queue_item_priority(item), queue_item_payload(item));
-                            stolen = stolen + 1;
-                            to_steal = to_steal - 1;
+                # Find underloaded targets
+                var j = 0;
+                while (j < cap && to_steal > 0) {
+                    var tp = entries + j * 24;
+                    if (j != i && load64(tp + 16) == 1) {
+                        var tmq = load64(tp + 8);
+                        # Steal as many as this target can take, rather than
+                        # one per (source, target) pair. The target index used
+                        # to advance after every steal, so with two nodes
+                        # max_steal_batch could never exceed 1 however it was
+                        # configured.
+                        var taking = 1;
+                        while (taking == 1 && to_steal > 0 && mq_queued_count(tmq) < threshold) {
+                            var item = mq_dequeue(mq);
+                            if (item == 0) { taking = 0; }
+                            else {
+                                # mq_dequeue marks the job RUNNING and bumps
+                                # the source's running_count. A steal is not
+                                # an execution, and nothing reversed that
+                                # transition — so every rebalance inflated the
+                                # source's running_count permanently, and once
+                                # it reached max_concurrent that node stopped
+                                # dequeuing anything at all.
+                                mq_fail(mq, item);
+                                mq_enqueue(tmq, queue_item_priority(item), queue_item_payload(item));
+                                stolen = stolen + 1;
+                                to_steal = to_steal - 1;
+                            }
                         }
                     }
+                    j = j + 1;
                 }
-                j = j + 1;
             }
         }
         i = i + 1;
@@ -140,7 +210,11 @@ fn fleet_rebalance(fq) {
 }
 
 fn fleet_node_count(fq) {
-    return map_size(load64(fq));
+    var mtx = load64(fq + 16);
+    mutex_lock(mtx);
+    var n = map_size(load64(fq));
+    mutex_unlock(mtx);
+    return n;
 }
 
 # FleetQueueStats struct (32 bytes):
@@ -150,23 +224,31 @@ fn fleet_node_count(fq) {
 #   offset 24: total_completed
 fn fleet_stats(fq) {
     var s = fl_alloc(32);
+    var mtx = load64(fq + 16);
+    mutex_lock(mtx);
     var nodes = load64(fq);
-    var keys = map_keys(nodes);
+    var entries = map_entries(nodes);
+    var cap = map_cap(nodes);
     var total_q = 0;
     var total_r = 0;
     var total_c = 0;
+    var n = 0;
     var i = 0;
-    var len = vec_len(keys);
-    while (i < len) {
-        var mq = map_get(nodes, vec_get(keys, i));
-        total_q = total_q + mq_queued_count(mq);
-        total_r = total_r + mq_running_count(mq);
-        total_c = total_c + mq_total_completed(mq);
+    while (i < cap) {
+        var ep = entries + i * 24;
+        if (load64(ep + 16) == 1) {
+            var mq = load64(ep + 8);
+            total_q = total_q + mq_queued_count(mq);
+            total_r = total_r + mq_running_count(mq);
+            total_c = total_c + mq_total_completed(mq);
+            n = n + 1;
+        }
         i = i + 1;
     }
-    store64(s, len);
+    store64(s, n);
     store64(s + 8, total_q);
     store64(s + 16, total_r);
     store64(s + 24, total_c);
+    mutex_unlock(mtx);
     return s;
 }

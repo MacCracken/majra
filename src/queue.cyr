@@ -332,55 +332,96 @@ fn mq_enqueue(mq, priority, payload) {
     return item;
 }
 
-# Dequeue next job and mark it Running.
+# Dequeue next job and mark it Running. Returns 0 if the queue is empty or
+# the concurrency cap is reached.
+#
+# Two defects fixed at 2.6.9:
+#
+# 1. The cap was ADVISORY. running_count was compared against max_concurrent
+#    in one critical section and incremented in a different one, so N threads
+#    could all observe running_count == max_c - 1, all pass the check, and all
+#    increment — a queue capped at 1 ran the whole pool concurrently. The
+#    check and the increment are now the same critical section.
+#
+# 2. mq_cancel had NO EFFECT on delivery. Dequeue overwrote the job's state
+#    with JOB_RUNNING unconditionally, so a job cancelled while queued was
+#    still handed to a worker, with its CANCELLED state silently overwritten.
+#    A cancelled job is now skipped and the search continues.
 fn mq_dequeue(mq) {
     var mtx = load64(mq + 16);
     var max_c = load64(mq + 40);
+    var jobs = load64(mq + 8);
 
-    # Check concurrency limit
-    if (max_c > 0) {
+    var out = 0;
+    var searching = 1;
+    while (searching == 1) {
         mutex_lock(mtx);
-        if (load64(mq + 32) >= max_c) {
+        if (max_c > 0 && load64(mq + 32) >= max_c) {
             mutex_unlock(mtx);
-            return 0;
+            searching = 0;
+        } else {
+            var item = cpq_dequeue(load64(mq));
+            if (item == 0) {
+                mutex_unlock(mtx);
+                searching = 0;
+            } else {
+                var key = load64(item + 32);
+                var mi = map_get(jobs, key);
+                if (mi != 0 && load64(mi + 32) == JOB_CANCELLED) {
+                    # Cancelled while queued: drop it and keep looking. The
+                    # slot is released here since no worker will complete it.
+                    map_delete(jobs, key);
+                    fl_free(mi);
+                    mutex_unlock(mtx);
+                } else {
+                    if (mi != 0) {
+                        store64(mi + 32, JOB_RUNNING);
+                        store64(mi + 48, time_now_ns());
+                    }
+                    store64(mq + 32, load64(mq + 32) + 1);
+                    mutex_unlock(mtx);
+                    out = item;
+                    searching = 0;
+                }
+            }
         }
-        mutex_unlock(mtx);
     }
 
-    var item = cpq_dequeue(load64(mq));
-    if (item == 0) { return 0; }
-
-    var key = load64(item + 32);
-
-    mutex_lock(mtx);
-    var mi = map_get(load64(mq + 8), key);
-    if (mi != 0) {
-        store64(mi + 32, JOB_RUNNING);
-        store64(mi + 48, time_now_ns());
-        store64(mq + 32, load64(mq + 32) + 1);
-    }
-    mutex_unlock(mtx);
+    if (out == 0) { return 0; }
 
     var vt = load64(mq + 48);
     if (vt != 0) {
-        metrics_queue_dequeued(vt, load64(mq + 24), load64(item + 16));
+        metrics_queue_dequeued(vt, load64(mq + 24), load64(out + 16));
     }
-
-    return item;
+    return out;
 }
 
 # Mark a job as completed.
+# Terminal transitions only decrement running_count when the job was actually
+# RUNNING. Previously any resolvable key decremented, so mq_complete followed
+# by mq_fail on the same item (or a double mq_complete) drove running_count
+# NEGATIVE — and a negative count sits permanently below max_concurrent, which
+# disables the concurrency cap for the life of the queue.
+#
+# The map entry is also released here. mq_enqueue inserted a ManagedItem per
+# job and nothing ever removed one, so a long-lived queue grew until the
+# process died. Terminal states are where a job stops being interesting.
 fn mq_complete(mq, item) {
     var key = load64(item + 32);
     var mtx = load64(mq + 16);
+    var jobs = load64(mq + 8);
 
     mutex_lock(mtx);
-    var mi = map_get(load64(mq + 8), key);
+    var mi = map_get(jobs, key);
     if (mi != 0) {
+        if (load64(mi + 32) == JOB_RUNNING) {
+            store64(mq + 32, load64(mq + 32) - 1);
+        }
         store64(mi + 32, JOB_COMPLETED);
         store64(mi + 56, time_now_ns());
-        store64(mq + 32, load64(mq + 32) - 1);
         counter_inc(load64(mq + 56));
+        map_delete(jobs, key);
+        fl_free(mi);
     }
     mutex_unlock(mtx);
 }
@@ -389,13 +430,18 @@ fn mq_complete(mq, item) {
 fn mq_fail(mq, item) {
     var key = load64(item + 32);
     var mtx = load64(mq + 16);
+    var jobs = load64(mq + 8);
 
     mutex_lock(mtx);
-    var mi = map_get(load64(mq + 8), key);
+    var mi = map_get(jobs, key);
     if (mi != 0) {
+        if (load64(mi + 32) == JOB_RUNNING) {
+            store64(mq + 32, load64(mq + 32) - 1);
+        }
         store64(mi + 32, JOB_FAILED);
         store64(mi + 56, time_now_ns());
-        store64(mq + 32, load64(mq + 32) - 1);
+        map_delete(jobs, key);
+        fl_free(mi);
     }
     mutex_unlock(mtx);
 }

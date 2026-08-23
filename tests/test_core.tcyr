@@ -1023,6 +1023,98 @@ fn test_sliding_window_separate_keys() {
 # Fleet — expanded tests (Rust: 10 tests)
 # =============================================================================
 
+# --- 2.6.9 P(-1) regressions: queue accounting + fleet lifecycle ---
+
+# mq_complete/mq_fail used to decrement running_count for ANY resolvable key,
+# so a double-terminate drove it NEGATIVE — and a negative count sits
+# permanently below max_concurrent, disabling the cap for the queue's life.
+fn test_mq_running_count_no_underflow() {
+    var mq = mq_new("underflow", 0);
+    var it = mq_enqueue(mq, PRIORITY_NORMAL, 1);
+    var got = mq_dequeue(mq);
+    assert_eq(mq_running_count(mq), 1, "1 running after dequeue");
+    mq_complete(mq, got);
+    assert_eq(mq_running_count(mq), 0, "0 running after complete");
+    # Second terminal transition on the same item must be a no-op.
+    mq_complete(mq, got);
+    mq_fail(mq, got);
+    assert_eq(mq_running_count(mq), 0, "running_count never goes negative");
+    println("  mq_running_count_no_underflow: ok");
+}
+
+# The concurrency cap was ADVISORY: the check and the increment lived in
+# different critical sections. Sequentially it must still hold exactly.
+fn test_mq_concurrency_cap_holds() {
+    var mq = mq_new("capped", 2);
+    mq_enqueue(mq, PRIORITY_NORMAL, 1);
+    mq_enqueue(mq, PRIORITY_NORMAL, 2);
+    mq_enqueue(mq, PRIORITY_NORMAL, 3);
+    var a = mq_dequeue(mq);
+    var b = mq_dequeue(mq);
+    assert(a != 0, "first dequeue under cap");
+    assert(b != 0, "second dequeue under cap");
+    assert_eq(mq_dequeue(mq), 0, "third dequeue refused at cap 2");
+    mq_complete(mq, a);
+    var c = mq_dequeue(mq);
+    assert(c != 0, "dequeue allowed again after a completion");
+    println("  mq_concurrency_cap_holds: ok");
+}
+
+# mq_cancel had NO EFFECT on delivery: mq_dequeue overwrote the job's state
+# with JOB_RUNNING unconditionally, so a cancelled job was still handed out.
+fn test_mq_cancel_prevents_delivery() {
+    var mq = mq_new("cancel2", 0);
+    var i1 = mq_enqueue(mq, PRIORITY_NORMAL, 111);
+    var i2 = mq_enqueue(mq, PRIORITY_LOW, 222);
+    mq_cancel(mq, i1);
+    var got = mq_dequeue(mq);
+    assert(got != 0, "a job is still delivered");
+    assert_eq(queue_item_payload(got), 222, "cancelled job is SKIPPED, not delivered");
+    assert_eq(mq_dequeue(mq), 0, "no further jobs");
+    println("  mq_cancel_prevents_delivery: ok");
+}
+
+# The job-tracking map grew forever: enqueue inserted, nothing removed.
+fn test_mq_job_map_released() {
+    var mq = mq_new("release", 0);
+    var it = mq_enqueue(mq, PRIORITY_NORMAL, 7);
+    assert_eq(mq_job_count(mq), 1, "1 tracked while live");
+    mq_complete(mq, mq_dequeue(mq));
+    assert_eq(mq_job_count(mq), 0, "tracking released on terminal state");
+    println("  mq_job_map_released: ok");
+}
+
+# fleet_register_node used to map_set a fresh queue over an existing node,
+# silently discarding every job already on it — what a flapping node does.
+fn test_fleet_reregister_preserves_jobs() {
+    var cfg = fleet_config_new(10, 5, 0);
+    var fq = fleet_new(cfg);
+    assert_eq(fleet_register_node(fq, "n1"), 1, "first register creates");
+    fleet_submit(fq, PRIORITY_NORMAL, 42);
+    assert_eq(fleet_register_node(fq, "n1"), 0, "re-register is a no-op");
+    var st = fleet_stats(fq);
+    assert_eq(load64(st + 8), 1, "queued job survived the re-register");
+    println("  fleet_reregister_preserves_jobs: ok");
+}
+
+# fleet_rebalance stole via mq_dequeue, which marks RUNNING and bumps the
+# source's running_count — and nothing ever reversed it, so every rebalance
+# inflated the source permanently until it hit max_concurrent and stalled.
+fn test_fleet_rebalance_running_count() {
+    var cfg = fleet_config_new(2, 10, 0);
+    var fq = fleet_new(cfg);
+    fleet_register_node(fq, "src");
+    fleet_register_node(fq, "dst");
+    var src = fleet_node_queue(fq, "src");
+    var i = 0;
+    while (i < 6) { mq_enqueue(src, PRIORITY_NORMAL, i); i = i + 1; }
+    assert_eq(mq_running_count(src), 0, "source starts with 0 running");
+    var moved = fleet_rebalance(fq);
+    assert(moved > 0, "rebalance moved at least one job");
+    assert_eq(mq_running_count(src), 0, "steal does NOT leave jobs marked running");
+    println("  fleet_rebalance_running_count: ok");
+}
+
 fn test_fleet_routing() {
     var cfg = fleet_config_new(10, 5, 0);
     var fq = fleet_new(cfg);
@@ -1281,6 +1373,12 @@ fn main() {
     test_sliding_window_key_is_owned();
 
     # Fleet
+    test_mq_running_count_no_underflow();
+    test_mq_concurrency_cap_holds();
+    test_mq_cancel_prevents_delivery();
+    test_mq_job_map_released();
+    test_fleet_reregister_preserves_jobs();
+    test_fleet_rebalance_running_count();
     test_fleet_routing();
     test_fleet_empty_submit();
 

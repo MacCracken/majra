@@ -202,6 +202,23 @@ fn pubsub_subscribe_filtered(ps, topic, filter_fn) {
 # ordering the old whole-publish lock gave. Snapshotting also keeps the string
 # hash out of the loop: a map_get per iteration cost ~40% on publish.
 fn pubsub_publish(ps, topic, payload) {
+    # ⚠ FAN-OUT IS BLOCKING, BY DESIGN — this is a backpressure contract, not
+    # an oversight, and it differs from relay (which switched to a
+    # non-blocking chan_try_send at 2.6.6 to match tokio broadcast semantics).
+    #
+    # A subscriber whose 64-slot ring is full parks THIS publish call until the
+    # consumer drains. 2.5.3 bounded the blast radius by releasing the hub
+    # mutex before sending, so a lagging consumer no longer freezes unrelated
+    # topics or blocks pubsub_subscribe — verified by
+    # test_pubsub_no_head_of_line_block, which asserts a parked publisher
+    # resumes once its channel drains.
+    #
+    # The residual risk is real and accepted: majra has no pubsub unsubscribe,
+    # so a subscriber that is ABANDONED without draining wedges any publish to
+    # its topic permanently. Dropping instead would trade that for silent
+    # message loss, which is the worse failure for a queue engine. Consumers
+    # must drain or exit the process. Tracked as a roadmap item (unsubscribe +
+    # a per-subscriber lag policy).
     var mtx = load64(ps + 16);
     var delivered = 0;
 
@@ -216,7 +233,13 @@ fn pubsub_publish(ps, topic, payload) {
         slen = load64(subs + 8);
     }
     var patterns = load64(ps + 8);
-    var pat_keys = map_keys(patterns);
+    # Snapshot the pattern slot array under the lock instead of calling
+    # map_keys, which allocates a vec from the BUMP allocator on EVERY publish
+    # and can never be freed. The slot array itself is stable while the lock is
+    # held; the loop below re-locks per pattern to read its subscriber list, so
+    # a concurrent subscribe that rehashes is picked up on the next publish.
+    var pat_entries = map_entries(patterns);
+    var pat_cap = map_cap(patterns);
     mutex_unlock(mtx);
 
     var i = 0;
@@ -224,8 +247,9 @@ fn pubsub_publish(ps, topic, payload) {
         var sub = load64(sdata + i * 8);
         var filter = load64(sub + 8);
         if (filter == 0 || fncall1(filter, payload) == 1) {
-            # chan_send returns -1 on a closed channel; only count a real
-            # delivery so the return value can't over-report.
+            # chan_send is BLOCKING, and deliberately so — see the note above
+            # pubsub_publish. chan_send returns -1 on a closed channel; only
+            # count a real delivery so the return value can't over-report.
             if (chan_send(load64(sub), payload) == 0) {
                 delivered = delivered + 1;
             }
@@ -235,10 +259,11 @@ fn pubsub_publish(ps, topic, payload) {
 
     # --- Pattern subscribers ---
     var j = 0;
-    var plen = vec_len(pat_keys);
-    while (j < plen) {
-        var pat = vec_get(pat_keys, j);
-        if (matches_pattern(topic, pat) == 1) {
+    while (j < pat_cap) {
+        var pep = pat_entries + j * 24;
+        var pat = 0;
+        if (load64(pep + 16) == 1) { pat = load64(pep); }
+        if (pat != 0 && matches_pattern(topic, pat) == 1) {
             mutex_lock(mtx);
             var psubs = map_get(patterns, pat);
             var pdata = 0;

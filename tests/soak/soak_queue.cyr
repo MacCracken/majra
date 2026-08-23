@@ -4,7 +4,8 @@
 # and verifies:
 #   - mq_queued_count and mq_running_count return to 0 after each round
 #   - mq_total_completed counts every completion
-#   - mq_job_count equals total enqueued
+#   - mq_job_count returns to 0 once every job reaches a terminal state
+#     (the job-tracking map must not retain completed jobs)
 #
 # Usage:
 #   cyrius build tests/soak/soak_queue.cyr build/soak_queue
@@ -97,12 +98,24 @@ fn main() {
         println("FAIL: completion count mismatch");
         return 1;
     }
-    # mq_job_count is map_size of the job-tracking map. Under cc5 < 5.4.14
-    # this was ~3% low due to Str/cstr hash mismatch in lib/hashmap.cyr;
-    # fixed upstream in 5.4.14 and majra now calls map_new_str() in mq_new.
-    fmt_int_fd(1, mq_job_count(mq)); println(" job_count");
-    if (mq_job_count(mq) != expected) {
-        println("FAIL: job_count mismatch");
+    # mq_job_count is map_size of the job-tracking map — the count of jobs
+    # still being TRACKED, which since 2.6.9 means jobs that have not reached a
+    # terminal state.
+    #
+    # This assertion used to require job_count == expected, i.e. it codified
+    # the unbounded growth the P(-1) audit flagged: mq_enqueue inserted a
+    # ManagedItem per job and nothing ever removed one, so a long-lived queue
+    # grew until the process died. mq_complete/mq_fail now release the entry,
+    # so after draining every job the tracking map is empty. That is the point
+    # of the fix, and this soak is where it is worth asserting: a queue that
+    # has completed 5000 jobs must not still be holding 5000 records.
+    #
+    # (Historical note: under cc5 < 5.4.14 this count ran ~3% low due to a
+    # Str/cstr hash mismatch in lib/hashmap.cyr, fixed upstream in 5.4.14;
+    # majra calls map_new_str() in mq_new.)
+    fmt_int_fd(1, mq_job_count(mq)); println(" job_count (0 = no leak)");
+    if (mq_job_count(mq) != 0) {
+        println("FAIL: job map retained entries for terminal jobs");
         return 1;
     }
 
