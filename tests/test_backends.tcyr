@@ -236,6 +236,24 @@ fn test_ws_accept_key() {
     println("  ws_accept_key: ok");
 }
 
+# 2.6.9: RFC 6455 conformance. ws_recv_frame needs a socket, so these cover
+# the constants and the send path's framing decisions, which is where the
+# headerless-payload and truncated-control-length bugs lived.
+fn test_ws_framing() {
+    assert_eq(WS_MAX_CONTROL_PAYLOAD, 125, "control payload cap is RFC 6455 125");
+    assert(WS_MAX_PAYLOAD > 0, "payload cap set");
+    assert(WS_MAX_PAYLOAD < 9223372036854775807, "payload cap bounded (CVE-2026-1528 class)");
+
+    # ws_send_pong refuses an over-long control payload rather than truncating
+    # the length into a byte and writing the full body anyway.
+    assert_eq(ws_send_pong(-1, "x", 126), -1, "pong refuses len > 125");
+    assert_eq(ws_send_pong(-1, "x", -1), -1, "pong refuses negative len");
+    # A negative length is refused before any write is attempted.
+    assert_eq(ws_send_text(-1, "x", -1), -1, "send_text refuses negative len");
+
+    println("  ws_framing: ok");
+}
+
 fn test_redis_resp() {
     var cmd = vec_new();
     vec_push(cmd, "SET");
@@ -325,6 +343,7 @@ fn main() {
     test_pg_wire();
     test_parse_ipv4();
     test_resp_limits();
+    test_ws_framing();
 
     return assert_summary();
 }

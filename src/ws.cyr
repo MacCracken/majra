@@ -1,15 +1,21 @@
-# majra/ws — WebSocket bridge for pub/sub fan-out
+# majra/ws — WebSocket framing primitives (RFC 6455) over TCP
 #
-# Implements WebSocket protocol (RFC 6455) over TCP:
-#   - HTTP/1.1 upgrade handshake with SHA-1 + base64
-#   - Frame parsing (text, binary, ping/pong, close)
-#   - Bridge to in-process pub/sub
+# Provides:
+#   - HTTP/1.1 upgrade handshake with SHA-1 + base64 (_ws_accept_upgrade)
+#   - Frame read/write: text, binary, ping/pong, close
 #
-# Protocol:
-#   1. Client connects via TCP
-#   2. HTTP upgrade handshake (requires SHA-1 of key + magic GUID)
-#   3. Client sends {"subscribe": "pattern"}
-#   4. Server forwards matching pub/sub messages as JSON text frames
+# ⚠ SCOPE — there is NO pub/sub bridge in this module.
+#
+# The header used to describe a four-step protocol ending "server forwards
+# matching pub/sub messages as JSON text frames". No such loop exists: nothing
+# reads the hub or max_connections stored by ws_bridge_new, and there is no
+# accept/serve function. What ships here are the framing primitives; a
+# consumer wanting fan-out drives ws_recv_frame / ws_send_text against its own
+# accept loop and its own pubsub hub. ws_bridge_new is retained as a
+# configuration holder with accessors, and wiring the loop is a roadmap item.
+#
+# Frames are read with server semantics: client frames MUST be masked
+# (§5.1) and control frames MUST be <= 125 bytes and unfragmented (§5.5).
 
 # --- SHA-1 Implementation (RFC 3174) ---
 # Required for WebSocket handshake: SHA1(client_key + magic_guid)
@@ -19,6 +25,10 @@ var _sha1_h1 = 0xEFCDAB89;
 var _sha1_h2 = 0x98BADCFE;
 var _sha1_h3 = 0x10325476;
 var _sha1_h4 = 0xC3D2E1F0;
+
+# 80-entry SHA-1 message schedule (global var[N] is N x 8 bytes = 640).
+# Scratch only — consumed within a single sha1() call.
+var _sha1_w[80];
 
 fn _sha1_rotl32(x, n) {
     x = x & 0xFFFFFFFF;
@@ -50,8 +60,15 @@ fn sha1(data, len) {
     store8(padded + padded_len - 2, (bit_len >> 8) & 0xFF);
     store8(padded + padded_len - 1, bit_len & 0xFF);
 
-    # Process each 64-byte block
-    var w = alloc(640);  # 80 entries × 8 bytes, heap-allocated
+    # Process each 64-byte block.
+    #
+    # The 80-entry message schedule used to come from alloc() — the BUMP
+    # allocator, which never reclaims — so every sha1() call, i.e. every
+    # WebSocket handshake, leaked 640 bytes permanently. An unauthenticated
+    # peer could exhaust memory by reconnecting. It is now a module-level
+    # scratch buffer: sha1 is a leaf function that consumes the schedule
+    # entirely before returning, so a single shared buffer is sufficient.
+    var w = &_sha1_w;
     var block = 0;
     while (block < padded_len) {
         # Prepare message schedule (32-bit words stored in 64-bit slots)
@@ -112,6 +129,8 @@ fn sha1(data, len) {
         block = block + 64;
     }
 
+    fl_free(padded);
+
     # Output 20-byte digest in big-endian
     var digest = fl_alloc(20);
     store8(digest, (h0>>24)&0xFF);
@@ -140,6 +159,39 @@ fn sha1(data, len) {
 # --- WebSocket Constants ---
 var WS_MAGIC_GUID = "258EAFA5-E914-47DA-95CA-5AB5DC11BE85";
 
+# Largest frame payload majra will allocate for. RFC 6455 allows a 63-bit
+# length; honouring that literally is the integer-overflow / memory-exhaustion
+# class behind CVE-2026-54466 and CVE-2026-1528. 1 MiB matches the IPC frame
+# cap in src/ipc.cyr.
+var WS_MAX_PAYLOAD = 1048576;
+# RFC 6455 §5.5: control frames carry at most 125 bytes and are never fragmented.
+var WS_MAX_CONTROL_PAYLOAD = 125;
+
+# Read exactly `want` bytes, looping over short reads. -1 if the peer closed
+# or errored first. A blocking socket may legitimately return fewer bytes than
+# asked for; the frame reader used to ignore these returns entirely and parse
+# whatever stale bytes were on the stack.
+fn _ws_read_full(fd, buf, want) {
+    var total = 0;
+    while (total < want) {
+        var r = syscall(SYS_READ, fd, buf + total, want - total);
+        if (r <= 0) { return -1; }
+        total = total + r;
+    }
+    return total;
+}
+
+# Write exactly `len` bytes, looping over short writes.
+fn _ws_write_full(fd, buf, len) {
+    var total = 0;
+    while (total < len) {
+        var w = syscall(SYS_WRITE, fd, buf + total, len - total);
+        if (w <= 0) { return -1; }
+        total = total + w;
+    }
+    return total;
+}
+
 # WebSocket opcodes
 enum WsOpcode {
     WS_TEXT = 1;
@@ -158,94 +210,194 @@ fn _ws_accept_key(client_key) {
     str_builder_add_cstr(sb, WS_MAGIC_GUID);
     var combined = str_builder_build(sb);
     var digest = sha1(str_data(combined), str_len(combined));
-    return majra_base64_encode(digest, 20);
+    var accept = majra_base64_encode(digest, 20);
+    fl_free(digest);
+    return accept;
 }
 
 # --- WebSocket Frame ---
 
 # Send a text frame (unmasked, server->client).
+# Send a text frame (unmasked, server->client).
+# Returns 0 on success, -1 on failure.
+#
+# The 127/64-bit length form is emitted for payloads >= 65536. Previously the
+# if/elif chain had no else, so a payload of 65536 bytes or more was written to
+# the socket with NO frame header at all — raw application bytes landing where
+# the peer expects a header, which corrupts the stream for the rest of the
+# connection.
 fn ws_send_text(fd, data, len) {
+    if (len < 0) { return -1; }
     if (len < 126) {
         var hdr[2];
         store8(&hdr, 0x81);
         store8(&hdr + 1, len);
-        syscall(SYS_WRITE, fd, &hdr, 2);
+        if (_ws_write_full(fd, &hdr, 2) < 0) { return -1; }
     } elif (len < 65536) {
-        var hdr[4];
-        store8(&hdr, 0x81);
-        store8(&hdr + 1, 126);
-        store8(&hdr + 2, (len >> 8) & 0xFF);
-        store8(&hdr + 3, len & 0xFF);
-        syscall(SYS_WRITE, fd, &hdr, 4);
+        var hdr4[4];
+        store8(&hdr4, 0x81);
+        store8(&hdr4 + 1, 126);
+        store8(&hdr4 + 2, (len >> 8) & 0xFF);
+        store8(&hdr4 + 3, len & 0xFF);
+        if (_ws_write_full(fd, &hdr4, 4) < 0) { return -1; }
+    } else {
+        var hdr10[10];
+        store8(&hdr10, 0x81);
+        store8(&hdr10 + 1, 127);
+        store8(&hdr10 + 2, (len >> 56) & 0xFF);
+        store8(&hdr10 + 3, (len >> 48) & 0xFF);
+        store8(&hdr10 + 4, (len >> 40) & 0xFF);
+        store8(&hdr10 + 5, (len >> 32) & 0xFF);
+        store8(&hdr10 + 6, (len >> 24) & 0xFF);
+        store8(&hdr10 + 7, (len >> 16) & 0xFF);
+        store8(&hdr10 + 8, (len >> 8) & 0xFF);
+        store8(&hdr10 + 9, len & 0xFF);
+        if (_ws_write_full(fd, &hdr10, 10) < 0) { return -1; }
     }
-    syscall(SYS_WRITE, fd, data, len);
+    if (_ws_write_full(fd, data, len) < 0) { return -1; }
+    return 0;
 }
 
-# Read a WebSocket frame. Returns {opcode, payload_ptr, payload_len} or 0.
+# Read a WebSocket frame. Returns {opcode, payload_ptr, payload_len, fin} or 0.
+#
+# Frame struct (32 bytes):
+#   offset  0: opcode
+#   offset  8: payload ptr
+#   offset 16: payload len
+#   offset 24: fin (0 or 1)
+#
+# RFC 6455 conformance repaired at 2.6.9. Previously this function:
+#   - never implemented the 127 / 64-bit length form, so the sentinel 127 was
+#     used as a LITERAL payload length. The eight big-endian length bytes were
+#     then consumed as payload and the real payload was parsed as the next
+#     frame header — a peer-controlled desync, not merely a wrong length.
+#   - discarded the return of the extended-length and masking-key reads, so a
+#     short read left uninitialised stack bytes driving the length and the
+#     unmask.
+#   - never bounded the payload length (the CVE-2026-54466 / CVE-2026-1528
+#     class).
+#   - accepted unmasked client frames, which §5.1 requires a server to reject.
+#   - never enforced §5.5's 125-byte, non-fragmented control-frame rule.
+#   - dropped RSV1-3 and FIN on the floor and never validated the opcode.
+#   - leaked the payload buffer on a short read.
 fn ws_recv_frame(fd) {
     var hdr[2];
-    var n = syscall(SYS_READ, fd, &hdr, 2);
-    if (n < 2) { return 0; }
+    if (_ws_read_full(fd, &hdr, 2) < 0) { return 0; }
 
-    var opcode = load8(&hdr) & 0x0F;
-    var masked = (load8(&hdr + 1) >> 7) & 1;
-    var payload_len = load8(&hdr + 1) & 0x7F;
+    var b0 = load8(&hdr);
+    var b1 = load8(&hdr + 1);
+    var fin = (b0 >> 7) & 1;
+    var rsv = (b0 >> 4) & 7;
+    var opcode = b0 & 0x0F;
+    var masked = (b1 >> 7) & 1;
+    var payload_len = b1 & 0x7F;
+
+    # §5.2: RSV1-3 must be zero unless an extension negotiated them. majra
+    # negotiates none, so a non-zero RSV is a protocol error.
+    if (rsv != 0) { return 0; }
+
+    # §5.2: opcodes 3-7 and 11-15 are reserved.
+    if (opcode > 10) { return 0; }
+    if (opcode > 2 && opcode < 8) { return 0; }
+
+    var is_control = 0;
+    if (opcode >= 8) { is_control = 1; }
 
     if (payload_len == 126) {
         var ext[2];
-        syscall(SYS_READ, fd, &ext, 2);
+        if (_ws_read_full(fd, &ext, 2) < 0) { return 0; }
         payload_len = (load8(&ext) << 8) | load8(&ext + 1);
+    } elif (payload_len == 127) {
+        var ext8[8];
+        if (_ws_read_full(fd, &ext8, 8) < 0) { return 0; }
+        # Reject anything with the top 32 bits set before composing, so the
+        # shift below cannot overflow into a negative i64.
+        if (load8(&ext8) != 0 || load8(&ext8 + 1) != 0
+          || load8(&ext8 + 2) != 0 || load8(&ext8 + 3) != 0) { return 0; }
+        payload_len = (load8(&ext8 + 4) << 24) | (load8(&ext8 + 5) << 16)
+                    | (load8(&ext8 + 6) << 8) | load8(&ext8 + 7);
     }
 
-    # Read mask key (4 bytes) if masked
+    if (payload_len < 0 || payload_len > WS_MAX_PAYLOAD) { return 0; }
+
+    # §5.5: control frames are never fragmented and carry at most 125 bytes.
+    if (is_control == 1) {
+        if (fin == 0) { return 0; }
+        if (payload_len > WS_MAX_CONTROL_PAYLOAD) { return 0; }
+    }
+
+    # §5.1: a server MUST reject an unmasked frame from a client. Masking is
+    # what stops a hostile script steering an intermediary into treating frame
+    # bytes as a second HTTP request (cache poisoning).
+    if (masked != 1) { return 0; }
+
     var mask[4];
-    if (masked == 1) {
-        syscall(SYS_READ, fd, &mask, 4);
-    }
+    if (_ws_read_full(fd, &mask, 4) < 0) { return 0; }
 
-    # Read payload
     var payload = fl_alloc(payload_len + 1);
-    var total = 0;
-    while (total < payload_len) {
-        var r = syscall(SYS_READ, fd, payload + total, payload_len - total);
-        if (r <= 0) { return 0; }
-        total = total + r;
+    if (payload == 0) { return 0; }
+    if (payload_len > 0) {
+        if (_ws_read_full(fd, payload, payload_len) < 0) {
+            fl_free(payload);
+            return 0;
+        }
     }
 
-    # Unmask
-    if (masked == 1) {
-        var mi = 0;
-        while (mi < payload_len) {
-            store8(payload + mi, load8(payload + mi) ^ load8(&mask + (mi & 3)));
-            mi = mi + 1;
-        }
+    var mi = 0;
+    while (mi < payload_len) {
+        store8(payload + mi, load8(payload + mi) ^ load8(&mask + (mi & 3)));
+        mi = mi + 1;
     }
     store8(payload + payload_len, 0);
 
-    var frame = fl_alloc(24);
+    var frame = fl_alloc(32);
+    if (frame == 0) { fl_free(payload); return 0; }
     store64(frame, opcode);
     store64(frame + 8, payload);
     store64(frame + 16, payload_len);
+    store64(frame + 24, fin);
     return frame;
 }
 
-# Send a close frame.
+fn ws_frame_opcode(f)  { return load64(f); }
+fn ws_frame_payload(f) { return load64(f + 8); }
+fn ws_frame_len(f)     { return load64(f + 16); }
+fn ws_frame_fin(f)     { return load64(f + 24); }
+
+# Release a frame returned by ws_recv_frame.
+fn ws_frame_free(f) {
+    if (f == 0) { return 0; }
+    var p = load64(f + 8);
+    if (p != 0) { fl_free(p); }
+    fl_free(f);
+    return 0;
+}
+
+# Send a close frame. Returns 0 on success, -1 on failure.
 fn ws_send_close(fd) {
     var hdr[2];
     store8(&hdr, 0x88);
     store8(&hdr + 1, 0);
-    syscall(SYS_WRITE, fd, &hdr, 2);
+    if (_ws_write_full(fd, &hdr, 2) < 0) { return -1; }
+    return 0;
 }
 
-# Send a pong frame.
+# Send a pong frame. Returns 0 on success, -1 on failure.
+#
+# The length used to be written with store8 and no range check, so a len of
+# 126 or more was truncated to its low 8 bits while the full payload was still
+# written — a malformed control frame plus a desynced stream. RFC 6455 §5.5
+# caps control payloads at 125, so an over-long pong is now refused outright.
 fn ws_send_pong(fd, data, len) {
+    if (len < 0 || len > WS_MAX_CONTROL_PAYLOAD) { return -1; }
     var hdr[2];
     store8(&hdr, 0x8A);
     store8(&hdr + 1, len);
-    syscall(SYS_WRITE, fd, &hdr, 2);
+    if (_ws_write_full(fd, &hdr, 2) < 0) { return -1; }
     if (len > 0) {
-        syscall(SYS_WRITE, fd, data, len);
+        if (_ws_write_full(fd, data, len) < 0) { return -1; }
     }
+    return 0;
 }
 
 # --- WebSocket Server ---
@@ -261,17 +413,26 @@ fn ws_bridge_new(pubsub_hub, max_connections) {
     return b;
 }
 
+fn ws_bridge_pubsub(b)          { return load64(b); }
+fn ws_bridge_max_connections(b) { return load64(b + 8); }
+
+fn ws_bridge_free(b) {
+    if (b != 0) { fl_free(b); }
+    return 0;
+}
+
 # Accept a WebSocket upgrade from a raw TCP connection.
 # Reads HTTP headers, extracts Sec-WebSocket-Key, sends 101 response.
 # Returns 1 on success, 0 on failure.
 fn _ws_accept_upgrade(fd) {
     # Read HTTP request (up to 4KB)
     var buf = fl_alloc(4096);
+    if (buf == 0) { return 0; }
     var total = 0;
     # Read until we see \r\n\r\n
     while (total < 4090) {
         var n = syscall(SYS_READ, fd, buf + total, 1);
-        if (n <= 0) { return 0; }
+        if (n <= 0) { fl_free(buf); return 0; }
         total = total + 1;
         # CR LF CR LF — the end of the HTTP header block.
         if (total >= 4 && load8(buf+total-4) == 13 && load8(buf+total-3) == 10
@@ -280,6 +441,12 @@ fn _ws_accept_upgrade(fd) {
         }
     }
     store8(buf + total, 0);
+
+    # §4.2.1: the handshake must be a GET. This used to send 101 Switching
+    # Protocols to ANY request merely containing the substring
+    # "Sec-WebSocket-Key: " — including a POST, or a request carrying it in a
+    # body rather than a header.
+    if (total < 4 || memeq(buf, "GET ", 4) != 1) { fl_free(buf); return 0; }
 
     # Find Sec-WebSocket-Key header
     var key_header = "Sec-WebSocket-Key: ";
@@ -292,16 +459,21 @@ fn _ws_accept_upgrade(fd) {
         }
         i = i + 1;
     }
-    if (key_pos == 0) { return 0; }
+    if (key_pos == 0) { fl_free(buf); return 0; }
 
     # Extract key value (until \r\n)
     var key_end = key_pos;
     while (key_end < total && load8(buf + key_end) != 13) {
         key_end = key_end + 1;
     }
-    var client_key = fl_alloc(key_end - key_pos + 1);
-    memcpy(client_key, buf + key_pos, key_end - key_pos);
-    store8(client_key + key_end - key_pos, 0);
+    var key_len = key_end - key_pos;
+    # A base64-encoded 16-byte nonce is 24 characters; anything wildly off is
+    # not a conforming handshake.
+    if (key_len < 1 || key_len > 128) { fl_free(buf); return 0; }
+    var client_key = fl_alloc(key_len + 1);
+    if (client_key == 0) { fl_free(buf); return 0; }
+    memcpy(client_key, buf + key_pos, key_len);
+    store8(client_key + key_len, 0);
 
     # Compute accept key
     var accept_key = _ws_accept_key(client_key);
@@ -314,6 +486,10 @@ fn _ws_accept_upgrade(fd) {
     str_builder_add_cstr(sb, accept_key);
     str_builder_add_cstr(sb, "\r\n\r\n");
     var resp = str_builder_build(sb);
-    syscall(SYS_WRITE, fd, str_data(resp), str_len(resp));
+    var rc = _ws_write_full(fd, str_data(resp), str_len(resp));
+    fl_free(client_key);
+    fl_free(accept_key);
+    fl_free(buf);
+    if (rc < 0) { return 0; }
     return 1;
 }
