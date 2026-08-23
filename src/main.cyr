@@ -260,10 +260,19 @@ fn test_heartbeat_eviction() {
     hb_register(ht, "n1", 0);
 
     # Sleep 30ms to go offline (offline_after = 20ms)
+    # Retry on EINTR (-4) with the kernel's remaining time. A null `rem` plus
+    # an ignored return meant a signal landing inside this window shortened
+    # the sleep below the eviction threshold and failed a correct module.
     var ts[16];
+    var rem[16];
     store64(&ts, 0);
     store64(&ts + 8, 30000000);
-    syscall(35, &ts, 0);
+    var sr = syscall(35, &ts, &rem);
+    while (sr == -4) {
+        store64(&ts, load64(&rem));
+        store64(&ts + 8, load64(&rem + 8));
+        sr = syscall(35, &ts, &rem);
+    }
 
     hb_update_statuses(ht);
     assert_eq(hb_len(ht), 1, "still present after cycle 1");

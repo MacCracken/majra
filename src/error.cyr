@@ -37,6 +37,15 @@ var _err_msg_buf[64];
 var _err_msg_len = 0;
 
 # Set the error detail message (copies up to 504 bytes).
+# ⚠ PROCESS-GLOBAL, UNSYNCHRONISED, AND BORROWED BY get_err_msg.
+#
+# set_err_msg writes a single process-wide buffer and get_err_msg returns a Str
+# that BORROWS it, so any later error anywhere in the process rewrites the
+# contents of a Str a caller is still holding — and two threads erroring at
+# once interleave bytes into one message. This is a diagnostic aid, not a
+# reliable channel: copy the bytes out immediately if you need them to survive,
+# and do not rely on it from multiple threads. The typed MajraErr codes
+# returned through Result are the load-bearing error channel.
 fn set_err_msg(msg) {
     var len = str_len(msg);
     if (len > 504) {

@@ -32,25 +32,36 @@ fn counter_get(c) {
 }
 
 # Evict entries from a hashmap where predicate_fn(key, value) returns 1.
-# Two-pass: collect keys to evict, then remove them.
 # Returns number of entries evicted.
+#
+# Rewritten at 2.6.9 to be ALLOCATION-FREE. It previously built two vecs per
+# call (map_keys plus a keys_to_remove list), both from the BUMP allocator,
+# which never reclaims — the exact leak ratelimit_evict_stale was rewritten to
+# eliminate at 2.6.4, still sitting here in the generic helper.
+#
+# It walks the slot array directly. Deleting during the walk is safe because
+# map_delete leaves a tombstone rather than reshuffling: _map_find skips
+# st == 2 and _map_grow_a rehashes only live entries, so no slot this loop has
+# yet to visit is moved.
+#
+# ⚠ The caller owns key/value lifetime. This helper removes the ENTRY only; it
+# does not free the key or the value, because it cannot know how they were
+# allocated. See ratelimit_evict_stale for the pattern that frees both.
 fn map_evict(m, predicate_fn) {
-    var keys_to_remove = vec_new();
-    var keys = map_keys(m);
+    var entries = map_entries(m);
+    var cap = map_cap(m);
+    var evicted = 0;
     var i = 0;
-    var len = vec_len(keys);
-    while (i < len) {
-        var k = vec_get(keys, i);
-        var v = map_get(m, k);
-        if (fncall2(predicate_fn, k, v) == 1) {
-            vec_push(keys_to_remove, k);
+    while (i < cap) {
+        var ep = entries + i * 24;
+        if (load64(ep + 16) == 1) {
+            var k = load64(ep);
+            var v = load64(ep + 8);
+            if (fncall2(predicate_fn, k, v) == 1) {
+                map_delete(m, k);
+                evicted = evicted + 1;
+            }
         }
-        i = i + 1;
-    }
-    var evicted = vec_len(keys_to_remove);
-    i = 0;
-    while (i < evicted) {
-        map_delete(m, vec_get(keys_to_remove, i));
         i = i + 1;
     }
     return evicted;

@@ -1154,6 +1154,27 @@ fn test_ratelimit_subinterval_polling_accrues() {
     println("  ratelimit_subinterval_polling_accrues: ok");
 }
 
+# 2.6.9: namespace prefixes are a tenant-isolation boundary and were entirely
+# unvalidated. A '#' or '+' in a prefix turned that tenant's own wildcard into
+# a cross-tenant subscription; a '/' or ':' made prefixes non-prefix-free so
+# "acme" and "acme/eu" collided.
+fn test_namespace_prefix_validation() {
+    assert(namespace_new("acme") != 0, "plain prefix accepted");
+    assert(namespace_new("tenant-a_1") != 0, "dashes and underscores accepted");
+
+    assert_eq(namespace_new("acme/eu"), 0, "prefix with '/' rejected (non-prefix-free)");
+    assert_eq(namespace_new("acme:eu"), 0, "prefix with ':' rejected (key delimiter)");
+    assert_eq(namespace_new("acme#"), 0, "prefix with '#' rejected (wildcard)");
+    assert_eq(namespace_new("acme+"), 0, "prefix with '+' rejected (wildcard)");
+    assert_eq(namespace_new(""), 0, "empty prefix rejected");
+    assert_eq(namespace_new(0), 0, "null prefix rejected");
+
+    # The concrete bypass: without validation, "a/#" produced the wildcard
+    # "a/#/#", whose embedded '#' matches every other tenant under "a".
+    assert_eq(namespace_valid_prefix("a/#"), 0, "the a/# bypass prefix is refused");
+    println("  namespace_prefix_validation: ok");
+}
+
 fn test_fleet_routing() {
     var cfg = fleet_config_new(10, 5, 0);
     var fq = fleet_new(cfg);
@@ -1412,6 +1433,7 @@ fn main() {
     test_sliding_window_key_is_owned();
 
     # Fleet
+    test_namespace_prefix_validation();
     test_sliding_window_evict();
     test_sliding_window_rejects_zero_window();
     test_ratelimit_subinterval_polling_accrues();

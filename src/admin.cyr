@@ -16,20 +16,40 @@
 # For high-throughput observability, front with Prometheus or a
 # pull-scraping agent rather than making this multi-threaded.
 
+# Tracker kinds. The admin endpoint MUST know which it holds.
+var ADMIN_TRACKER_CONCURRENT = 0;
+var ADMIN_TRACKER_BASIC = 1;
+
 # MajraAdmin struct (32 bytes, 4 fields):
-#   offset  0: fleet_tracker  (i64) — hb_tracker or chb_tracker (may be 0)
+#   offset  0: fleet_tracker  (i64) — chb_tracker or hb_tracker (may be 0)
 #   offset  8: ratelimiter    (i64) — ratelimiter ptr (may be 0)
-#   offset 16: reserved_1     (i64) — future: managed queue ref
-#   offset 24: reserved_2     (i64) — future: pubsub hub ref
+#   offset 16: tracker_kind   (i64) — ADMIN_TRACKER_CONCURRENT | _BASIC
+#   offset 24: reserved       (i64) — future: pubsub hub ref
+#
+# ⚠ tracker_kind is a MEMORY-SAFETY field, not bookkeeping.
+#
+# The struct comment used to say the tracker "may be hb_tracker or
+# chb_tracker" while _admin_fleet_json unconditionally called
+# chb_fleet_stats. hb_tracker is fl_alloc(16) — map@0, cfg@8, NO MUTEX —
+# while chb_fleet_stats does load64(cht + 16) and mutex_lock()s the result.
+# Handing it an hb_tracker therefore reads 8 bytes PAST the allocation and
+# treats whatever is there as a mutex pointer, then atomically writes to it.
+# The kind is now recorded and checked.
 
 fn majra_admin_new(fleet_tracker, ratelimiter) {
+    return majra_admin_new_ex(fleet_tracker, ADMIN_TRACKER_CONCURRENT, ratelimiter);
+}
+
+fn majra_admin_new_ex(fleet_tracker, tracker_kind, ratelimiter) {
     var a = fl_alloc(32);
     store64(a, fleet_tracker);
     store64(a + 8, ratelimiter);
-    store64(a + 16, 0);
+    store64(a + 16, tracker_kind);
     store64(a + 24, 0);
     return a;
 }
+
+fn majra_admin_tracker_kind(a) { return load64(a + 16); }
 
 fn majra_admin_fleet_tracker(a) { return load64(a); }
 fn majra_admin_ratelimiter(a)   { return load64(a + 8); }
@@ -44,7 +64,13 @@ fn _admin_fleet_json(a) {
         var empty = "{\"error\":\"no fleet tracker\"}";
         ret2(empty, strlen(empty));
     }
-    # Assume chb_tracker; majra's admin currently only accepts concurrent.
+    # Only a concurrent tracker has the mutex chb_fleet_stats reads at +16.
+    # A basic hb_tracker is 16 bytes, so calling it would read past the
+    # allocation and lock whatever it found.
+    if (load64(a + 16) != ADMIN_TRACKER_CONCURRENT) {
+        var basic = "{\"error\":\"fleet stats require a concurrent tracker\"}";
+        ret2(basic, strlen(basic));
+    }
     var s = chb_fleet_stats(t);
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "{\"total\":");
@@ -66,15 +92,19 @@ fn _admin_fleet_json(a) {
     ret2(str_data(body), str_len(body));
 }
 
+# ⚠ `key` is accepted and NOT used for filtering — the response is the
+# limiter's GLOBAL counters regardless of which key was asked for, while the
+# route is documented as `/ratelimit/:key`. An operator reading
+# /ratelimit?key=tenant-a sees fleet-wide totals and can easily read them as
+# that tenant's. The key is echoed in the response so the answer is at least
+# self-describing; real per-key stats need a ratelimit_stats_for_key helper
+# (roadmap item, cross-referenced from CHANGELOG 2.6.9).
 fn _admin_ratelimit_json(a, key) {
     var rl = load64(a + 8);
     if (rl == 0 || key == 0) {
         var empty = "{\"error\":\"no ratelimiter or key\"}";
         ret2(empty, strlen(empty));
     }
-    # ratelimit_stats returns global stats (total_allowed, total_rejected,
-    # active_keys, total_evicted) — per-key stats would need a new helper.
-    # Good enough for v1; per-key lookup is a follow-up.
     var s = ratelimit_stats(rl);
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "{\"allowed\":");
@@ -85,7 +115,7 @@ fn _admin_ratelimit_json(a, key) {
     str_builder_add_int(sb, load64(s + 16));
     str_builder_add_cstr(sb, ",\"evicted\":");
     str_builder_add_int(sb, load64(s + 24));
-    str_builder_add_cstr(sb, "}");
+    str_builder_add_cstr(sb, ",\"scope\":\"global\"}");
     var body = str_builder_build(sb);
     ret2(str_data(body), str_len(body));
 }
@@ -124,8 +154,19 @@ fn majra_admin_handler(ctx, cfd, buf, blen) {
 }
 
 # Run the admin endpoint in this thread. Blocks indefinitely.
-# Bind to "127.0.0.1" for localhost-only; use "0.0.0.0" only behind
-# a reverse proxy.
+#
+# `addr` is a dotted-quad STRING — pass "127.0.0.1" for localhost-only, and
+# "0.0.0.0" only behind a reverse proxy. Returns -1 for an unparseable address
+# rather than binding somewhere unintended.
+#
+# ⚠ This used to forward `addr` straight to sandhi_server_run, which passes it
+# to sock_bind -> sockaddr_in, where it is a PACKED INTEGER (0x0100007F for
+# 127.0.0.1), not a string. So the documented "bind 127.0.0.1 for
+# localhost-only" call actually stored the low 32 bits of a char* pointer as
+# the bind address — the one guarantee this endpoint makes (it has no auth of
+# its own) was decided by a pointer value.
 fn majra_admin_serve(admin, addr, port) {
-    return sandhi_server_run(addr, port, &majra_admin_handler, admin);
+    var packed = majra_parse_ipv4(addr);
+    if (packed < 0) { return -1; }
+    return sandhi_server_run(packed, port, &majra_admin_handler, admin);
 }

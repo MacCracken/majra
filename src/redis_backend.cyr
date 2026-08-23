@@ -10,39 +10,6 @@
 #   Bulk string:   $5\r\nhello\r\n
 #   Array:         *2\r\n$3\r\nGET\r\n$3\r\nkey\r\n
 
-# Parse a dotted-quad IPv4 literal into the little-endian packed form
-# store32() expects (matching INADDR_LOOPBACK()'s 0x0100007F). Returns -1 if
-# `host` is not a bare dotted quad.
-fn majra_parse_ipv4(host) {
-    var acc = 0;
-    var octet = 0;
-    var digits = 0;
-    var shift = 0;
-    var i = 0;
-    var n = strlen(host);
-    while (i <= n) {
-        var ch = 0;
-        if (i < n) { ch = load8(host + i); }
-        if (i == n || ch == 46) {
-            if (digits == 0 || octet > 255) { return -1; }
-            if (shift > 24) { return -1; }
-            acc = acc | (octet << shift);
-            shift = shift + 8;
-            octet = 0;
-            digits = 0;
-        } elif (ch >= 48 && ch <= 57) {
-            octet = octet * 10 + (ch - 48);
-            digits = digits + 1;
-            if (digits > 3) { return -1; }
-        } else {
-            return -1;
-        }
-        i = i + 1;
-    }
-    if (shift != 32) { return -1; }
-    return acc;
-}
-
 # --- Limits ---
 #
 # Every one of these bounds a value taken straight off the wire. Without them a

@@ -10,8 +10,44 @@
 # Namespace is just a Str pointer to the prefix string.
 # All functions take the prefix Str as their first argument.
 
-# Create a new namespace from a C string.
+# Create a new namespace from a C string. Returns 0 for an invalid prefix.
+#
+# ⚠ THIS IS A TENANT-ISOLATION BOUNDARY, so the prefix is validated.
+#
+# namespace_new used to accept anything. Two ways that broke isolation:
+#
+#  1. A prefix containing '#' or '+' turns the tenant's OWN
+#     namespace_wildcard()/namespace_pattern() into a cross-tenant
+#     subscription — namespace_wildcard builds "<prefix>/#", so a prefix of
+#     "a/#" yields "a/#/#", and matches_pattern honours the embedded '#' as a
+#     multi-level wildcard covering every other tenant under "a".
+#
+#  2. A prefix containing the delimiters '/' or ':' makes prefixes
+#     non-prefix-free: tenants "acme" and "acme/eu" both produce topics under
+#     "acme/", so acme's wildcard "acme/#" matches every acme/eu topic, and
+#     namespace_strip_topic hands acme a topic that belongs to acme/eu.
+#
+# Rejecting the metacharacters outright is the only cheap fix that closes both:
+# escaping them would change every topic string majra has ever emitted.
+fn namespace_valid_prefix(prefix_cstr) {
+    if (prefix_cstr == 0) { return 0; }
+    var n = strlen(prefix_cstr);
+    if (n == 0) { return 0; }
+    var i = 0;
+    while (i < n) {
+        var c = load8(prefix_cstr + i);
+        # '/' 47, ':' 58, '#' 35, '+' 43
+        if (c == 47 || c == 58 || c == 35 || c == 43) { return 0; }
+        # Control bytes and NUL-adjacent junk have no business in an identifier
+        # that ends up in topic strings, keys and node ids.
+        if (c < 32 || c == 127) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
 fn namespace_new(prefix_cstr) {
+    if (namespace_valid_prefix(prefix_cstr) == 0) { return 0; }
     return str_from(prefix_cstr);
 }
 

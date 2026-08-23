@@ -38,12 +38,20 @@ fn _envelope_canonicalize(e) {
     var to_name = envelope_to_name(e);
     var payload = envelope_payload(e);
 
+    # A NULL field and an EMPTY field both used to canonicalise to a zero
+    # length followed by zero bytes, so two structurally different envelopes —
+    # one broadcast (to_name == 0), one addressed to "" — produced identical
+    # signing input and a signature valid for both. Encode presence in the
+    # length prefix: 0xFFFFFFFF means absent, any other value is a real length.
     var from_len = 0;
-    if (from != 0) { from_len = str_len(from); }
+    var from_tag = 4294967295;
+    if (from != 0) { from_len = str_len(from); from_tag = from_len; }
     var to_len = 0;
-    if (to_name != 0) { to_len = str_len(to_name); }
+    var to_tag = 4294967295;
+    if (to_name != 0) { to_len = str_len(to_name); to_tag = to_len; }
     var pay_len = 0;
-    if (payload != 0) { pay_len = str_len(payload); }
+    var pay_tag = 4294967295;
+    if (payload != 0) { pay_len = str_len(payload); pay_tag = pay_len; }
 
     var hdr = 8 + 8 + 8 + 8 + 4 + 4 + 4;
     var total = hdr + from_len + to_len + pay_len;
@@ -56,24 +64,24 @@ fn _envelope_canonicalize(e) {
 
     var pos = 32;
     # Write u32 big-endian length + bytes for each variable field
-    store8(buf + pos, (from_len >> 24) & 0xFF);
-    store8(buf + pos + 1, (from_len >> 16) & 0xFF);
-    store8(buf + pos + 2, (from_len >> 8) & 0xFF);
-    store8(buf + pos + 3, from_len & 0xFF);
+    store8(buf + pos, (from_tag >> 24) & 0xFF);
+    store8(buf + pos + 1, (from_tag >> 16) & 0xFF);
+    store8(buf + pos + 2, (from_tag >> 8) & 0xFF);
+    store8(buf + pos + 3, from_tag & 0xFF);
     pos = pos + 4;
     if (from_len > 0) { memcpy(buf + pos, str_data(from), from_len); pos = pos + from_len; }
 
-    store8(buf + pos, (to_len >> 24) & 0xFF);
-    store8(buf + pos + 1, (to_len >> 16) & 0xFF);
-    store8(buf + pos + 2, (to_len >> 8) & 0xFF);
-    store8(buf + pos + 3, to_len & 0xFF);
+    store8(buf + pos, (to_tag >> 24) & 0xFF);
+    store8(buf + pos + 1, (to_tag >> 16) & 0xFF);
+    store8(buf + pos + 2, (to_tag >> 8) & 0xFF);
+    store8(buf + pos + 3, to_tag & 0xFF);
     pos = pos + 4;
     if (to_len > 0) { memcpy(buf + pos, str_data(to_name), to_len); pos = pos + to_len; }
 
-    store8(buf + pos, (pay_len >> 24) & 0xFF);
-    store8(buf + pos + 1, (pay_len >> 16) & 0xFF);
-    store8(buf + pos + 2, (pay_len >> 8) & 0xFF);
-    store8(buf + pos + 3, pay_len & 0xFF);
+    store8(buf + pos, (pay_tag >> 24) & 0xFF);
+    store8(buf + pos + 1, (pay_tag >> 16) & 0xFF);
+    store8(buf + pos + 2, (pay_tag >> 8) & 0xFF);
+    store8(buf + pos + 3, pay_tag & 0xFF);
     pos = pos + 4;
     if (pay_len > 0) { memcpy(buf + pos, str_data(payload), pay_len); pos = pos + pay_len; }
 
@@ -81,8 +89,14 @@ fn _envelope_canonicalize(e) {
 }
 
 # Sign an envelope. Produces a SignedEnvelope.
-#   sk_ptr: raw 32-byte Ed25519 secret key (caller owns; typically fl_alloc'd
-#           and zeroized after signing session ends)
+#   sk_ptr: Ed25519 secret key buffer. ⚠ sigil's ed25519_sign reads sk[0..32]
+#           as the seed AND sk[32..64] as the cached public key, so this buffer
+#           must be the 64-BYTE expanded form, not a bare 32-byte seed. Passing
+#           32 bytes reads 32 bytes past the allocation and signs against
+#           whatever follows it, producing signatures that never verify. The
+#           comment previously said "raw 32-byte Ed25519 secret key", which is
+#           what made that an easy mistake. Caller owns it; zeroize after the
+#           signing session ends.
 #   pk_ptr: raw 32-byte Ed25519 public key that corresponds to sk
 fn signed_envelope_new(e, sk_ptr, pk_ptr) {
     ed25519_init();

@@ -70,12 +70,31 @@ fn time_epoch_ns() {
 # Returns two values: hi in rax, lo via rethi().
 fn uuid_generate() {
     var buf[16];   # 16 bytes (128 random bits); `var X[N]` local is N bytes
-    #ifdef CYRIUS_TARGET_AGNOS
-    sys_getrandom(&buf, 16, 0);
-    #endif
-    #ifndef CYRIUS_TARGET_AGNOS
-    syscall(SYS_GETRANDOM, &buf, 16, 0);
-    #endif
+    # Zero the buffer first so a short/failed getrandom cannot leave stale
+    # stack bytes standing in for entropy, and RETRY rather than proceed.
+    #
+    # The return was previously discarded entirely, so on failure the id was
+    # built from whatever the stack held — plausibly identical across calls,
+    # which collapses envelope ids that dedup and signature canonicalisation
+    # both key on.
+    memset(&buf, 0, 16);
+    var got = 0;
+    var attempts = 0;
+    while (got < 16 && attempts < 8) {
+        #ifdef CYRIUS_TARGET_AGNOS
+        var n = sys_getrandom(&buf + got, 16 - got, 0);
+        #endif
+        #ifndef CYRIUS_TARGET_AGNOS
+        var n = syscall(SYS_GETRANDOM, &buf + got, 16 - got, 0);
+        #endif
+        if (n > 0) { got = got + n; }
+        attempts = attempts + 1;
+    }
+    if (got < 16) {
+        # Entropy is unavailable. Returning a predictable id is worse than
+        # returning nothing: report 0/0 so the caller can fail loudly.
+        ret2(0, 0);
+    }
     var hi = load64(&buf);
     var lo = load64(&buf + 8);
     # Set version 4 (bits 48-51 of hi) and variant 1 (bits 62-63 of lo)

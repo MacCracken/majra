@@ -1,7 +1,9 @@
-# majra/dag — DAG workflow engine with parallel step scheduling
+# majra/dag — DAG workflow engine with dependency-tier scheduling
 #
 # Replaces Rust's WorkflowEngine, WorkflowDefinition, WorkflowRun, etc.
-# Uses thread_create/join for parallel step execution within tiers.
+# Steps are grouped into dependency tiers and executed SERIALLY within each
+# tier. (This line previously claimed thread_create/join parallelism; dag.cyr
+# calls neither. See the note on workflow_execute.)
 
 # Workflow step status
 enum StepStatus {
@@ -155,12 +157,18 @@ fn _compute_tiers(def) {
     var num_steps = vec_len(steps);
     var tiers = vec_new();
 
-    # Build in-degree map: step_id -> count of dependencies
+    # Build in-degree map: step_id -> count of dependencies.
+    #
+    # In-degree state is keyed by step id, so two steps sharing an id collapse
+    # into ONE map entry and every duplicate after the first is silently
+    # dropped from the schedule. Detect it and refuse the workflow instead:
+    # returning a partial DAG that looks complete is the worse failure.
     var in_degree = map_new();
     var i = 0;
     while (i < num_steps) {
         var s = vec_get(steps, i);
         var sid = load64(s);
+        if (map_has(in_degree, sid) == 1) { return 0; }
         map_set(in_degree, sid, vec_len(load64(s + 16)));
         i = i + 1;
     }
@@ -180,7 +188,14 @@ fn _compute_tiers(def) {
             i = i + 1;
         }
         if (vec_len(tier) == 0) {
-            break;
+            # Kahn's algorithm cannot make progress: the remaining steps form a
+            # CYCLE, or one depends on an id that is not in this workflow.
+            #
+            # This used to `break` and hand back the acyclic PREFIX, so
+            # workflow_execute ran part of the DAG and reported success — a
+            # workflow silently missing its tail. Return 0 so the caller can
+            # tell a malformed DAG from a completed one.
+            return 0;
         }
         # Reduce in-degree for dependents
         var j = 0;
@@ -218,10 +233,19 @@ fn _compute_tiers(def) {
 
 # Execute a workflow definition with a given executor function and input.
 # executor_fn(step_ptr, ctx_ptr) -> StepResult ptr
-# Returns: RUN_COMPLETED or RUN_FAILED
+# Returns: RUN_COMPLETED, or RUN_FAILED (including for a malformed DAG).
+#
+# ⚠ Steps within a tier execute SERIALLY. The module header used to claim
+# parallel within-tier execution via thread_create/join; dag.cyr calls
+# neither, and never has. Tiers are a dependency-ordering construct here, not
+# a concurrency one. Parallel tier execution is a roadmap item.
 fn workflow_execute(def, executor_fn, input) {
     var ctx = workflow_context_new(input);
     var tiers = _compute_tiers(def);
+    # _compute_tiers returns 0 for a malformed DAG (a dependency cycle, a
+    # dangling dependency id, or duplicate step ids). Running the schedulable
+    # prefix and reporting success is exactly the failure this guards.
+    if (tiers == 0) { return RUN_FAILED; }
     var num_tiers = vec_len(tiers);
     var final_status = RUN_COMPLETED;
 
@@ -259,10 +283,23 @@ fn workflow_execute(def, executor_fn, input) {
                     sys_sleep_ms(attempt * 10);
                     #endif
                     #ifndef CYRIUS_TARGET_AGNOS
+                    # tv_nsec MUST be in [0, 999999999]. attempt * 10ms
+                    # exceeds a second at attempt 100 and nanosleep then
+                    # returns EINVAL immediately — the backoff silently stops
+                    # backing off and the retry loop becomes a tight spin.
+                    # Split into whole seconds + remainder, and retry on EINTR
+                    # (-4) so a signal does not shorten the wait.
+                    var total_ns = attempt * 10000000;
                     var ts[16];   # struct timespec = 2×i64 = 16 bytes (local = N bytes)
-                    store64(&ts, 0);
-                    store64(&ts + 8, attempt * 10000000);
-                    syscall(35, &ts, 0);
+                    var rem[16];
+                    store64(&ts, total_ns / 1000000000);
+                    store64(&ts + 8, total_ns - (total_ns / 1000000000) * 1000000000);
+                    var sr = syscall(35, &ts, &rem);
+                    while (sr == -4) {
+                        store64(&ts, load64(&rem));
+                        store64(&ts + 8, load64(&rem + 8));
+                        sr = syscall(35, &ts, &rem);
+                    }
                     #endif
                 }
             }

@@ -136,7 +136,12 @@ fn hb_heartbeat_with_metadata(ht, id, metadata) {
 
 fn hb_deregister(ht, id) {
     var nodes = load64(ht);
-    return map_delete(nodes, id);
+    var old = map_get(nodes, id);
+    var r = map_delete(nodes, id);
+    # NodeState blocks were fl_alloc'd and never freed on ANY removal path, so
+    # a fleet that churns nodes leaked one per removal.
+    if (old != 0) { fl_free(old); }
+    return r;
 }
 
 # Sweep all nodes, return vec of (id_str, new_status) pairs for transitions.
@@ -192,7 +197,10 @@ fn hb_update_statuses(ht) {
         i = 0;
         len = vec_len(to_evict);
         while (i < len) {
-            map_delete(nodes, vec_get(to_evict, i));
+            var ev_id = vec_get(to_evict, i);
+            var ev_ns = map_get(nodes, ev_id);
+            map_delete(nodes, ev_id);
+            if (ev_ns != 0) { fl_free(ev_ns); }
             i = i + 1;
         }
     }
@@ -253,8 +261,13 @@ fn chb_tracker_new(cfg) {
 fn chb_register(cht, id, metadata) {
     var mtx = load64(cht + 16);
     mutex_lock(mtx);
+    # Re-registering an existing id replaced the map entry and abandoned the
+    # previous NodeState — and re-register on reconnect is exactly what a
+    # flapping node does.
+    var prev = map_get(load64(cht), id);
     var ns = _node_state_new(metadata);
     map_set(load64(cht), id, ns);
+    if (prev != 0) { fl_free(prev); }
     mutex_unlock(mtx);
 }
 
@@ -317,7 +330,9 @@ fn chb_heartbeat_with_telemetry(cht, id, gpu_vec) {
 fn chb_deregister(cht, id) {
     var mtx = load64(cht + 16);
     mutex_lock(mtx);
+    var old_ns = map_get(load64(cht), id);
     var r = map_delete(load64(cht), id);
+    if (old_ns != 0) { fl_free(old_ns); }
     mutex_unlock(mtx);
     return r;
 }
@@ -375,7 +390,10 @@ fn chb_update_statuses(cht) {
         i = 0;
         len = vec_len(to_evict);
         while (i < len) {
-            map_delete(nodes, vec_get(to_evict, i));
+            var ev_id = vec_get(to_evict, i);
+            var ev_ns = map_get(nodes, ev_id);
+            map_delete(nodes, ev_id);
+            if (ev_ns != 0) { fl_free(ev_ns); }
             i = i + 1;
         }
     }

@@ -218,40 +218,49 @@ fn cbarrier_arrive(cbs, name, participant) {
 }
 
 # Globals for arrive_and_wait — avoids local clobbering across function calls
-var _aaw_result_state = 0;
-var _aaw_result_code = 0;
-
-fn _cbarrier_do_arrive(cbs_ptr, name, participant) {
+# _cbarrier_do_arrive writes its two results into a CALLER-PROVIDED buffer:
+#   out[0..7]  = state ptr
+#   out[8..15] = result code
+#
+# These used to be the file-scope globals _aaw_result_state/_aaw_result_code.
+# They were serialised only by the PER-SET mutex, so two threads working on two
+# DIFFERENT ConcurrentBarrierSets held different locks and clobbered each
+# other's result — thread A could read B's state pointer and then futex-wait on
+# a barrier it never joined, or read B's error code and return it as its own.
+# agnosai runs one barrier set per workflow, so concurrent sets are the normal
+# case, not an edge case.
+fn _cbarrier_do_arrive(cbs_ptr, name, participant, out) {
     var barriers = load64(cbs_ptr);
     var state = map_get(barriers, name);
     if (state == 0) {
-        _aaw_result_state = 0;
-        _aaw_result_code = ERR_BARRIER;
+        store64(out, 0);
+        store64(out + 8, ERR_BARRIER);
         return 0;
     }
     _set_add(load64(state + 8), participant);
     if (_cbarrier_check_release(state) == 1) {
-        _aaw_result_state = 0;
-        _aaw_result_code = 0;
+        store64(out, 0);
+        store64(out + 8, 0);
         return 0;
     }
-    _aaw_result_state = state;
-    _aaw_result_code = 1;
+    store64(out, state);
+    store64(out + 8, 1);
     return 0;
 }
 
 # Blocking arrive — waits until the barrier releases.
 fn cbarrier_arrive_and_wait(cbs, name, participant) {
     var mtx = load64(cbs + 8);
+    var res[16];
     mutex_lock(mtx);
-    _cbarrier_do_arrive(load64(cbs), name, participant);
+    _cbarrier_do_arrive(load64(cbs), name, participant, &res);
 
-    if (_aaw_result_code != 1) {
+    if (load64(&res + 8) != 1) {
         mutex_unlock(mtx);
-        return _aaw_result_code;
+        return load64(&res + 8);
     }
 
-    var state = _aaw_result_state;
+    var state = load64(&res);
     var futex_addr = state + 32;
     var released_addr = state + 24;
     var val = load64(futex_addr);
