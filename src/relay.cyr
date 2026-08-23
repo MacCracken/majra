@@ -420,23 +420,34 @@ fn relay_evict_stale_dedup(r, max_idle_ns) {
     var now = time_now_ns();
     var mtx = load64(r + 40);
     mutex_lock(mtx);
+    # Carries both defects 2.6.9 fixed in the sibling eviction path inside
+    # relay_receive_ex and did not apply here: it built TWO bump-allocated vecs
+    # per sweep (map_keys plus to_remove, neither reclaimable), and it deleted
+    # DedupEntry blocks without freeing them — so the routine whose whole job
+    # is bounding the dedup table's memory leaked a block per eviction.
+    #
+    # Now allocation-free, walking the slot array directly. Deleting during the
+    # walk is safe because map_delete leaves a tombstone rather than
+    # reshuffling: _map_find skips st == 2 and _map_grow_a rehashes only live
+    # entries, so no slot this loop has yet to visit moves.
     var seen = load64(r + 16);
-    var keys = map_keys(seen);
-    var to_remove = vec_new();
+    var entries = map_entries(seen);
+    var cap = map_cap(seen);
+    var count = 0;
     var i = 0;
-    var len = vec_len(keys);
-    while (i < len) {
-        var k = vec_get(keys, i);
-        var e = map_get(seen, k);
-        if (now - load64(e + 8) > max_idle_ns) {
-            vec_push(to_remove, k);
+    while (i < cap) {
+        var sp = entries + i * 24;
+        if (load64(sp + 16) == 1) {
+            var e = load64(sp + 8);
+            if (now - load64(e + 8) > max_idle_ns) {
+                var k = load64(sp);
+                map_delete(seen, k);
+                # Free strictly AFTER the delete, which needs the key to find
+                # the entry — same ordering rule as ratelimit_evict_stale.
+                fl_free(e);
+                count = count + 1;
+            }
         }
-        i = i + 1;
-    }
-    var count = vec_len(to_remove);
-    i = 0;
-    while (i < count) {
-        map_delete(seen, vec_get(to_remove, i));
         i = i + 1;
     }
     if (count > 0) {

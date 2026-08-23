@@ -381,14 +381,25 @@ fn mq_dequeue(mq) {
                     fl_free(mi);
                     mutex_unlock(mtx);
                 } else {
+                    # The increment stays INSIDE the mi guard. 2.6.9 moved it
+                    # out, but both decrement sites (mq_complete, mq_fail)
+                    # still require mi != 0 — so delivering a job whose
+                    # tracking entry was already removed consumed a
+                    # concurrency slot that nothing could ever give back, and
+                    # the queue ratcheted toward its cap and stopped
+                    # dequeuing. Skip such an item rather than deliver it: it
+                    # has no tracking entry, so it can never be completed.
                     if (mi != 0) {
                         store64(mi + 32, JOB_RUNNING);
                         store64(mi + 48, time_now_ns());
+                        store64(mq + 32, load64(mq + 32) + 1);
+                        mutex_unlock(mtx);
+                        out = item;
+                        searching = 0;
+                    } else {
+                        mutex_unlock(mtx);
+                        queue_item_free(item);
                     }
-                    store64(mq + 32, load64(mq + 32) + 1);
-                    mutex_unlock(mtx);
-                    out = item;
-                    searching = 0;
                 }
             }
         }
@@ -467,10 +478,13 @@ fn mq_complete(mq, item) {
 
     mutex_lock(mtx);
     var mi = map_get(jobs, key);
-    if (mi != 0) {
-        if (load64(mi + 32) == JOB_RUNNING) {
-            store64(mq + 32, load64(mq + 32) - 1);
-        }
+    # Only a job that actually reached RUNNING is terminated here. 2.6.9
+    # deleted and freed the ManagedItem for ANY resolvable key, including one
+    # still JOB_QUEUED — leaving its QueueItem sitting in the priority queue
+    # with no tracking entry, which mq_dequeue would later pop and (before the
+    # guard above) hand out as an untrackable job.
+    if (mi != 0 && load64(mi + 32) == JOB_RUNNING) {
+        store64(mq + 32, load64(mq + 32) - 1);
         store64(mi + 32, JOB_COMPLETED);
         store64(mi + 56, time_now_ns());
         counter_inc(load64(mq + 56));
@@ -488,10 +502,8 @@ fn mq_fail(mq, item) {
 
     mutex_lock(mtx);
     var mi = map_get(jobs, key);
-    if (mi != 0) {
-        if (load64(mi + 32) == JOB_RUNNING) {
-            store64(mq + 32, load64(mq + 32) - 1);
-        }
+    if (mi != 0 && load64(mi + 32) == JOB_RUNNING) {
+        store64(mq + 32, load64(mq + 32) - 1);
         store64(mi + 32, JOB_FAILED);
         store64(mi + 56, time_now_ns());
         map_delete(jobs, key);

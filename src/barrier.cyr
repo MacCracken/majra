@@ -73,9 +73,24 @@ fn _set_is_superset(arrived, expected) {
 #   offset  8: arrived (i64) — vec of participant name strings
 #   offset 16: was_forced (i64)
 
+# Takes a COPY of the participants vec.
+#
+# barrier_force mutates the expected set in place via _set_remove, so storing
+# the caller's vec by reference let two barriers built from one shared list
+# corrupt each other's membership, and silently modified the caller's own vec.
+# 2.6.9 fixed exactly this in _cbarrier_state_new and left the non-concurrent
+# twin alone.
 fn _barrier_state_new(participants_vec) {
     var bs = fl_alloc(24);
-    store64(bs, participants_vec);
+    var owned = vec_new();
+    var pi = 0;
+    var pn = 0;
+    if (participants_vec != 0) { pn = vec_len(participants_vec); }
+    while (pi < pn) {
+        vec_push(owned, vec_get(participants_vec, pi));
+        pi = pi + 1;
+    }
+    store64(bs, owned);
     store64(bs + 8, vec_new());
     store64(bs + 16, 0);
     return bs;

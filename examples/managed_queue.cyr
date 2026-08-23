@@ -81,7 +81,7 @@ fn main() {
     print_num(mq_total_completed(mq));
     println(" jobs completed");
     print_num(mq_job_count(mq));
-    println(" total jobs tracked");
+    println(" jobs still tracked (terminal jobs are released)");
 
     return 0;
 }

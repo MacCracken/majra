@@ -124,9 +124,36 @@ var _pg_db_g = 0;
 var _pg_pw_g = 0;
 var _pg_connect_mtx = 0;
 
+# Initialised eagerly at module load rather than lazily.
+#
+# The lazy `if (_pg_connect_mtx == 0) { _pg_connect_mtx = mutex_new(); }` was
+# itself unsynchronised, so the first two concurrent pg_connect calls could
+# each observe 0, each build a mutex, and each lock a DIFFERENT one — leaving
+# the connect globals unprotected in exactly the window the mutex exists for.
+var _pg_connect_mtx_init = _pg_connect_mtx_bootstrap();
+
+fn _pg_connect_mtx_bootstrap() {
+    _pg_connect_mtx = mutex_new();
+    return 1;
+}
+
 fn _pg_connect_lock() {
-    if (_pg_connect_mtx == 0) { _pg_connect_mtx = mutex_new(); }
     mutex_lock(_pg_connect_mtx);
+    return 0;
+}
+
+# Release a message struct returned by _pg_read_msg, and its body.
+#
+# Nothing freed these: pg_query's main loop, pg_connect's handshake and its
+# ReadyForQuery loop, and the ErrorResponse drain all dropped both the 24-byte
+# descriptor and its body on the floor. A long-lived connection leaked one of
+# each per message received, which for a query returning many DataRows is per
+# row.
+fn _pg_msg_free(m) {
+    if (m == 0) { return 0; }
+    var d = load64(m + 8);
+    if (d != 0) { fl_free(d); }
+    fl_free(m);
     return 0;
 }
 
@@ -287,15 +314,17 @@ fn pg_connect(host, port, user, database, password) {
         # A message whose declared length is exactly 4 carries no body, so
         # load64(msg + 8) is 0 — reading the auth type straight off it was a
         # null dereference on a malformed (or hostile) server reply.
-        if (load64(msg + 16) < 4) { syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
+        if (load64(msg + 16) < 4) { _pg_msg_free(msg); syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
         var auth_type = _pg_read_be32(load64(msg + 8), 0);
         if (auth_type == PG_AUTH_CLEARTEXT) {
+            _pg_msg_free(msg);
             if (_pg_send_password(fd, _pg_pw_g) < 0) { syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
             msg = _pg_read_msg(fd);
             if (msg == 0) { syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
-            if (load64(msg + 16) < 4) { syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
+            if (load64(msg + 16) < 4) { _pg_msg_free(msg); syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
             auth_type = _pg_read_be32(load64(msg + 8), 0);
         }
+        _pg_msg_free(msg);
         if (auth_type != PG_AUTH_OK) {
             # Includes SASL/SCRAM-SHA-256 (type 10), which majra does not
             # implement — fail closed rather than proceed unauthenticated.
@@ -303,6 +332,8 @@ fn pg_connect(host, port, user, database, password) {
             mutex_unlock(_pg_connect_mtx);
             return 0;
         }
+    } else {
+        _pg_msg_free(msg);
     }
 
     # Read until ReadyForQuery. A _pg_read_msg failure is NOT equivalent to
@@ -319,6 +350,7 @@ fn pg_connect(host, port, user, database, password) {
             return 0;
         }
         if (load64(msg) == PG_MSG_READY) { done = 1; }
+        _pg_msg_free(msg);
     }
 
     var conn = fl_alloc(16);
@@ -345,9 +377,10 @@ fn pg_query(conn, sql) {
         var msg = _pg_read_msg(fd);
         if (msg == 0) { break; }
         var mtype = load64(msg);
+        var stop = 0;
 
         if (mtype == PG_MSG_ROW_DESC) {
-            if (load64(msg + 8) == 0 || load64(msg + 16) < 2) { break; }
+            if (load64(msg + 8) == 0 || load64(msg + 16) < 2) { _pg_msg_free(msg); break; }
             num_cols = _pg_read_be16(load64(msg + 8), 0);
         }
         elif (mtype == PG_MSG_DATA_ROW) {
@@ -355,10 +388,10 @@ fn pg_query(conn, sql) {
             var data_len = load64(msg + 16);
             # Every offset below is derived from the wire, so each one is
             # bounded against the message body the server actually sent.
-            if (data == 0 || data_len < 2) { break; }
+            if (data == 0 || data_len < 2) { _pg_msg_free(msg); break; }
             var col_count = _pg_read_be16(data, 0);
             # Each column costs at least its own 4-byte length prefix.
-            if (col_count > (data_len - 2) / 4) { break; }
+            if (col_count > (data_len - 2) / 4) { _pg_msg_free(msg); break; }
             var row = vec_new();
             var pos = 2;
             var ci = 0;
@@ -389,7 +422,7 @@ fn pg_query(conn, sql) {
                     ci = ci + 1;
                 }
             }
-            if (bad == 1) { break; }
+            if (bad == 1) { _pg_msg_free(msg); break; }
             vec_push(rows, row);
         }
         elif (mtype == PG_MSG_CMD_COMPLETE) {
@@ -405,13 +438,18 @@ fn pg_query(conn, sql) {
             while (draining == 1) {
                 var m2 = _pg_read_msg(fd);
                 if (m2 == 0) { draining = 0; }
-                elif (load64(m2) == PG_MSG_READY) { draining = 0; }
+                else {
+                    if (load64(m2) == PG_MSG_READY) { draining = 0; }
+                    _pg_msg_free(m2);
+                }
             }
-            break;
+            stop = 1;
         }
         elif (mtype == PG_MSG_READY) {
-            break;
+            stop = 1;
         }
+        _pg_msg_free(msg);
+        if (stop == 1) { break; }
     }
 
     return rows;

@@ -1075,6 +1075,33 @@ fn test_mq_cancel_prevents_delivery() {
 }
 
 # The job-tracking map grew forever: enqueue inserted, nothing removed.
+# 2.6.10: mq_complete/mq_fail used to delete and free the ManagedItem for ANY
+# resolvable key, including a job still JOB_QUEUED — leaving its QueueItem in
+# the priority queue with no tracking entry. Terminating a queued job must be
+# a no-op.
+fn test_mq_terminate_queued_is_noop() {
+    var mq = mq_new("term-queued", 0);
+    var it = mq_enqueue(mq, PRIORITY_NORMAL, 55);
+    assert_eq(mq_job_count(mq), 1, "job tracked while queued");
+
+    mq_complete(mq, it);
+    assert_eq(mq_job_count(mq), 1, "complete on a QUEUED job does not evict it");
+    assert_eq(mq_running_count(mq), 0, "and does not touch running_count");
+
+    mq_fail(mq, it);
+    assert_eq(mq_job_count(mq), 1, "fail on a QUEUED job does not evict it either");
+
+    # It must still be deliverable.
+    var got = mq_dequeue(mq);
+    assert(got != 0, "queued job still dequeues after a spurious terminate");
+    assert_eq(queue_item_payload(got), 55, "and it is the right job");
+    assert_eq(mq_running_count(mq), 1, "now it is running");
+    mq_complete(mq, got);
+    assert_eq(mq_running_count(mq), 0, "running_count returns to 0");
+    assert_eq(mq_job_count(mq), 0, "tracking released on the real terminal");
+    println("  mq_terminate_queued_is_noop: ok");
+}
+
 fn test_mq_job_map_released() {
     var mq = mq_new("release", 0);
     var it = mq_enqueue(mq, PRIORITY_NORMAL, 7);
@@ -1441,6 +1468,7 @@ fn main() {
     test_mq_concurrency_cap_holds();
     test_mq_cancel_prevents_delivery();
     test_mq_job_map_released();
+    test_mq_terminate_queued_is_noop();
     test_fleet_reregister_preserves_jobs();
     test_fleet_rebalance_running_count();
     test_fleet_routing();
