@@ -10,6 +10,52 @@
 #   Bulk string:   $5\r\nhello\r\n
 #   Array:         *2\r\n$3\r\nGET\r\n$3\r\nkey\r\n
 
+# Parse a dotted-quad IPv4 literal into the little-endian packed form
+# store32() expects (matching INADDR_LOOPBACK()'s 0x0100007F). Returns -1 if
+# `host` is not a bare dotted quad.
+fn majra_parse_ipv4(host) {
+    var acc = 0;
+    var octet = 0;
+    var digits = 0;
+    var shift = 0;
+    var i = 0;
+    var n = strlen(host);
+    while (i <= n) {
+        var ch = 0;
+        if (i < n) { ch = load8(host + i); }
+        if (i == n || ch == 46) {
+            if (digits == 0 || octet > 255) { return -1; }
+            if (shift > 24) { return -1; }
+            acc = acc | (octet << shift);
+            shift = shift + 8;
+            octet = 0;
+            digits = 0;
+        } elif (ch >= 48 && ch <= 57) {
+            octet = octet * 10 + (ch - 48);
+            digits = digits + 1;
+            if (digits > 3) { return -1; }
+        } else {
+            return -1;
+        }
+        i = i + 1;
+    }
+    if (shift != 32) { return -1; }
+    return acc;
+}
+
+# --- Limits ---
+#
+# Every one of these bounds a value taken straight off the wire. Without them a
+# compromised or impersonated Redis endpoint controls an allocation size, a
+# loop bound, or the recursion depth of the reply parser.
+#
+# Redis's own proto-max-bulk-len defaults to 512 MB; 64 MB is far above
+# anything majra's own commands produce and can be raised if a consumer needs
+# it.
+var RESP_MAX_BULK = 67108864;
+var RESP_MAX_ARRAY = 1048576;
+var RESP_MAX_DEPTH = 8;
+
 # --- RESP Protocol ---
 
 # Append CRLF to a string builder.
@@ -40,8 +86,17 @@ fn _resp_send_cmd(fd, cmd) {
         i = i + 1;
     }
     var msg = str_builder_build(sb);
-    var w = syscall(SYS_WRITE, fd, str_data(msg), str_len(msg));
-    if (w < 0) { return -1; }
+    # A short write used to count as success, which desynchronises the command
+    # stream: the server parses a truncated command and every later reply is
+    # misattributed.
+    var data = str_data(msg);
+    var mlen = str_len(msg);
+    var total = 0;
+    while (total < mlen) {
+        var w = syscall(SYS_WRITE, fd, data + total, mlen - total);
+        if (w <= 0) { return -1; }
+        total = total + w;
+    }
     return 0;
 }
 
@@ -53,7 +108,16 @@ fn _resp_read_line(fd) {
         var n = syscall(SYS_READ, fd, &_resp_buf + pos, 1);
         if (n <= 0) { return 0; }
         if (pos > 0 && load8(&_resp_buf + pos - 1) == 13 && load8(&_resp_buf + pos) == 10) {
-            return str_new(&_resp_buf, pos - 1);
+            # Return an OWNED copy. _resp_buf is a module global, so handing
+            # back a Str aliasing it meant every previously-returned simple
+            # string, error and integer line was rewritten by the next read —
+            # nested array replies clobbered their own earlier elements.
+            var line_len = pos - 1;
+            var copy = fl_alloc(line_len + 1);
+            if (copy == 0) { return 0; }
+            memcpy(copy, &_resp_buf, line_len);
+            store8(copy + line_len, 0);
+            return str_new(copy, line_len);
         }
         pos = pos + 1;
     }
@@ -66,6 +130,11 @@ fn _resp_read_line(fd) {
 #   For bulk strings: Str or 0 (nil)
 #   For arrays: vec of reply values
 fn _resp_read_reply(fd) {
+    return _resp_read_reply_d(fd, 0);
+}
+
+fn _resp_read_reply_d(fd, depth) {
+    if (depth > RESP_MAX_DEPTH) { return 0; }
     var line = _resp_read_line(fd);
     if (line == 0) { return 0; }
     var data = str_data(line);
@@ -87,11 +156,18 @@ fn _resp_read_reply(fd) {
         # $bulk string
         var blen = str_to_int(str_new(data + 1, str_len(line) - 1));
         if (blen < 0) { return 0; }
+        # Without this cap, `$9223372036854775807` makes `blen + 2` WRAP
+        # NEGATIVE; _fl_class sends any negative size down the size<=16 path,
+        # so fl_alloc hands back a 16-byte block which str_new then labels
+        # with a length of INT64_MAX. The first str_eq on that reply walks the
+        # entire address space.
+        if (blen > RESP_MAX_BULK) { return 0; }
         var buf = fl_alloc(blen + 2);
+        if (buf == 0) { return 0; }
         var total = 0;
         while (total < blen + 2) {
             var n = syscall(SYS_READ, fd, buf + total, blen + 2 - total);
-            if (n <= 0) { return 0; }
+            if (n <= 0) { fl_free(buf); return 0; }
             total = total + n;
         }
         return str_new(buf, blen);
@@ -100,10 +176,16 @@ fn _resp_read_reply(fd) {
         # *array
         var count = str_to_int(str_new(data + 1, str_len(line) - 1));
         if (count < 0) { return 0; }
+        # An oversized count spins this loop growing `arr` long after the
+        # socket has stopped producing, and unbounded nesting turns
+        # server-controlled depth into call-stack depth.
+        if (count > RESP_MAX_ARRAY) { return 0; }
         var arr = vec_new();
         var j = 0;
         while (j < count) {
-            vec_push(arr, _resp_read_reply(fd));
+            var elem = _resp_read_reply_d(fd, depth + 1);
+            if (elem == 0) { return arr; }
+            vec_push(arr, elem);
             j = j + 1;
         }
         return arr;
@@ -118,9 +200,18 @@ fn _resp_read_reply(fd) {
 #   offset 8: prefix (i64) — C string for key namespacing
 
 fn redis_connect(host, port) {
+    # `host` was accepted and then ignored — every connection went to
+    # INADDR_LOOPBACK() regardless, so redis_connect("10.0.0.5", 6379) silently
+    # talked to localhost. Now parsed; a non-dotted-quad host fails rather than
+    # redirecting. (No resolver in the stdlib: pass an IPv4 literal.)
+    var addr = INADDR_LOOPBACK();
+    if (host != 0 && strlen(host) > 0) {
+        addr = majra_parse_ipv4(host);
+        if (addr < 0) { return 0; }
+    }
     var fd = syscall(41, AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { return 0; }
-    var sa = sockaddr_in(INADDR_LOOPBACK(), port);
+    var sa = sockaddr_in(addr, port);
     var ret = syscall(42, fd, sa, 16);
     if (ret < 0) {
         syscall(SYS_CLOSE, fd);
@@ -141,7 +232,15 @@ fn redis_set_prefix(rc, prefix) {
 }
 
 fn redis_close(rc) {
-    syscall(SYS_CLOSE, load64(rc));
+    if (rc == 0) { return 0; }
+    var fd = load64(rc);
+    if (fd < 0) { return 0; }
+    syscall(SYS_CLOSE, fd);
+    # Poison the fd so a second close cannot hit a descriptor the kernel has
+    # since handed to something else, and release the handle.
+    store64(rc, -1);
+    fl_free(rc);
+    return 0;
 }
 
 # Build prefixed key

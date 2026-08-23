@@ -253,7 +253,60 @@ fn test_pg_wire() {
     _pg_write_be32(&buf, 0, 196608);
     assert_eq(_pg_read_be32(&buf, 0), 196608, "pg protocol version");
 
+    # 2.6.9 regression: PostgreSQL encodes a NULL DataRow column as int32 -1
+    # (FF FF FF FF). _pg_read_be32 composes zero-extended load8s, so it returns
+    # 4294967295 and the `col_len < 0` NULL guard was unreachable — a NULL
+    # column drove fl_alloc(4294967296) plus a 4 GiB memcpy. _pg_read_i32
+    # sign-extends so the guard fires.
+    store8(&buf, 0xFF); store8(&buf + 1, 0xFF);
+    store8(&buf + 2, 0xFF); store8(&buf + 3, 0xFF);
+    assert_eq(_pg_read_be32(&buf, 0), 4294967295, "pg be32 zero-extends (unsigned)");
+    assert_eq(_pg_read_i32(&buf, 0), -1, "pg i32 sign-extends: NULL sentinel is -1");
+    assert(_pg_read_i32(&buf, 0) < 0, "pg NULL guard is reachable");
+
+    # Boundary: 0x7FFFFFFF stays positive, 0x80000000 goes negative.
+    store8(&buf, 0x7F); store8(&buf + 1, 0xFF);
+    store8(&buf + 2, 0xFF); store8(&buf + 3, 0xFF);
+    assert_eq(_pg_read_i32(&buf, 0), 2147483647, "pg i32 max positive");
+    store8(&buf, 0x80); store8(&buf + 1, 0x00);
+    store8(&buf + 2, 0x00); store8(&buf + 3, 0x00);
+    assert_eq(_pg_read_i32(&buf, 0), -2147483648, "pg i32 min negative");
+
     println("  pg_wire: ok");
+}
+
+# 2.6.9: redis_connect/pg_connect accepted a `host` argument and ignored it,
+# always dialling INADDR_LOOPBACK(). majra_parse_ipv4 is what makes `host`
+# load-bearing; a bad literal must fail rather than silently mean localhost.
+fn test_parse_ipv4() {
+    assert_eq(majra_parse_ipv4("127.0.0.1"), INADDR_LOOPBACK(), "ipv4 loopback matches INADDR_LOOPBACK");
+    assert_eq(majra_parse_ipv4("0.0.0.0"), 0, "ipv4 all-zero");
+    # 10.0.0.5 packs little-endian as 0x0500000A
+    assert_eq(majra_parse_ipv4("10.0.0.5"), 0x0500000A, "ipv4 10.0.0.5");
+    assert_eq(majra_parse_ipv4("255.255.255.255"), 0xFFFFFFFF, "ipv4 broadcast");
+
+    assert_eq(majra_parse_ipv4("256.0.0.1"), -1, "ipv4 rejects octet > 255");
+    assert_eq(majra_parse_ipv4("1.2.3"), -1, "ipv4 rejects 3 octets");
+    assert_eq(majra_parse_ipv4("1.2.3.4.5"), -1, "ipv4 rejects 5 octets");
+    assert_eq(majra_parse_ipv4("1.2.3."), -1, "ipv4 rejects trailing dot");
+    assert_eq(majra_parse_ipv4("redis.internal"), -1, "ipv4 rejects a hostname");
+    assert_eq(majra_parse_ipv4(""), -1, "ipv4 rejects empty");
+    assert_eq(majra_parse_ipv4("1.2.3.4444"), -1, "ipv4 rejects >3 digits");
+    println("  parse_ipv4: ok");
+}
+
+# 2.6.9: the RESP reply parser takes its allocation size, loop bound and
+# recursion depth straight off the wire. These are the caps that bound them.
+fn test_resp_limits() {
+    assert(RESP_MAX_BULK > 0, "resp bulk cap set");
+    assert(RESP_MAX_ARRAY > 0, "resp array cap set");
+    assert(RESP_MAX_DEPTH > 0, "resp depth cap set");
+    # The wraparound that motivated the cap: INT64_MAX + 2 goes negative, and
+    # _fl_class routes any negative size down the size<=16 path, so fl_alloc
+    # would hand back a 16-byte block labelled INT64_MAX long.
+    assert(9223372036854775807 + 2 < 0, "blen + 2 wraps negative at INT64_MAX");
+    assert(RESP_MAX_BULK < 9223372036854775807 - 2, "cap is below the wrap point");
+    println("  resp_limits: ok");
 }
 
 fn main() {
@@ -270,6 +323,8 @@ fn main() {
     test_ws_accept_key();
     test_redis_resp();
     test_pg_wire();
+    test_parse_ipv4();
+    test_resp_limits();
 
     return assert_summary();
 }

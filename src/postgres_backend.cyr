@@ -7,6 +7,23 @@
 #   Frontend -> Backend: [1B type][4B length][payload]
 #   Backend -> Frontend: [1B type][4B length][payload]
 #   Startup message has no type byte: [4B length][4B protocol][params...]
+#
+# ⚠ SECURITY — TRANSPORT AND AUTHENTICATION LIMITS
+#
+# This client speaks PLAINTEXT PostgreSQL. It sends no SSLRequest and performs
+# no TLS handshake, and the only authentication method it implements is
+# AuthenticationCleartextPassword (type 3) — so the password crosses the wire
+# in the clear along with every query and result row.
+#
+# PostgreSQL has defaulted to scram-sha-256 since v14; a server configured that
+# way sends auth type 10 and majra fails the connect closed rather than
+# downgrading. Reaching a modern server therefore requires `password` in
+# pg_hba.conf, which is exactly the weakening this note is warning about.
+#
+# Use this ONLY over loopback or an already-confidential channel (a unix-socket
+# proxy, a TLS-terminating sidecar, a WireGuard/VPN link). Do NOT point it at a
+# PostgreSQL server across an untrusted network. Tracked as a roadmap item:
+# SCRAM-SHA-256 + SSLRequest via sigil.
 
 # --- PostgreSQL Wire Protocol Constants ---
 
@@ -27,6 +44,11 @@ var PG_MSG_NOTICE = 78;
 # Auth types
 var PG_AUTH_OK = 0;
 var PG_AUTH_CLEARTEXT = 3;
+
+# Largest backend message majra will allocate for. The wire length field is a
+# signed int32, so without a cap a peer can request ~2 GB with a five-byte
+# header. 16 MiB is far above any DataRow majra's own schema produces.
+var PG_MAX_MSG = 16777216;
 
 # --- Connection ---
 
@@ -49,11 +71,64 @@ fn _pg_read_be16(buf, offset) {
     return (load8(buf+offset) << 8) | load8(buf+offset+1);
 }
 
-# Globals for PG startup to avoid local clobbering
+# SIGNED big-endian int32.
+#
+# `_pg_read_be32` composes four ZERO-EXTENDED load8 results, so it can never
+# return a negative number: the PostgreSQL NULL sentinel (int32 -1, on the wire
+# as FF FF FF FF) came back as 4294967295. Every `< 0` test against it was
+# therefore dead code. Use this reader for any wire field PostgreSQL may send
+# negative — today that is the DataRow column length.
+fn _pg_read_i32(buf, offset) {
+    var v = _pg_read_be32(buf, offset);
+    if (v >= 0x80000000) { return v - 0x100000000; }
+    return v;
+}
+
+# Read exactly `want` bytes, looping over short reads. Returns the byte count,
+# or -1 if the peer closed or errored before `want` bytes arrived. A blocking
+# TCP socket is entitled to return fewer bytes than requested; treating that as
+# fatal (as this file did) drops legitimate traffic.
+fn _pg_read_full(fd, buf, want) {
+    var total = 0;
+    while (total < want) {
+        var r = syscall(SYS_READ, fd, buf + total, want - total);
+        if (r <= 0) { return -1; }
+        total = total + r;
+    }
+    return total;
+}
+
+# Write exactly `len` bytes, looping over short writes.
+fn _pg_write_full(fd, buf, len) {
+    var total = 0;
+    while (total < len) {
+        var w = syscall(SYS_WRITE, fd, buf + total, len - total);
+        if (w <= 0) { return -1; }
+        total = total + w;
+    }
+    return total;
+}
+
+
+# Globals for PG startup to avoid local clobbering.
+#
+# These are process-wide and live across the whole blocking handshake, so two
+# threads calling pg_connect concurrently used to overwrite each other's fd and
+# credentials — thread A could complete the handshake against thread B's socket
+# using thread B's password. `_pg_connect_mtx` serialises the entire connect
+# path. Connections themselves are independent once returned; only the
+# handshake is serialised.
 var _pg_fd_g = 0;
 var _pg_user_g = 0;
 var _pg_db_g = 0;
 var _pg_pw_g = 0;
+var _pg_connect_mtx = 0;
+
+fn _pg_connect_lock() {
+    if (_pg_connect_mtx == 0) { _pg_connect_mtx = mutex_new(); }
+    mutex_lock(_pg_connect_mtx);
+    return 0;
+}
 
 # Send startup message: protocol version 3.0, user, database
 fn _pg_startup() {
@@ -74,25 +149,29 @@ fn _pg_startup() {
     memcpy(msg + pos, "database", 8); pos = pos + 8; store8(msg + pos, 0); pos = pos + 1;
     memcpy(msg + pos, database, db_len); pos = pos + db_len; store8(msg + pos, 0); pos = pos + 1;
     store8(msg + pos, 0);
-    syscall(SYS_WRITE, fd, msg, msg_len);
+    var rc = _pg_write_full(fd, msg, msg_len);
+    fl_free(msg);
+    return rc;
 }
 
 # Read a single backend message. Returns {type, data_ptr, data_len} or 0.
 fn _pg_read_msg(fd) {
     var hdr[8];
-    var n = syscall(SYS_READ, fd, &hdr, 5);
-    if (n < 5) { return 0; }
+    if (_pg_read_full(fd, &hdr, 5) < 0) { return 0; }
     var msg_type = load8(&hdr);
     var msg_len = _pg_read_be32(&hdr, 1);
+    # The length covers itself, so anything below 4 is malformed; the upper
+    # bound stops a peer requesting a multi-gigabyte allocation from a
+    # five-byte header.
+    if (msg_len < 4 || msg_len > PG_MAX_MSG) { return 0; }
     var data_len = msg_len - 4;
     var data = 0;
     if (data_len > 0) {
         data = fl_alloc(data_len + 1);
-        var total = 0;
-        while (total < data_len) {
-            var r = syscall(SYS_READ, fd, data + total, data_len - total);
-            if (r <= 0) { return 0; }
-            total = total + r;
+        if (data == 0) { return 0; }
+        if (_pg_read_full(fd, data, data_len) < 0) {
+            fl_free(data);
+            return 0;
         }
         store8(data + data_len, 0);
     }
@@ -112,7 +191,9 @@ fn _pg_send_query(fd, sql) {
     _pg_write_be32(msg, 1, msg_len);
     memcpy(msg + 5, sql, sql_len);
     store8(msg + 5 + sql_len, 0);
-    syscall(SYS_WRITE, fd, msg, 1 + msg_len);
+    var rc = _pg_write_full(fd, msg, 1 + msg_len);
+    fl_free(msg);
+    return rc;
 }
 
 # Send password message (cleartext)
@@ -124,7 +205,11 @@ fn _pg_send_password(fd, password) {
     _pg_write_be32(msg, 1, msg_len);
     memcpy(msg + 5, password, pw_len);
     store8(msg + 5 + pw_len, 0);
-    syscall(SYS_WRITE, fd, msg, 1 + msg_len);
+    var rc = _pg_write_full(fd, msg, 1 + msg_len);
+    # Do not leave the plaintext password sitting in a freed heap block.
+    memset(msg, 0, 1 + msg_len);
+    fl_free(msg);
+    return rc;
 }
 
 # Send terminate message
@@ -137,11 +222,22 @@ fn _pg_terminate(fd) {
 
 # Connect to PostgreSQL. Returns PgConn or 0.
 fn pg_connect(host, port, user, database, password) {
+    # `host` used to be accepted and then ignored — every connection went to
+    # INADDR_LOOPBACK() no matter what the caller asked for. Now parsed; a
+    # non-dotted-quad host is a hard failure rather than a silent redirect to
+    # localhost. (No resolver in the stdlib: pass an IPv4 literal.)
+    var addr = INADDR_LOOPBACK();
+    if (host != 0 && strlen(host) > 0) {
+        addr = majra_parse_ipv4(host);
+        if (addr < 0) { return 0; }
+    }
+    _pg_connect_lock();
     _pg_fd_g = syscall(41, AF_INET, SOCK_STREAM, 0);
-    if (_pg_fd_g < 0) { return 0; }
-    var sa = sockaddr_in(INADDR_LOOPBACK(), port);
+    if (_pg_fd_g < 0) { mutex_unlock(_pg_connect_mtx); return 0; }
+    var sa = sockaddr_in(addr, port);
     if (syscall(42, _pg_fd_g, sa, 16) < 0) {
         syscall(SYS_CLOSE, _pg_fd_g);
+        mutex_unlock(_pg_connect_mtx);
         return 0;
     }
     _pg_user_g = user;
@@ -153,35 +249,51 @@ fn pg_connect(host, port, user, database, password) {
 
     # Read auth response
     var msg = _pg_read_msg(fd);
-    if (msg == 0) { syscall(SYS_CLOSE, fd); return 0; }
+    if (msg == 0) { syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
 
     var msg_type = load64(msg);
     if (msg_type == PG_MSG_AUTH) {
+        # A message whose declared length is exactly 4 carries no body, so
+        # load64(msg + 8) is 0 — reading the auth type straight off it was a
+        # null dereference on a malformed (or hostile) server reply.
+        if (load64(msg + 16) < 4) { syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
         var auth_type = _pg_read_be32(load64(msg + 8), 0);
         if (auth_type == PG_AUTH_CLEARTEXT) {
-            _pg_send_password(fd, _pg_pw_g);
-            # Read AuthenticationOk
+            if (_pg_send_password(fd, _pg_pw_g) < 0) { syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
             msg = _pg_read_msg(fd);
-            if (msg == 0) { syscall(SYS_CLOSE, fd); return 0; }
+            if (msg == 0) { syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
+            if (load64(msg + 16) < 4) { syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
+            auth_type = _pg_read_be32(load64(msg + 8), 0);
         }
-        if (auth_type != PG_AUTH_OK && _pg_read_be32(load64(msg + 8), 0) != PG_AUTH_OK) {
+        if (auth_type != PG_AUTH_OK) {
+            # Includes SASL/SCRAM-SHA-256 (type 10), which majra does not
+            # implement — fail closed rather than proceed unauthenticated.
             syscall(SYS_CLOSE, fd);
+            mutex_unlock(_pg_connect_mtx);
             return 0;
         }
     }
 
-    # Read until ReadyForQuery
+    # Read until ReadyForQuery. A _pg_read_msg failure is NOT equivalent to
+    # ReadyForQuery: treating it as such handed back a fully-formed connection
+    # struct for a socket that had already failed or closed, and every later
+    # pg_query on it returned an empty row set indistinguishable from "no
+    # rows". Fail the connect instead.
     var done = 0;
     while (done == 0) {
         msg = _pg_read_msg(fd);
-        if (msg == 0 || load64(msg) == PG_MSG_READY) {
-            done = 1;
+        if (msg == 0) {
+            syscall(SYS_CLOSE, fd);
+            mutex_unlock(_pg_connect_mtx);
+            return 0;
         }
+        if (load64(msg) == PG_MSG_READY) { done = 1; }
     }
 
     var conn = fl_alloc(16);
     store64(conn, fd);
     store64(conn + 8, 1);
+    mutex_unlock(_pg_connect_mtx);
     return conn;
 }
 
@@ -204,37 +316,66 @@ fn pg_query(conn, sql) {
         var mtype = load64(msg);
 
         if (mtype == PG_MSG_ROW_DESC) {
-            # Parse field count
+            if (load64(msg + 8) == 0 || load64(msg + 16) < 2) { break; }
             num_cols = _pg_read_be16(load64(msg + 8), 0);
         }
         elif (mtype == PG_MSG_DATA_ROW) {
             var data = load64(msg + 8);
+            var data_len = load64(msg + 16);
+            # Every offset below is derived from the wire, so each one is
+            # bounded against the message body the server actually sent.
+            if (data == 0 || data_len < 2) { break; }
             var col_count = _pg_read_be16(data, 0);
+            # Each column costs at least its own 4-byte length prefix.
+            if (col_count > (data_len - 2) / 4) { break; }
             var row = vec_new();
             var pos = 2;
             var ci = 0;
+            var bad = 0;
             while (ci < col_count) {
-                var col_len = _pg_read_be32(data, pos);
-                pos = pos + 4;
-                if (col_len < 0) {
-                    # NULL value
-                    vec_push(row, 0);
-                } else {
-                    var val = fl_alloc(col_len + 1);
-                    memcpy(val, data + pos, col_len);
-                    store8(val + col_len, 0);
-                    vec_push(row, val);
-                    pos = pos + col_len;
+                if (pos + 4 > data_len) { bad = 1; ci = col_count; }
+                else {
+                    # SIGNED read: PostgreSQL encodes NULL as length -1, and
+                    # the zero-extending _pg_read_be32 turned that into
+                    # 4294967295 — a 4 GiB alloc + 4 GiB memcpy on any NULL.
+                    var col_len = _pg_read_i32(data, pos);
+                    pos = pos + 4;
+                    if (col_len < 0) {
+                        vec_push(row, 0);
+                    } elif (col_len > data_len - pos) {
+                        bad = 1;
+                        ci = col_count;
+                    } else {
+                        var val = fl_alloc(col_len + 1);
+                        if (val == 0) { bad = 1; ci = col_count; }
+                        else {
+                            memcpy(val, data + pos, col_len);
+                            store8(val + col_len, 0);
+                            vec_push(row, val);
+                            pos = pos + col_len;
+                        }
+                    }
+                    ci = ci + 1;
                 }
-                ci = ci + 1;
             }
+            if (bad == 1) { break; }
             vec_push(rows, row);
         }
         elif (mtype == PG_MSG_CMD_COMPLETE) {
             # Command completed
         }
         elif (mtype == PG_MSG_ERROR) {
-            # Error response
+            # PostgreSQL ALWAYS sends ReadyForQuery after ErrorResponse.
+            # Breaking here left it queued, so the next pg_query read the
+            # previous query's ReadyForQuery as its own first message and
+            # every subsequent result was offset by one. Drain to the real
+            # sync point before returning.
+            var draining = 1;
+            while (draining == 1) {
+                var m2 = _pg_read_msg(fd);
+                if (m2 == 0) { draining = 0; }
+                elif (load64(m2) == PG_MSG_READY) { draining = 0; }
+            }
             break;
         }
         elif (mtype == PG_MSG_READY) {
