@@ -291,12 +291,23 @@ fn test_ws_framing() {
     assert(WS_MAX_PAYLOAD > 0, "payload cap set");
     assert(WS_MAX_PAYLOAD < 9223372036854775807, "payload cap bounded (CVE-2026-1528 class)");
 
-    # ws_send_pong refuses an over-long control payload rather than truncating
-    # the length into a byte and writing the full body anyway.
-    assert_eq(ws_send_pong(-1, "x", 126), -1, "pong refuses len > 125");
-    assert_eq(ws_send_pong(-1, "x", -1), -1, "pong refuses negative len");
-    # A negative length is refused before any write is attempted.
-    assert_eq(ws_send_text(-1, "x", -1), -1, "send_text refuses negative len");
+    # Over a REAL fd, so a refusal is distinguishable from a write failure.
+    # These assertions used to run against fd = -1, where every path returns
+    # -1 and removing the guards would not have failed the test.
+    var sv[8];
+    syscall(53, 1, 1, 0, &sv);
+    var wa = load32(&sv);
+    var wb = load32(&sv + 4);
+
+    assert_eq(ws_send_pong(wa, "x", 1), 0, "a legal 1-byte pong SUCCEEDS on a live fd");
+    assert_eq(ws_send_pong(wa, "x", 126), -1, "pong refuses len > 125 (RFC 6455 5.5)");
+    assert_eq(ws_send_pong(wa, "x", -1), -1, "pong refuses negative len");
+    assert_eq(ws_send_close(wa), 0, "close frame writes on a live fd");
+    assert_eq(ws_send_text(wa, "hi", 2), 0, "a short text frame SUCCEEDS on a live fd");
+    assert_eq(ws_send_text(wa, "x", -1), -1, "send_text refuses negative len");
+
+    syscall(SYS_CLOSE, wa);
+    syscall(SYS_CLOSE, wb);
 
     println("  ws_framing: ok");
 }
@@ -465,6 +476,74 @@ fn test_parse_ipv4() {
 
 # 2.6.9: the RESP reply parser takes its allocation size, loop bound and
 # recursion depth straight off the wire. These are the caps that bound them.
+# Build a RedisConn wrapping an existing fd (layout: fd@0, prefix@8).
+fn _mk_conn(fd) {
+    var rc = fl_alloc(16);
+    store64(rc, fd);
+    store64(rc + 8, "");
+    return rc;
+}
+
+# Feed `bytes` into a socketpair and parse them as one RESP reply.
+# Returns the conn so the caller can inspect liveness; reply via ret2.
+fn _resp_parse(bytes, len) {
+    var sv[8];
+    syscall(53, 1, 1, 0, &sv);
+    var a = load32(&sv);
+    var b = load32(&sv + 4);
+    syscall(SYS_WRITE, a, bytes, len);
+    var rc = _mk_conn(b);
+    var reply = _resp_read_reply(rc);
+    syscall(SYS_CLOSE, a);
+    ret2(rc, reply);
+}
+
+# 2.6.10: these used to assert only that three constants were positive and
+# that i64 addition wraps — neither of which can detect the guards being
+# removed. Now they drive the parser over a real socket.
+fn test_resp_parser() {
+    # A nil bulk string is a VALID reply, not a failure. 2.6.9's
+    # `if (elem == 0) { return arr; }` truncated arrays containing one.
+    var c1 = _resp_parse("*2\r\n$-1\r\n:7\r\n", 15);
+    var r1 = rethi();
+    assert_eq(vec_len(r1), 2, "array with a nil element keeps BOTH elements");
+    assert_eq(vec_get(r1, 0), 0, "nil element is 0");
+    assert_eq(vec_get(r1, 1), 7, "element after the nil survives");
+    assert_eq(redis_is_alive(c1), 1, "a nil element does NOT poison the connection");
+
+    # The integer 0 is likewise valid — the rate-limiter reply shape.
+    var c2 = _resp_parse("*2\r\n:0\r\n:1\r\n", 14);
+    var r2 = rethi();
+    assert_eq(vec_len(r2), 2, "array containing :0 keeps both elements");
+    assert_eq(vec_get(r2, 0), 0, "the :0 element");
+    assert_eq(vec_get(r2, 1), 1, "the element after it");
+    assert_eq(redis_is_alive(c2), 1, ":0 does not poison the connection");
+
+    # An over-cap bulk length must be refused AND must kill the connection,
+    # because the body it announced can never be consumed.
+    var c3 = _resp_parse("$999999999\r\n", 13);
+    assert_eq(rethi(), 0, "over-cap bulk length is refused");
+    assert_eq(redis_is_alive(c3), 0, "over-cap bulk POISONS the connection");
+
+    # Same for an over-cap array count.
+    var c4 = _resp_parse("*99999999\r\n", 12);
+    assert_eq(redis_is_alive(c4), 0, "over-cap array count poisons the connection");
+
+    # And for an unrecognised type byte — we no longer know where the next
+    # reply begins.
+    var c5 = _resp_parse("!nope\r\n", 8);
+    assert_eq(rethi(), 0, "unknown type byte is refused");
+    assert_eq(redis_is_alive(c5), 0, "unknown type byte poisons the connection");
+
+    # A well-formed simple string round-trips and leaves the conn healthy.
+    var c6 = _resp_parse("+PONG\r\n", 8);
+    var r6 = rethi();
+    assert_eq(str_eq(r6, str_from("PONG")), 1, "simple string round-trips");
+    assert_eq(redis_is_alive(c6), 1, "healthy reply leaves the connection alive");
+
+    println("  resp_parser: ok");
+}
+
 fn test_resp_limits() {
     assert(RESP_MAX_BULK > 0, "resp bulk cap set");
     assert(RESP_MAX_ARRAY > 0, "resp array cap set");
@@ -496,6 +575,7 @@ fn main() {
     test_pg_literal_escaping();
     test_parse_ipv4();
     test_resp_limits();
+    test_resp_parser();
     test_ws_framing();
 
     return assert_summary();

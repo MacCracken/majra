@@ -1238,6 +1238,10 @@ fn _dag_test_exec(step, ctx) {
     return step_result_new(STEP_COMPLETED, load64(step), 0);
 }
 
+fn _dag_always_ok(step, ctx) {
+    return step_result_new(STEP_COMPLETED, 0, "ok");
+}
+
 fn _dag_fail_then_succeed(step, ctx) {
     # Fail on first attempt, succeed on retry
     # Use a global to track attempts
@@ -1248,6 +1252,79 @@ fn _dag_fail_then_succeed(step, ctx) {
     return step_result_new(STEP_COMPLETED, 42, 0);
 }
 var _dag_attempt = 0;
+
+# 2.6.10: nothing exercised _compute_tiers's malformed-DAG rejection, which
+# 2.6.9 added. Before it, a cycle made Kahn's loop break and hand back the
+# acyclic PREFIX, so workflow_execute ran part of the workflow and reported
+# RUN_COMPLETED — a workflow silently missing its tail.
+# 2.6.10: no test or caller anywhere exercised transport_send /
+# transport_recv, which is why 2.6.9's fncall2 -> fncall3 fix (they were
+# silently dropping the `len` argument the vtable contract documents) went
+# unverified. This registers a 3-arg implementation and checks the length
+# actually arrives.
+var _tp_last_len = 0;
+
+fn _tp_send(self_ptr, data, len) {
+    _tp_last_len = len;
+    return len;
+}
+
+fn _tp_recv(self_ptr, buf, buf_len) {
+    _tp_last_len = buf_len;
+    return buf_len;
+}
+
+fn test_transport_vtable_arity() {
+    var vt = fl_alloc(32);
+    store64(vt, &_tp_send);
+    store64(vt + 8, &_tp_recv);
+    store64(vt + 16, 0);
+    store64(vt + 24, 0);
+
+    _tp_last_len = 0;
+    assert_eq(transport_send(vt, 0, "payload", 7), 7, "transport_send returns the impl result");
+    assert_eq(_tp_last_len, 7, "transport_send FORWARDS len (was dropped by fncall2)");
+
+    _tp_last_len = 0;
+    assert_eq(transport_recv(vt, 0, "buf", 3), 3, "transport_recv returns the impl result");
+    assert_eq(_tp_last_len, 3, "transport_recv FORWARDS buf_len");
+    println("  transport_vtable_arity: ok");
+}
+
+fn test_dag_rejects_cycle() {
+    var def = workflow_def_new("cyc", "cyclic workflow");
+    var a = workflow_step_new("a", "step a");
+    var b = workflow_step_new("b", "step b");
+    step_add_dep(a, "b");
+    step_add_dep(b, "a");
+    workflow_def_add_step(def, a);
+    workflow_def_add_step(def, b);
+    assert_eq(workflow_execute(def, &_dag_always_ok, 0), RUN_FAILED,
+        "a dependency cycle FAILS the run rather than running a prefix");
+    println("  dag_rejects_cycle: ok");
+}
+
+# A dependency on a step id that is not in the workflow is equally malformed.
+fn test_dag_rejects_dangling_dep() {
+    var def = workflow_def_new("dangle", "dangling dep");
+    var a = workflow_step_new("a", "step a");
+    step_add_dep(a, "nonexistent");
+    workflow_def_add_step(def, a);
+    assert_eq(workflow_execute(def, &_dag_always_ok, 0), RUN_FAILED,
+        "a dangling dependency FAILS the run");
+    println("  dag_rejects_dangling_dep: ok");
+}
+
+# Duplicate step ids collapse into one in-degree entry, silently dropping
+# every duplicate after the first.
+fn test_dag_rejects_duplicate_ids() {
+    var def = workflow_def_new("dup", "duplicate ids");
+    workflow_def_add_step(def, workflow_step_new("same", "first"));
+    workflow_def_add_step(def, workflow_step_new("same", "second"));
+    assert_eq(workflow_execute(def, &_dag_always_ok, 0), RUN_FAILED,
+        "duplicate step ids FAIL the run");
+    println("  dag_rejects_duplicate_ids: ok");
+}
 
 fn test_dag_retry() {
     var def = workflow_def_new("retry-test", "retry workflow");
@@ -1475,6 +1552,10 @@ fn main() {
     test_fleet_empty_submit();
 
     # DAG
+    test_transport_vtable_arity();
+    test_dag_rejects_cycle();
+    test_dag_rejects_dangling_dep();
+    test_dag_rejects_duplicate_ids();
     test_dag_retry();
     test_dag_skip_policy();
     test_dag_storage_crud();
