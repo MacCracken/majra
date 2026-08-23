@@ -182,6 +182,37 @@ fn _pg_read_msg(fd) {
     return result;
 }
 
+# Append `s` to `sb` as a QUOTED, ESCAPED SQL string literal, including the
+# surrounding single quotes.
+#
+# majra's PostgreSQL client speaks the simple query protocol and implements no
+# prepared statements, so every value reaches the server inside a literal and
+# escaping is the only defence available. Standard SQL: a single quote inside a
+# literal is written twice. PostgreSQL has defaulted standard_conforming_strings
+# to on since 9.1, so a backslash is an ordinary character and needs no
+# treatment; majra never emits E'' strings, where that would not hold.
+#
+# Returns 0 on success, -1 if `s` is null.
+fn _pg_add_literal(sb, s) {
+    if (s == 0) { return -1; }
+    str_builder_add_cstr(sb, "'");
+    var n = strlen(s);
+    var i = 0;
+    while (i < n) {
+        var c = load8(s + i);
+        if (c == 39) { str_builder_add_cstr(sb, "''"); }
+        else {
+            var one[2];
+            store8(&one, c);
+            store8(&one + 1, 0);
+            str_builder_add_cstr(sb, &one);
+        }
+        i = i + 1;
+    }
+    str_builder_add_cstr(sb, "'");
+    return 0;
+}
+
 # Send a simple query
 fn _pg_send_query(fd, sql) {
     var sql_len = strlen(sql);
@@ -431,28 +462,28 @@ fn pg_init_workflow_tables(conn) {
 fn pg_save_workflow_def(conn, def_id, name, steps_json) {
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "INSERT INTO majra_workflow_definitions ");
-    str_builder_add_cstr(sb, "(id, name, steps_json, created_at, updated_at) VALUES ('");
-    str_builder_add_cstr(sb, def_id);
-    str_builder_add_cstr(sb, "', '");
-    str_builder_add_cstr(sb, name);
-    str_builder_add_cstr(sb, "', '");
-    str_builder_add_cstr(sb, steps_json);
+    str_builder_add_cstr(sb, "(id, name, steps_json, created_at, updated_at) VALUES (");
+    if (_pg_add_literal(sb, def_id) < 0) { return -1; }
+    str_builder_add_cstr(sb, ", ");
+    if (_pg_add_literal(sb, name) < 0) { return -1; }
+    str_builder_add_cstr(sb, ", ");
+    if (_pg_add_literal(sb, steps_json) < 0) { return -1; }
     var now = time_now_ns() / 1000000;
-    str_builder_add_cstr(sb, "', ");
+    str_builder_add_cstr(sb, ", ");
     str_builder_add_int(sb, now);
     str_builder_add_cstr(sb, ", ");
     str_builder_add_int(sb, now);
     str_builder_add_cstr(sb, ") ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, ");
     str_builder_add_cstr(sb, "steps_json = EXCLUDED.steps_json, updated_at = EXCLUDED.updated_at");
     pg_exec(conn, str_data(str_builder_build(sb)));
+    return 0;
 }
 
 # Get a workflow definition by ID. Returns first row or 0.
 fn pg_get_workflow_def(conn, def_id) {
     var sb = str_builder_new();
-    str_builder_add_cstr(sb, "SELECT id, name, steps_json FROM majra_workflow_definitions WHERE id = '");
-    str_builder_add_cstr(sb, def_id);
-    str_builder_add_cstr(sb, "'");
+    str_builder_add_cstr(sb, "SELECT id, name, steps_json FROM majra_workflow_definitions WHERE id = ");
+    if (_pg_add_literal(sb, def_id) < 0) { return 0; }
     var rows = pg_query(conn, str_data(str_builder_build(sb)));
     if (vec_len(rows) == 0) { return 0; }
     return vec_get(rows, 0);
@@ -461,8 +492,8 @@ fn pg_get_workflow_def(conn, def_id) {
 # Delete a workflow definition.
 fn pg_delete_workflow_def(conn, def_id) {
     var sb = str_builder_new();
-    str_builder_add_cstr(sb, "DELETE FROM majra_workflow_definitions WHERE id = '");
-    str_builder_add_cstr(sb, def_id);
-    str_builder_add_cstr(sb, "'");
+    str_builder_add_cstr(sb, "DELETE FROM majra_workflow_definitions WHERE id = ");
+    if (_pg_add_literal(sb, def_id) < 0) { return -1; }
     pg_exec(conn, str_data(str_builder_build(sb)));
+    return 0;
 }

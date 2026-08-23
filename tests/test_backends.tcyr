@@ -419,6 +419,33 @@ fn test_pg_wire() {
 # 2.6.9: redis_connect/pg_connect accepted a `host` argument and ignored it,
 # always dialling INADDR_LOOPBACK(). majra_parse_ipv4 is what makes `host`
 # load-bearing; a bad literal must fail rather than silently mean localhost.
+# 2.6.10: pg_save/get/delete_workflow_def spliced caller strings straight into
+# quoted SQL literals — an injection the FIRST audit pass missed entirely.
+# _pg_add_literal doubles embedded quotes per the SQL standard.
+fn test_pg_literal_escaping() {
+    var sb = str_builder_new();
+    assert_eq(_pg_add_literal(sb, "plain"), 0, "escape plain returns ok");
+    assert_eq(streq(str_data(str_builder_build(sb)), "'plain'"), 1, "plain is quoted");
+
+    var sb2 = str_builder_new();
+    _pg_add_literal(sb2, "it's");
+    assert_eq(streq(str_data(str_builder_build(sb2)), "'it''s'"), 1, "single quote is doubled");
+
+    # The injection shape: closing the literal and appending SQL.
+    var sb3 = str_builder_new();
+    _pg_add_literal(sb3, "x'; DROP TABLE majra_workflow_definitions; --");
+    assert_eq(streq(str_data(str_builder_build(sb3)),
+        "'x''; DROP TABLE majra_workflow_definitions; --'"), 1,
+        "injection payload stays inside one literal");
+
+    var sb4 = str_builder_new();
+    _pg_add_literal(sb4, "");
+    assert_eq(streq(str_data(str_builder_build(sb4)), "''"), 1, "empty string is an empty literal");
+
+    assert_eq(_pg_add_literal(sb, 0), -1, "null is refused");
+    println("  pg_literal_escaping: ok");
+}
+
 fn test_parse_ipv4() {
     assert_eq(majra_parse_ipv4("127.0.0.1"), INADDR_LOOPBACK(), "ipv4 loopback matches INADDR_LOOPBACK");
     assert_eq(majra_parse_ipv4("0.0.0.0"), 0, "ipv4 all-zero");
@@ -466,6 +493,7 @@ fn main() {
     test_ws_accept_key();
     test_redis_resp();
     test_pg_wire();
+    test_pg_literal_escaping();
     test_parse_ipv4();
     test_resp_limits();
     test_ws_framing();

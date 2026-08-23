@@ -272,11 +272,15 @@ fn chb_register(cht, id, metadata) {
 }
 
 fn chb_register_with_telemetry(cht, id, metadata, gpu_vec) {
+    # Same re-registration leak chb_register closes: replacing an existing
+    # entry abandoned the previous NodeState. 2.6.9 fixed only chb_register.
     var mtx = load64(cht + 16);
     mutex_lock(mtx);
+    var prev = map_get(load64(cht), id);
     var ns = _node_state_new(metadata);
     store64(ns + 24, gpu_vec);
     map_set(load64(cht), id, ns);
+    if (prev != 0) { fl_free(prev); }
     mutex_unlock(mtx);
 }
 
@@ -402,12 +406,34 @@ fn chb_update_statuses(cht) {
     return transitions;
 }
 
+# Returns a CALLER-OWNED COPY of the node's state, or 0. Release with
+# chb_node_free.
+#
+# This used to hand back the tracker's internal NodeState pointer after
+# dropping the mutex. That was merely racy until 2.6.9 added fl_free on every
+# removal path — at which point it became a USE-AFTER-FREE: an eviction sweep
+# or a deregister on another thread can recycle the block while the caller is
+# still reading it, and the freelist will hand those 40 bytes to the next
+# allocation. Copying under the lock is the only way to hand out a value that
+# stays valid without refcounting.
 fn chb_get(cht, id) {
+    if (cht == 0) { return 0; }
     var mtx = load64(cht + 16);
     mutex_lock(mtx);
     var ns = map_get(load64(cht), id);
+    var copy = 0;
+    if (ns != 0) {
+        copy = fl_alloc(40);
+        if (copy != 0) { memcpy(copy, ns, 40); }
+    }
     mutex_unlock(mtx);
-    return ns;
+    return copy;
+}
+
+# Release a NodeState copy returned by chb_get.
+fn chb_node_free(ns) {
+    if (ns != 0) { fl_free(ns); }
+    return 0;
 }
 
 fn chb_get_gpu_telemetry(cht, id) {
