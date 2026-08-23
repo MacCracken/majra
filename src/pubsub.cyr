@@ -94,14 +94,52 @@ fn matches_pattern(topic, pattern) {
 
 # --- Subscriber ---
 # A subscriber has a channel and an optional filter function pointer.
-# Subscriber struct (16 bytes):
-#   offset 0: chan (i64) — MPSC channel ptr
-#   offset 8: filter_fn (i64) — function ptr or 0
+# --- Lag policy ---
+#
+# What a publish does when a subscriber's 64-slot ring is full.
+#
+# BLOCK is the default and preserves the contract 2.5.3 established: the
+# publish parks until the consumer drains. 2.5.3 bounded the blast radius to
+# the single publish call (the hub mutex is released first), so a lagging
+# consumer no longer freezes unrelated topics — but a subscriber ABANDONED
+# without draining still wedges publishes to its own topic permanently, and
+# before 2.7.0 there was no unsubscribe with which to break that.
+#
+# The alternatives are opt-in per subscription, because the right answer is the
+# caller's: dropping trades a wedge for silent message loss, which for a queue
+# engine is often the worse failure. Chosen deliberately rather than baked in.
+enum PubSubLagPolicy {
+    PUBSUB_LAG_BLOCK = 0;        # park until there is room (default)
+    PUBSUB_LAG_DROP_NEWEST = 1;  # discard the message being published
+    PUBSUB_LAG_DROP_OLDEST = 2;  # evict the oldest queued message, then enqueue
+    PUBSUB_LAG_UNSUBSCRIBE = 3;  # self-heal: deactivate the subscription
+}
 
+# Subscriber struct (40 bytes):
+#   offset  0: chan (i64) — MPSC channel ptr
+#   offset  8: filter_fn (i64) — function ptr or 0
+#   offset 16: active (i64) — 1 while subscribed, 0 once unsubscribed
+#   offset 24: policy (i64) — PubSubLagPolicy
+#   offset 32: dropped (i64) — messages this subscription lost to lag
+#
+# ⚠ UNSUBSCRIBE TOMBSTONES, IT DOES NOT REMOVE.
+#
+# pubsub_publish snapshots each subscriber list as a (data, len) pair under a
+# short lock and walks it UNLOCKED — which is only sound because pushes append
+# and never shift. A `vec_remove` would move live entries under an in-flight
+# walk, so unsubscribe clears `active` instead and the walk skips it. That
+# keeps the 2.5.3 head-of-line fix and the unsubscribe from being in tension.
+#
+# Reclamation happens by REPLACING the vec (see _pubsub_compact), never by
+# shifting one, so an in-flight snapshot keeps pointing at a still-valid
+# backing buffer.
 fn _sub_new(chan, filter_fn) {
-    var s = fl_alloc(16);
+    var s = fl_alloc(40);
     store64(s, chan);
     store64(s + 8, filter_fn);
+    store64(s + 16, 1);
+    store64(s + 24, PUBSUB_LAG_BLOCK);
+    store64(s + 32, 0);
     return s;
 }
 
@@ -183,6 +221,51 @@ fn pubsub_subscribe_filtered(ps, topic, filter_fn) {
     return ch;
 }
 
+# Deliver one payload to one subscriber, honouring its lag policy.
+# Returns 1 if the message was queued, 0 otherwise.
+#
+# Called with the hub mutex NOT held — BLOCK genuinely blocks, and parking
+# inside the critical section is the 2.5.3 bug.
+fn _pubsub_deliver(sub, payload) {
+    if (load64(sub + 16) != 1) { return 0; }
+    var ch = load64(sub);
+    var policy = load64(sub + 24);
+
+    if (policy == PUBSUB_LAG_BLOCK) {
+        if (chan_send(ch, payload) == 0) { return 1; }
+        return 0;
+    }
+
+    var rc = chan_try_send(ch, payload);
+    if (rc == 0) { return 1; }
+    # -1 is a closed channel, -2 is a full one. Only the full case is lag.
+    if (rc != 0 - 2) {
+        store64(sub + 32, load64(sub + 32) + 1);
+        return 0;
+    }
+
+    if (policy == PUBSUB_LAG_DROP_NEWEST) {
+        store64(sub + 32, load64(sub + 32) + 1);
+        return 0;
+    }
+    if (policy == PUBSUB_LAG_DROP_OLDEST) {
+        # Evict one queued message to make room. A concurrent consumer may
+        # take that slot first, in which case the retry simply succeeds.
+        chan_try_recv(ch);
+        store64(sub + 32, load64(sub + 32) + 1);
+        if (chan_try_send(ch, payload) == 0) { return 1; }
+        return 0;
+    }
+    if (policy == PUBSUB_LAG_UNSUBSCRIBE) {
+        # Self-healing: an abandoned subscriber deactivates itself rather than
+        # holding its topic hostage.
+        store64(sub + 16, 0);
+        store64(sub + 32, load64(sub + 32) + 1);
+        return 0;
+    }
+    return 0;
+}
+
 # Publish to a topic. Delivers to exact and pattern subscribers.
 # Returns number of subscribers delivered to.
 # The hub mutex is NEVER held across a chan_send. A subscriber channel is
@@ -247,12 +330,7 @@ fn pubsub_publish(ps, topic, payload) {
         var sub = load64(sdata + i * 8);
         var filter = load64(sub + 8);
         if (filter == 0 || fncall1(filter, payload) == 1) {
-            # chan_send is BLOCKING, and deliberately so — see the note above
-            # pubsub_publish. chan_send returns -1 on a closed channel; only
-            # count a real delivery so the return value can't over-report.
-            if (chan_send(load64(sub), payload) == 0) {
-                delivered = delivered + 1;
-            }
+            delivered = delivered + _pubsub_deliver(sub, payload);
         }
         i = i + 1;
     }
@@ -279,9 +357,7 @@ fn pubsub_publish(ps, topic, payload) {
                 var psub = load64(pdata + k * 8);
                 var pfilter = load64(psub + 8);
                 if (pfilter == 0 || fncall1(pfilter, payload) == 1) {
-                    if (chan_send(load64(psub), payload) == 0) {
-                        delivered = delivered + 1;
-                    }
+                    delivered = delivered + _pubsub_deliver(psub, payload);
                 }
                 k = k + 1;
             }
@@ -291,6 +367,143 @@ fn pubsub_publish(ps, topic, payload) {
 
     counter_inc(load64(ps + 24));
     return delivered;
+}
+
+# --- Unsubscribe ---
+
+# Stop delivering to `ch` on `topic`. Returns 1 if a subscription was
+# deactivated, 0 if none matched.
+#
+# ⚠ DELIVERY STOPS PROMPTLY, NOT INSTANTLY. A publish already walking its
+# snapshot may still deliver one more message to this channel. The channel
+# therefore remains VALID and owned by the caller — drain it, then close it
+# with chan_close if you own it. Do not free it out from under a concurrent
+# publish.
+fn pubsub_unsubscribe(ps, topic, ch) {
+    if (ps == 0 || topic == 0 || ch == 0) { return 0; }
+    var mtx = load64(ps + 16);
+    mutex_lock(mtx);
+    var n = _pubsub_deactivate(load64(ps), topic, ch);
+    mutex_unlock(mtx);
+    return n;
+}
+
+# Same, for a pattern subscription.
+fn pubsub_unsubscribe_pattern(ps, pattern, ch) {
+    if (ps == 0 || pattern == 0 || ch == 0) { return 0; }
+    var mtx = load64(ps + 16);
+    mutex_lock(mtx);
+    var n = _pubsub_deactivate(load64(ps + 8), pattern, ch);
+    mutex_unlock(mtx);
+    return n;
+}
+
+# Caller must hold the hub mutex.
+fn _pubsub_deactivate(m, key, ch) {
+    var subs = map_get(m, key);
+    if (subs == 0) { return 0; }
+    var found = 0;
+    var i = 0;
+    var n = vec_len(subs);
+    var dead = 0;
+    while (i < n) {
+        var sub = vec_get(subs, i);
+        if (load64(sub) == ch && load64(sub + 16) == 1) {
+            store64(sub + 16, 0);
+            found = 1;
+        }
+        if (load64(sub + 16) == 0) { dead = dead + 1; }
+        i = i + 1;
+    }
+    # Reclaim once tombstones dominate. Compaction REPLACES the vec rather than
+    # shifting it, so a publish already walking the old snapshot keeps reading
+    # valid memory — the same property that makes vec_push safe here.
+    if (dead > 8 && dead * 2 > n) { _pubsub_compact(m, key, subs); }
+    return found;
+}
+
+# Caller must hold the hub mutex.
+fn _pubsub_compact(m, key, subs) {
+    var fresh = vec_new();
+    var i = 0;
+    var n = vec_len(subs);
+    while (i < n) {
+        var sub = vec_get(subs, i);
+        if (load64(sub + 16) == 1) { vec_push(fresh, sub); }
+        i = i + 1;
+    }
+    map_set(m, key, fresh);
+    return 0;
+}
+
+# Live (non-tombstoned) subscriber count for a topic.
+fn pubsub_subscriber_count(ps, topic) {
+    if (ps == 0) { return 0; }
+    var mtx = load64(ps + 16);
+    mutex_lock(mtx);
+    var subs = map_get(load64(ps), topic);
+    var live = 0;
+    if (subs != 0) {
+        var i = 0;
+        var n = vec_len(subs);
+        while (i < n) {
+            if (load64(vec_get(subs, i) + 16) == 1) { live = live + 1; }
+            i = i + 1;
+        }
+    }
+    mutex_unlock(mtx);
+    return live;
+}
+
+# --- Lag policy control ---
+
+# Subscribe with an explicit lag policy. Returns the channel.
+fn pubsub_subscribe_with_policy(ps, topic, policy) {
+    var ch = pubsub_subscribe(ps, topic);
+    pubsub_set_policy(ps, topic, ch, policy);
+    return ch;
+}
+
+# Set the lag policy for an existing subscription. Returns 1 if it matched.
+fn pubsub_set_policy(ps, topic, ch, policy) {
+    if (ps == 0 || ch == 0) { return 0; }
+    if (policy < PUBSUB_LAG_BLOCK || policy > PUBSUB_LAG_UNSUBSCRIBE) { return 0; }
+    var mtx = load64(ps + 16);
+    mutex_lock(mtx);
+    var subs = map_get(load64(ps), topic);
+    var found = 0;
+    if (subs != 0) {
+        var i = 0;
+        var n = vec_len(subs);
+        while (i < n) {
+            var sub = vec_get(subs, i);
+            if (load64(sub) == ch) { store64(sub + 24, policy); found = 1; }
+            i = i + 1;
+        }
+    }
+    mutex_unlock(mtx);
+    return found;
+}
+
+# How many messages this subscription has lost to lag. Always 0 under
+# PUBSUB_LAG_BLOCK, which never drops.
+fn pubsub_dropped_count(ps, topic, ch) {
+    if (ps == 0 || ch == 0) { return 0; }
+    var mtx = load64(ps + 16);
+    mutex_lock(mtx);
+    var subs = map_get(load64(ps), topic);
+    var n_dropped = 0;
+    if (subs != 0) {
+        var i = 0;
+        var n = vec_len(subs);
+        while (i < n) {
+            var sub = vec_get(subs, i);
+            if (load64(sub) == ch) { n_dropped = load64(sub + 32); }
+            i = i + 1;
+        }
+    }
+    mutex_unlock(mtx);
+    return n_dropped;
 }
 
 fn pubsub_total_published(ps) {

@@ -1279,6 +1279,119 @@ fn _tp_recv(self_ptr, buf, buf_len) {
     return buf_len;
 }
 
+# --- 2.7.0: unsubscribe + per-subscriber lag policy ---
+
+fn test_pubsub_unsubscribe() {
+    var ps = pubsub_new();
+    var a = pubsub_subscribe(ps, "t/x");
+    var b = pubsub_subscribe(ps, "t/x");
+    assert_eq(pubsub_subscriber_count(ps, "t/x"), 2, "two live subscribers");
+
+    assert_eq(pubsub_publish(ps, "t/x", 1), 2, "both receive before unsubscribe");
+    assert_eq(chan_recv(a), 1, "a got it");
+    assert_eq(chan_recv(b), 1, "b got it");
+
+    assert_eq(pubsub_unsubscribe(ps, "t/x", a), 1, "unsubscribe reports a match");
+    assert_eq(pubsub_subscriber_count(ps, "t/x"), 1, "one live subscriber left");
+    assert_eq(pubsub_publish(ps, "t/x", 2), 1, "only the remaining subscriber is delivered to");
+    assert_eq(chan_recv(b), 2, "b still receives");
+
+    # Idempotent, and a non-subscriber is not a match.
+    assert_eq(pubsub_unsubscribe(ps, "t/x", a), 0, "second unsubscribe is a no-op");
+    assert_eq(pubsub_unsubscribe(ps, "t/x", 0), 0, "null channel is refused");
+    assert_eq(pubsub_unsubscribe(ps, "no/such/topic", b), 0, "unknown topic is a no-op");
+    println("  pubsub_unsubscribe: ok");
+}
+
+# The wedge this feature exists to break. A subscriber that never drains fills
+# its 64-slot ring; under the default BLOCK policy the 65th publish would park
+# forever. DROP_NEWEST keeps the publisher moving and counts what was lost.
+fn test_pubsub_lag_drop_newest() {
+    var ps = pubsub_new();
+    var ch = pubsub_subscribe_with_policy(ps, "lag/dn", PUBSUB_LAG_DROP_NEWEST);
+
+    var i = 0;
+    while (i < 64) { pubsub_publish(ps, "lag/dn", i); i = i + 1; }
+    assert_eq(pubsub_dropped_count(ps, "lag/dn", ch), 0, "nothing dropped while the ring has room");
+
+    # The ring is full. Under BLOCK this call would never return.
+    assert_eq(pubsub_publish(ps, "lag/dn", 999), 0, "publish to a full ring delivers to nobody");
+    assert_eq(pubsub_dropped_count(ps, "lag/dn", ch), 1, "and the drop is COUNTED, not silent");
+
+    # The queued messages are intact and in order — DROP_NEWEST discards the
+    # new one, not the backlog.
+    assert_eq(chan_recv(ch), 0, "oldest queued message survived");
+    assert_eq(chan_recv(ch), 1, "and the one after it");
+    println("  pubsub_lag_drop_newest: ok");
+}
+
+fn test_pubsub_lag_drop_oldest() {
+    var ps = pubsub_new();
+    var ch = pubsub_subscribe_with_policy(ps, "lag/do", PUBSUB_LAG_DROP_OLDEST);
+
+    var i = 0;
+    while (i < 64) { pubsub_publish(ps, "lag/do", i); i = i + 1; }
+    # Full. DROP_OLDEST evicts message 0 to make room for 999.
+    assert_eq(pubsub_publish(ps, "lag/do", 999), 1, "DROP_OLDEST still delivers the new message");
+    assert_eq(pubsub_dropped_count(ps, "lag/do", ch), 1, "one message was evicted");
+    assert_eq(chan_recv(ch), 1, "message 0 was evicted; 1 is now oldest");
+    println("  pubsub_lag_drop_oldest: ok");
+}
+
+# The self-healing policy: an abandoned subscriber deactivates itself rather
+# than holding its topic hostage.
+fn test_pubsub_lag_unsubscribe() {
+    var ps = pubsub_new();
+    var dead = pubsub_subscribe_with_policy(ps, "lag/un", PUBSUB_LAG_UNSUBSCRIBE);
+    var live = pubsub_subscribe(ps, "lag/un");
+    assert_eq(pubsub_subscriber_count(ps, "lag/un"), 2, "two subscribers");
+
+    # Fill the abandoned one's ring, draining the healthy one as we go.
+    var i = 0;
+    while (i < 64) { pubsub_publish(ps, "lag/un", i); chan_recv(live); i = i + 1; }
+    assert_eq(pubsub_subscriber_count(ps, "lag/un"), 2, "still two while there was room");
+
+    pubsub_publish(ps, "lag/un", 999);
+    assert_eq(pubsub_subscriber_count(ps, "lag/un"), 1, "the abandoned subscriber removed ITSELF");
+    assert_eq(chan_recv(live), 999, "the healthy subscriber still received it");
+
+    # And the topic keeps working afterwards.
+    assert_eq(pubsub_publish(ps, "lag/un", 1000), 1, "topic is not wedged");
+    assert_eq(chan_recv(live), 1000, "delivery continues");
+    println("  pubsub_lag_unsubscribe: ok");
+}
+
+# BLOCK must remain the default, because 2.5.3's backpressure contract and
+# test_pubsub_no_head_of_line_block both depend on it.
+fn test_pubsub_default_policy_is_block() {
+    var ps = pubsub_new();
+    var ch = pubsub_subscribe(ps, "def/pol");
+    var i = 0;
+    while (i < 64) { pubsub_publish(ps, "def/pol", i); i = i + 1; }
+    # Never dropped anything: BLOCK does not drop.
+    assert_eq(pubsub_dropped_count(ps, "def/pol", ch), 0, "default policy never drops");
+    assert_eq(pubsub_set_policy(ps, "def/pol", ch, 99), 0, "an out-of-range policy is refused");
+    assert_eq(pubsub_set_policy(ps, "def/pol", ch, PUBSUB_LAG_DROP_NEWEST), 1, "policy can be changed");
+    println("  pubsub_default_policy_is_block: ok");
+}
+
+# Tombstones must not accumulate without bound; compaction REPLACES the vec
+# rather than shifting it, so in-flight snapshots stay valid.
+fn test_pubsub_tombstone_compaction() {
+    var ps = pubsub_new();
+    var keep = pubsub_subscribe(ps, "comp/t");
+    var i = 0;
+    while (i < 40) {
+        var tmp = pubsub_subscribe(ps, "comp/t");
+        pubsub_unsubscribe(ps, "comp/t", tmp);
+        i = i + 1;
+    }
+    assert_eq(pubsub_subscriber_count(ps, "comp/t"), 1, "only the kept subscription is live");
+    assert_eq(pubsub_publish(ps, "comp/t", 7), 1, "delivery still works after heavy churn");
+    assert_eq(chan_recv(keep), 7, "and the survivor receives");
+    println("  pubsub_tombstone_compaction: ok");
+}
+
 fn test_transport_vtable_arity() {
     var vt = fl_alloc(32);
     store64(vt, &_tp_send);
@@ -1557,6 +1670,12 @@ fn main() {
     test_fleet_empty_submit();
 
     # DAG
+    test_pubsub_unsubscribe();
+    test_pubsub_lag_drop_newest();
+    test_pubsub_lag_drop_oldest();
+    test_pubsub_lag_unsubscribe();
+    test_pubsub_default_policy_is_block();
+    test_pubsub_tombstone_compaction();
     test_transport_vtable_arity();
     test_dag_rejects_cycle();
     test_dag_rejects_dangling_dep();
