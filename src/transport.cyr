@@ -10,11 +10,11 @@
 #   offset 24: close_fn(self)
 
 fn transport_send(vt, self_ptr, data, len) {
-    return fncall2(load64(vt), self_ptr, data);
+    return fncall3(load64(vt), self_ptr, data, len);
 }
 
 fn transport_recv(vt, self_ptr, buf, buf_len) {
-    return fncall2(load64(vt + 8), self_ptr, buf);
+    return fncall3(load64(vt + 8), self_ptr, buf, buf_len);
 }
 
 fn transport_is_connected(vt, self_ptr) {
@@ -32,45 +32,86 @@ enum CircuitState {
     CIRCUIT_HALF_OPEN = 2;
 }
 
-# CircuitBreaker struct (32 bytes):
+# CircuitBreaker struct (48 bytes):
 #   offset  0: consecutive_failures (i64)
 #   offset  8: tripped_at_ns (i64)
 #   offset 16: failure_threshold (i64)
 #   offset 24: cooldown_ns (i64)
+#   offset 32: mutex (i64)
+#   offset 40: probe_inflight (i64) — 1 once a half-open probe has been handed out
+#
+# The mutex and probe_inflight slots were added at 2.6.9. Before them
+# `circuit_record_failure` did an unsynchronised read-modify-write on the
+# failure counter, so concurrent failures were lost and a breaker driven by a
+# worker pool could sit below its threshold forever; and `circuit_state`
+# returned CIRCUIT_HALF_OPEN to *every* caller once the cooldown elapsed, which
+# is a thundering herd onto the endpoint the breaker exists to protect.
 
 fn circuit_breaker_new(failure_threshold, cooldown_ns) {
-    var cb = fl_alloc(32);
+    var cb = fl_alloc(48);
     store64(cb, 0);
     store64(cb + 8, 0);
     store64(cb + 16, failure_threshold);
     store64(cb + 24, cooldown_ns);
+    store64(cb + 32, mutex_new());
+    store64(cb + 40, 0);
     return cb;
 }
 
+# Half-open admits exactly ONE probe per cooldown window. The first caller
+# after the cooldown elapses gets CIRCUIT_HALF_OPEN and claims the probe;
+# everyone else keeps seeing CIRCUIT_OPEN until that probe reports back via
+# circuit_record_success / circuit_record_failure.
 fn circuit_state(cb) {
+    var mtx = load64(cb + 32);
+    mutex_lock(mtx);
     var failures = load64(cb);
     var threshold = load64(cb + 16);
-    if (failures < threshold) { return CIRCUIT_CLOSED; }
+    if (failures < threshold) {
+        mutex_unlock(mtx);
+        return CIRCUIT_CLOSED;
+    }
     var elapsed = time_now_ns() - load64(cb + 8);
-    if (elapsed >= load64(cb + 24)) { return CIRCUIT_HALF_OPEN; }
+    if (elapsed >= load64(cb + 24)) {
+        if (load64(cb + 40) == 0) {
+            store64(cb + 40, 1);
+            mutex_unlock(mtx);
+            return CIRCUIT_HALF_OPEN;
+        }
+    }
+    mutex_unlock(mtx);
     return CIRCUIT_OPEN;
 }
 
 fn circuit_record_success(cb) {
+    var mtx = load64(cb + 32);
+    mutex_lock(mtx);
     store64(cb, 0);
     store64(cb + 8, 0);
+    store64(cb + 40, 0);
+    mutex_unlock(mtx);
 }
 
 fn circuit_record_failure(cb) {
-    store64(cb, load64(cb) + 1);
-    if (load64(cb) >= load64(cb + 16)) {
+    var mtx = load64(cb + 32);
+    mutex_lock(mtx);
+    var f = load64(cb) + 1;
+    store64(cb, f);
+    if (f >= load64(cb + 16)) {
         store64(cb + 8, time_now_ns());
     }
+    # A failed probe re-arms the cooldown rather than leaving the gate open.
+    store64(cb + 40, 0);
+    mutex_unlock(mtx);
 }
 
 fn circuit_reset(cb) {
+    var mtx = load64(cb + 32);
+    mutex_lock(mtx);
     store64(cb, 0);
     store64(cb + 8, 0);
+    store64(cb + 40, 0);
+    mutex_unlock(mtx);
 }
 
 # ConnectionPool struct (24 bytes):
@@ -95,17 +136,35 @@ fn conn_pool_with_circuit_breaker(pool, endpoint, threshold, cooldown_ns) {
 }
 
 fn conn_pool_circuit_state(pool, endpoint) {
-    var cbs = load64(pool + 8);
-    var cb = map_get(cbs, endpoint);
+    var mtx = load64(pool + 16);
+    mutex_lock(mtx);
+    var cb = map_get(load64(pool + 8), endpoint);
+    mutex_unlock(mtx);
     if (cb == 0) { return CIRCUIT_CLOSED; }
+    # circuit_state takes the breaker's own mutex; don't nest it under the
+    # pool mutex (lock-ordering hazard for no benefit — the breaker pointer
+    # is stable once published).
     return circuit_state(cb);
 }
 
 fn conn_pool_reset_circuit(pool, endpoint) {
+    var mtx = load64(pool + 16);
+    mutex_lock(mtx);
     var cb = map_get(load64(pool + 8), endpoint);
+    mutex_unlock(mtx);
     if (cb != 0) { circuit_reset(cb); }
 }
 
+# Number of endpoints that have a circuit breaker registered.
+#
+# This reads the `circuit_breakers` map at offset 8, NOT the `connections` map
+# at offset 0. Nothing in majra ever inserts into `connections` — there is no
+# acquire/release API — so counting it always returned 0 regardless of how many
+# endpoints were registered. Corrected at 2.6.9.
 fn conn_pool_endpoint_count(pool) {
-    return map_size(load64(pool));
+    var mtx = load64(pool + 16);
+    mutex_lock(mtx);
+    var n = map_size(load64(pool + 8));
+    mutex_unlock(mtx);
+    return n;
 }
