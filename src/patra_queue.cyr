@@ -6,7 +6,17 @@
 # .patra file.
 #
 # Schema:
-#   jobs(id INT, priority INT, payload STR, status INT, created_ns INT)
+#   jobs(id INT, priority INT, payload TEXT, status INT, created_ns INT)
+#
+# ⚠ SCHEMA CHANGE AT 2.6.9: payload was STR, which patra caps at 255 bytes.
+# Enqueue accepted any length and the rejection was discarded, so a longer
+# payload (a JSON spec, a base64 blob) was silently dropped while enqueue
+# reported success. TEXT is chain-page backed and uncapped. An existing
+# .patra file keeps its old STR column — delete it, or migrate, to lift the cap.
+#
+# ⚠ All SQL is built with PREPARED STATEMENTS. Do not reintroduce string
+# concatenation here: the payload is caller-supplied, and splicing it into a
+# quoted literal let it close the literal and rewrite the columns after it.
 #
 # Status codes match the in-memory queue's JOB_* constants from queue.cyr:
 #   0=queued, 1=running, 2=completed, 3=failed
@@ -19,27 +29,32 @@
 #   patra_queue_queued_count(q);
 #   patra_queue_close(q);
 
-# patra_queue struct (24 bytes):
+# patra_queue struct (32 bytes):
 #   offset  0: db (i64)       — patra_open handle
 #   offset  8: next_id (i64)  — monotonic ID counter
 #   offset 16: initialized (i64) — 1 once CREATE TABLE has run
+#   offset 24: mutex (i64)    — guards next_id and the dequeue claim
 
 fn _pq_create_sql() {
     var sb = str_builder_new();
     str_builder_add_cstr(sb, "CREATE TABLE jobs (");
-    str_builder_add_cstr(sb, "id INT, priority INT, payload STR, status INT, created_ns INT)");
+    str_builder_add_cstr(sb, "id INT, priority INT, payload TEXT, status INT, created_ns INT)");
     return str_cstr(str_builder_build(sb));
 }
 
+# Returns PATRA_OK when the table is usable, otherwise the patra error.
+# This used to return 0 unconditionally and patra_queue_new discarded it, so an
+# I/O error or a full store left a live handle pointing at no table.
 fn _pq_ensure_table(pq) {
-    if (load64(pq + 16) == 1) { return 0; }
+    if (load64(pq + 16) == 1) { return PATRA_OK; }
     var db = load64(pq);
     var r = patra_exec(db, _pq_create_sql());
     # PATRA_OK on first create, PATRA_ERR_EXISTS on reopen — both fine.
     if (r == PATRA_OK || r == PATRA_ERR_EXISTS) {
         store64(pq + 16, 1);
+        return PATRA_OK;
     }
-    return 0;
+    return r;
 }
 
 # On open, find the max id in the existing jobs table so new IDs don't
@@ -63,11 +78,17 @@ fn patra_queue_new(path) {
     patra_init();
     var db = patra_open(path);
     if (db == 0) { return 0; }
-    var pq = fl_alloc(24);
+    var pq = fl_alloc(32);
+    if (pq == 0) { patra_close(db); return 0; }
     store64(pq, db);
     store64(pq + 8, 1);
     store64(pq + 16, 0);
-    _pq_ensure_table(pq);
+    store64(pq + 24, mutex_new());
+    if (_pq_ensure_table(pq) != PATRA_OK) {
+        patra_close(db);
+        fl_free(pq);
+        return 0;
+    }
     _pq_load_next_id(pq);
     return pq;
 }
@@ -75,26 +96,44 @@ fn patra_queue_new(path) {
 fn patra_queue_close(pq) {
     if (pq == 0) { return 0; }
     patra_close(load64(pq));
+    store64(pq, 0);
     fl_free(pq);
     return 0;
 }
 
+# Returns the new job id, or 0 if the INSERT did not commit.
+#
+# The payload used to be spliced into a single-quoted SQL literal, so a payload
+# containing a quote closed the literal and rewrote the columns after it — an
+# enqueue of "x', 2, 0) y '" set its own status and created_ns. patra_bind_text
+# writes the bytes to the row without reparsing them as SQL.
+#
+# The return was also discarded, so a rejected INSERT was indistinguishable
+# from a committed one and the caller got an id for a job that does not exist.
 fn patra_queue_enqueue(pq, priority, payload) {
+    if (pq == 0 || payload == 0) { return 0; }
     var db = load64(pq);
-    var id = load64(pq + 8);
-    store64(pq + 8, id + 1);
+    var mtx = load64(pq + 24);
+    mutex_lock(mtx);
 
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "INSERT INTO jobs VALUES (");
-    str_builder_add_int(sb, id);
-    str_builder_add_cstr(sb, ", ");
-    str_builder_add_int(sb, priority);
-    str_builder_add_cstr(sb, ", '");
-    str_builder_add_cstr(sb, payload);
-    str_builder_add_cstr(sb, "', 0, ");
-    str_builder_add_int(sb, time_now_ns());
-    str_builder_add_cstr(sb, ")");
-    patra_exec(db, str_cstr(str_builder_build(sb)));
+    var stmt = patra_prepare(db, "INSERT INTO jobs VALUES (?, ?, ?, 0, ?)");
+    if (stmt == 0) { mutex_unlock(mtx); return 0; }
+
+    var id = load64(pq + 8);
+    patra_bind_int(stmt, 0, id);
+    patra_bind_int(stmt, 1, priority);
+    patra_bind_text(stmt, 2, payload, strlen(payload));
+    patra_bind_int(stmt, 3, time_now_ns());
+
+    var rc = patra_exec_prepared(db, stmt);
+    patra_finalize(stmt);
+    if (rc != PATRA_OK) {
+        mutex_unlock(mtx);
+        return 0;
+    }
+    # Only consume the id once the row is durable.
+    store64(pq + 8, id + 1);
+    mutex_unlock(mtx);
     return id;
 }
 
@@ -107,47 +146,110 @@ fn patra_queue_enqueue(pq, priority, payload) {
 # server-side `ORDER BY priority ASC, id ASC LIMIT 1` returns the
 # right row directly — no client-side scan + sort.
 fn patra_queue_dequeue(pq) {
+    if (pq == 0) { return 0; }
     var db = load64(pq);
-    var rs = patra_query(db, "SELECT * FROM jobs WHERE status = 0 ORDER BY priority ASC, id ASC LIMIT 1");
-    if (rs == 0) { return 0; }
-    if (patra_result_count(rs) == 0) { patra_result_free(rs); return 0; }
+    var mtx = load64(pq + 24);
+    mutex_lock(mtx);
 
-    # SELECT * order: id(0), priority(1), payload(2), status(3), created_ns(4)
-    var best_id  = patra_result_get_int(rs, 0, 0);
-    var best_pri = patra_result_get_int(rs, 0, 1);
+    # The claim is SELECT-then-conditional-UPDATE, and the UPDATE carries
+    # `AND status = 0`. This used to be an unconditional
+    # `UPDATE ... WHERE id = N` with no transaction, so two consumers that
+    # both selected the same row both "claimed" it and the job ran twice.
+    # Now the loser's UPDATE matches zero rows and it retries for another job.
+    var job = 0;
+    var searching = 1;
+    while (searching == 1) {
+        var rs = patra_query(db, "SELECT * FROM jobs WHERE status = 0 ORDER BY priority ASC, id ASC LIMIT 1");
+        if (rs == 0) { searching = 0; }
+        elif (patra_result_count(rs) == 0) {
+            patra_result_free(rs);
+            searching = 0;
+        } else {
+            # SELECT * order: id(0), priority(1), payload(2), status(3), created_ns(4)
+            var best_id  = patra_result_get_int(rs, 0, 0);
+            var best_pri = patra_result_get_int(rs, 0, 1);
 
-    # Copy payload BEFORE freeing the result set (result rows are owned
-    # by the rs buffer).
-    var pay_cstr = patra_result_get_str(rs, 0, 2);
-    var pay_len = strlen(pay_cstr);
-    var pay_copy = fl_alloc(pay_len + 1);
-    memcpy(pay_copy, pay_cstr, pay_len);
-    store8(pay_copy + pay_len, 0);
+            # Copy payload BEFORE freeing the result set (result rows are
+            # owned by the rs buffer).
+            #
+            # payload is a TEXT column since 2.6.9, so it is stored as a
+            # (page, len) reference rather than inline. patra_result_get_str
+            # would hand back a pointer to that REFERENCE STRUCT, and strlen
+            # over it walks raw page-pointer bytes — a garbage length driving
+            # a garbage memcpy. TEXT needs the length/read pair.
+            var pay_len = patra_result_get_text_len(rs, 0, 2);
+            if (pay_len < 0) { pay_len = 0; }
+            var pay_copy = fl_alloc(pay_len + 1);
+            if (pay_copy == 0) { patra_result_free(rs); searching = 0; }
+            else {
+                if (pay_len > 0) {
+                    if (patra_result_read_text(db, rs, 0, 2, pay_copy) != PATRA_OK) {
+                        fl_free(pay_copy);
+                        patra_result_free(rs);
+                        mutex_unlock(mtx);
+                        return 0;
+                    }
+                }
+                store8(pay_copy + pay_len, 0);
+                patra_result_free(rs);
 
-    patra_result_free(rs);
-
-    # Mark running
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "UPDATE jobs SET status = 1 WHERE id = ");
-    str_builder_add_int(sb, best_id);
-    patra_exec(db, str_cstr(str_builder_build(sb)));
-
-    var job = fl_alloc(32);
-    store64(job, best_id);
-    store64(job + 8, best_pri);
-    store64(job + 16, pay_copy);
-    store64(job + 24, 1);
+                var stmt = patra_prepare(db, "UPDATE jobs SET status = 1 WHERE id = ? AND status = 0");
+                if (stmt == 0) { fl_free(pay_copy); searching = 0; }
+                else {
+                    patra_bind_int(stmt, 0, best_id);
+                    var affected[8];
+                    store64(&affected, 0);
+                    var rc = patra_exec_returning(db, stmt, &affected);
+                    patra_finalize(stmt);
+                    if (rc != PATRA_OK) { fl_free(pay_copy); searching = 0; }
+                    elif (load64(&affected) == 0) {
+                        # Another consumer claimed it between our SELECT and
+                        # our UPDATE. Drop this one and look again.
+                        fl_free(pay_copy);
+                    } else {
+                        job = fl_alloc(32);
+                        if (job == 0) { fl_free(pay_copy); }
+                        else {
+                            store64(job, best_id);
+                            store64(job + 8, best_pri);
+                            store64(job + 16, pay_copy);
+                            store64(job + 24, 1);
+                        }
+                        searching = 0;
+                    }
+                }
+            }
+        }
+    }
+    mutex_unlock(mtx);
     return job;
 }
 
+# Release a job struct returned by patra_queue_dequeue.
+fn patra_job_free(j) {
+    if (j == 0) { return 0; }
+    var p = load64(j + 16);
+    if (p != 0) { fl_free(p); }
+    fl_free(j);
+    return 0;
+}
+
+# Returns 1 if a row moved, 0 otherwise. The patra_exec return used to be
+# discarded here too, so a failed status update looked exactly like a
+# successful one.
 fn _pq_update_status(pq, id, new_status) {
+    if (pq == 0) { return 0; }
     var db = load64(pq);
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "UPDATE jobs SET status = ");
-    str_builder_add_int(sb, new_status);
-    str_builder_add_cstr(sb, " WHERE id = ");
-    str_builder_add_int(sb, id);
-    patra_exec(db, str_cstr(str_builder_build(sb)));
+    var stmt = patra_prepare(db, "UPDATE jobs SET status = ? WHERE id = ?");
+    if (stmt == 0) { return 0; }
+    patra_bind_int(stmt, 0, new_status);
+    patra_bind_int(stmt, 1, id);
+    var affected[8];
+    store64(&affected, 0);
+    var rc = patra_exec_returning(db, stmt, &affected);
+    patra_finalize(stmt);
+    if (rc != PATRA_OK) { return 0; }
+    if (load64(&affected) > 0) { return 1; }
     return 0;
 }
 
@@ -157,10 +259,12 @@ fn patra_queue_fail(pq, id)     { return _pq_update_status(pq, id, 3); }
 # Count rows matching a status, server-side. `SELECT COUNT(*) WHERE ...`
 # returns a single-row aggregate; pull the integer out of column 0.
 fn _pq_count_where_status(pq, status) {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "SELECT COUNT(*) FROM jobs WHERE status = ");
-    str_builder_add_int(sb, status);
-    var rs = patra_query(load64(pq), str_cstr(str_builder_build(sb)));
+    if (pq == 0) { return 0; }
+    var stmt = patra_prepare(load64(pq), "SELECT COUNT(*) FROM jobs WHERE status = ?");
+    if (stmt == 0) { return 0; }
+    patra_bind_int(stmt, 0, status);
+    var rs = patra_query_prepared(load64(pq), stmt);
+    patra_finalize(stmt);
     if (rs == 0) { return 0; }
     var n = 0;
     if (patra_result_count(rs) > 0) {

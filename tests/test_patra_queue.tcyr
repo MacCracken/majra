@@ -49,6 +49,9 @@ fn test_patra_queue() {
     var job1 = patra_queue_dequeue(q);
     assert(job1 != 0, "dequeue returned a job");
     assert_eq(patra_job_priority(job1), PRIORITY_CRITICAL, "critical dequeued first");
+    # The payload round-trip was never asserted, so the copy at
+    # patra_queue_dequeue was entirely unverified.
+    assert_eq(streq(patra_job_payload(job1), "job-critical"), 1, "job1 payload round-trips");
     assert_eq(patra_queue_queued_count(q), 2, "2 queued after dequeue");
     assert_eq(patra_queue_running_count(q), 1, "1 running");
 
@@ -74,11 +77,64 @@ fn test_patra_queue() {
     println("  patra_queue: ok");
 }
 
+# 2.6.9 regressions: SQL injection through the payload, the swallowed
+# patra_exec return, and the 255-byte STR cap that silently dropped jobs.
+fn test_patra_queue_hardening() {
+    patra_init();
+    sys_unlink("/tmp/majra_patra_hardening_test.patra");
+    var q = patra_queue_new("/tmp/majra_patra_hardening_test.patra");
+    assert(q != 0, "hardening queue opened");
+
+    #
+    # SQL injection: the payload used to be spliced into a quoted SQL literal,
+    # so a quote closed the literal and rewrote the columns after it. These
+    # payloads must survive byte-for-byte.
+    var before = patra_queue_queued_count(q);
+    var inj_id = patra_queue_enqueue(q, PRIORITY_NORMAL, "it's a job");
+    assert(inj_id != 0, "enqueue with an apostrophe returns an id");
+    assert_eq(patra_queue_queued_count(q), before + 1, "apostrophe payload actually committed");
+
+    var evil = "x', 2, 0) y '";
+    var evil_id = patra_queue_enqueue(q, PRIORITY_LOW, evil);
+    assert(evil_id != 0, "enqueue with injection payload returns an id");
+    assert_eq(patra_queue_queued_count(q), before + 2, "injection payload committed as data");
+
+    # A long payload: the column was STR (patra caps it at 255) and the
+    # rejection was swallowed, so enqueue reported success and dropped the job.
+    var big = fl_alloc(1200);
+    memset(big, 122, 1199);
+    store8(big + 1199, 0);
+    var big_id = patra_queue_enqueue(q, PRIORITY_LOW, big);
+    assert(big_id != 0, "enqueue of a 1199-byte payload returns an id");
+    assert_eq(patra_queue_queued_count(q), before + 3, "long payload actually committed (TEXT column)");
+
+    # Drain and verify the injection payload comes back verbatim.
+    var found_evil = 0;
+    var drain = patra_queue_dequeue(q);
+    while (drain != 0) {
+        if (streq(patra_job_payload(drain), evil) == 1) { found_evil = 1; }
+        patra_queue_complete(q, patra_job_id(drain));
+        patra_job_free(drain);
+        drain = patra_queue_dequeue(q);
+    }
+    assert_eq(found_evil, 1, "injection payload stored and returned verbatim");
+    assert_eq(patra_queue_queued_count(q), 0, "queue drained");
+
+    # A status update for an id that does not exist must report no-op, not
+    # success — the patra_exec return used to be discarded entirely.
+    assert_eq(patra_queue_complete(q, 999999), 0, "complete on a missing id reports 0 rows");
+
+    patra_queue_close(q);
+    sys_unlink("/tmp/majra_patra_hardening_test.patra");
+    println("  patra_queue_hardening: ok");
+}
+
 fn main() {
     alloc_init();
     fl_init();
     println("=== majra patra_queue tests ===");
     test_patra_queue();
+    test_patra_queue_hardening();
     return assert_summary();
 }
 
