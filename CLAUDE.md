@@ -107,7 +107,7 @@ Run this pass before tagging `X.Y.0` or `X.0.0` — ship the result as the last 
 4. Benchmark additions for new code; `cyrius bench` for regression check.
 5. Policy: `cyrius deny src/main.cyr` if touching syscall / network / fs surfaces.
 6. Regenerate all four dist bundles if `src/` changed.
-7. Docs: `CHANGELOG.md`, `docs/development/roadmap.md`, `docs/development/state.md`, [`docs/doc-health.md`](docs/doc-health.md) row touch.
+7. Docs: `CHANGELOG.md` stanza, `docs/development/state.md` refresh, [`docs/doc-health.md`](docs/doc-health.md) row touch, and **delete** any [`roadmap.md`](docs/development/roadmap.md) item this work shipped.
 8. Version sync: `VERSION` is the source of truth; `cyrius.cyml` reads it via `${file:VERSION}`.
 
 ### Closeout Pass (last patch of every minor, before tagging `X.Y+1.0`)
@@ -117,7 +117,7 @@ Subset of P(-1) — same shape, lighter touch:
 1. Full test suite — `0 failed` across all 4 suites + fuzz.
 2. Benchmark vs prior closeout — flag regressions > 10%.
 3. Cleanup sweep — stale comments, dead `#ifdef` branches, unused includes.
-4. Doc sync — CHANGELOG stanza, roadmap "Recently shipped" update, state.md refresh, doc-health.md sweep.
+4. Doc sync — CHANGELOG stanza, state.md refresh, doc-health.md sweep, and prune shipped items out of roadmap.md (it is forward-facing; shipped work belongs only in the CHANGELOG).
 5. Bundle regen — all four `cyrius distlib` profiles.
 6. Version verify — `VERSION`, `cyrius.cyml`, CHANGELOG header, intended git tag all match.
 7. Clean build — `rm -rf build lib && cyrius lib sync --full && cyrius deps && cyrius build --no-deps src/main.cyr build/majra` passes from cold.
@@ -166,7 +166,7 @@ How we write majra code in cyrius. For *compiler gotchas* (clobbering, fixup cap
 - [`CHANGELOG.md`](CHANGELOG.md) — source of truth for shipped work.
 - [`docs/architecture/overview.md`](docs/architecture/overview.md) — system-level module map + data flow.
 - [`docs/architecture/`](docs/architecture/) — design notes about majra (numbered, never-renumbered). Empty beyond `overview.md` today; add an entry when a load-bearing majra invariant earns one. *Not* the place for "cyrius did X weird"-style notes — toolchain conventions live in this file's Cyrius Conventions section; toolchain-version-tied gotchas live in [`docs/development/dependency-watch.md`](docs/development/dependency-watch.md).
-- [`docs/development/roadmap.md`](docs/development/roadmap.md) — recently shipped + open items + waiting-on-upstream.
+- [`docs/development/roadmap.md`](docs/development/roadmap.md) — **forward-facing only**: Now / Next / Backlog / Waiting-on-upstream / Non-goals, each backlog entry naming the trigger that would promote it. Shipped work belongs in `CHANGELOG.md` and current state in `state.md`; when a roadmap item ships, delete it rather than converting it into a shipped entry. (It had accumulated ~100 lines of per-release "Recently shipped" sections — a shadow changelog — which were removed at 2.6.9.)
 - [`docs/development/state.md`](docs/development/state.md) — **live state, refreshed every release.**
 - [`docs/development/dependency-watch.md`](docs/development/dependency-watch.md) — per-dep version tracking, upgrade rationale.
 - [`docs/development/cyrius-quirks.md`](docs/development/cyrius-quirks.md) — toolchain gotchas affecting how majra is written. Strikethrough-and-archive resolved entries when the cyrius pin moves.

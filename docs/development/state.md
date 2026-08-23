@@ -161,14 +161,14 @@ Full history in [`../../CHANGELOG.md`](../../CHANGELOG.md).
 
 | Item | Status | Where to look |
 |---|---|---|
-| **pubsub has no unsubscribe** | Open, deliberate. An abandoned subscriber wedges publishes to its topic permanently, because fan-out is a blocking backpressure contract (2.5.3, asserted by `test_pubsub_no_head_of_line_block`). Dropping instead would trade a wedge for silent message loss. Needs unsubscribe + a per-subscriber lag policy | CHANGELOG 2.6.9 · [audit](../audit/2026-08-22-audit.md) |
-| **PostgreSQL: cleartext auth, no TLS** | Open. Only `AuthenticationCleartextPassword` is implemented and no `SSLRequest` is sent, so credentials and queries cross the wire in the clear. The connect fails closed on SCRAM (type 10) rather than downgrading. Needs SCRAM-SHA-256 + TLS via sigil | `src/postgres_backend.cyr` header |
-| **Per-key ratelimit stats** | Open. `/ratelimit` returns the limiter's global counters for any key; the response is marked `"scope":"global"` so it is self-describing | `src/admin.cyr` |
-| **Parallel DAG tier execution** | Open. Steps within a tier run serially; the header claimed thread_create/join parallelism and was corrected at 2.6.9 | `src/dag.cyr` |
+| **pubsub has no unsubscribe** | Open by design — an abandoned subscriber wedges its topic, because fan-out is a blocking backpressure contract | plan: [roadmap § Next](roadmap.md) |
+| **PostgreSQL: cleartext auth, no TLS** | Open — credentials and queries cross the wire in the clear; the connect fails closed on SCRAM rather than downgrading | plan: [roadmap § Next](roadmap.md) |
+| **Per-key ratelimit stats** | Open — `/ratelimit` returns global counters for any key, marked `"scope":"global"` | plan: [roadmap § Backlog](roadmap.md) |
+| **Parallel DAG tier execution** | Open — steps within a tier run serially | plan: [roadmap § Backlog](roadmap.md) |
 | ~~**`base64_*` collides with `lib/bayan.cyr`**~~ | **RESOLVED** at 2.6.8 — renamed to `majra_base64_encode` / `majra_base64_decode`. All four profiles emit zero duplicate-fn warnings | CHANGELOG 2.6.8 · [`semver.md`](semver.md) § Documented exceptions |
-| **Shared-memory IPC transport** | engineering backlog, parked until a consumer hits the syscall-per-message ceiling | [`roadmap.md`](roadmap.md) "Engineering backlog" |
-| **agnos `--agnos` full build (non-core)** | `src/patra_queue.cyr` pulls patra, whose `lib/patra.cyr` still references `SYS_LSEEK` unguarded on agnos. Core (`dist/majra.cyr`) is agnos-clean since 2.5.0; only the `backends` profile + daemon `--agnos` build is blocked | CHANGELOG 2.5.0 "Known residual" |
-| **aarch64 cross-build** | unblocked since 2.4.5; wiring the CI step is a verification task, not blocked-on-upstream | [`roadmap.md`](roadmap.md) "Engineering backlog" |
+| **Shared-memory IPC transport** | parked until a consumer hits the syscall-per-message ceiling | plan: [roadmap § Backlog](roadmap.md) |
+| **agnos `--agnos` full build (non-core)** | blocked upstream on patra's unguarded `SYS_LSEEK`. Core is agnos-clean since 2.5.0; only `backends` + a daemon `--agnos` build are affected | plan: [roadmap § Waiting on upstream](roadmap.md) |
+| **aarch64 cross-build** | unblocked since 2.4.5; wiring the CI step is a verification task | plan: [roadmap § Backlog](roadmap.md) |
 | ~~**sigil pin lags the toolchain fold**~~ | **RESOLVED** at 2.6.8 — sigil is a `[deps].stdlib` module now and tracks the pin. The whole class is closed: majra declares zero git deps | `cyrius.cyml [deps]` |
 | ~~**sigil asm-offset drift**~~ | **RESOLVED** at 2.4.5 | [dependency-watch.md](dependency-watch.md) |
 
