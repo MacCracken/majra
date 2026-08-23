@@ -5,7 +5,7 @@ description: Toolchain-side gotchas that affect how majra code is written. Refre
 
 # Cyrius compiler quirks
 
-> **Toolchain floor**: cyrius 6.1.x (see [`state.md`](state.md) for the current exact pin) | **Refresh cadence**: when the pin moves or a new quirk surfaces. | **Last verified**: 6.4.83 (2.5.2) — quirks #4 and #6 re-checked empirically; #6 rewritten (it had gone stale describing 6.1.x behavior).
+> **Toolchain floor**: cyrius 6.1.x (see [`state.md`](state.md) for the current exact pin) | **Refresh cadence**: when the pin moves or a new quirk surfaces. | **Last verified**: 6.5.35 (2.6.8) — the undefined-fn `ud2` rule re-confirmed empirically against a clean-room consumer build (it is what made the missing-`sigil` sidecar a runtime SIGILL rather than a build failure); snapshot count and `lib sync --full` note refreshed. **Prior**: 6.4.83 (2.5.2) — quirks #4 and #6 re-checked; #6 rewritten.
 
 Things about the cyrius compiler that affect how majra code is written. None of these are bug reports — they're *load-bearing facts about the toolchain*. If a pattern in `src/` looks weird, the answer is probably here.
 
@@ -46,7 +46,7 @@ Picking the wrong one compiles cleanly but corrupts at runtime via silent collis
 
 ### 4. `var buf[N]` sizing: **locals are N bytes, globals are N×8 bytes**
 
-Two different rules — this asymmetry bit the 2.5.0 + 2.5.1 buffer audits and misleads first-read reviewers (verified empirically at cyrius 6.4.62; unchanged at 6.4.83):
+Two different rules — this asymmetry bit the 2.5.0 + 2.5.1 buffer audits and misleads first-read reviewers (verified empirically at cyrius 6.4.62; unchanged at 6.4.83 and 6.5.35):
 
 - **Function-local `var buf[N]` = N bytes.** A byte-sized scratch buffer. A 16-byte `struct timespec` needs `var ts[16]`, not `var ts[2]` (= 2 bytes → overflow). Confirmed: `soak_heartbeat` phase B silently corrupted its node count until `var ts[2]`→`var ts[16]` (CHANGELOG 2.5.1); likewise `key[32]` (AES-256), `nonce[12]` (GCM IV), `buf[4]` (be32).
 - **Module-level / global `var buf[N]` = N × 8 bytes** (N `i64` slots in the data segment). So a global `var _resp_buf[512]` genuinely holds **4096** bytes and `var _err_msg_buf[64]` holds 512 — byte-indexed access (`store8(&buf + pos, …)`) up to those larger bounds is in-range. **Compute a global's real capacity as `N*8` before "fixing" it**: `redis_backend.cyr`'s `while (pos < 4088)` loop over global `var _resp_buf[512]` (= 4096 B) is correct, *not* an overflow — a naive N-bytes reading flags a false positive here.
@@ -61,11 +61,11 @@ Two different rules — this asymmetry bit the 2.5.0 + 2.5.1 buffer audits and m
 
 **Implication for new majra code**: we still don't write inline asm, but if we ever need a hardware-acceleration hot path, use `param_load` rather than decoding `[rbp-N]` by hand.
 
-**Implication for our deps**: this is why sigil was held at 2.9.0 through the 2.4.x line. Since 2.4.5 (cyrius 6.x) sigil's NI dispatch uses `param_load`, so we track **latest (3.12.1 as of 2.5.2)**. Full story in [`dependency-watch.md § sigil`](dependency-watch.md).
+**Implication for our deps**: this is why sigil was held at 2.9.0 through the 2.4.x line. Since 2.4.5 (cyrius 6.x) sigil's NI dispatch uses `param_load`, so the constraint is gone — and since **2.6.8** sigil is a folded stdlib module that simply tracks the toolchain pin (3.12.9 under 6.5.35), so there is no separate sigil version to hold or advance. Full story in [`dependency-watch.md § sigil`](dependency-watch.md).
 
 ### 6. Undefined symbols: **reachable = hard build error, unreachable = warning + runtime `ud2`**
 
-The behavior has moved twice. cc5 made an undefined function a hard compile error; **cyrius 6.1.x** downgraded it to a `warning: undefined function '<name>'` with the call lowered to a `ud2` — the build succeeded and the program **SIGILLed (exit 132) the instant that call executed**. The current toolchain splits the two cases on reachability (verified empirically at both 6.4.62 and 6.4.83 — this is *not* a 6.4.83 change; the entry below was simply stale):
+The behavior has moved twice. cc5 made an undefined function a hard compile error; **cyrius 6.1.x** downgraded it to a `warning: undefined function '<name>'` with the call lowered to a `ud2` — the build succeeded and the program **SIGILLed (exit 132) the instant that call executed**. The current toolchain splits the two cases on reachability (verified empirically at 6.4.62, 6.4.83 and 6.5.35 — this is *not* a 6.4.83 change; the entry below was simply stale):
 
 - **Reachable call site** → `error: refusing to emit binary with N reachable undefined function(s) (pass --allow-undef to downgrade)`. **No binary is written.** Caught at build time again.
 - **Unreachable call site** → `warning: undefined function '<name>' (call site may be unreachable)` and the build succeeds. The `ud2` is still there, so anything that makes the site reachable later turns into a SIGILL.
@@ -76,7 +76,7 @@ The behavior has moved twice. cc5 made an undefined function a hard compile erro
 
 ### 7. Cyrius 6.x splits stdlib (`lib sync`) from git deps (`deps`); build with `--no-deps`
 
-`cyrius deps` no longer provisions the stdlib — it only resolves `[deps.*]` git deps. The version-pinned stdlib snapshot (99 `.cyr` files under 6.4.62 *and* 6.4.83 — was 97 under 6.2.11, 88 under 6.1.35, 94 under 6.1.24; the count tracks the toolchain — including the toolchain-internal `slice`/`ct`/`chrono`/`async`/`dynlib`/`fdlopen`/`tls` that sigil/sandhi reach into) is copied into `./lib/` by **`cyrius lib sync --full`**. Run `lib sync --full` *before* `deps`.
+`cyrius deps` no longer provisions the stdlib — it only resolves `[deps.*]` git deps, and **majra has declared none since 2.6.8**, so the step exists purely to write/verify `cyrius.lock`. The version-pinned stdlib snapshot (**108 `.cyr` files under 6.5.31 and 6.5.35** — was 99 under 6.4.62–6.4.83, 97 under 6.2.11, 88 under 6.1.35, 94 under 6.1.24; the count tracks the toolchain — including the toolchain-internal `slice`/`ct`/`chrono`/`async`/`dynlib`/`fdlopen`/`tls` that sigil/sandhi reach into, and `sigil` itself since the 6.5.x fold) is copied into `./lib/` by **`cyrius lib sync --full`**. Run `lib sync --full` *before* `deps`.
 
 **`--full` is load-bearing since 6.4.x**: a bare `cyrius lib sync` copies only the modules named in `[deps].stdlib` (40 files) and omits exactly the toolchain-internal set above — which then hits quirk #6.
 
@@ -117,7 +117,7 @@ equals N×M and that no two returned pointers alias. The failure rate is low
 
 Upstream: `lib/freelist.cyr` gaining `lib/alloc.cyr`'s spinlock would dissolve
 the class. Until then majra defends itself with lock placement. Re-check this
-entry whenever the cyrius pin moves — verified present at **6.4.83**.
+entry whenever the cyrius pin moves — verified present at **6.5.35**.
 
 ---
 

@@ -8,12 +8,21 @@ network connections (Redis, PostgreSQL, WebSocket, IPC) are initiated by the
 consumer's code.
 
 **Crypto trust boundary**: when using the `signed` or `backends` profiles, sigil
-(first-party, resolved into `lib/sigil.cyr` by `cyrius deps` from the version
-pinned in `[deps.sigil]`) is the sole crypto implementation. AES-256-GCM,
-Ed25519, HMAC-SHA256, HKDF all live there. sigil's own `docs/audit/` directory
-documents its crypto audit surface. See [`dependency-watch.md`](dependency-watch.md)
-for the rationale on the current sigil 3.12.1 pin (latest, and tracking latest since the
-2.4.5 cyrius 6.x migration cleared the asm-offset blocker).
+(first-party) is the sole crypto implementation. AES-256-GCM, Ed25519,
+HMAC-SHA256, HKDF all live there. sigil's own `docs/audit/` directory documents
+its crypto audit surface. Since **2.6.8** sigil is a *folded cyrius stdlib
+module*, provisioned into `lib/sigil.cyr` by `cyrius lib sync --full` and
+version-tied to the toolchain pin (3.12.9 under cyrius 6.5.35) rather than to a
+`[deps.sigil]` git tag — so the supply-chain surface is the toolchain snapshot,
+covered by `cyrius.lock`'s 108 hashes and CI's `cyrius deps --verify`. See
+[`dependency-watch.md`](dependency-watch.md) for why the git dep was retired.
+
+> **Consumer-side note.** Bundles published at **2.6.7 and earlier** carry
+> `.deps` sidecars that omit `sigil` for the `signed` / `backends` profiles. A
+> consumer that provisions strictly from the sidecar builds with undefined
+> `ed25519_*` — reported as a warning, lowered to a trapping `ud2`, and
+> surfacing as a SIGILL on first use rather than a failed build. Fixed at 2.6.8;
+> consumers pinned earlier should add `sigil` to their own include set.
 
 ## Attack Surface
 

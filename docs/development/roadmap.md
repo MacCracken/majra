@@ -2,6 +2,15 @@
 
 Completed items live in [CHANGELOG.md](../../CHANGELOG.md).
 
+## Recently shipped (2.6.8)
+
+- **sigil moved from a `[deps.sigil]` git dep into `[deps].stdlib`** — closing the second half of the folded-module hazard 2.6.7 opened. 2.6.7 fixed the *version* lag; the *declaration shape* was the load-bearing half. `cyrius distlib` classifies a git dep out of the stdlib leaves, so `dist/majra-signed.deps` and `dist/majra-backends.deps` — the sidecars for the two profiles that exist *because* they carry crypto — never named `sigil`. A consumer provisioning strictly from the sidecar got undefined `ed25519_{init,sign,verify}` + `ct_eq_bytes_lens`, and since an undefined fn lowers to a trapping `ud2` the build reported **`OK`** and the process SIGILLed at first signature. Verified in a clean room before and after. Both sidecars now carry `sigil`. See [`dependency-watch.md`](dependency-watch.md).
+- **majra now declares zero git dependencies.** `cyrius.lock` is 108 pure hashes with no commit-pin line, and `cyrius deps` resolves nothing — which retires the overlay-ordering hazard that 2.5.2 and 2.6.7 were both written to counteract.
+- **Cyrius toolchain pin 6.5.31 → 6.5.35.** Snapshot holds at 108 files; three move (`patra` 1.13.9 → 1.13.10, plus `bayan` and `vani`, neither of which majra calls). sigil is unchanged at 3.12.9 — 6.5.35 folds exactly the version the manifest already named, so this bump carries no dep-version movement of its own. Four bundle bodies byte-identical; the whole `dist/*.cyr` diff is four banner lines.
+- **No formatter drift, no lint delta, no benchmark delta.** 0/23 `src/` files reformat under 6.5.35 (6.5.31 had moved `src/ws.cyr`); lint output is byte-identical under both pins. The benchmark claim was *measured*, not asserted — the same `bench_all.bcyr` was built against both toolchains and run head-to-head, and a first-pass +6.4% / −28% spread collapsed into noise across four further trials.
+- **Full matrix clean from a cold `rm -rf build lib`**: 410/410 CI (core 150, expanded 200, backends 43, patra-queue 17) + 3/3 fuzz + 4/4 soak + 17/17 bench + 2/2 examples, with `cyrius deps --verify` at 108/0.
+- **Filed, not fixed**: `base64_encode` / `base64_decode` in `src/ipc_encrypted.cyr` collide with the folded `lib/bayan.cyr`, and the return contracts disagree (`{ptr, len}` struct vs scalar). Pre-existing — reproduced under 6.5.31 — and deferred because renaming a symbol carried in the `backends` bundle is a distribution-contract change.
+
 ## Recently shipped (2.5.3)
 
 - **Two silent data-loss races fixed, both rooted in `fl_alloc` being unsynchronized while `alloc` is not** (see [`cyrius-quirks.md`](cyrius-quirks.md) §8). Concurrent `pubsub_subscribe` handed 1-7 callers per 800 a channel that no subscriber entry pointed at — their `chan_recv` blocked forever, and the delivered count hid it. Concurrent `mq_enqueue` lost 4-12 jobs per 800 to duplicate job keys (`_next_job_key()` did an unlocked read-modify-write). Both fixed by taking the object's mutex *before* allocating; both now have regression tests.

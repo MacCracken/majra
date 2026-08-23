@@ -5,6 +5,86 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.8] — 2026-08-22 — the folded-module sweep finishes the job
+
+**410** assertions green across four suites (core 150, expanded 200, backend 43,
+patra-queue 17), 0 failed. Dep hashes **108 verified / 0 failed**. Fuzz (3/3),
+soak (4/4), benchmarks (17/17) and examples (2/2) clean from a cold
+`rm -rf build lib` rebuild.
+
+### Changed — `[deps.sigil]` git dep → `[deps].stdlib`
+
+**2.6.7 fixed the version and left the shape.** That release swept every
+`[deps.X]` where X is a folded stdlib module and moved sigil 3.12.7 → 3.12.9 to
+match the toolchain. It read the hazard as *a stale pin downgrading a folded
+module* — true, but the smaller half. The declaration itself was the problem.
+
+`distlib` classifies a git dep **out of the stdlib leaves**, so
+`dist/majra-signed.deps` and `dist/majra-backends.deps` were published without
+naming `sigil` at all — the two profiles that exist *because* they carry crypto.
+Verified in a clean room against the shipped 2.6.7 sidecar: a consumer
+provisioning exactly what it declares gets
+
+```
+warning: undefined function 'ed25519_init'
+warning: undefined function 'ed25519_sign'
+warning: undefined function 'ed25519_verify'
+warning: undefined function 'ct_eq_bytes_lens'
+OK
+```
+
+— note the `OK`. An undefined fn lowers to a trapping `ud2`, so this is not a
+build failure a consumer would notice; it is a **SIGILL the first time an
+envelope is signed**. Both sidecars now carry `sigil`, and the same clean-room
+build resolves all four symbols.
+
+This is the identical shape the manifest already warns about for sakshi
+(*"kavach hit exactly that"*) — sigil was simply never re-read under that rule
+after the 6.5.x fold made it a stdlib module. The `⚠ do not re-add` note now
+sits over both.
+
+**Consequence for pinning**: sigil tracks the toolchain fold; the cyrius pin is
+the only knob that moves it. `cyrius.lock` drops to **zero git deps** — 108
+pure hashes, no commit-pin line — and `cyrius deps` resolves nothing, which
+removes the overlay-ordering hazard both 2.5.2 and 2.6.7 were written to
+counteract.
+
+### Changed — Cyrius pin 6.5.31 → 6.5.35
+
+Snapshot holds at **108 files**. Three move: `patra` 1.13.9 → 1.13.10, plus
+`bayan` and `vani` (majra calls neither). Every other folded module is
+unchanged, sigil included — 6.5.35 folds the same 3.12.9 the manifest already
+named, so this bump carries no dep-version movement of its own.
+
+No formatter drift: 0/23 `src/` files reformat under 6.5.35, where 6.5.31 had
+moved `src/ws.cyr`. Lint output is byte-identical under both pins (the
+`src/error.cyr` bare-`ERR_*` notes and the `src/admin.cyr:77` untracked deferral
+are pre-existing, and unchanged).
+
+**No benchmark delta.** Rather than assert this, the same `benches/bench_all.bcyr`
+was built against both toolchains and run head-to-head. A first-pass read
+suggested a +6.4% `pattern_wildcard_+` regression and a −28%
+`pubsub_publish_nosub` win; across four further trials both pins converge inside
+noise on every target (`pq_enqueue` 567–587ns both, `pattern_wildcard_+` 100–111
+vs 101–102ns). The first-run spread was warm-up, not codegen.
+
+### Unchanged
+
+All four bundle bodies stay byte-identical — the whole `dist/*.cyr` diff is four
+banner lines. Only the `.deps` sidecars move, and only to gain `sigil`.
+
+### Known — `base64_encode` / `base64_decode` collide with `lib/bayan.cyr`
+
+`cyrius distlib backends` warns `duplicate fn 'base64_encode' (last definition
+wins; first defined in lib/bayan.cyr)`. **Pre-existing and not introduced here** —
+reproduced identically under 6.5.31. It matters more than a duplicate-symbol
+warning usually would, because the two contracts disagree: majra's
+`base64_decode` (`src/ipc_encrypted.cyr`) returns a 16-byte `{ptr, len}` struct,
+while bayan's returns a scalar. A consumer whose include order lets bayan win
+would misread that return. Filed for a follow-up rename rather than fixed here,
+since renaming a symbol carried in the `backends` bundle is a distribution-
+contract change and this release is a toolchain bump.
+
 ## [2.6.7] — 2026-08-20 — the last folded-module pin that lagged the toolchain
 
 **410** assertions green across four suites (core 150, expanded 200, backend 43,

@@ -5,7 +5,7 @@ description = "Distributed queue & multiplex engine — pub/sub, queues, relay, 
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/majra"
 language = "cyrius"
-cyrius = "6.5.31"
+cyrius = "6.5.35"
 
 [build]
 entry = "src/main.cyr"
@@ -126,7 +126,7 @@ modules = [
 # load-bearing for CI completeness checks.
 [deps]
 # Legacy stdlib hint list (cyrius 5.x model). Under cyrius 6.x the full
-# stdlib snapshot is provisioned by `cyrius lib sync` (94 files), so this
+# stdlib snapshot is provisioned by `cyrius lib sync --full` (108 files), so this
 # list is no longer the sole source of what lands in ./lib/ — it's kept
 # as a human-readable record of the stdlib surface majra's entry points
 # include. (Don't add toolchain-internal modules like `slice`/`ct` here:
@@ -161,19 +161,30 @@ stdlib = [
     "async",
     "sandhi",
     "sakshi",
+    "sigil",
 ]
 
-# External first-party deps. Vendored into lib/ for reproducibility;
-# `cyrius deps` resyncs to the pinned tag.
+# sigil provides Ed25519 (`src/signed_envelope.cyr`) and AES-256-GCM
+# (`src/ipc_encrypted.cyr`) — 6 symbols total. The core engine has no crypto
+# surface; only the `signed` and `backends` profiles reach for it.
 #
-# sigil provides AES-256-GCM (since 2.8.4) used by src/ipc_encrypted.cyr.
-# Only the backends profile needs it; the core engine has no crypto
-# surface. See lib/sigil.cyr (bundled dist, ~5.8k lines).
-[deps.sigil]
-git = "https://github.com/MacCracken/sigil.git"
-path = "../sigil"
-tag = "3.12.9"
-modules = ["dist/sigil.cyr"]
+# sigil moved from `[deps.sigil]` into `[deps].stdlib` at the 6.5.35 pin —
+# the same move sakshi made at 6.5.18, and for the second half of the same
+# reason. 2.6.7 swept every `[deps.X]` where X is a folded stdlib module and
+# corrected sigil's *version* lag (3.12.7 → 3.12.9); it left the *declaration
+# shape*, which is the half that was actually load-bearing here.
+#
+# A git dep makes `distlib` reclassify the module out of the **stdlib leaves**,
+# so `dist/majra-signed.deps` and `dist/majra-backends.deps` shipped without
+# naming `sigil` at all. A consumer provisioning strictly from the sidecar got
+# undefined `ed25519_init` / `ed25519_sign` / `ed25519_verify` — and an
+# undefined fn compiles to a trapping `ud2`, so the build reported **OK** and
+# the failure landed at runtime as a SIGILL. Verified in a clean room before
+# the move, and closed by it: both sidecars now carry `sigil`.
+#
+# ⚠ Do NOT re-add a `[deps.sigil]` block to "pin" sigil independently. The pin
+# it would buy is worth less than the sidecar it costs; sigil tracks the
+# toolchain fold, and the cyrius pin is the knob that moves it.
 
 # sakshi moved from `[deps.sakshi]` into `[deps].stdlib` at the 6.5.18 pin.
 #

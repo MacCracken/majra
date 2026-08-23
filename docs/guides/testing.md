@@ -33,11 +33,11 @@ cyrius build --no-deps tests/soak/soak_queue.cyr build/soak_queue && ./build/soa
 | Suite | File | Assertions | Coverage |
 |-------|------|-----------|----------|
 | Core | `src/main.cyr` | 150 | All 15 core modules + revived relay dedup |
-| Expanded | `tests/test_core.tcyr` | 112 | Deep: queue lifecycle, pubsub patterns, DAG retry, fleet routing, circuit breaker, integration, multi-threaded barrier, plus the 2.5.3 concurrency + wildcard-alignment regressions |
-| Backends | `tests/test_backends.tcyr` | 42 | base64, SHA-1, AES-256-GCM, signed envelopes, admin endpoint, WebSocket, RESP, PG wire |
+| Expanded | `tests/test_core.tcyr` | 200 | Deep: queue lifecycle, pubsub patterns, DAG retry, fleet routing, circuit breaker, integration, multi-threaded barrier, plus the 2.5.3 concurrency + wildcard-alignment regressions and the 2.6.x relay / ratelimit / priority-queue regressions |
+| Backends | `tests/test_backends.tcyr` | 43 | base64, SHA-1, AES-256-GCM, signed envelopes, admin endpoint, WebSocket, RESP, PG wire |
 | Patra queue | `tests/test_patra_queue.tcyr` | 17 | Durable enqueue / priority dequeue / complete / counts / reopen persistence |
-| Live | `tests/test_live.tcyr` | 36 | 7 Redis + 4 PostgreSQL categories (see below) |
-| **Total** | | **357** (321 CI + 36 live) | |
+| Live | `tests/test_live.tcyr` | 36 | 7 Redis + 4 PostgreSQL categories (see below). **CI-only** — needs Redis on :6379 + PostgreSQL on :5432, so a dev-box "full matrix" run is 410, not 446 |
+| **Total** | | **446** (410 CI + 36 live) | |
 
 `test_patra_queue` is a separate entry point because adding it to `test_backends` blows the cc5 16384 fixup-table cap (patra pulls sakshi + io + fs transitively).
 

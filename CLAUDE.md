@@ -33,8 +33,8 @@ This file (`CLAUDE.md`) is durable rules.
 ## Quick Start
 
 ```bash
-cyrius lib sync --full                                 # copy full version-pinned stdlib snapshot → ./lib/ (99 files under 6.4.83; --full is load-bearing since 6.4.x — bare `lib sync` copies only the [deps].stdlib subset)
-cyrius deps                                            # overlay sigil git dep + write cyrius.lock; run AFTER lib sync
+cyrius lib sync --full                                 # copy full version-pinned stdlib snapshot → ./lib/ (--full is load-bearing since 6.4.x — bare `lib sync` copies only the [deps].stdlib subset)
+cyrius deps                                            # write cyrius.lock; run AFTER lib sync (majra declares no git deps — this resolves nothing, but it is what the lockfile gate verifies)
 cyrius build --no-deps src/main.cyr build/majra && ./build/majra        # build + core tests
 cyrius build --no-deps tests/test_backends.tcyr build/test_backends && ./build/test_backends
 cyrius distlib && cyrius distlib signed && cyrius distlib admin && cyrius distlib backends  # regenerate 4 dist bundles
@@ -43,15 +43,21 @@ cyrius audit                                           # full: self-host, test, 
 
 > **Cyrius 6.x build workflow (since 2.4.5).** Stdlib provisioning and
 > git-dep resolution are separate steps: `cyrius lib sync --full` populates
-> `./lib/` from the version-pinned snapshot (the toolchain modules
+> `./lib/` from the version-pinned snapshot (including the toolchain modules
 > sigil/sandhi reach into — `slice`, `tls`, `ct`, `chrono`, `async`,
 > `sakshi`, `dynlib`, `fdlopen`, `keccak`, `random`), then `cyrius deps`
-> overlays the sigil git dep. **`--full` is load-bearing since cyrius 6.4.x**:
+> writes the lockfile. **`--full` is load-bearing since cyrius 6.4.x**:
 > a bare `cyrius lib sync` copies only the declared `[deps].stdlib` subset
 > and omits those toolchain modules. Build with `--no-deps` so the build's
 > auto-`deps` doesn't re-resolve and perturb the synced lib's include order.
 > A missing toolchain module compiles to a runtime-trapping `ud2`, so it
 > surfaces as a **SIGILL at runtime, not a build error**.
+>
+> **Since 2.6.8 majra declares no git deps at all** — sigil was the last one,
+> and it moved into `[deps].stdlib` because a git dep on a *folded* stdlib
+> module makes `distlib` drop it from the published `.deps` sidecars. See the
+> ⚠ notes in `cyrius.cyml [deps]`; do not re-add a `[deps.<folded-module>]`
+> block to "pin" one.
 
 Full test matrix + soak + fuzz + bench commands in [`docs/guides/testing.md`](docs/guides/testing.md).
 
@@ -71,7 +77,7 @@ Full test matrix + soak + fuzz + bench commands in [`docs/guides/testing.md`](do
 - **NEVER use `gh` CLI** — use `curl` against the GitHub API if needed
 - **Do not hardcode the Cyrius version in CI YAML** — the `cyrius = "..."` field in `cyrius.cyml` is the single source of truth. CI reads it dynamically.
 - **Do not forget to regenerate `dist/`** after any `src/` change — all four profile bundles must move together.
-- **Do not add dependencies beyond the Cyrius toolchain + sigil.** Crypto goes through sigil; everything else uses stdlib.
+- **Do not add dependencies beyond the Cyrius toolchain.** Crypto goes through sigil, which is itself a folded stdlib module since the 6.5.x line — majra declares zero git deps. **Do not add a `[deps.<name>]` block for anything the snapshot already ships**: `distlib` reclassifies it out of the stdlib leaves and silently drops it from the `.deps` sidecars.
 - **Do not commit `build/` or `lib/`** — both are gitignored, repopulated by `cyrius build` / `cyrius deps`.
 - **Do not skip benchmarks before claiming performance improvements.**
 - **Do not skip the soak set** if a change could plausibly affect queue lifecycle, relay dedup, pubsub fan-out, barrier cycles, or heartbeat eviction.

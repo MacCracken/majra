@@ -4,7 +4,7 @@
 
 Majra provides shared messaging primitives for the [AGNOS](https://github.com/MacCracken) ecosystem, eliminating duplicate pub/sub, queue, relay, and heartbeat implementations across [AgnosAI](https://github.com/MacCracken/agnosai), [Ifran](https://github.com/MacCracken/synapse), [SecureYeoman](https://github.com/MacCracken/secureyeoman), and [daimon](https://github.com/agnostos/daimon).
 
-**Written in [Cyrius](https://github.com/MacCracken/cyrius)** — compiles to a statically linked binary via `cyrius build`. Optional crypto surface (signed envelopes, encrypted IPC) pulls [sigil](https://github.com/MacCracken/sigil) ≥ 3.12.1; the core profile has no external deps.
+**Written in [Cyrius](https://github.com/MacCracken/cyrius)** — compiles to a statically linked binary via `cyrius build`. Optional crypto surface (signed envelopes, encrypted IPC) pulls [sigil](https://github.com/MacCracken/sigil) — a folded cyrius stdlib module since the 6.5.x line, so it arrives with the toolchain rather than as a separate dep. The core profile has no crypto surface at all, and majra declares **zero git dependencies**.
 
 ## Modules
 
@@ -203,14 +203,16 @@ modules = ["dist/majra-backends.cyr"]  # everything: all profiles + redis/pg/ws/
 
 The bundles are **pure `src/` concatenation** — they carry no `include "lib/…"` lines of their own, so the consumer's entry point must supply every stdlib module the bundle (and sigil) reaches into. The `.deps` sidecar next to each bundle lists what *majra's own code* needs; the crypto profiles need more than that, because sigil reaches into the stdlib too. These sets are verified by building a clean consumer against each shipped bundle:
 
+> **Sidecar note (fixed at 2.6.8).** Through 2.6.7 the `majra-signed` and `majra-backends` sidecars omitted `sigil` itself, because declaring it as a git dep made `cyrius distlib` classify it out of the stdlib leaves. A consumer that provisioned strictly from the sidecar got undefined `ed25519_*` — and since an undefined fn lowers to a trapping `ud2`, the build reported `OK` and the process SIGILLed at first use. Both sidecars name `sigil` from 2.6.8 on. If you pinned `2.6.7` or earlier, add `sigil` to your own include set.
+
 | Profile | sibling dep | stdlib modules the consumer must include |
 |---|---|---|
 | `majra` (core) | — | the `.deps` sidecar set |
 | `majra-admin` | — | sidecar + `net`, `io`, `chrono`, `async`, `dynlib`, `fdlopen`, `sakshi`, `random`, then `tls` **before** `sandhi` (sandhi reads `TLS_BACKEND_LIBSSL` at parse time) |
-| `majra-signed` | sigil ≥ 3.12.1 | sidecar + `thread_local`, `io`, `fs`, `chrono`, `bayan`, `ct`, `keccak`, `random` |
-| `majra-backends` | sigil ≥ 3.12.1 | the signed set + `net`, `async`, `sakshi`, `dynlib`, `fdlopen`, `tls`, `sandhi`, `patra` |
+| `majra-signed` | sigil ≥ 3.12.9 (stdlib fold) | sidecar (now incl. `sigil`) + `thread_local`, `io`, `fs`, `chrono`, `bayan`, `ct`, `keccak`, `random` |
+| `majra-backends` | sigil ≥ 3.12.9 (stdlib fold) | the signed set + `net`, `async`, `sakshi`, `dynlib`, `fdlopen`, `tls`, `sandhi`, `patra` |
 
-> **Toolchain floor for the crypto profiles: cyrius ≥ 6.4.64.** sigil 3.12.1 allocates its crypto-bank thread-local slot dynamically via `thread_local_alloc()`, which first appears in the 6.4.64 stdlib snapshot (`TLOCAL_MAX_SLOTS` 16 → 128). Pairing sigil 3.12.1 with an older snapshot fails the build with `refusing to emit binary with N reachable undefined function(s)`. sigil's own source comment says "requires cyrius >= 6.4.65" — 6.4.64 is where the symbol actually lands, so 6.4.65 is the conservative-safe floor. `lib/thread_local.cyr` itself was already required at sigil 3.11.1 (for `thread_local_{init,get,set}`); this README simply never said so.
+> **Toolchain floor for the crypto profiles: cyrius ≥ 6.4.64.** sigil 3.12.x allocates its crypto-bank thread-local slot dynamically via `thread_local_alloc()`, which first appears in the 6.4.64 stdlib snapshot (`TLOCAL_MAX_SLOTS` 16 → 128); an older snapshot fails the build with `refusing to emit binary with N reachable undefined function(s)`. sigil's own source comment says "requires cyrius >= 6.4.65" — 6.4.64 is where the symbol actually lands, so 6.4.65 is the conservative-safe floor. `lib/thread_local.cyr` was already required at sigil 3.11.1 (for `thread_local_{init,get,set}`). Since sigil now rides the stdlib snapshot, a consumer on cyrius ≥ 6.5.x satisfies this floor automatically.
 
 A `signed`-only consumer can pull sigil's per-primitive `dist/sigil-ed25519.cyr` profile (~2k lines) instead of the full crypto bundle.
 
@@ -228,12 +230,12 @@ A `signed`-only consumer can pull sigil's per-primitive `dist/sigil-ed25519.cyr`
 
 Majra was originally a Rust library (v1.0.4, ~13,000 lines). It was ported to Cyrius via `cyrius port`, re-implementing all modules from scratch.
 
-| Metric | Rust v1.0.4 | Cyrius v2.4.x |
+| Metric | Rust v1.0.4 | Cyrius v2.6.x |
 |--------|-------------|---------------|
-| Source lines | 12,969 | ~5,500 |
+| Source lines | 12,969 | ~5,800 |
 | Modules | 22 | 22 (QUIC deferred on sigil X25519) |
-| Dependencies | 25 crates | 0 core, 1 optional (sigil) |
-| Toolchain | cargo + rustc + LLVM | cyrius 6.4.83 |
+| Dependencies | 25 crates | 0 — sigil is a folded stdlib module |
+| Toolchain | cargo + rustc + LLVM | cyrius 6.5.35 |
 
 ## License
 
