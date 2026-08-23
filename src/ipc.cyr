@@ -1,7 +1,13 @@
 # majra/ipc — Unix domain socket IPC with length-prefixed framing
 #
 # Protocol: 4-byte big-endian length prefix + payload bytes.
-# Blocking I/O (no async).
+# Blocking I/O (no async). Frames are capped at IPC_MAX_FRAME both ways.
+#
+# ⚠ ACCESS CONTROL: the bound socket's mode is set to 0600 (owner only) so a
+# co-tenant local user cannot connect. It was previously left to the ambient
+# umask, which on a typical 022 process yields a world-connectable socket —
+# and majra performs no peer-credential check, so connecting IS authenticating.
+# A caller needing group access must widen the mode itself after ipc_bind.
 
 # Linux x86_64 syscall numbers for networking
 var _SYS_SOCKET = 41;
@@ -11,17 +17,42 @@ var _SYS_BIND = 49;
 var _SYS_LISTEN = 50;
 var _SOCK_STREAM = 1;
 var _AF_UNIX = 1;
+var _SYS_FCHMOD = 91;
 
-# Build a sockaddr_un structure (110 bytes: 2 byte family + 108 byte path)
+# Largest frame either direction will accept or emit. The receive side always
+# had this cap; the send side did not, so majra could emit a frame that every
+# majra receiver rejects.
+var IPC_MAX_FRAME = 1048576;
+# sockaddr_un.sun_path is 108 bytes including the NUL.
+var IPC_MAX_PATH = 107;
+
+# Build a sockaddr_un. Returns 0 for a path that is empty or too long.
+#
+# This used to CLAMP an over-long path to 107 bytes rather than fail, so two
+# distinct service paths sharing a 107-byte prefix silently resolved to the
+# same socket — a client could reach a service it did not ask for. An empty
+# path was also accepted, which binds into the ABSTRACT namespace under
+# whatever bytes the uninitialised block happened to hold (fl_alloc does not
+# zero a recycled block).
 fn _sockaddr_un(path) {
+    if (path == 0) { return 0; }
+    var plen = strlen(path);
+    if (plen == 0 || plen > IPC_MAX_PATH) { return 0; }
     var sa = fl_alloc(112);
+    if (sa == 0) { return 0; }
+    memset(sa, 0, 112);
     store8(sa, _AF_UNIX);
     store8(sa + 1, 0);
-    var plen = strlen(path);
-    if (plen > 107) { plen = 107; }
     memcpy(sa + 2, path, plen);
     store8(sa + 2 + plen, 0);
     return sa;
+}
+
+# Actual addrlen for a sockaddr_un carrying `path`: family (2) + path + NUL.
+# Passing a hardcoded 110 made the kernel read past the path into whatever the
+# block held.
+fn _sockaddr_un_len(path) {
+    return 2 + strlen(path) + 1;
 }
 
 # IPC Server: bind to a Unix socket path, listen.
@@ -35,14 +66,24 @@ fn ipc_bind(path) {
     return Err(ERR_IPC);
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var fd = syscall(_SYS_SOCKET, _AF_UNIX, _SOCK_STREAM, 0);
-    if (fd < 0) { return Err(ERR_IPC); }
-    sys_unlink(path);
     var sa = _sockaddr_un(path);
-    var ret = syscall(_SYS_BIND, fd, sa, 110);
-    if (ret < 0) { return Err(ERR_IPC); }
+    if (sa == 0) { return Err(ERR_IPC); }
+    var fd = syscall(_SYS_SOCKET, _AF_UNIX, _SOCK_STREAM, 0);
+    if (fd < 0) { fl_free(sa); return Err(ERR_IPC); }
+    sys_unlink(path);
+    var ret = syscall(_SYS_BIND, fd, sa, _sockaddr_un_len(path));
+    fl_free(sa);
+    # Every one of these paths used to leak both the fd and the sockaddr.
+    if (ret < 0) { syscall(SYS_CLOSE, fd); return Err(ERR_IPC); }
+    # Owner-only: without this the mode is whatever the ambient umask allows,
+    # and any local user can connect to an endpoint that has no auth of its own.
+    if (syscall(_SYS_FCHMOD, fd, 384) < 0) {
+        syscall(SYS_CLOSE, fd);
+        sys_unlink(path);
+        return Err(ERR_IPC);
+    }
     ret = syscall(_SYS_LISTEN, fd, 128);
-    if (ret < 0) { return Err(ERR_IPC); }
+    if (ret < 0) { syscall(SYS_CLOSE, fd); sys_unlink(path); return Err(ERR_IPC); }
     return Ok(fd);
     #endif
 }
@@ -65,49 +106,102 @@ fn ipc_connect(path) {
     return Err(ERR_IPC);
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var fd = syscall(_SYS_SOCKET, _AF_UNIX, _SOCK_STREAM, 0);
-    if (fd < 0) { return Err(ERR_IPC); }
     var sa = _sockaddr_un(path);
-    var ret = syscall(_SYS_CONNECT, fd, sa, 110);
-    if (ret < 0) { return Err(ERR_IPC); }
+    if (sa == 0) { return Err(ERR_IPC); }
+    var fd = syscall(_SYS_SOCKET, _AF_UNIX, _SOCK_STREAM, 0);
+    if (fd < 0) { fl_free(sa); return Err(ERR_IPC); }
+    var ret = syscall(_SYS_CONNECT, fd, sa, _sockaddr_un_len(path));
+    fl_free(sa);
+    if (ret < 0) { syscall(SYS_CLOSE, fd); return Err(ERR_IPC); }
     return Ok(fd);
     #endif
 }
 
+# Write exactly `len` bytes, retrying on EINTR (-4) and on short writes.
+# A signal used to tear down the connection mid-frame.
+fn _ipc_write_full(fd, buf, len) {
+    var total = 0;
+    while (total < len) {
+        var w = syscall(SYS_WRITE, fd, buf + total, len - total);
+        if (w == -4) { w = 0; }
+        elif (w <= 0) { return -1; }
+        total = total + w;
+    }
+    return total;
+}
+
+# Read exactly `want` bytes, retrying on EINTR (-4) and on short reads.
+# Returns -1 on error, -2 if the peer closed before any byte arrived.
+fn _ipc_read_full(fd, buf, want) {
+    var total = 0;
+    while (total < want) {
+        var r = syscall(SYS_READ, fd, buf + total, want - total);
+        if (r == -4) { r = 0; }
+        elif (r == 0) {
+            if (total == 0) { return -2; }
+            return -1;
+        }
+        elif (r < 0) { return -1; }
+        total = total + r;
+    }
+    return total;
+}
+
 # Send a length-prefixed frame.
 fn ipc_send_frame(fd, data, len) {
+    # The receive side has always capped frames at 1 MiB; the send side did
+    # not, so majra could emit a frame every majra receiver rejects. Cap both.
+    if (len < 0 || len > IPC_MAX_FRAME) { return Err(ERR_IPC_FRAME_TOO_LARGE); }
     var hdr[4];
     store8(&hdr, (len >> 24) & 0xFF);
     store8(&hdr + 1, (len >> 16) & 0xFF);
     store8(&hdr + 2, (len >> 8) & 0xFF);
     store8(&hdr + 3, len & 0xFF);
-    var w = syscall(SYS_WRITE, fd, &hdr, 4);
-    if (w != 4) { return Err(ERR_IPC); }
-    w = syscall(SYS_WRITE, fd, data, len);
-    if (w != len) { return Err(ERR_IPC); }
+    if (_ipc_write_full(fd, &hdr, 4) < 0) { return Err(ERR_IPC); }
+    if (len > 0) {
+        if (_ipc_write_full(fd, data, len) < 0) { return Err(ERR_IPC); }
+    }
     return Ok(0);
 }
 
 # Receive a length-prefixed frame.
 fn ipc_recv_frame(fd) {
     var hdr[4];
-    var r = syscall(SYS_READ, fd, &hdr, 4);
-    if (r == 0) { return Err(ERR_IPC_CONN_CLOSED); }
-    if (r != 4) { return Err(ERR_IPC); }
+    var r = _ipc_read_full(fd, &hdr, 4);
+    if (r == -2) { return Err(ERR_IPC_CONN_CLOSED); }
+    if (r < 0) { return Err(ERR_IPC); }
     var len = load8(&hdr) * 16777216 + load8(&hdr + 1) * 65536 + load8(&hdr + 2) * 256 + load8(&hdr + 3);
-    if (len > 1048576) { return Err(ERR_IPC_FRAME_TOO_LARGE); }
+    if (len > IPC_MAX_FRAME) {
+        # The declared body is still queued on the socket. Returning while
+        # leaving it there let the next ipc_recv_frame read four bytes of the
+        # peer's payload as the next length prefix — from then on the peer
+        # chose every frame boundary. The oversized frame is terminal: close.
+        syscall(SYS_CLOSE, fd);
+        return Err(ERR_IPC_FRAME_TOO_LARGE);
+    }
     var buf = fl_alloc(len + 1);
-    var total = 0;
-    while (total < len) {
-        var n = syscall(SYS_READ, fd, buf + total, len - total);
-        if (n <= 0) { return Err(ERR_IPC); }
-        total = total + n;
+    if (buf == 0) { return Err(ERR_IPC); }
+    if (len > 0) {
+        if (_ipc_read_full(fd, buf, len) < 0) {
+            fl_free(buf);
+            return Err(ERR_IPC);
+        }
     }
     store8(buf + len, 0);
     var frame = fl_alloc(16);
+    if (frame == 0) { fl_free(buf); return Err(ERR_IPC); }
     store64(frame, len);
     store64(frame + 8, buf);
     return Ok(frame);
+}
+
+# Release a frame returned by ipc_recv_frame.
+fn ipc_frame_free(f) {
+    if (f == 0) { return 0; }
+    var b = load64(f + 8);
+    if (b != 0) { fl_free(b); }
+    fl_free(f);
+    return 0;
 }
 
 # Close an IPC connection.

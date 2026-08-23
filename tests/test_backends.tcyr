@@ -93,22 +93,69 @@ fn test_sha1() {
 fn test_encrypted_ipc() {
     var key[32];   # AES-256 key = 32 bytes (local var[N] is N bytes)
     memset(&key, 42, 32);
-    var eipc = encrypted_ipc_new(0, &key);
+
+    # 2.6.9: the role argument is mandatory and must be one of the two
+    # defined values — a channel whose endpoints share a role shares a nonce
+    # space, which is the bug this parameter exists to prevent.
+    assert_eq(encrypted_ipc_new(0, &key, 7), 0, "eipc rejects an undefined role");
+
+    var eipc = encrypted_ipc_new(0, &key, ENCRYPTED_IPC_INITIATOR);
+    assert(eipc != 0, "eipc initiator constructed");
+    assert_eq(encrypted_ipc_role(eipc), ENCRYPTED_IPC_INITIATOR, "eipc role stored");
     assert_eq(encrypted_ipc_messages_sent(eipc), 0, "eipc 0 msgs");
     assert_eq(encrypted_ipc_needs_rekey(eipc), 0, "eipc no rekey");
 
-    var n1 = _make_nonce(eipc);
-    assert(n1 != 0, "nonce 1 generated");
-    assert_eq(encrypted_ipc_messages_sent(eipc), 1, "eipc 1 msg");
+    # --- The critical invariant: the two directions must never share a nonce.
+    var na[12];
+    var nb[12];
+    _write_nonce(&na, ENCRYPTED_IPC_INITIATOR, 0);
+    _write_nonce(&nb, ENCRYPTED_IPC_RESPONDER, 0);
+    assert(memeq(&na, &nb, 12) != 1, "counter 0 nonces DIFFER across roles");
+    assert_eq(load8(&na), ENCRYPTED_IPC_INITIATOR, "initiator role in nonce byte 0");
+    assert_eq(load8(&nb), ENCRYPTED_IPC_RESPONDER, "responder role in nonce byte 0");
 
-    var n2 = _make_nonce(eipc);
-    assert(n2 != 0, "nonce 2 generated");
+    # Same role + same counter is deterministic; same role + different counter differs.
+    var nc[12];
+    _write_nonce(&nc, ENCRYPTED_IPC_INITIATOR, 0);
+    assert_eq(memeq(&na, &nc, 12), 1, "nonce is deterministic for (role, counter)");
+    _write_nonce(&nc, ENCRYPTED_IPC_INITIATOR, 1);
+    assert(memeq(&na, &nc, 12) != 1, "counter 0 and 1 nonces differ");
+
+    # Counter is consumed only on success and is visible via messages_sent.
+    assert_eq(_next_counter(eipc), 0, "first counter is 0");
+    assert_eq(_next_counter(eipc), 1, "second counter is 1");
     assert_eq(encrypted_ipc_messages_sent(eipc), 2, "eipc 2 msgs");
 
-    encrypted_ipc_rekey(eipc, &key);
+    # --- Rekey must refuse a key identical to the installed one: resetting the
+    # counter is only safe because the key changed.
+    var r_same = encrypted_ipc_rekey(eipc, &key);
+    assert_eq(is_err_result(r_same), 1, "rekey REFUSES an identical key");
+    assert_eq(encrypted_ipc_messages_sent(eipc), 2, "refused rekey left counter alone");
+
+    var key2[32];
+    memset(&key2, 99, 32);
+    var r_new = encrypted_ipc_rekey(eipc, &key2);
+    assert_eq(is_err_result(r_new), 0, "rekey accepts a genuinely new key");
     assert_eq(encrypted_ipc_messages_sent(eipc), 0, "eipc rekey reset");
 
     println("  encrypted_ipc: ok");
+}
+
+# 2.6.9: majra_base64_decode consumed 4 input bytes per iteration while sizing
+# its output len/4*3, so a length that is not a multiple of 4 read past the end
+# of the input AND wrote past the end of the output. Invalid alphabet bytes
+# also used to fold to 0 ('A'), decoding corrupt input to plausible plaintext.
+fn test_base64_decode_validation() {
+    assert_eq(majra_base64_decode("abc", 3), 0, "b64 decode rejects len % 4 != 0");
+    assert_eq(majra_base64_decode("", 0), 0, "b64 decode rejects empty");
+    assert_eq(majra_base64_decode("a", 1), 0, "b64 decode rejects len 1");
+    assert_eq(majra_base64_decode("ab!@", 4), 0, "b64 decode rejects non-alphabet bytes");
+
+    var ok = majra_base64_decode("aGVsbG8=", 8);
+    assert(ok != 0, "b64 decode accepts valid input");
+    assert_eq(load64(ok + 8), 5, "b64 decode length 5");
+    assert_eq(memeq(load64(ok), "hello", 5), 1, "b64 decode roundtrip");
+    println("  base64_decode_validation: ok");
 }
 
 fn test_signed_envelope() {
@@ -254,6 +301,55 @@ fn test_ws_framing() {
     println("  ws_framing: ok");
 }
 
+# 2.6.9: src/ipc.cyr ships in all four dist profiles and had NO test in any
+# suite — which is why its defects went unnoticed. Round-trips over a real
+# socketpair, and covers the path and frame-size guards.
+fn test_ipc() {
+    # _sockaddr_un now fails instead of silently truncating an over-long path
+    # (two paths sharing a 107-byte prefix used to collide onto one socket).
+    assert_eq(_sockaddr_un(""), 0, "sockaddr_un rejects empty path");
+    var longp = fl_alloc(200);
+    memset(longp, 97, 199);
+    store8(longp + 199, 0);
+    assert_eq(_sockaddr_un(longp), 0, "sockaddr_un rejects path > 107");
+    var okp = _sockaddr_un("/tmp/majra-test.sock");
+    assert(okp != 0, "sockaddr_un accepts a normal path");
+    assert_eq(_sockaddr_un_len("/tmp/x"), 9, "sockaddr_un_len = 2 + len + NUL");
+
+    # socketpair(AF_UNIX, SOCK_STREAM, 0, sv) — a real connected pair.
+    var sv[8];
+    var rc = syscall(53, 1, 1, 0, &sv);
+    assert_eq(rc, 0, "socketpair created");
+    var a = load32(&sv);
+    var b = load32(&sv + 4);
+
+    # Round-trip a frame.
+    var sent = ipc_send_frame(a, "hello ipc", 9);
+    assert_eq(is_err_result(sent), 0, "ipc_send_frame ok");
+    var got = ipc_recv_frame(b);
+    assert_eq(is_err_result(got), 0, "ipc_recv_frame ok");
+    var f = payload(got);
+    assert_eq(load64(f), 9, "ipc frame length 9");
+    assert_eq(memeq(load64(f + 8), "hello ipc", 9), 1, "ipc frame payload intact");
+    ipc_frame_free(f);
+
+    # A zero-length frame is legal and must round-trip.
+    assert_eq(is_err_result(ipc_send_frame(a, "", 0)), 0, "ipc zero-length send ok");
+    var g0 = ipc_recv_frame(b);
+    assert_eq(is_err_result(g0), 0, "ipc zero-length recv ok");
+    assert_eq(load64(payload(g0)), 0, "ipc zero-length is 0");
+    ipc_frame_free(payload(g0));
+
+    # The send side now refuses what the receive side would reject, instead of
+    # emitting a frame no majra receiver can accept.
+    assert_eq(is_err_result(ipc_send_frame(a, "x", IPC_MAX_FRAME + 1)), 1, "ipc send refuses > 1 MiB");
+    assert_eq(is_err_result(ipc_send_frame(a, "x", -1)), 1, "ipc send refuses negative len");
+
+    syscall(SYS_CLOSE, a);
+    syscall(SYS_CLOSE, b);
+    println("  ipc: ok");
+}
+
 fn test_redis_resp() {
     var cmd = vec_new();
     vec_push(cmd, "SET");
@@ -335,6 +431,8 @@ fn main() {
     test_base64();
     test_sha1();
     test_encrypted_ipc();
+    test_base64_decode_validation();
+    test_ipc();
     test_aes_gcm_roundtrip();
     test_signed_envelope();
     test_admin();
