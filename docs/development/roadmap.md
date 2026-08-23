@@ -7,50 +7,73 @@ ships, **delete it**; do not convert it into a changelog entry.
 
 ## How to read this
 
-| Bucket | Meaning |
+Work is scheduled against **release targets**, not priority labels. Every item
+names the version it is aimed at and the condition that would move it.
+
+| Target | Theme |
 |---|---|
-| **Now** | Committed for the next cut. Scope is settled and there is a definition of done. |
-| **Next** | Agreed and scheduled behind *Now*. Scope understood; work not started. |
-| **Backlog** | Real work with a real reason, but no trigger yet. Each entry names what would promote it. |
-| **Waiting on upstream** | Blocked on cyrius, sigil, or patra. Names the blocker. |
+| **2.6.10** | Hardening. Second P(-1) pass and its repairs. PATCH — no API changes. |
+| **2.7.0** | Finish what the audit deferred — the additive APIs 2.6.9 declined to invent mid-repair. |
+| **2.7 line** | Larger capabilities, each taking the next MINOR as its trigger fires. |
+| **Waiting on upstream** | Blocked outside this repo. Names the blocker. |
 | **Non-goals** | Deliberately out of scope, recorded so the question stops recurring. |
 
-An item earns promotion when its **trigger** fires — a consumer need, a
-dependency landing, or a measurement crossing a threshold. Triggers are written
-down so promotion is a decision rather than a mood.
+> **Why these can't all be patch releases.** [`semver.md`](semver.md) reserves
+> PATCH for "bug fixes, performance, documentation — no API changes", so
+> anything adding a public function takes the next MINOR. "The 2.7.x line"
+> below is therefore a *development line*, not a run of patch numbers:
+> `pubsub_unsubscribe` and PostgreSQL SCRAM cannot share one. 2.7.0 batches the
+> three small additive items so they cost a single version between them.
+
+An item moves when its **trigger** fires — a consumer need, a dependency
+landing, or a measurement crossing a threshold. Triggers are written down so
+promotion is a decision rather than a mood.
 
 ---
 
-## Now
+## 2.6.10 — hardening
 
-### Second P(-1) pass before the 2.7.0 cut
+### Second P(-1) pass and repairs
 
 [`CLAUDE.md`](../../CLAUDE.md) P(-1) step 10 says *"repeat if heavy — keep
 drilling until the pass is genuinely clean, not just no errors."* The
 [2026-08-22 pass](../audit/2026-08-22-audit.md) returned **115 confirmed
 findings**, which is heavy on any reading, and it rewrote enough code that the
-rewrites themselves are now unaudited.
+rewrites themselves are unaudited.
 
 **Done when**: a second pass over the modules 2.6.9 changed most heavily
-returns no new high-severity findings.
+returns no new high-severity findings, and its own write-up lands in
+`docs/audit/`.
 
 **Re-examine specifically** — all introduced by 2.6.9, none yet audited:
 
-- the replay window in `encrypted_ipc_recv`: counter monotonicity across a
-  rekey, and whether a peer can wedge it
-- the new bounds arithmetic in the DataRow and RESP parsers — that is exactly
-  where the previous bugs lived
+- **Ownership.** 2.6.9 added a large number of `fl_free` calls to code that
+  previously just leaked. A leak is a far safer bug than a double-free, so every
+  new free needs both of its sites traced.
+- The replay window in `encrypted_ipc_recv`: counter monotonicity across a
+  rekey, and whether a peer can wedge it.
+- The new bounds arithmetic in the DataRow and RESP parsers — bounds checks are
+  themselves a classic source of off-by-one and sign errors, and that is exactly
+  where the previous bugs lived.
 - `relay_send` and `relay_receive_ex` now hold the relay mutex across the
-  fan-out, which is safe *only* while every send path stays non-blocking
-- `mq_dequeue`'s cancelled-job skip loop, which can now iterate
+  fan-out, and `encrypted_ipc_send` now holds the connection mutex across
+  `ipc_send_frame` — a socket write. Each is safe *only* if that path genuinely
+  never blocks.
+- Loops 2.6.9 added: `mq_dequeue`'s cancelled-job skip, `patra_queue_dequeue`'s
+  claim-retry, `pg_query`'s ErrorResponse drain, `fleet_deregister_node`'s
+  drain. Each needs a termination argument.
+
+**Scope note**: repairs that require an API change do not belong in a PATCH.
+If the pass surfaces one, it moves to 2.7.0 and the reason is recorded here.
 
 ### Consumer migration guide for the 2.6.9 breaking changes
 
-2.6.9 changed three public signatures plus two behaviours. Consumers pinning it
-need a recipe, in the shape of the existing `docs/guides/migration-*.md` files.
+Documentation, so it ships inside the PATCH without affecting its
+classification.
 
-**Done when** it covers: `encrypted_ipc_new` (new required role argument),
-`majra_admin_serve` (address is now a parsed dotted-quad string),
+**Done when** it covers, in the shape of the existing
+`docs/guides/migration-*.md` files: `encrypted_ipc_new` (new required role
+argument), `majra_admin_serve` (address is now a parsed dotted-quad string),
 `transport_send`/`transport_recv` (all three arguments now forwarded),
 `namespace_new` (now rejects `/`, `:`, `#`, `+`, control bytes), and the
 `patra_queue` `STR` → `TEXT` schema change — which needs an explicit "delete or
@@ -59,11 +82,15 @@ migrate the existing `.patra` file" step, since an old file silently keeps its
 
 ---
 
-## Next
+## 2.7.0 — finish what the audit deferred
+
+The additive APIs 2.6.9 declined to invent while it was repairing 115 findings.
+Batched into one MINOR because each adds a public function and each is
+individually small.
 
 ### pubsub unsubscribe + per-subscriber lag policy
 
-The deferral 2.6.9 documented most carefully. Fan-out is a **blocking
+The deferral the audit documented most carefully. Fan-out is a **blocking
 backpressure contract**: 2.5.3 established it and
 `test_pubsub_no_head_of_line_block` asserts it. The consequence is that a
 subscriber abandoned without draining wedges publishes to its topic
@@ -78,29 +105,9 @@ disconnect) chosen by the caller rather than baked in.
 on whether `relay` should share the mechanism — it already drops via
 `chan_try_send`, matching `tokio::sync::broadcast`.
 
-**Trigger**: any consumer creating subscriptions dynamically. Today's consumers
-subscribe at startup and hold for process life, which is why this has not bitten.
-
-### PostgreSQL SCRAM-SHA-256 + `SSLRequest`
-
-`postgres_backend.cyr` speaks **plaintext** and implements only
-`AuthenticationCleartextPassword`, so the password and every query and result
-row cross the wire in the clear. PostgreSQL has defaulted to `scram-sha-256`
-since v14, so reaching a modern server means weakening `pg_hba.conf` to
-`password` — which CI does today, and that is the tell.
-
-2.6.9 made the connect **fail closed** on auth type 10 rather than downgrade,
-so the current state is at least honest. It remains a real capability gap.
-
-**Scope**: SCRAM-SHA-256 (SASL, RFC 5802) over sigil's HMAC-SHA256 + PBKDF2,
-and `SSLRequest` (code 80877103) + TLS via `lib/tls.cyr`.
-
-**Trigger**: any consumer needing PostgreSQL over something other than loopback
-or an already-confidential channel.
-
----
-
-## Backlog
+**Trigger**: already fired in principle — any consumer creating subscriptions
+dynamically hits it. Today's consumers subscribe at startup and hold for process
+life, which is the only reason it has not bitten.
 
 ### Per-key rate-limit statistics
 
@@ -120,10 +127,35 @@ observability.
 2.6.9 corrected the header rather than the code. Tiers are a dependency-ordering
 construct today — a coherent design, just not the advertised one.
 
-**Scope**: thread-per-step within a tier, bounded pool, and a decision on how a
-failing step affects its siblings.
+**Scope**: thread-per-step within a tier, a bounded pool, and a decision on how
+a failing step affects its siblings.
 **Trigger**: a workflow whose tier width and per-step latency make serial
-execution the bottleneck. Needs a measurement, not an intuition.
+execution the bottleneck. Needs a measurement, not an intuition — and it should
+be taken with the concurrency lessons of the 2.6.9 audit in hand.
+
+---
+
+## 2.7 line — larger capabilities
+
+Each takes the next available MINOR when its trigger fires. Ordered by expected
+value, not by commitment.
+
+### PostgreSQL SCRAM-SHA-256 + `SSLRequest`
+
+`postgres_backend.cyr` speaks **plaintext** and implements only
+`AuthenticationCleartextPassword`, so the password and every query and result
+row cross the wire in the clear. PostgreSQL has defaulted to `scram-sha-256`
+since v14, so reaching a modern server means weakening `pg_hba.conf` to
+`password` — which CI does today, and that is the tell.
+
+2.6.9 made the connect **fail closed** on auth type 10 rather than downgrade,
+so the current state is at least honest. It remains the largest capability gap
+majra ships.
+
+**Scope**: SCRAM-SHA-256 (SASL, RFC 5802) over sigil's HMAC-SHA256 + PBKDF2,
+and `SSLRequest` (code 80877103) + TLS via `lib/tls.cyr`.
+**Trigger**: any consumer needing PostgreSQL over something other than loopback
+or an already-confidential channel.
 
 ### QUIC transport
 
@@ -137,9 +169,10 @@ are.
 
 The historical `SYS_OPEN` blocker is long gone (agnosys 1.3.2). Wiring and
 verifying a `cyrius build --aarch64` CI step is a discrete, unblocked
-*verification* task — not a porting one.
+*verification* task — not a porting one, and arguably a PATCH since it adds no
+API.
 **Trigger**: any non-x86_64 consumer. All current consumers are
-x86_64-server-side, so this stays low priority.
+x86_64-server-side.
 
 ### Shared-memory IPC transport (mmap-based)
 

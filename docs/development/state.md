@@ -161,14 +161,14 @@ Full history in [`../../CHANGELOG.md`](../../CHANGELOG.md).
 
 | Item | Status | Where to look |
 |---|---|---|
-| **pubsub has no unsubscribe** | Open by design — an abandoned subscriber wedges its topic, because fan-out is a blocking backpressure contract | plan: [roadmap § Next](roadmap.md) |
-| **PostgreSQL: cleartext auth, no TLS** | Open — credentials and queries cross the wire in the clear; the connect fails closed on SCRAM rather than downgrading | plan: [roadmap § Next](roadmap.md) |
-| **Per-key ratelimit stats** | Open — `/ratelimit` returns global counters for any key, marked `"scope":"global"` | plan: [roadmap § Backlog](roadmap.md) |
-| **Parallel DAG tier execution** | Open — steps within a tier run serially | plan: [roadmap § Backlog](roadmap.md) |
+| **pubsub has no unsubscribe** | Open by design — an abandoned subscriber wedges its topic, because fan-out is a blocking backpressure contract | plan: [roadmap § 2.7.0](roadmap.md) |
+| **PostgreSQL: cleartext auth, no TLS** | Open — credentials and queries cross the wire in the clear; the connect fails closed on SCRAM rather than downgrading | plan: [roadmap § 2.7 line](roadmap.md) |
+| **Per-key ratelimit stats** | Open — `/ratelimit` returns global counters for any key, marked `"scope":"global"` | plan: [roadmap § 2.7.0](roadmap.md) |
+| **Parallel DAG tier execution** | Open — steps within a tier run serially | plan: [roadmap § 2.7.0](roadmap.md) |
 | ~~**`base64_*` collides with `lib/bayan.cyr`**~~ | **RESOLVED** at 2.6.8 — renamed to `majra_base64_encode` / `majra_base64_decode`. All four profiles emit zero duplicate-fn warnings | CHANGELOG 2.6.8 · [`semver.md`](semver.md) § Documented exceptions |
-| **Shared-memory IPC transport** | parked until a consumer hits the syscall-per-message ceiling | plan: [roadmap § Backlog](roadmap.md) |
+| **Shared-memory IPC transport** | parked until a consumer hits the syscall-per-message ceiling | plan: [roadmap § 2.7 line](roadmap.md) |
 | **agnos `--agnos` full build (non-core)** | blocked upstream on patra's unguarded `SYS_LSEEK`. Core is agnos-clean since 2.5.0; only `backends` + a daemon `--agnos` build are affected | plan: [roadmap § Waiting on upstream](roadmap.md) |
-| **aarch64 cross-build** | unblocked since 2.4.5; wiring the CI step is a verification task | plan: [roadmap § Backlog](roadmap.md) |
+| **aarch64 cross-build** | unblocked since 2.4.5; wiring the CI step is a verification task | plan: [roadmap § 2.7 line](roadmap.md) |
 | ~~**sigil pin lags the toolchain fold**~~ | **RESOLVED** at 2.6.8 — sigil is a `[deps].stdlib` module now and tracks the pin. The whole class is closed: majra declares zero git deps | `cyrius.cyml [deps]` |
 | ~~**sigil asm-offset drift**~~ | **RESOLVED** at 2.4.5 | [dependency-watch.md](dependency-watch.md) |
 
