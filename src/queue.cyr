@@ -51,6 +51,13 @@ fn queue_item_new(priority, payload) {
     return item;
 }
 
+# Release a QueueItem. Only for items the caller owns outright — an item
+# handed to mq_enqueue is owned by the queue until it terminates.
+fn queue_item_free(item) {
+    if (item != 0) { fl_free(item); }
+    return 0;
+}
+
 fn queue_item_id_hi(item) { return load64(item); }
 fn queue_item_id_lo(item) { return load64(item + 8); }
 fn queue_item_priority(item) { return load64(item + 16); }
@@ -392,6 +399,53 @@ fn mq_dequeue(mq) {
     var vt = load64(mq + 48);
     if (vt != 0) {
         metrics_queue_dequeued(vt, load64(mq + 24), load64(out + 16));
+    }
+    return out;
+}
+
+# Remove the next QUEUED job without treating it as an execution.
+#
+# Returns the QueueItem, or 0 if nothing is queued. The caller owns the item
+# and should release it with queue_item_free once it has copied what it needs.
+#
+# This exists because a steal or a drain is NOT a dequeue. `mq_dequeue` marks
+# the job RUNNING, increments running_count, and — critically — REFUSES once
+# running_count reaches max_concurrent. Using it to move work therefore
+# (a) inflated the source's running_count, and (b) silently gave up on a queue
+# whose jobs were already at the cap, which is precisely the state a rebalance
+# or a deregister needs to act on. fleet.cyr used mq_dequeue + a compensating
+# mq_fail for both; this is the primitive it actually wanted.
+#
+# Cancelled jobs are dropped rather than handed back, matching mq_dequeue.
+fn mq_take_queued(mq) {
+    var mtx = load64(mq + 16);
+    var jobs = load64(mq + 8);
+
+    var out = 0;
+    var searching = 1;
+    while (searching == 1) {
+        mutex_lock(mtx);
+        var item = cpq_dequeue(load64(mq));
+        if (item == 0) {
+            mutex_unlock(mtx);
+            searching = 0;
+        } else {
+            var key = load64(item + 32);
+            var mi = map_get(jobs, key);
+            var cancelled = 0;
+            if (mi != 0 && load64(mi + 32) == JOB_CANCELLED) { cancelled = 1; }
+            if (mi != 0) {
+                map_delete(jobs, key);
+                fl_free(mi);
+            }
+            mutex_unlock(mtx);
+            if (cancelled == 1) {
+                queue_item_free(item);
+            } else {
+                out = item;
+                searching = 0;
+            }
+        }
     }
     return out;
 }

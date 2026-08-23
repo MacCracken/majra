@@ -64,19 +64,22 @@ fn fleet_deregister_node(fq, node_id) {
     if (mq == 0) { mutex_unlock(mtx); return 0; }
     map_delete(nodes, node_id);
 
+    # mq_take_queued, NOT mq_dequeue. mq_dequeue refuses once running_count
+    # reaches max_concurrent, so a node with jobs already running would have
+    # dropped out of this loop immediately and discarded every QUEUED job —
+    # the same silent job loss deregister was supposed to stop.
     var orphaned = 0;
     var draining = 1;
     while (draining == 1) {
-        var item = mq_dequeue(mq);
+        var item = mq_take_queued(mq);
         if (item == 0) { draining = 0; }
         else {
-            # mq_dequeue marked it running on a queue that is going away.
-            mq_fail(mq, item);
             var tid = _fleet_select_node(fq);
             if (tid == 0) { orphaned = orphaned + 1; }
             else {
                 mq_enqueue(map_get(nodes, tid), queue_item_priority(item), queue_item_payload(item));
             }
+            queue_item_free(item);
         }
     }
     mutex_unlock(mtx);
@@ -181,18 +184,17 @@ fn fleet_rebalance(fq) {
                         # configured.
                         var taking = 1;
                         while (taking == 1 && to_steal > 0 && mq_queued_count(tmq) < threshold) {
-                            var item = mq_dequeue(mq);
+                            # mq_take_queued, NOT mq_dequeue. A steal is not an
+                            # execution: mq_dequeue would mark the job RUNNING,
+                            # inflate the source's running_count, and — worse —
+                            # REFUSE outright once that count hit
+                            # max_concurrent, which is exactly the saturated
+                            # node a rebalance most needs to relieve.
+                            var item = mq_take_queued(mq);
                             if (item == 0) { taking = 0; }
                             else {
-                                # mq_dequeue marks the job RUNNING and bumps
-                                # the source's running_count. A steal is not
-                                # an execution, and nothing reversed that
-                                # transition — so every rebalance inflated the
-                                # source's running_count permanently, and once
-                                # it reached max_concurrent that node stopped
-                                # dequeuing anything at all.
-                                mq_fail(mq, item);
                                 mq_enqueue(tmq, queue_item_priority(item), queue_item_payload(item));
+                                queue_item_free(item);
                                 stolen = stolen + 1;
                                 to_steal = to_steal - 1;
                             }

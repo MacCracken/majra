@@ -38,7 +38,7 @@ enum CircuitState {
 #   offset 16: failure_threshold (i64)
 #   offset 24: cooldown_ns (i64)
 #   offset 32: mutex (i64)
-#   offset 40: probe_inflight (i64) — 1 once a half-open probe has been handed out
+#   offset 40: probe_at_ns (i64) — when the outstanding half-open probe was issued (0 = none)
 #
 # The mutex and probe_inflight slots were added at 2.6.9. Before them
 # `circuit_record_failure` did an unsynchronised read-modify-write on the
@@ -83,8 +83,18 @@ fn circuit_state(cb) {
     }
     var elapsed = time_now_ns() - load64(cb + 8);
     if (elapsed >= load64(cb + 24)) {
-        if (load64(cb + 40) == 0) {
-            store64(cb + 40, 1);
+        # A probe is only allowed to hold the gate for one cooldown window.
+        #
+        # 2.6.9 stored a bare in-flight FLAG, cleared only by
+        # circuit_record_success / _failure / _reset. A caller that took a
+        # probe and then never reported — it crashed, it was cancelled, it
+        # simply forgot — left the flag set forever, so circuit_state returned
+        # CIRCUIT_OPEN for the life of the process even after the endpoint
+        # recovered. The breaker latched open, which is the same availability
+        # failure it exists to prevent, just inverted.
+        var probe_at = load64(cb + 40);
+        if (probe_at == 0 || time_now_ns() - probe_at >= load64(cb + 24)) {
+            store64(cb + 40, time_now_ns());
             mutex_unlock(mtx);
             return CIRCUIT_HALF_OPEN;
         }

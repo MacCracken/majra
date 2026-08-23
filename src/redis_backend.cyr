@@ -107,27 +107,35 @@ fn _resp_read_reply_d(fd, depth) {
     var data = str_data(line);
     var type_byte = load8(data);
 
+    # NOTE ON OWNERSHIP: `line` borrows an fl_alloc'd copy made by
+    # _resp_read_line. The simple-string and error cases hand a Str over it
+    # back to the caller, so those must NOT free it — the caller owns it and
+    # releases it with resp_reply_free. The integer and length-header cases
+    # consume it here and free it.
     if (type_byte == 43) {
-        # +simple string
+        # +simple string — caller owns the buffer
         return str_new(data + 1, str_len(line) - 1);
     }
     if (type_byte == 45) {
-        # -error
+        # -error — caller owns the buffer
         return str_new(data + 1, str_len(line) - 1);
     }
     if (type_byte == 58) {
-        # :integer
-        return str_to_int(str_new(data + 1, str_len(line) - 1));
+        # :integer — the line is fully consumed here
+        var iv = str_to_int(str_new(data + 1, str_len(line) - 1));
+        fl_free(data);
+        return iv;
     }
     if (type_byte == 36) {
         # $bulk string
         var blen = str_to_int(str_new(data + 1, str_len(line) - 1));
-        if (blen < 0) { return 0; }
+        if (blen < 0) { fl_free(data); return 0; }
         # Without this cap, `$9223372036854775807` makes `blen + 2` WRAP
         # NEGATIVE; _fl_class sends any negative size down the size<=16 path,
         # so fl_alloc hands back a 16-byte block which str_new then labels
         # with a length of INT64_MAX. The first str_eq on that reply walks the
         # entire address space.
+        fl_free(data);
         if (blen > RESP_MAX_BULK) { return 0; }
         var buf = fl_alloc(blen + 2);
         if (buf == 0) { return 0; }
@@ -142,6 +150,7 @@ fn _resp_read_reply_d(fd, depth) {
     if (type_byte == 42) {
         # *array
         var count = str_to_int(str_new(data + 1, str_len(line) - 1));
+        fl_free(data);
         if (count < 0) { return 0; }
         # An oversized count spins this loop growing `arr` long after the
         # socket has stopped producing, and unbounded nesting turns
@@ -150,13 +159,35 @@ fn _resp_read_reply_d(fd, depth) {
         var arr = vec_new();
         var j = 0;
         while (j < count) {
-            var elem = _resp_read_reply_d(fd, depth + 1);
-            if (elem == 0) { return arr; }
-            vec_push(arr, elem);
+            # ⚠ Do NOT treat a 0 element as a parse failure.
+            #
+            # 2.6.9 added `if (elem == 0) { return arr; }` here, but this
+            # function returns 0 for THREE different things: a read failure, a
+            # nil bulk string (`$-1`, which this module's own doc comment
+            # documents as 0), and an integer reply of `:0`. So an ordinary
+            # Redis reply — a rate-limiter Lua script returning
+            # `*2\r\n:0\r\n:1\r\n`, or an MGET with a missing key — was
+            # truncated to an empty array, and the elements it did not consume
+            # stayed queued on the socket. The next command on that connection
+            # then read the leftovers as its own reply and the stream was
+            # permanently offset by one. Push every element; a genuine socket
+            # failure is caught by the read loop above, which cannot produce
+            # more elements anyway.
+            vec_push(arr, _resp_read_reply_d(fd, depth + 1));
             j = j + 1;
         }
         return arr;
     }
+    # Unrecognised type byte — nothing else will consume the line.
+    fl_free(data);
+    return 0;
+}
+
+# Release a Str reply returned by _resp_read_reply for a simple string, an
+# error, or a bulk string. Integers are values, arrays are vecs from the bump
+# allocator; neither needs this.
+fn resp_reply_free(reply) {
+    if (reply != 0) { fl_free(str_data(reply)); }
     return 0;
 }
 

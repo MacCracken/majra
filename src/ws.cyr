@@ -26,9 +26,6 @@ var _sha1_h2 = 0x98BADCFE;
 var _sha1_h3 = 0x10325476;
 var _sha1_h4 = 0xC3D2E1F0;
 
-# 80-entry SHA-1 message schedule (global var[N] is N x 8 bytes = 640).
-# Scratch only — consumed within a single sha1() call.
-var _sha1_w[80];
 
 fn _sha1_rotl32(x, n) {
     x = x & 0xFFFFFFFF;
@@ -62,13 +59,18 @@ fn sha1(data, len) {
 
     # Process each 64-byte block.
     #
-    # The 80-entry message schedule used to come from alloc() — the BUMP
-    # allocator, which never reclaims — so every sha1() call, i.e. every
-    # WebSocket handshake, leaked 640 bytes permanently. An unauthenticated
-    # peer could exhaust memory by reconnecting. It is now a module-level
-    # scratch buffer: sha1 is a leaf function that consumes the schedule
-    # entirely before returning, so a single shared buffer is sufficient.
-    var w = &_sha1_w;
+    # The 80-entry message schedule comes from the FREELIST, per call.
+    #
+    # Originally it came from alloc() — the BUMP allocator, which never
+    # reclaims — so every handshake leaked 640 bytes and an unauthenticated
+    # peer could exhaust memory by reconnecting. 2.6.9 fixed that leak by
+    # switching to a module-level scratch buffer, which fixed the leak and
+    # broke REENTRANCY: sha1 is exported in all four dist bundles, so two
+    # consumer threads hashing concurrently interleaved writes into one
+    # schedule and both received a digest of neither message. fl_alloc fixes
+    # both — it is per-call like the original, and reclaimable unlike alloc.
+    var w = fl_alloc(640);
+    if (w == 0) { fl_free(padded); return 0; }
     var block = 0;
     while (block < padded_len) {
         # Prepare message schedule (32-bit words stored in 64-bit slots)
@@ -130,6 +132,7 @@ fn sha1(data, len) {
     }
 
     fl_free(padded);
+    fl_free(w);
 
     # Output 20-byte digest in big-endian
     var digest = fl_alloc(20);

@@ -286,6 +286,17 @@ fn encrypted_ipc_send(e, data, len) {
     return rc;
 }
 
+# Tear down a connection whose framing can no longer be trusted. Caller must
+# hold the mutex.
+fn _encrypted_ipc_kill(e) {
+    if (load64(e + 56) == 1) { return 0; }
+    store64(e + 56, 1);
+    var fd = load64(e);
+    if (fd >= 0) { ipc_close(fd); }
+    store64(e, -1);
+    return 0;
+}
+
 fn encrypted_ipc_recv(e) {
     if (e == 0) { return Err(ERR_IPC); }
     var mtx = load64(e + 24);
@@ -293,7 +304,17 @@ fn encrypted_ipc_recv(e) {
     if (load64(e + 56) == 1) { mutex_unlock(mtx); return Err(ERR_IPC); }
 
     var frame_result = ipc_recv_frame(load64(e));
-    if (is_err_result(frame_result) == 1) { mutex_unlock(mtx); return frame_result; }
+    if (is_err_result(frame_result) == 1) {
+        # ERR_IPC_FRAME_TOO_LARGE is terminal: the oversized body is still
+        # queued, so the framing can never resynchronise. We own the fd, so we
+        # are the ones who close it — and we poison the handle so a later send
+        # cannot write into a descriptor the kernel has since reassigned.
+        if (err_code_of(frame_result) == ERR_IPC_FRAME_TOO_LARGE) {
+            _encrypted_ipc_kill(e);
+        }
+        mutex_unlock(mtx);
+        return frame_result;
+    }
     var frame_ptr = payload(frame_result);
     var raw = load64(frame_ptr + 8);
     var raw_len = load64(frame_ptr);
@@ -387,7 +408,10 @@ fn encrypted_ipc_close(e) {
         fl_free(k);
         store64(e + 8, 0);
     }
-    ipc_close(load64(e));
+    # A poisoned fd (-1) means _encrypted_ipc_kill already closed it. Closing
+    # again would hand SYS_CLOSE a number the kernel may have reassigned.
+    var fd = load64(e);
+    if (fd >= 0) { ipc_close(fd); }
     store64(e, -1);
     mutex_unlock(mtx);
     return 0;

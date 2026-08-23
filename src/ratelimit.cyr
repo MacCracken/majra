@@ -112,12 +112,31 @@ fn ratelimit_check(rl, key) {
     # the fractional credit on every call. A limiter polled in a tight loop
     # therefore refilled at ZERO no matter how much wall time passed. Advancing
     # only by the consumed whole-token time keeps the remainder for next call.
-    if (refill > 0 && rate_x1000 > 0) {
+    # ⚠ ORDER MATTERS, and the guard on `refill` is load-bearing.
+    #
+    # 2.6.9 computed `refill * 1000000000` FIRST and unconditionally. `refill`
+    # is bounded by nothing — only `tokens` is clamped to burst above — so a
+    # bucket idle long enough overflows i64, `consumed_ns` comes back NEGATIVE,
+    # and `last_ns + consumed_ns` moves the clock BACKWARD. Every later call
+    # then sees an even larger elapsed_ns, refills to full burst, and returns
+    # allowed. That is a permanent, silent bypass of the limiter for that key —
+    # a security control failing open, introduced by the fix for a starvation
+    # bug. For a 1000 req/s limiter it needs roughly 2.6 hours idle, i.e. a
+    # reconnecting tenant reaches it on its own.
+    #
+    # A full bucket carries nothing, so it takes the clock outright and never
+    # reaches the multiply. Below that, refill is bounded by construction (a
+    # larger refill would have clamped tokens to burst), and the explicit cap
+    # keeps that reasoning from silently breaking if burst grows.
+    if (tokens >= burst_x1000) {
+        store64(bucket_ptr + 8, now);
+    } elif (refill > 0 && rate_x1000 > 0 && refill < 9000000000) {
         var consumed_ns = refill * 1000000000 / rate_x1000;
-        if (consumed_ns > elapsed_ns) { consumed_ns = elapsed_ns; }
+        if (consumed_ns < 0 || consumed_ns > elapsed_ns) { consumed_ns = elapsed_ns; }
         store64(bucket_ptr + 8, last_ns + consumed_ns);
-    } elif (tokens >= burst_x1000) {
-        # Already full — nothing to carry, so don't accumulate unbounded debt.
+    } elif (refill > 0) {
+        # Refill too large to convert back safely; the bucket is effectively
+        # full anyway, so take the clock rather than risk the multiply.
         store64(bucket_ptr + 8, now);
     }
 

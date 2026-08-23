@@ -347,6 +347,33 @@ fn test_ipc() {
 
     syscall(SYS_CLOSE, a);
     syscall(SYS_CLOSE, b);
+
+    # 2.6.10 regression: ipc_bind must leave the ON-DISK socket owner-only.
+    #
+    # 2.6.9 called fchmod AFTER bind, which only touches the sockfs inode —
+    # connect(2) checks the filesystem inode created by bind, so the mode stayed
+    # umask-derived (0755 under a typical 022) while the module header promised
+    # 0600. Nothing tested ipc_bind at all, which is why it shipped.
+    sys_unlink("/tmp/majra_ipc_mode_test.sock");
+    var br = ipc_bind("/tmp/majra_ipc_mode_test.sock");
+    assert_eq(is_err_result(br), 0, "ipc_bind succeeded");
+    var st[144];
+    memset(&st, 0, 144);
+    # stat(2) = syscall 4; st_mode is a u32 at offset 24 in struct stat.
+    assert_eq(syscall(4, "/tmp/majra_ipc_mode_test.sock", &st), 0, "stat on the bound socket");
+    var mode = load32(&st + 24) & 511;
+    assert_eq(mode, 384, "bound socket is 0600, not umask-derived");
+    ipc_close(payload(br));
+    sys_unlink("/tmp/majra_ipc_mode_test.sock");
+
+    # An over-long or empty path must fail rather than truncate or bind
+    # into the abstract namespace.
+    var longpath = fl_alloc(200);
+    memset(longpath, 97, 199);
+    store8(longpath + 199, 0);
+    assert_eq(is_err_result(ipc_bind(longpath)), 1, "ipc_bind refuses a path > 107");
+    assert_eq(is_err_result(ipc_bind("")), 1, "ipc_bind refuses an empty path");
+
     println("  ipc: ok");
 }
 
