@@ -231,6 +231,18 @@ fn _compute_tiers(def) {
     return tiers;
 }
 
+# Release a workflow context.
+#
+# workflow_execute still leaks its tier vecs and StepResults (both from the
+# bump allocator, which cannot free), so this is not a complete teardown — it
+# covers the context block itself, which is the one thing the malformed-DAG
+# early return can cleanly reclaim. Full run teardown needs the tier
+# structures to move off the bump allocator; tracked on the roadmap.
+fn workflow_context_free(ctx) {
+    if (ctx != 0) { fl_free(ctx); }
+    return 0;
+}
+
 # Execute a workflow definition with a given executor function and input.
 # executor_fn(step_ptr, ctx_ptr) -> StepResult ptr
 # Returns: RUN_COMPLETED, or RUN_FAILED (including for a malformed DAG).
@@ -245,7 +257,12 @@ fn workflow_execute(def, executor_fn, input) {
     # _compute_tiers returns 0 for a malformed DAG (a dependency cycle, a
     # dangling dependency id, or duplicate step ids). Running the schedulable
     # prefix and reporting success is exactly the failure this guards.
-    if (tiers == 0) { return RUN_FAILED; }
+    if (tiers == 0) {
+        # The context was allocated above; release it rather than abandon it on
+        # the one path that returns before the run starts.
+        workflow_context_free(ctx);
+        return RUN_FAILED;
+    }
     var num_tiers = vec_len(tiers);
     var final_status = RUN_COMPLETED;
 

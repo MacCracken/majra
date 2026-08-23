@@ -92,7 +92,9 @@ fn _pg_read_full(fd, buf, want) {
     var total = 0;
     while (total < want) {
         var r = syscall(SYS_READ, fd, buf + total, want - total);
-        if (r <= 0) { return -1; }
+        # EINTR (-4) retries; see the note in src/ws.cyr's _ws_read_full.
+        if (r == -4) { r = 0; }
+        elif (r <= 0) { return -1; }
         total = total + r;
     }
     return total;
@@ -103,7 +105,8 @@ fn _pg_write_full(fd, buf, len) {
     var total = 0;
     while (total < len) {
         var w = syscall(SYS_WRITE, fd, buf + total, len - total);
-        if (w <= 0) { return -1; }
+        if (w == -4) { w = 0; }
+        elif (w <= 0) { return -1; }
         total = total + w;
     }
     return total;

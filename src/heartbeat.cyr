@@ -152,29 +152,36 @@ fn hb_update_statuses(ht) {
     var now = time_now_ns();
     var transitions = vec_new();
 
-    var keys = map_keys(nodes);
+    # Walks the hashmap slot array directly. map_keys builds a vec from the
+    # BUMP allocator on every call and this runs on every sweep, twice — the
+    # same never-reclaimed-allocation class 2.6.9 removed from fleet, pubsub
+    # and relay and did not apply here.
+    var entries = map_entries(nodes);
+    var cap = map_cap(nodes);
     var i = 0;
-    var len = vec_len(keys);
-    while (i < len) {
-        var id = vec_get(keys, i);
-        var ns = map_get(nodes, id);
-        var elapsed = now - load64(ns + 8);
-        var prev = load64(ns);
-        var new_status = _classify_status(elapsed, cfg);
+    while (i < cap) {
+        var ep = entries + i * 24;
+        if (load64(ep + 16) == 1) {
+            var id = load64(ep);
+            var ns = load64(ep + 8);
+            var elapsed = now - load64(ns + 8);
+            var prev = load64(ns);
+            var new_status = _classify_status(elapsed, cfg);
 
-        if (new_status == STATUS_OFFLINE) {
-            store64(ns + 32, load64(ns + 32) + 1);
-        } else {
-            store64(ns + 32, 0);
-        }
+            if (new_status == STATUS_OFFLINE) {
+                store64(ns + 32, load64(ns + 32) + 1);
+            } else {
+                store64(ns + 32, 0);
+            }
 
-        if (new_status != prev) {
-            store64(ns, new_status);
-            # Store transition as pair: push id then status
-            var pair = fl_alloc(16);
-            store64(pair, id);
-            store64(pair + 8, new_status);
-            vec_push(transitions, pair);
+            if (new_status != prev) {
+                store64(ns, new_status);
+                # Store transition as pair: push id then status
+                var pair = fl_alloc(16);
+                store64(pair, id);
+                store64(pair + 8, new_status);
+                vec_push(transitions, pair);
+            }
         }
         i = i + 1;
     }
@@ -182,27 +189,34 @@ fn hb_update_statuses(ht) {
     # Handle eviction
     var eviction_cycles = load64(cfg + 16);
     if (eviction_cycles > 0) {
-        var to_evict = vec_new();
-        keys = map_keys(nodes);
+        # Two-pass, but over an fl_alloc'd array rather than two bump vecs.
+        # The collect pass is separate because map_delete during a slot walk is
+        # safe only for the entry being deleted; sizing by map_size bounds it.
+        var nlive = map_size(nodes);
+        var to_evict = 0;
+        var nev = 0;
+        if (nlive > 0) { to_evict = fl_alloc(nlive * 8); }
         i = 0;
-        len = vec_len(keys);
-        while (i < len) {
-            var id = vec_get(keys, i);
-            var ns = map_get(nodes, id);
-            if (load64(ns + 32) >= eviction_cycles) {
-                vec_push(to_evict, id);
+        while (i < cap && to_evict != 0) {
+            var ep2 = entries + i * 24;
+            if (load64(ep2 + 16) == 1) {
+                var ns2 = load64(ep2 + 8);
+                if (load64(ns2 + 32) >= eviction_cycles && nev < nlive) {
+                    store64(to_evict + nev * 8, load64(ep2));
+                    nev = nev + 1;
+                }
             }
             i = i + 1;
         }
         i = 0;
-        len = vec_len(to_evict);
-        while (i < len) {
-            var ev_id = vec_get(to_evict, i);
+        while (i < nev) {
+            var ev_id = load64(to_evict + i * 8);
             var ev_ns = map_get(nodes, ev_id);
             map_delete(nodes, ev_id);
             if (ev_ns != 0) { fl_free(ev_ns); }
             i = i + 1;
         }
+        if (to_evict != 0) { fl_free(to_evict); }
     }
 
     return transitions;
@@ -350,28 +364,32 @@ fn chb_update_statuses(cht) {
     var now = time_now_ns();
     var transitions = vec_new();
 
-    var keys = map_keys(nodes);
+    # Slot-array walk — see the note on the non-concurrent sweep above.
+    var entries = map_entries(nodes);
+    var cap = map_cap(nodes);
     var i = 0;
-    var len = vec_len(keys);
-    while (i < len) {
-        var id = vec_get(keys, i);
-        var ns = map_get(nodes, id);
-        var elapsed = now - load64(ns + 8);
-        var prev = load64(ns);
-        var new_status = _classify_status(elapsed, cfg);
+    while (i < cap) {
+        var ep = entries + i * 24;
+        if (load64(ep + 16) == 1) {
+            var id = load64(ep);
+            var ns = load64(ep + 8);
+            var elapsed = now - load64(ns + 8);
+            var prev = load64(ns);
+            var new_status = _classify_status(elapsed, cfg);
 
-        if (new_status == STATUS_OFFLINE) {
-            store64(ns + 32, load64(ns + 32) + 1);
-        } else {
-            store64(ns + 32, 0);
-        }
+            if (new_status == STATUS_OFFLINE) {
+                store64(ns + 32, load64(ns + 32) + 1);
+            } else {
+                store64(ns + 32, 0);
+            }
 
-        if (new_status != prev) {
-            store64(ns, new_status);
-            var pair = fl_alloc(16);
-            store64(pair, id);
-            store64(pair + 8, new_status);
-            vec_push(transitions, pair);
+            if (new_status != prev) {
+                store64(ns, new_status);
+                var pair = fl_alloc(16);
+                store64(pair, id);
+                store64(pair + 8, new_status);
+                vec_push(transitions, pair);
+            }
         }
         i = i + 1;
     }
@@ -379,27 +397,34 @@ fn chb_update_statuses(cht) {
     # Handle eviction
     var eviction_cycles = load64(cfg + 16);
     if (eviction_cycles > 0) {
-        var to_evict = vec_new();
-        keys = map_keys(nodes);
+        # Two-pass, but over an fl_alloc'd array rather than two bump vecs.
+        # The collect pass is separate because map_delete during a slot walk is
+        # safe only for the entry being deleted; sizing by map_size bounds it.
+        var nlive = map_size(nodes);
+        var to_evict = 0;
+        var nev = 0;
+        if (nlive > 0) { to_evict = fl_alloc(nlive * 8); }
         i = 0;
-        len = vec_len(keys);
-        while (i < len) {
-            var id = vec_get(keys, i);
-            var ns = map_get(nodes, id);
-            if (load64(ns + 32) >= eviction_cycles) {
-                vec_push(to_evict, id);
+        while (i < cap && to_evict != 0) {
+            var ep2 = entries + i * 24;
+            if (load64(ep2 + 16) == 1) {
+                var ns2 = load64(ep2 + 8);
+                if (load64(ns2 + 32) >= eviction_cycles && nev < nlive) {
+                    store64(to_evict + nev * 8, load64(ep2));
+                    nev = nev + 1;
+                }
             }
             i = i + 1;
         }
         i = 0;
-        len = vec_len(to_evict);
-        while (i < len) {
-            var ev_id = vec_get(to_evict, i);
+        while (i < nev) {
+            var ev_id = load64(to_evict + i * 8);
             var ev_ns = map_get(nodes, ev_id);
             map_delete(nodes, ev_id);
             if (ev_ns != 0) { fl_free(ev_ns); }
             i = i + 1;
         }
+        if (to_evict != 0) { fl_free(to_evict); }
     }
 
     mutex_unlock(mtx);

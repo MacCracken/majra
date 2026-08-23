@@ -34,6 +34,7 @@ fn _sb_crlf(sb) {
 # cmd is a vec of C strings (command + arguments).
 # Returns 0 on success, -1 on failure.
 fn _resp_send_cmd(fd, cmd) {
+    if (fd < 0) { return -1; }
     var sb = str_builder_new();
     # Array header
     str_builder_add_cstr(sb, "*");
@@ -96,14 +97,45 @@ fn _resp_read_line(fd) {
 #   For integers: the integer value
 #   For bulk strings: Str or 0 (nil)
 #   For arrays: vec of reply values
-fn _resp_read_reply(fd) {
-    return _resp_read_reply_d(fd, 0);
+# Takes the CONNECTION, not a bare fd, so it can poison a stream it can no
+# longer parse.
+#
+# Every abort below — a cap exceeded, a read failure, an unrecognised type
+# byte — leaves bytes the server already committed to sending sitting in the
+# socket. Returning without marking the connection meant the next command read
+# those leftovers as its own reply and every result from then on was
+# misattributed, silently. A caller cannot detect that; the only safe move is
+# to make the connection unusable so it fails loudly instead.
+#
+# A nil bulk string (`$-1`) and the integer `:0` are NOT failures — they also
+# return 0, which is why the connection state, not the return value, is what
+# distinguishes them.
+fn _resp_read_reply(rc) {
+    return _resp_read_reply_d(rc, 0);
 }
 
-fn _resp_read_reply_d(fd, depth) {
-    if (depth > RESP_MAX_DEPTH) { return 0; }
+# Mark a connection's framing untrustworthy. Subsequent commands fail fast.
+fn _resp_poison(rc) {
+    if (rc == 0) { return 0; }
+    var fd = load64(rc);
+    if (fd >= 0) { syscall(SYS_CLOSE, fd); }
+    store64(rc, -1);
+    return 0;
+}
+
+fn redis_is_alive(rc) {
+    if (rc == 0) { return 0; }
+    if (load64(rc) < 0) { return 0; }
+    return 1;
+}
+
+fn _resp_read_reply_d(rc, depth) {
+    if (rc == 0) { return 0; }
+    var fd = load64(rc);
+    if (fd < 0) { return 0; }
+    if (depth > RESP_MAX_DEPTH) { _resp_poison(rc); return 0; }
     var line = _resp_read_line(fd);
-    if (line == 0) { return 0; }
+    if (line == 0) { _resp_poison(rc); return 0; }
     var data = str_data(line);
     var type_byte = load8(data);
 
@@ -136,13 +168,13 @@ fn _resp_read_reply_d(fd, depth) {
         # with a length of INT64_MAX. The first str_eq on that reply walks the
         # entire address space.
         fl_free(data);
-        if (blen > RESP_MAX_BULK) { return 0; }
+        if (blen > RESP_MAX_BULK) { _resp_poison(rc); return 0; }
         var buf = fl_alloc(blen + 2);
         if (buf == 0) { return 0; }
         var total = 0;
         while (total < blen + 2) {
             var n = syscall(SYS_READ, fd, buf + total, blen + 2 - total);
-            if (n <= 0) { fl_free(buf); return 0; }
+            if (n <= 0) { fl_free(buf); _resp_poison(rc); return 0; }
             total = total + n;
         }
         return str_new(buf, blen);
@@ -155,7 +187,7 @@ fn _resp_read_reply_d(fd, depth) {
         # An oversized count spins this loop growing `arr` long after the
         # socket has stopped producing, and unbounded nesting turns
         # server-controlled depth into call-stack depth.
-        if (count > RESP_MAX_ARRAY) { return 0; }
+        if (count > RESP_MAX_ARRAY) { _resp_poison(rc); return 0; }
         var arr = vec_new();
         var j = 0;
         while (j < count) {
@@ -173,13 +205,15 @@ fn _resp_read_reply_d(fd, depth) {
             # permanently offset by one. Push every element; a genuine socket
             # failure is caught by the read loop above, which cannot produce
             # more elements anyway.
-            vec_push(arr, _resp_read_reply_d(fd, depth + 1));
+            vec_push(arr, _resp_read_reply_d(rc, depth + 1));
             j = j + 1;
         }
         return arr;
     }
-    # Unrecognised type byte — nothing else will consume the line.
+    # Unrecognised type byte — nothing else will consume the line, and we no
+    # longer know where the next reply starts.
     fl_free(data);
+    _resp_poison(rc);
     return 0;
 }
 
@@ -229,13 +263,18 @@ fn redis_set_prefix(rc, prefix) {
     store64(rc + 8, prefix);
 }
 
+# Closes the socket and releases the handle. The handle is INVALID afterwards —
+# do not call anything else with it.
+#
+# 2.6.9's comment claimed the `store64(rc, -1)` poison made a second close
+# safe. It did not: the very next line frees the block, so the poison survives
+# only until the freelist reuses those bytes, and a double close would then
+# read whatever the new owner wrote. The poison is kept for the window before
+# the free, but the real contract is the one stated above.
 fn redis_close(rc) {
     if (rc == 0) { return 0; }
     var fd = load64(rc);
-    if (fd < 0) { return 0; }
-    syscall(SYS_CLOSE, fd);
-    # Poison the fd so a second close cannot hit a descriptor the kernel has
-    # since handed to something else, and release the handle.
+    if (fd >= 0) { syscall(SYS_CLOSE, fd); }
     store64(rc, -1);
     fl_free(rc);
     return 0;
@@ -259,7 +298,7 @@ fn redis_set(rc, key, value) {
     vec_push(cmd, _redis_pkey(rc, key));
     vec_push(cmd, value);
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 fn redis_get(rc, key) {
@@ -267,7 +306,7 @@ fn redis_get(rc, key) {
     vec_push(cmd, "GET");
     vec_push(cmd, _redis_pkey(rc, key));
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 fn redis_del(rc, key) {
@@ -275,7 +314,7 @@ fn redis_del(rc, key) {
     vec_push(cmd, "DEL");
     vec_push(cmd, _redis_pkey(rc, key));
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 fn redis_exists(rc, key) {
@@ -283,7 +322,7 @@ fn redis_exists(rc, key) {
     vec_push(cmd, "EXISTS");
     vec_push(cmd, _redis_pkey(rc, key));
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 # SET with EX (expire in seconds)
@@ -296,7 +335,7 @@ fn redis_setex(rc, key, value, ttl_secs) {
     var ttl_str = str_data(str_from_int(ttl_secs));
     vec_push(cmd, ttl_str);
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 # --- Sorted Set (Queue) ---
@@ -308,7 +347,7 @@ fn redis_zadd(rc, key, member, score) {
     vec_push(cmd, str_data(str_from_int(score)));
     vec_push(cmd, member);
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 fn redis_zpopmin(rc, key) {
@@ -317,7 +356,7 @@ fn redis_zpopmin(rc, key) {
     vec_push(cmd, _redis_pkey(rc, key));
     vec_push(cmd, "1");
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 fn redis_zcard(rc, key) {
@@ -325,7 +364,7 @@ fn redis_zcard(rc, key) {
     vec_push(cmd, "ZCARD");
     vec_push(cmd, _redis_pkey(rc, key));
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 # --- Pub/Sub (publish only — subscribe requires dedicated connection) ---
@@ -336,7 +375,7 @@ fn redis_publish(rc, channel, message) {
     vec_push(cmd, _redis_pkey(rc, channel));
     vec_push(cmd, message);
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 # --- Hash (for rate limiter) ---
@@ -348,7 +387,7 @@ fn redis_hset(rc, key, field, value) {
     vec_push(cmd, field);
     vec_push(cmd, value);
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 fn redis_hget(rc, key, field) {
@@ -357,7 +396,7 @@ fn redis_hget(rc, key, field) {
     vec_push(cmd, _redis_pkey(rc, key));
     vec_push(cmd, field);
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 fn redis_expire(rc, key, seconds) {
@@ -366,7 +405,7 @@ fn redis_expire(rc, key, seconds) {
     vec_push(cmd, _redis_pkey(rc, key));
     vec_push(cmd, str_data(str_from_int(seconds)));
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 # --- KEYS (for heartbeat list_online) ---
@@ -376,7 +415,7 @@ fn redis_keys(rc, pattern) {
     vec_push(cmd, "KEYS");
     vec_push(cmd, _redis_pkey(rc, pattern));
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 # --- EVAL (for rate limiter Lua script) ---
@@ -391,7 +430,7 @@ fn redis_eval(rc, script, num_keys, key, arg1, arg2, arg3) {
     vec_push(cmd, arg2);
     vec_push(cmd, arg3);
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
 
 # --- PING (connection test) ---
@@ -400,5 +439,5 @@ fn redis_ping(rc) {
     var cmd = vec_new();
     vec_push(cmd, "PING");
     _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(load64(rc));
+    return _resp_read_reply(rc);
 }
