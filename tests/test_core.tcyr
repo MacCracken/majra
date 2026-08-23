@@ -950,8 +950,13 @@ fn test_ratelimit_evict_reclaims() {
     assert_eq(ratelimit_key_count(rl), 0, "evict leaves 0 keys");
 
     # No allocation between the evict and these probes.
+    #
+    # ⚠ The bucket probe must match the TokenBucket's real size, because
+    # fl_alloc buckets by size class — a mismatched probe lands in a different
+    # class and cannot observe the recycled block. The bucket grew 16 -> 32
+    # bytes at 2.7.0 when it gained per-key allowed/rejected counters.
     var reused_key = fl_alloc(41);
-    var reused_bucket = fl_alloc(16);
+    var reused_bucket = fl_alloc(32);
     assert_eq(reused_key, owned_key, "evict returned the key block to the freelist");
     assert_eq(reused_bucket, owned_bucket, "evict returned the bucket to the freelist");
     assert_eq(load64(ratelimit_stats(rl) + 24), 1, "evict is counted in stats");

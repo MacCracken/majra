@@ -249,8 +249,14 @@ fn test_admin() {
     chb_register(cht, "node-a", 100);
     chb_register(cht, "node-b", 200);
 
-    var rl = ratelimit_new(1000000, 5);
+    # Two keys with DIFFERENT outcomes, so per-key stats are distinguishable
+    # from each other and from the global totals. k1 has burst 2, so its third
+    # request is refused.
+    var rl = ratelimit_new(1, 2);
     ratelimit_check(rl, "k1");
+    ratelimit_check(rl, "k1");
+    ratelimit_check(rl, "k1");
+    ratelimit_check(rl, "k2");
 
     var admin = majra_admin_new(cht, rl);
     assert(admin != 0, "admin allocated");
@@ -265,12 +271,42 @@ fn test_admin() {
     assert(str_contains_cstr(fleet_s, "online") == 1, "fleet json has 'online'");
     assert(str_contains_cstr(fleet_s, "total") == 1, "fleet json has 'total'");
 
+    # 2.7.0: /ratelimit?key=<k> reports THAT KEY, not the limiter-wide totals.
     var rl_body = _admin_ratelimit_json(admin, "k1");
     var rl_len = rethi();
     assert(rl_len > 0, "ratelimit json non-empty");
     var rl_s = str_new(rl_body, rl_len);
-    assert(str_contains_cstr(rl_s, "allowed") == 1, "ratelimit json has 'allowed'");
-    assert(str_contains_cstr(rl_s, "evicted") == 1, "ratelimit json has 'evicted'");
+    assert(str_contains_cstr(rl_s, "\"scope\":\"key\"") == 1, "keyed query is key-scoped");
+    assert(str_contains_cstr(rl_s, "allowed") == 1, "keyed json has 'allowed'");
+    assert(str_contains_cstr(rl_s, "tokens_x1000") == 1, "keyed json reports remaining credit");
+    assert(str_contains_cstr(rl_s, "evicted") == 0, "keyed json does NOT leak global counters");
+
+    # Omitting the key still reports limiter-wide totals, explicitly labelled.
+    var g_body = _admin_ratelimit_json(admin, 0);
+    var g_len = rethi();
+    var g_s = str_new(g_body, g_len);
+    assert(str_contains_cstr(g_s, "\"scope\":\"global\"") == 1, "unkeyed query is global-scoped");
+    assert(str_contains_cstr(g_s, "evicted") == 1, "global json has 'evicted'");
+
+    # An unseen key is reported as unknown, not as zeroes that look like a
+    # quiet tenant.
+    var u_body = _admin_ratelimit_json(admin, "never-seen");
+    var u_len = rethi();
+    var u_s = str_new(u_body, u_len);
+    assert(str_contains_cstr(u_s, "unknown key") == 1, "an unseen key is reported unknown");
+
+    # The underlying per-key numbers must actually differ per key.
+    var s1 = ratelimit_stats_for_key(rl, "k1");
+    var s2 = ratelimit_stats_for_key(rl, "k2");
+    assert(s1 != 0, "k1 has stats");
+    assert(s2 != 0, "k2 has stats");
+    assert_eq(ratelimit_key_allowed(s1), 2, "k1 allowed 2 (burst)");
+    assert_eq(ratelimit_key_rejected(s1), 1, "k1 rejected 1");
+    assert_eq(ratelimit_key_allowed(s2), 1, "k2 allowed 1");
+    assert_eq(ratelimit_key_rejected(s2), 0, "k2 rejected 0 — NOT k1's count");
+    assert_eq(ratelimit_stats_for_key(rl, "never-seen"), 0, "unseen key has no stats");
+    ratelimit_stats_free(s1);
+    ratelimit_stats_free(s2);
 
     println("  admin: ok");
 }
@@ -433,6 +469,49 @@ fn test_pg_wire() {
 # 2.6.10: pg_save/get/delete_workflow_def spliced caller strings straight into
 # quoted SQL literals — an injection the FIRST audit pass missed entirely.
 # _pg_add_literal doubles embedded quotes per the SQL standard.
+# 2.7.0: the residual half of a memory-safety finding. Passing a BASIC tracker
+# to the two-argument constructor used to make chb_fleet_stats read 8 bytes
+# past the allocation and mutex_lock() the result. 2.6.9 recorded a
+# caller-declared kind; 2.6.10 found the constructor still had to trust it.
+# Both tracker layouts now carry a type tag, so it is detected.
+fn test_tracker_type_tags() {
+    var cfg = heartbeat_config_new(1000000000, 2000000000, 3);
+
+    var basic = hb_tracker_new(cfg);
+    var conc = chb_tracker_new(cfg);
+    assert_eq(hb_tracker_kind(basic), HB_KIND_BASIC, "basic tracker tags itself");
+    assert_eq(hb_tracker_kind(conc), HB_KIND_CONCURRENT, "concurrent tracker tags itself");
+    assert(HB_KIND_BASIC != HB_KIND_CONCURRENT, "the two tags differ");
+
+    # A non-tracker pointer must not be mistaken for either.
+    var junk = fl_alloc(32);
+    memset(junk, 0, 32);
+    assert_eq(hb_tracker_kind(junk), 0, "a zeroed block is not a tracker");
+    assert_eq(hb_tracker_kind(0), 0, "null is not a tracker");
+
+    # The constructor DETECTS rather than trusting.
+    var a_basic = majra_admin_new(basic, 0);
+    assert_eq(majra_admin_tracker_kind(a_basic), ADMIN_TRACKER_BASIC,
+        "majra_admin_new detects a BASIC tracker (it used to assume CONCURRENT)");
+    var a_conc = majra_admin_new(conc, 0);
+    assert_eq(majra_admin_tracker_kind(a_conc), ADMIN_TRACKER_CONCURRENT,
+        "majra_admin_new detects a CONCURRENT tracker");
+
+    # An INCORRECT explicit kind cannot reintroduce the out-of-bounds read:
+    # detection wins over the caller's claim.
+    var lied = majra_admin_new_ex(basic, ADMIN_TRACKER_CONCURRENT, 0);
+    assert_eq(majra_admin_tracker_kind(lied), ADMIN_TRACKER_BASIC,
+        "a wrong explicit kind is overridden by the tracker's own tag");
+
+    # And /fleet on a basic tracker degrades to an error rather than reading
+    # out of bounds.
+    var body = _admin_fleet_json(a_basic);
+    var blen = rethi();
+    assert(blen > 0, "basic tracker yields a body");
+    assert_eq(memeq(body, "{\"error\"", 8), 1, "basic tracker yields an ERROR json, not a fleet read");
+    println("  tracker_type_tags: ok");
+}
+
 fn test_pg_literal_escaping() {
     var sb = str_builder_new();
     assert_eq(_pg_add_literal(sb, "plain"), 0, "escape plain returns ok");
@@ -572,6 +651,7 @@ fn main() {
     test_ws_accept_key();
     test_redis_resp();
     test_pg_wire();
+    test_tracker_type_tags();
     test_pg_literal_escaping();
     test_parse_ipv4();
     test_resp_limits();

@@ -100,21 +100,54 @@ fn gpu_telemetry_new(util_x100, mem_used, mem_total, temp_x100) {
 #   offset 0: nodes (i64) — hashmap: string -> NodeState ptr
 #   offset 8: config (i64) — HeartbeatConfig ptr
 
+# Tracker type tags. Distinctive values so a stray pointer, a small integer or
+# a zeroed block cannot be mistaken for a tracker.
+var HB_KIND_BASIC = 0x6D616A48425F3031;
+var HB_KIND_CONCURRENT = 0x6D616A48425F3032;
+
+# HeartbeatTracker struct (24 bytes):
+#   offset  0: kind (i64) — HB_KIND_BASIC
+#   offset  8: nodes (i64) — hashmap: node_id -> NodeState
+#   offset 16: config (i64)
+#
+# ⚠ THE TAG AT OFFSET 0 IS A MEMORY-SAFETY FIELD, not bookkeeping.
+#
+# The two tracker types used to be indistinguishable from their pointers —
+# hb_tracker was fl_alloc(16) with the map at 0, chb_tracker fl_alloc(24) with
+# a mutex at 16 — so `chb_fleet_stats(an_hb_tracker)` read 8 bytes PAST the
+# allocation and mutex_lock()ed whatever it found. 2.6.9 added a caller-declared
+# kind to majra_admin_new; 2.6.10 found that the two-argument form still had to
+# TRUST that declaration, because nothing could check it.
+#
+# Both layouts now carry a magic at offset 0, so the check is real. The values
+# are deliberately large and unusual: a stray pointer, a small integer, or a
+# zeroed block will not collide with either.
 fn hb_tracker_new(cfg) {
-    var ht = fl_alloc(16);
-    store64(ht, map_new());
-    store64(ht + 8, cfg);
+    var ht = fl_alloc(24);
+    store64(ht, HB_KIND_BASIC);
+    store64(ht + 8, map_new());
+    store64(ht + 16, cfg);
     return ht;
 }
 
+# Returns HB_KIND_BASIC, HB_KIND_CONCURRENT, or 0 if `t` is not a tracker.
+# Safe to call on any non-null pointer to an allocation of at least 8 bytes.
+fn hb_tracker_kind(t) {
+    if (t == 0) { return 0; }
+    var k = load64(t);
+    if (k == HB_KIND_BASIC) { return HB_KIND_BASIC; }
+    if (k == HB_KIND_CONCURRENT) { return HB_KIND_CONCURRENT; }
+    return 0;
+}
+
 fn hb_register(ht, id, metadata) {
-    var nodes = load64(ht);
+    var nodes = load64(ht + 8);
     var ns = _node_state_new(metadata);
     map_set(nodes, id, ns);
 }
 
 fn hb_heartbeat(ht, id) {
-    var nodes = load64(ht);
+    var nodes = load64(ht + 8);
     var ns = map_get(nodes, id);
     if (ns == 0) { return 0; }
     store64(ns, STATUS_ONLINE);
@@ -124,7 +157,7 @@ fn hb_heartbeat(ht, id) {
 }
 
 fn hb_heartbeat_with_metadata(ht, id, metadata) {
-    var nodes = load64(ht);
+    var nodes = load64(ht + 8);
     var ns = map_get(nodes, id);
     if (ns == 0) { return 0; }
     store64(ns, STATUS_ONLINE);
@@ -135,7 +168,7 @@ fn hb_heartbeat_with_metadata(ht, id, metadata) {
 }
 
 fn hb_deregister(ht, id) {
-    var nodes = load64(ht);
+    var nodes = load64(ht + 8);
     var old = map_get(nodes, id);
     var r = map_delete(nodes, id);
     # NodeState blocks were fl_alloc'd and never freed on ANY removal path, so
@@ -147,8 +180,8 @@ fn hb_deregister(ht, id) {
 # Sweep all nodes, return vec of (id_str, new_status) pairs for transitions.
 # Each pair is stored as a 16-byte struct: { id_ptr, status }.
 fn hb_update_statuses(ht) {
-    var nodes = load64(ht);
-    var cfg = load64(ht + 8);
+    var nodes = load64(ht + 8);
+    var cfg = load64(ht + 16);
     var now = time_now_ns();
     var transitions = vec_new();
 
@@ -223,20 +256,20 @@ fn hb_update_statuses(ht) {
 }
 
 fn hb_get(ht, id) {
-    return map_get(load64(ht), id);
+    return map_get(load64(ht + 8), id);
 }
 
 fn hb_len(ht) {
-    return map_size(load64(ht));
+    return map_size(load64(ht + 8));
 }
 
 fn hb_is_empty(ht) {
-    return map_size(load64(ht)) == 0;
+    return map_size(load64(ht + 8)) == 0;
 }
 
 # List nodes by status — returns vec of id string pointers
 fn hb_list_by_status(ht, status) {
-    var nodes = load64(ht);
+    var nodes = load64(ht + 8);
     var result = vec_new();
     var keys = map_keys(nodes);
     var i = 0;
@@ -264,23 +297,29 @@ fn hb_online(ht) {
 #   offset  8: config (i64) — HeartbeatConfig ptr
 #   offset 16: mutex (i64)
 
+# ConcurrentHeartbeatTracker struct (32 bytes):
+#   offset  0: kind (i64) — HB_KIND_CONCURRENT
+#   offset  8: nodes (i64) — hashmap: node_id -> NodeState
+#   offset 16: config (i64)
+#   offset 24: mutex (i64)
 fn chb_tracker_new(cfg) {
-    var cht = fl_alloc(24);
-    store64(cht, map_new());
-    store64(cht + 8, cfg);
-    store64(cht + 16, mutex_new());
+    var cht = fl_alloc(32);
+    store64(cht, HB_KIND_CONCURRENT);
+    store64(cht + 8, map_new());
+    store64(cht + 16, cfg);
+    store64(cht + 24, mutex_new());
     return cht;
 }
 
 fn chb_register(cht, id, metadata) {
-    var mtx = load64(cht + 16);
+    var mtx = load64(cht + 24);
     mutex_lock(mtx);
     # Re-registering an existing id replaced the map entry and abandoned the
     # previous NodeState — and re-register on reconnect is exactly what a
     # flapping node does.
-    var prev = map_get(load64(cht), id);
+    var prev = map_get(load64(cht + 8), id);
     var ns = _node_state_new(metadata);
-    map_set(load64(cht), id, ns);
+    map_set(load64(cht + 8), id, ns);
     if (prev != 0) { fl_free(prev); }
     mutex_unlock(mtx);
 }
@@ -288,20 +327,20 @@ fn chb_register(cht, id, metadata) {
 fn chb_register_with_telemetry(cht, id, metadata, gpu_vec) {
     # Same re-registration leak chb_register closes: replacing an existing
     # entry abandoned the previous NodeState. 2.6.9 fixed only chb_register.
-    var mtx = load64(cht + 16);
+    var mtx = load64(cht + 24);
     mutex_lock(mtx);
-    var prev = map_get(load64(cht), id);
+    var prev = map_get(load64(cht + 8), id);
     var ns = _node_state_new(metadata);
     store64(ns + 24, gpu_vec);
-    map_set(load64(cht), id, ns);
+    map_set(load64(cht + 8), id, ns);
     if (prev != 0) { fl_free(prev); }
     mutex_unlock(mtx);
 }
 
 fn chb_heartbeat(cht, id) {
-    var mtx = load64(cht + 16);
+    var mtx = load64(cht + 24);
     mutex_lock(mtx);
-    var ns = map_get(load64(cht), id);
+    var ns = map_get(load64(cht + 8), id);
     if (ns == 0) {
         mutex_unlock(mtx);
         return 0;
@@ -314,9 +353,9 @@ fn chb_heartbeat(cht, id) {
 }
 
 fn chb_heartbeat_with_metadata(cht, id, metadata) {
-    var mtx = load64(cht + 16);
+    var mtx = load64(cht + 24);
     mutex_lock(mtx);
-    var ns = map_get(load64(cht), id);
+    var ns = map_get(load64(cht + 8), id);
     if (ns == 0) {
         mutex_unlock(mtx);
         return 0;
@@ -330,9 +369,9 @@ fn chb_heartbeat_with_metadata(cht, id, metadata) {
 }
 
 fn chb_heartbeat_with_telemetry(cht, id, gpu_vec) {
-    var mtx = load64(cht + 16);
+    var mtx = load64(cht + 24);
     mutex_lock(mtx);
-    var ns = map_get(load64(cht), id);
+    var ns = map_get(load64(cht + 8), id);
     if (ns == 0) {
         mutex_unlock(mtx);
         return 0;
@@ -346,21 +385,21 @@ fn chb_heartbeat_with_telemetry(cht, id, gpu_vec) {
 }
 
 fn chb_deregister(cht, id) {
-    var mtx = load64(cht + 16);
+    var mtx = load64(cht + 24);
     mutex_lock(mtx);
-    var old_ns = map_get(load64(cht), id);
-    var r = map_delete(load64(cht), id);
+    var old_ns = map_get(load64(cht + 8), id);
+    var r = map_delete(load64(cht + 8), id);
     if (old_ns != 0) { fl_free(old_ns); }
     mutex_unlock(mtx);
     return r;
 }
 
 fn chb_update_statuses(cht) {
-    var mtx = load64(cht + 16);
+    var mtx = load64(cht + 24);
     mutex_lock(mtx);
     # Reuse the single-threaded logic by constructing a temp tracker view
-    var nodes = load64(cht);
-    var cfg = load64(cht + 8);
+    var nodes = load64(cht + 8);
+    var cfg = load64(cht + 16);
     var now = time_now_ns();
     var transitions = vec_new();
 
@@ -443,9 +482,9 @@ fn chb_update_statuses(cht) {
 # stays valid without refcounting.
 fn chb_get(cht, id) {
     if (cht == 0) { return 0; }
-    var mtx = load64(cht + 16);
+    var mtx = load64(cht + 24);
     mutex_lock(mtx);
-    var ns = map_get(load64(cht), id);
+    var ns = map_get(load64(cht + 8), id);
     var copy = 0;
     if (ns != 0) {
         copy = fl_alloc(40);
@@ -462,9 +501,9 @@ fn chb_node_free(ns) {
 }
 
 fn chb_get_gpu_telemetry(cht, id) {
-    var mtx = load64(cht + 16);
+    var mtx = load64(cht + 24);
     mutex_lock(mtx);
-    var ns = map_get(load64(cht), id);
+    var ns = map_get(load64(cht + 8), id);
     var result = 0;
     if (ns != 0) {
         result = load64(ns + 24);
@@ -474,17 +513,17 @@ fn chb_get_gpu_telemetry(cht, id) {
 }
 
 fn chb_len(cht) {
-    return map_size(load64(cht));
+    return map_size(load64(cht + 8));
 }
 
 fn chb_is_empty(cht) {
-    return map_size(load64(cht)) == 0;
+    return map_size(load64(cht + 8)) == 0;
 }
 
 fn chb_list_by_status(cht, status) {
-    var mtx = load64(cht + 16);
+    var mtx = load64(cht + 24);
     mutex_lock(mtx);
-    var nodes = load64(cht);
+    var nodes = load64(cht + 8);
     var result = vec_new();
     var keys = map_keys(nodes);
     var i = 0;
@@ -507,9 +546,9 @@ fn chb_online(cht) {
 
 # Fleet stats aggregation
 fn chb_fleet_stats(cht) {
-    var mtx = load64(cht + 16);
+    var mtx = load64(cht + 24);
     mutex_lock(mtx);
-    var nodes = load64(cht);
+    var nodes = load64(cht + 8);
     var s = fl_alloc(56);
     # Zero-init
     var j = 0;

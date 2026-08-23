@@ -70,9 +70,16 @@ fn ratelimit_check(rl, key) {
     var bucket_ptr = map_get(buckets, key);
     if (bucket_ptr == 0) {
         # New key: start with full burst
-        bucket_ptr = fl_alloc(16);
+        # TokenBucket struct (32 bytes):
+        #   offset  0: tokens_x1000
+        #   offset  8: last_access_ns
+        #   offset 16: allowed   — per-key, added at 2.7.0
+        #   offset 24: rejected  — per-key, added at 2.7.0
+        bucket_ptr = fl_alloc(32);
         store64(bucket_ptr, burst_x1000);
         store64(bucket_ptr + 8, now);
+        store64(bucket_ptr + 16, 0);
+        store64(bucket_ptr + 24, 0);
         map_set(buckets, _ratelimit_key_own(key), bucket_ptr);
     }
 
@@ -145,8 +152,10 @@ fn ratelimit_check(rl, key) {
         tokens = tokens - 1000;
         result = 1;
         counter_inc(load64(rl + 32));
+        store64(bucket_ptr + 16, load64(bucket_ptr + 16) + 1);
     } else {
         counter_inc(load64(rl + 40));
+        store64(bucket_ptr + 24, load64(bucket_ptr + 24) + 1);
     }
     store64(bucket_ptr, tokens);
 
@@ -223,6 +232,50 @@ fn ratelimit_stats(rl) {
     store64(s + 16, map_size(load64(rl + 16)));
     store64(s + 24, counter_get(load64(rl + 48)));
     return s;
+}
+
+# Per-key statistics. Returns a caller-owned 32-byte struct, or 0 if the key
+# has never been seen:
+#   offset  0: allowed        — requests this key was granted
+#   offset  8: rejected       — requests this key was refused
+#   offset 16: tokens_x1000   — credit remaining right now
+#   offset 24: last_access_ns — when the bucket last refilled
+#
+# The admin endpoint's /ratelimit route reported the limiter's GLOBAL counters
+# for whatever key it was handed, so an operator reading
+# /ratelimit?key=tenant-a saw fleet-wide totals and could easily read them as
+# that tenant's. 2.6.9 labelled the response "scope":"global" to stop it being
+# actively misleading; this is the actual answer.
+#
+# Release with ratelimit_stats_free.
+fn ratelimit_stats_for_key(rl, key) {
+    if (rl == 0 || key == 0) { return 0; }
+    var mtx = load64(rl + 24);
+    mutex_lock(mtx);
+    var b = map_get(load64(rl + 16), key);
+    var out = 0;
+    if (b != 0) {
+        out = fl_alloc(32);
+        if (out != 0) {
+            store64(out, load64(b + 16));
+            store64(out + 8, load64(b + 24));
+            store64(out + 16, load64(b));
+            store64(out + 24, load64(b + 8));
+        }
+    }
+    mutex_unlock(mtx);
+    return out;
+}
+
+fn ratelimit_key_allowed(s)   { return load64(s); }
+fn ratelimit_key_rejected(s)  { return load64(s + 8); }
+fn ratelimit_key_tokens(s)    { return load64(s + 16); }
+fn ratelimit_key_last_ns(s)   { return load64(s + 24); }
+
+# Releases a struct from ratelimit_stats_for_key OR ratelimit_stats.
+fn ratelimit_stats_free(s) {
+    if (s != 0) { fl_free(s); }
+    return 0;
 }
 
 # --- Sliding Window Rate Limiter ---
