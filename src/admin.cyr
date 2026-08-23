@@ -36,6 +36,21 @@ var ADMIN_TRACKER_BASIC = 1;
 # treats whatever is there as a mutex pointer, then atomically writes to it.
 # The kind is now recorded and checked.
 
+# ⚠ REQUIRES a CONCURRENT tracker (chb_tracker_new). Passing a basic
+# hb_tracker here is a contract violation with a memory-safety consequence, not
+# merely a wrong answer: chb_fleet_stats reads a mutex pointer at offset 16,
+# which is 8 bytes PAST an hb_tracker's 16-byte allocation, and then locks it.
+#
+# Use majra_admin_new_ex(t, ADMIN_TRACKER_BASIC, rl) for a basic tracker; /fleet
+# then returns an explanatory error instead of reading out of bounds.
+#
+# The tracker_kind field cannot be inferred, because the two tracker types are
+# not distinguishable from their pointers — hb_tracker is fl_alloc(16) and
+# chb_tracker fl_alloc(24), with no type tag in either. Making them
+# distinguishable means adding a tag to both layouts, which is 2.7.0 work
+# (roadmap § 2.7.0), not a patch. Until then this default trusts the
+# documented contract: defaulting to BASIC instead would keep incorrect callers
+# safe at the cost of silently removing /fleet from every CORRECT one.
 fn majra_admin_new(fleet_tracker, ratelimiter) {
     return majra_admin_new_ex(fleet_tracker, ADMIN_TRACKER_CONCURRENT, ratelimiter);
 }

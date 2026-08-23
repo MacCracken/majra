@@ -136,6 +136,16 @@ var ENCRYPTED_IPC_RESPONDER = 1;
 #   offset 40: role (i64) — ENCRYPTED_IPC_INITIATOR | ENCRYPTED_IPC_RESPONDER
 #   offset 48: peer_counter (i64) — highest peer counter accepted, -1 initially
 #   offset 56: closed (i64) — 1 once encrypted_ipc_close has run
+#   offset 64: recv_mutex (i64) — guards the receive half INDEPENDENTLY
+#
+# ⚠ TWO mutexes, deliberately. 2.6.9 put send and recv under ONE, then held it
+# across ipc_recv_frame — a BLOCKING read(2). A receiver parked waiting for a
+# peer that sends nothing therefore blocked every send on the same handle
+# indefinitely, which for a request/response protocol is a self-deadlock: the
+# reply can never arrive because the request can never be written. Splitting
+# them keeps each half internally serialised (nonce counter and write ordering
+# on one side, replay window and read ordering on the other) without coupling
+# the two directions.
 #
 # ⚠ THE ROLE ARGUMENT IS LOAD-BEARING AES-GCM SAFETY, NOT BOOKKEEPING.
 #
@@ -153,7 +163,7 @@ var ENCRYPTED_IPC_RESPONDER = 1;
 fn encrypted_ipc_new(ipc_fd, key_ptr, role) {
     if (role != ENCRYPTED_IPC_INITIATOR && role != ENCRYPTED_IPC_RESPONDER) { return 0; }
     aes_gcm_global_init();
-    var e = fl_alloc(64);
+    var e = fl_alloc(72);
     if (e == 0) { return 0; }
     store64(e, ipc_fd);
     var kcopy = fl_alloc(32);
@@ -166,6 +176,7 @@ fn encrypted_ipc_new(ipc_fd, key_ptr, role) {
     store64(e + 40, role);
     store64(e + 48, -1);
     store64(e + 56, 0);
+    store64(e + 64, mutex_new());
     return e;
 }
 
@@ -224,10 +235,25 @@ fn encrypted_ipc_needs_rekey(e) {
 # mistake to make on a reconnect path.
 fn encrypted_ipc_rekey(e, new_key_ptr) {
     if (e == 0 || new_key_ptr == 0) { return Err(ERR_IPC); }
+    # Touches both halves (key, send counter, replay window), so it takes both
+    # locks. Order is always send -> recv; nothing takes them the other way.
     var mtx = load64(e + 24);
+    var rmtx = load64(e + 64);
     mutex_lock(mtx);
+    mutex_lock(rmtx);
+    if (load64(e + 56) == 1) {
+        mutex_unlock(rmtx);
+        mutex_unlock(mtx);
+        return Err(ERR_IPC);
+    }
     var cur = load64(e + 8);
+    if (cur == 0) {
+        mutex_unlock(rmtx);
+        mutex_unlock(mtx);
+        return Err(ERR_IPC);
+    }
     if (ct_eq_bytes_lens(cur, AES_256_KEY_SIZE, new_key_ptr, AES_256_KEY_SIZE) == 1) {
+        mutex_unlock(rmtx);
         mutex_unlock(mtx);
         return Err(ERR_IPC);
     }
@@ -237,6 +263,7 @@ fn encrypted_ipc_rekey(e, new_key_ptr) {
     # The peer restarts its counter too, so the replay window must reopen or
     # every post-rekey frame would look like a replay.
     store64(e + 48, -1);
+    mutex_unlock(rmtx);
     mutex_unlock(mtx);
     return Ok(0);
 }
@@ -299,7 +326,8 @@ fn _encrypted_ipc_kill(e) {
 
 fn encrypted_ipc_recv(e) {
     if (e == 0) { return Err(ERR_IPC); }
-    var mtx = load64(e + 24);
+    # The RECEIVE mutex — never the send mutex. See the struct note.
+    var mtx = load64(e + 64);
     mutex_lock(mtx);
     if (load64(e + 56) == 1) { mutex_unlock(mtx); return Err(ERR_IPC); }
 
@@ -396,8 +424,10 @@ fn encrypted_ipc_payload_free(r) {
 fn encrypted_ipc_close(e) {
     if (e == 0) { return 0; }
     var mtx = load64(e + 24);
+    var rmtx = load64(e + 64);
     mutex_lock(mtx);
-    if (load64(e + 56) == 1) { mutex_unlock(mtx); return 0; }
+    mutex_lock(rmtx);
+    if (load64(e + 56) == 1) { mutex_unlock(rmtx); mutex_unlock(mtx); return 0; }
     store64(e + 56, 1);
     # Zeroize the key buffer, then actually release it. Previously the key was
     # wiped but never freed and the handle stayed usable, so a post-close send
@@ -413,6 +443,16 @@ fn encrypted_ipc_close(e) {
     var fd = load64(e);
     if (fd >= 0) { ipc_close(fd); }
     store64(e, -1);
+    mutex_unlock(rmtx);
     mutex_unlock(mtx);
+    return 0;
+}
+
+# Release the EncryptedIpc handle itself. Call AFTER encrypted_ipc_close —
+# 2.6.9's close freed the key and closed the fd but never released the struct,
+# and exported no teardown that did.
+fn encrypted_ipc_free(e) {
+    if (e == 0) { return 0; }
+    fl_free(e);
     return 0;
 }

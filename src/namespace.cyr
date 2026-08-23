@@ -58,6 +58,10 @@ fn namespace_prefix(ns) {
 
 # Prefix a topic with / delimiter.
 fn namespace_topic(ns, topic_cstr) {
+    # namespace_new returns 0 for an invalid prefix, and the module's own usage
+    # recipes feed its result straight in here. Guard rather than dereference:
+    # a caller that skipped the check gets 0 back instead of a segfault.
+    if (ns == 0 || topic_cstr == 0) { return 0; }
     var sb = str_builder_new();
     str_builder_add(sb, ns);
     str_builder_add_cstr(sb, "/");
@@ -67,6 +71,7 @@ fn namespace_topic(ns, topic_cstr) {
 
 # Prefix a key with : delimiter.
 fn namespace_key(ns, key_cstr) {
+    if (ns == 0 || key_cstr == 0) { return 0; }
     var sb = str_builder_new();
     str_builder_add(sb, ns);
     str_builder_add_cstr(sb, ":");
@@ -86,6 +91,7 @@ fn namespace_pattern(ns, pattern_cstr) {
 
 # Build wildcard pattern: {prefix}/#
 fn namespace_wildcard(ns) {
+    if (ns == 0) { return 0; }
     var sb = str_builder_new();
     str_builder_add(sb, ns);
     str_builder_add_cstr(sb, "/#");
@@ -95,6 +101,7 @@ fn namespace_wildcard(ns) {
 # Strip namespace prefix from a topic (/ delimiter).
 # Returns the bare topic as a Str, or 0 if topic doesn't belong to this namespace.
 fn namespace_strip_topic(ns, topic) {
+    if (ns == 0 || topic == 0) { return 0; }
     var prefix_len = str_len(ns);
     var topic_len = str_len(topic);
     # Must be longer than prefix + "/"
@@ -122,6 +129,7 @@ fn namespace_strip_topic(ns, topic) {
 # Strip namespace prefix from a key (: delimiter).
 # Returns the bare key as a Str, or 0 if key doesn't belong to this namespace.
 fn namespace_strip_key(ns, key) {
+    if (ns == 0 || key == 0) { return 0; }
     var prefix_len = str_len(ns);
     var key_len = str_len(key);
     if (key_len <= prefix_len + 1) {

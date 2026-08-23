@@ -120,6 +120,23 @@ mistake fleet-wide totals for that tenant's.
 **Trigger**: a multi-tenant consumer using the admin endpoint for per-tenant
 observability.
 
+### Type-tag the heartbeat trackers
+
+`hb_tracker` (16 bytes) and `chb_tracker` (24 bytes, mutex at offset 16) are
+not distinguishable from their pointers, so `majra_admin_new` has to trust the
+caller. Passing a basic tracker to the two-argument form makes
+`chb_fleet_stats` read 8 bytes past the allocation and lock the result.
+
+2.6.9 added an `ADMIN_TRACKER_*` field to record the kind, and 2.6.10 found
+that the two-argument default still trusts the contract — defaulting it to
+BASIC instead would keep incorrect callers safe only by silently removing
+`/fleet` from every correct one.
+
+**Scope**: a type tag at a common offset in both tracker layouts, so
+`majra_admin_new` can detect rather than trust. Touches every heartbeat
+accessor, which is why it is not a patch.
+**Trigger**: scheduled — it is the residual half of a memory-safety finding.
+
 ### Parallel DAG tier execution
 
 `dag.cyr` executes steps within a tier **serially**. The module header claimed

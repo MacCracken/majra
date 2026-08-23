@@ -177,17 +177,34 @@ fn patra_queue_dequeue(pq) {
             # would hand back a pointer to that REFERENCE STRUCT, and strlen
             # over it walks raw page-pointer bytes — a garbage length driving
             # a garbage memcpy. TEXT needs the length/read pair.
+            # patra_result_get_text_len returns -1 when the column is NOT
+            # TEXT — which is exactly what a .patra file written before 2.6.9
+            # has, since the payload column was STR then. 2.6.9 clamped that
+            # -1 to 0, so every job in an existing file dequeued with an EMPTY
+            # payload and was still marked running: silent, total data loss on
+            # upgrade, for the one file format majra promises to persist.
+            # Fall back to the STR reader so old files keep working.
             var pay_len = patra_result_get_text_len(rs, 0, 2);
-            if (pay_len < 0) { pay_len = 0; }
+            var is_text = 1;
+            if (pay_len < 0) {
+                is_text = 0;
+                var legacy = patra_result_get_str(rs, 0, 2);
+                pay_len = 0;
+                if (legacy != 0) { pay_len = strlen(legacy); }
+            }
             var pay_copy = fl_alloc(pay_len + 1);
             if (pay_copy == 0) { patra_result_free(rs); searching = 0; }
             else {
                 if (pay_len > 0) {
-                    if (patra_result_read_text(db, rs, 0, 2, pay_copy) != PATRA_OK) {
-                        fl_free(pay_copy);
-                        patra_result_free(rs);
-                        mutex_unlock(mtx);
-                        return 0;
+                    if (is_text == 1) {
+                        if (patra_result_read_text(db, rs, 0, 2, pay_copy) != PATRA_OK) {
+                            fl_free(pay_copy);
+                            patra_result_free(rs);
+                            mutex_unlock(mtx);
+                            return 0;
+                        }
+                    } else {
+                        memcpy(pay_copy, patra_result_get_str(rs, 0, 2), pay_len);
                     }
                 }
                 store8(pay_copy + pay_len, 0);
