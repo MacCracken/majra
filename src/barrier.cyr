@@ -150,9 +150,24 @@ fn barrier_set_is_empty(bs) {
 #   offset 24: released_flag (i64) — 0 or 1
 #   offset 32: futex_addr (i64) — address for futex wait/wake
 
+# Takes a COPY of the participants vec.
+#
+# The caller's vec used to be stored by reference, and cbarrier_force mutates
+# it in place via _set_remove — so two barriers created from one shared
+# participant list corrupted each other's expected set, and the caller's own
+# vec was silently modified out from under it. A barrier's membership must not
+# depend on what the caller does with its list afterwards.
 fn _cbarrier_state_new(participants) {
     var cbs = fl_alloc(40);
-    store64(cbs, participants);
+    var owned = vec_new();
+    var i = 0;
+    var n = 0;
+    if (participants != 0) { n = vec_len(participants); }
+    while (i < n) {
+        vec_push(owned, vec_get(participants, i));
+        i = i + 1;
+    }
+    store64(cbs, owned);
     store64(cbs + 8, vec_new());
     store64(cbs + 16, 0);
     store64(cbs + 24, 0);

@@ -106,6 +106,8 @@ fn signed_envelope_new(e, sk_ptr, pk_ptr) {
 
     var sig = fl_alloc(SIGNED_ENV_SIG_LEN);
     ed25519_sign(sk_ptr, canon, canon_len, sig);
+    # The canonical buffer is scratch — free it once it has been signed over.
+    fl_free(canon);
 
     var pk_copy = fl_alloc(SIGNED_ENV_PK_LEN);
     memcpy(pk_copy, pk_ptr, SIGNED_ENV_PK_LEN);
@@ -144,7 +146,22 @@ fn signed_envelope_verify(se, expected_pk) {
     var canon = _envelope_canonicalize(e);
     var canon_len = rethi();
     var ok = ed25519_verify(signer_pk, canon, canon_len, sig);
+    # This is the UNTRUSTED path — a peer that feeds verify failures could
+    # otherwise leak a payload-sized buffer per attempt.
+    fl_free(canon);
     if (ok == 0) { return 3; }
+    return 0;
+}
+
+# Release a SignedEnvelope produced by signed_envelope_new. Does NOT free the
+# inner envelope, which the caller supplied and still owns.
+fn signed_envelope_free(se) {
+    if (se == 0) { return 0; }
+    var sig = load64(se + 8);
+    var pk = load64(se + 16);
+    if (sig != 0) { fl_free(sig); }
+    if (pk != 0) { fl_free(pk); }
+    fl_free(se);
     return 0;
 }
 

@@ -5,6 +5,154 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.9] — 2026-08-22 — the first P(-1) hardening pass
+
+**515** assertions green across four suites (core 150, expanded 236, backend
+101, patra-queue 28), 0 failed, from a cold `rm -rf build lib` rebuild. Dep
+hashes 108 verified / 0 failed. Fuzz 3/3, soak 4/4, benchmarks 17/17, examples
+2/2, `cyrius deny` 0 violations.
+
+The first audit under the P(-1) process, and the first entry in `docs/audit/`.
+**115 findings confirmed, 2 refuted** across 23 `src/` modules — every one
+produced by one reviewer and re-checked by a separate adversarial verifier
+instructed to default to *refuted* when uncertain. Full write-up, method, and
+the complete finding list in
+[`docs/audit/2026-08-22-audit.md`](docs/audit/2026-08-22-audit.md).
+
+| Severity | Count |
+|---|---|
+| Critical | 2 |
+| High | 30 |
+| Medium | 49 |
+| Low | 34 |
+
+### ⚠ Breaking changes
+
+Three public signatures moved. All three are unavoidable — the old forms cannot
+be made correct.
+
+- **`encrypted_ipc_new(ipc_fd, key_ptr)` → `encrypted_ipc_new(ipc_fd, key_ptr,
+  role)`.** Pass `ENCRYPTED_IPC_INITIATOR` at one end and
+  `ENCRYPTED_IPC_RESPONDER` at the other. See the critical finding below.
+- **`majra_admin_serve(admin, addr, port)`** now takes `addr` as a dotted-quad
+  string and parses it. It previously forwarded the value to `sockaddr_in`,
+  which wants a packed integer — so the documented `"127.0.0.1"` call bound to
+  the low 32 bits of a `char*`.
+- **`transport_send` / `transport_recv`** now forward all three arguments the
+  vtable contract documents. No in-tree caller existed; a consumer implementing
+  the documented 3-arg signature was reading a garbage length.
+
+Also behavioural, without a signature change:
+
+- **`namespace_new` now returns 0** for a prefix containing `/`, `:`, `#`, `+`
+  or a control byte.
+- **`patra_queue`'s `payload` column is now `TEXT`** rather than `STR`. An
+  existing `.patra` file keeps its old 255-byte-capped column; delete or
+  migrate it.
+- **`mq_job_count`** now counts jobs that have not reached a terminal state,
+  because terminal transitions release the record. It previously only grew.
+
+### CRITICAL — both directions of an encrypted IPC channel shared one nonce space
+
+Both endpoints share one pre-shared key, and each derived nonces from its own
+counter starting at 0 with **nothing in the 12-byte nonce distinguishing the two
+directions**. The first message each way used a byte-identical `(key, nonce)`
+pair, and so did every later pair at the same counter.
+
+Under AES-GCM this is the one failure the construction cannot survive: an
+identical `(key, nonce)` means an identical keystream, so XORing the two
+ciphertexts yields the XOR of the two plaintexts — and a nonce collision leaks
+the GHASH subkey, which lets an attacker forge tags for arbitrary messages.
+Confidentiality and integrity fall together.
+
+The role now occupies nonce byte 0. Added replay protection at the same time
+(AEAD gives integrity, not freshness — a captured frame replayed cleanly
+forever): the peer's counter must strictly increase and its nonce must carry
+the *peer's* role, so an attacker cannot reflect our own frames back at us.
+
+### CRITICAL — PostgreSQL NULL columns crashed the client
+
+`_pg_read_be32` composes four **zero-extended** `load8` results, so it can never
+return a negative number: PostgreSQL's NULL sentinel (int32 `-1`, on the wire as
+`FF FF FF FF`) came back as `4294967295`. The `col_len < 0` NULL guard in
+`pg_query` was therefore unreachable dead code, and a NULL column took the value
+branch — `fl_alloc(4294967296)` plus a 4 GiB `memcpy` out of a DataRow body a
+few bytes long.
+
+Reachable from ordinary traffic, not a hostile server: majra's own
+`pg_init_workflow_tables` declares five nullable columns. `test_live` never
+fired it because it only selects non-NULL literals. Verified with a compiled
+probe before fixing, and fixed with a sign-extending `_pg_read_i32`.
+
+### Highlights from the 30 high-severity findings
+
+- **WebSocket never implemented the 127 / 64-bit length form**, so the sentinel
+  was used as a literal payload length and the eight length bytes were consumed
+  as payload — a peer-controlled frame desync. External research put two 2026
+  CVEs on this exact code shape (CVE-2026-54466, CVE-2026-1528).
+- **`ws_send_text` emitted headerless payloads** at 65536 bytes or more: the
+  if/elif chain had no else.
+- **RESP bulk length wrapped into a tiny allocation.**
+  `$9223372036854775807` makes `blen + 2` wrap negative; `_fl_class` routes a
+  negative size down the `size <= 16` path, so `fl_alloc` returned a 16-byte
+  block that `str_new` labelled `INT64_MAX` long.
+- **`redis_connect` and `pg_connect` ignored `host`**, always dialling
+  loopback.
+- **The managed queue's concurrency cap was advisory** — checked in one
+  critical section, incremented in another.
+- **`mq_cancel` had no effect on delivery**; dequeue overwrote the state
+  unconditionally.
+- **`fleet_rebalance` corrupted its source node's accounting**: a steal marks
+  the job RUNNING and nothing reversed it, so a node eventually stopped
+  dequeuing entirely.
+- **`relay_send` emitted out of sequence order** — the sequence was claimed
+  under the mutex, the fan-out done after releasing it.
+- **The token bucket refilled at zero under fast polling**: the truncated
+  refill was 0 but the clock was reset anyway, discarding fractional credit.
+- **`patra_queue` spliced caller payloads into SQL literals**, and discarded
+  every `patra_exec` return.
+- **`cbarrier_arrive_and_wait` returned results through file-scope globals**
+  serialised only by the per-set mutex, so concurrent barrier sets clobbered
+  each other.
+- **The admin endpoint read 8 bytes past an `hb_tracker`** and locked whatever
+  it found.
+- **`namespace_new` was unvalidated**, and it is a tenant-isolation boundary: a
+  `#` in a prefix turned that tenant's own wildcard into a cross-tenant
+  subscription.
+- **`src/ipc.cyr`'s socket was left at the ambient umask** (world-connectable
+  on a typical 022 process) with no peer-credential check — connecting *was*
+  authenticating. Now 0600.
+
+### Performance
+
+Measured head-to-head against a `dda5b72` build of the same benchmark, three
+trials each: `pubsub_publish_nosub` **-35%**, `fleet_stats_100` **-16%** (both
+from removing `map_keys` bump allocations from hot paths), `ratelimit_check`
+and `circuit_state` unchanged. One regression below the flag threshold:
+`pq_enqueue` **+7.9%** — the priority-queue code was not modified, so this is
+most likely code-layout movement.
+
+`circuit_state` first regressed 2ns → 49ns from the mutex added for the
+half-open probe gate; a lock-free fast path for the common below-threshold case
+restored it to 3ns.
+
+### Tests
+
+410 → 515 assertions, concentrated on the defects themselves. `src/ipc.cyr`
+shipped in all four dist profiles with **no test in any suite** — which is why
+its defects went unnoticed — and now round-trips over a real socketpair.
+
+`tests/soak/soak_queue.cyr` asserted `job_count == total_enqueued`; it was
+codifying the unbounded-growth leak, and now asserts the map drains to 0.
+
+### Not fixed, deliberately
+
+pubsub's blocking fan-out (a backpressure contract 2.5.3 established and a test
+asserts; dropping would trade a wedge for silent message loss), PostgreSQL
+SCRAM-SHA-256 + TLS (a feature, not a repair — the connect now fails closed on
+auth type 10 rather than downgrading), per-key ratelimit stats, and parallel DAG
+tier execution. Each is documented at the call site and listed in the audit.
+
 ## [2.6.8] — 2026-08-22 — the folded-module sweep finishes the job
 
 **410** assertions green across four suites (core 150, expanded 200, backend 43,

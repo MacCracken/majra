@@ -24,6 +24,33 @@ covered by `cyrius.lock`'s 108 hashes and CI's `cyrius deps --verify`. See
 > surfacing as a SIGILL on first use rather than a failed build. Fixed at 2.6.8;
 > consumers pinned earlier should add `sigil` to their own include set.
 
+## Audit history
+
+| Date | Scope | Result |
+|---|---|---|
+| 2026-08-22 | First P(-1) pass — all 23 `src/` modules, six review lenses, adversarial verification | 115 confirmed / 2 refuted; 2 critical, 30 high. [`../audit/2026-08-22-audit.md`](../audit/2026-08-22-audit.md) |
+
+> **IPC access control changed at 2.6.9.** `ipc_bind` now chmods the socket to
+> 0600. It previously inherited the ambient umask — world-connectable on a
+> typical 022 process — and majra performs no peer-credential check, so
+> connecting to the endpoint *is* authenticating to it. A deployment needing
+> group access must widen the mode itself, deliberately.
+>
+> **Encrypted IPC gained direction separation and replay protection at 2.6.9.**
+> Before that, both directions of a channel derived nonces from independent
+> counters starting at 0 under a shared key, so every message pair at the same
+> counter reused `(key, nonce)` — see the audit. `encrypted_ipc_new` now
+> requires a role. Replay defence is a strictly-increasing peer counter checked
+> only *after* the tag authenticates.
+
+> **Ed25519 verification strictness is sigil's property, not majra's.**
+> `signed_envelope_verify` delegates to `ed25519_verify`. RFC 8032 5.1.7's
+> `S < L` check is what makes Ed25519 non-malleable, and implementations
+> genuinely diverge on it (CVE-2026-33895 is a forgery from its absence) and on
+> whether small-order public keys and R values are rejected. majra does not
+> reimplement any of it and must not be read as guaranteeing it — that
+> guarantee belongs to sigil's own audit surface.
+
 ## Attack Surface
 
 | Module | Surface | Risk | Mitigation |

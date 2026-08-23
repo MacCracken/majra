@@ -6,7 +6,7 @@ type: state
 
 # Current State — majra
 
-> **Last refresh**: 2026-08-22 (post-2.6.8) | **Refresh cadence**: every release (ideally bumped by the release post-hook).
+> **Last refresh**: 2026-08-22 (post-2.6.9) | **Refresh cadence**: every release (ideally bumped by the release post-hook).
 > **What this file is**: volatile state. The companion `CLAUDE.md` holds durable rules; this file holds whatever drifts release-to-release. Per [first-party-documentation § CLAUDE.md](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/first-party-documentation.md#claudemd), version numbers, test counts, consumer lists, and in-flight work all live here, not in `CLAUDE.md`.
 
 ---
@@ -15,9 +15,9 @@ type: state
 
 | File | Value | Source |
 |---|---|---|
-| `VERSION` | **2.6.8** | single source of truth |
+| `VERSION` | **2.6.9** | single source of truth |
 | `cyrius.cyml [package].version` | `${file:VERSION}` | reads `VERSION` |
-| Latest git tag | `2.6.8` | release workflow asserts `VERSION == tag` |
+| Latest git tag | `2.6.9` | release workflow asserts `VERSION == tag` |
 
 ## Toolchain
 
@@ -76,31 +76,30 @@ Lockfile (`cyrius.lock`) carries SHA-256 over **108** resolved files — the who
 
 | Target | Lines | Bytes |
 |---|---|---|
-| `dist/majra.cyr` (core) | 3,565 | 106 KB |
-| `dist/majra-signed.cyr` | 3,711 | 112 KB |
-| `dist/majra-admin.cyr` | 3,700 | 111 KB |
-| `dist/majra-backends.cyr` | 5,225 | 159 KB |
-| `src/` total | 5,813 lines across 23 files | — |
+| `dist/majra.cyr` (core) | 4,188 | 135 KB |
+| `dist/majra-signed.cyr` | 4,365 | 142 KB |
+| `dist/majra-admin.cyr` | 4,364 | 142 KB |
+| `dist/majra-backends.cyr` | 6,568 | 219 KB |
+| `src/` total | 7,166 lines across 23 files | — |
 
-> **At 2.6.8** three of the four bundle bodies stay byte-identical (banner line
-> only); `dist/majra-backends.cyr` moves by the `majra_base64_*` rename alone —
-> two `fn` definitions and one call site. The `.deps` sidecars also move:
-> `majra`, `majra-signed` and `majra-backends` each gained `sigil`.
+> **All four bundles moved substantially at 2.6.9** — the P(-1) hardening pass
+> touched every module. `src/` grew 5,813 → 7,166 lines, much of it the
+> rationale comments recording what each guard is defending against.
 
 ## Test surface
 
 | Suite | Entry point | Assertions | Notes |
 |---|---|---|---|
 | Core | `src/main.cyr` (binary self-tests) | 150 | runs as part of `cyrius build` smoke |
-| Expanded | `tests/test_core.tcyr` | 200 | broader unit coverage; grew across the 2.6.x relay/ratelimit/queue fix arc |
-| Backends | `tests/test_backends.tcyr` | 43 | redis / pg / ws / aes-gcm / signed_envelope / admin |
-| Patra-queue | `tests/test_patra_queue.tcyr` | 17 | separate entry — adding to test_backends used to blow the 16384 fixup cap |
-| **CI total** | | **410** | |
+| Expanded | `tests/test_core.tcyr` | 236 | broader unit coverage; grew across the 2.6.x relay/ratelimit/queue fix arc |
+| Backends | `tests/test_backends.tcyr` | 101 | redis / pg / ws / aes-gcm / signed_envelope / admin |
+| Patra-queue | `tests/test_patra_queue.tcyr` | 28 | separate entry — adding to test_backends used to blow the 16384 fixup cap |
+| **CI total** | | **515** | |
 | Live integration | `tests/test_live.tcyr` | 36 | requires Redis + PostgreSQL. **CI-only** — not runnable on a dev box without `redis:7-alpine` + `postgres:16-alpine` up; 7 Redis + 4 PostgreSQL categories |
 | Fuzz harnesses | `fuzz/*.fcyr` | 3 binaries | 500-iter run × 10s timeout per harness in CI |
 | Benchmarks | `benches/bench_all.bcyr` | 17 targets | history tracked via `bench-history.csv` (gitignored — **not present on a fresh clone**, so cross-release comparison means rebuilding the prior pin, as 2.6.8 did) |
 | Examples | `examples/*.cyr` | 2 binaries | `managed_queue`, `pubsub_tiers`; CI builds + runs both |
-| Soak | `tests/soak/soak_*.cyr` (4 files) | queue 5k ops, pubsub 2k topics, relay dedup+evict, heartbeat 100×20 + auto-evict | on-demand; all 4 clean under 6.5.35 at 2.6.8 |
+| Soak | `tests/soak/soak_*.cyr` (4 files) | queue 5k ops, pubsub 2k topics, relay dedup+evict, heartbeat 100×20 + auto-evict | on-demand; all 4 clean under 6.5.35 at 2.6.9. `soak_queue`'s job_count assertion was rewritten at 2.6.9 — it had been asserting the unbounded-growth leak |
 
 ## Distribution bundles (4 profiles)
 
@@ -140,6 +139,7 @@ fails on stale diff.
 
 | Tag | Date | Headline |
 |---|---|---|
+| 2.6.9 | 2026-08-22 | **First P(-1) hardening pass**, and the first entry in `docs/audit/`. 115 findings confirmed / 2 refuted across 23 modules, each produced by one reviewer and re-checked by an independent adversarial verifier. Two criticals: encrypted IPC used ONE nonce space for both directions of a channel (byte-identical `(key, nonce)` each way — keystream reuse plus GHASH subkey leakage), and PostgreSQL NULL columns drove a 4 GiB alloc + memcpy because `_pg_read_be32` zero-extends so the `col_len < 0` guard was dead code. Plus 30 highs: the WebSocket 64-bit length form was never implemented, RESP bulk length wrapped negative into a 16-byte block labelled INT64_MAX, `host` was ignored by both backends, the queue's concurrency cap was advisory, `mq_cancel` didn't prevent delivery, `fleet_rebalance` corrupted running_count, `relay_send` emitted out of order, patra_queue spliced payloads into SQL. **Three breaking signature changes** (`encrypted_ipc_new`, `majra_admin_serve`, `transport_send`/`_recv`) — none avoidable. Tests 410 → 515. `pubsub_publish_nosub` -35%, `fleet_stats_100` -16%; `pq_enqueue` +7.9%. See [`docs/audit/2026-08-22-audit.md`](../audit/2026-08-22-audit.md). |
 | 2.6.8 | 2026-08-22 | **The folded-module sweep finishes the job.** sigil moved from a `[deps.sigil]` git dep into `[deps].stdlib` — `distlib` had been classifying it out of the stdlib leaves, so `majra-signed.deps` / `majra-backends.deps` shipped without naming `sigil` and a sidecar-provisioned consumer got a `ud2` SIGILL on first `ed25519_*` call (build reported `OK`). Verified in a clean room both before and after. `cyrius.lock` drops to zero git deps / 108 pure hashes. Cyrius pin 6.5.31 → 6.5.35 (snapshot holds at 108; `patra` 1.13.9 → 1.13.10, `bayan` + `vani` move, neither called). No formatter drift, no lint delta, no benchmark delta (measured head-to-head against a 6.5.31 build over 5 trials, not asserted). Bundle bodies byte-identical. |
 | 2.6.7 | 2026-08-20 | `[deps.sigil]` 3.12.7 → 3.12.9 — the last folded-module pin lagging the toolchain, found by sweeping the whole dependency closure. Cyrius pin 6.5.20 → 6.5.31 (eleven minors). `src/ws.cyr` reformatted for 6.5.31's canonical continuation indent. Fixed `version-bump.sh` telling you to regenerate 2 of 4 bundles. |
 | 2.6.6 | 2026-08-13 | **A full subscriber ring blocked the relay's SENDER, forever.** Both fan-out paths used `chan_send` (futex-waits for space) where Rust's `Relay::send` never blocks; now `chan_try_send`. 2.6.5 is what made it reachable — honouring the requested capacity meant a depth-2 relay deadlocked on the third send. Found by adversarial review of the 2.6.5 change set, not by the suite. |
@@ -161,6 +161,10 @@ Full history in [`../../CHANGELOG.md`](../../CHANGELOG.md).
 
 | Item | Status | Where to look |
 |---|---|---|
+| **pubsub has no unsubscribe** | Open, deliberate. An abandoned subscriber wedges publishes to its topic permanently, because fan-out is a blocking backpressure contract (2.5.3, asserted by `test_pubsub_no_head_of_line_block`). Dropping instead would trade a wedge for silent message loss. Needs unsubscribe + a per-subscriber lag policy | CHANGELOG 2.6.9 · [audit](../audit/2026-08-22-audit.md) |
+| **PostgreSQL: cleartext auth, no TLS** | Open. Only `AuthenticationCleartextPassword` is implemented and no `SSLRequest` is sent, so credentials and queries cross the wire in the clear. The connect fails closed on SCRAM (type 10) rather than downgrading. Needs SCRAM-SHA-256 + TLS via sigil | `src/postgres_backend.cyr` header |
+| **Per-key ratelimit stats** | Open. `/ratelimit` returns the limiter's global counters for any key; the response is marked `"scope":"global"` so it is self-describing | `src/admin.cyr` |
+| **Parallel DAG tier execution** | Open. Steps within a tier run serially; the header claimed thread_create/join parallelism and was corrected at 2.6.9 | `src/dag.cyr` |
 | ~~**`base64_*` collides with `lib/bayan.cyr`**~~ | **RESOLVED** at 2.6.8 — renamed to `majra_base64_encode` / `majra_base64_decode`. All four profiles emit zero duplicate-fn warnings | CHANGELOG 2.6.8 · [`semver.md`](semver.md) § Documented exceptions |
 | **Shared-memory IPC transport** | engineering backlog, parked until a consumer hits the syscall-per-message ceiling | [`roadmap.md`](roadmap.md) "Engineering backlog" |
 | **agnos `--agnos` full build (non-core)** | `src/patra_queue.cyr` pulls patra, whose `lib/patra.cyr` still references `SYS_LSEEK` unguarded on agnos. Core (`dist/majra.cyr`) is agnos-clean since 2.5.0; only the `backends` profile + daemon `--agnos` build is blocked | CHANGELOG 2.5.0 "Known residual" |

@@ -2,6 +2,21 @@
 
 Completed items live in [CHANGELOG.md](../../CHANGELOG.md).
 
+## Recently shipped (2.6.9)
+
+- **First P(-1) hardening pass** — module-by-module review, external research and security audit, written up in [`../audit/2026-08-22-audit.md`](../audit/2026-08-22-audit.md) (the first entry in `docs/audit/`, which CLAUDE.md describes as "created when first earned"). **115 findings confirmed, 2 refuted** across 23 `src/` modules; every finding was produced by one reviewer and re-checked by a separate adversarial verifier told to default to *refuted* when uncertain. 2 critical, 30 high, 49 medium, 34 low — all repaired in this release.
+- **Two criticals.** (1) Encrypted IPC used ONE nonce space for both directions of a channel: both endpoints share a key and each counted from 0 with nothing in the nonce distinguishing direction, so every message pair at the same counter reused `(key, nonce)` — keystream reuse plus GHASH subkey leakage, i.e. confidentiality and integrity both gone. (2) PostgreSQL NULL columns drove `fl_alloc(4294967296)` + a 4 GiB memcpy, because `_pg_read_be32` zero-extends and so the `col_len < 0` NULL guard was unreachable dead code — reachable from ordinary traffic against majra's own nullable schema.
+- **Three breaking signature changes**, none avoidable: `encrypted_ipc_new` gained a required role, `majra_admin_serve` now parses its address string (it was passing a `char*` where `sockaddr_in` wants a packed integer, so the documented localhost-only bind was decided by a pointer value), and `transport_send`/`transport_recv` now forward all three arguments their vtable contract documents.
+- **Tests 410 → 515.** `src/ipc.cyr` shipped in all four dist profiles with no test in any suite — now round-trips over a real socketpair. `soak_queue` had been asserting the unbounded-growth leak it was supposed to catch; it now asserts the job map drains.
+- **Performance**, measured head-to-head against a 2.6.8 build over three trials: `pubsub_publish_nosub` -35%, `fleet_stats_100` -16% (removing `map_keys` bump allocations from hot paths), `pq_enqueue` +7.9% (below the flag threshold; the priority-queue code was untouched, so most likely code layout).
+
+### Deferred out of 2.6.9, with reasons
+
+- **pubsub unsubscribe + lag policy.** Fan-out blocks by design (a backpressure contract 2.5.3 established and a test asserts), so an abandoned subscriber wedges its topic forever. Dropping instead would trade that for silent message loss — the worse failure for a queue engine. Needs a real unsubscribe.
+- **PostgreSQL SCRAM-SHA-256 + `SSLRequest`.** Currently cleartext auth over a plaintext socket; the connect fails closed on SCRAM rather than downgrading. This is a feature, not a repair.
+- **Per-key ratelimit stats** for `/ratelimit` (returns global counters today, now marked `"scope":"global"`).
+- **Parallel DAG tier execution** — the header claimed it, the code never did; header corrected.
+
 ## Recently shipped (2.6.8)
 
 - **sigil moved from a `[deps.sigil]` git dep into `[deps].stdlib`** — closing the second half of the folded-module hazard 2.6.7 opened. 2.6.7 fixed the *version* lag; the *declaration shape* was the load-bearing half. `cyrius distlib` classifies a git dep out of the stdlib leaves, so `dist/majra-signed.deps` and `dist/majra-backends.deps` — the sidecars for the two profiles that exist *because* they carry crypto — never named `sigil`. A consumer provisioning strictly from the sidecar got undefined `ed25519_{init,sign,verify}` + `ct_eq_bytes_lens`, and since an undefined fn lowers to a trapping `ud2` the build reported **`OK`** and the process SIGILLed at first signature. Verified in a clean room before and after. Both sidecars now carry `sigil`. See [`dependency-watch.md`](dependency-watch.md).
