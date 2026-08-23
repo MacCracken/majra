@@ -1409,6 +1409,102 @@ fn test_transport_vtable_arity() {
     println("  transport_vtable_arity: ok");
 }
 
+# --- 2.7.0: opt-in parallel tier execution ---
+
+var _par_concurrent = 0;
+var _par_peak = 0;
+var _par_mtx = 0;
+var _par_ran = 0;
+
+fn _par_step(step, ctx) {
+    mutex_lock(_par_mtx);
+    _par_concurrent = _par_concurrent + 1;
+    _par_ran = _par_ran + 1;
+    if (_par_concurrent > _par_peak) { _par_peak = _par_concurrent; }
+    mutex_unlock(_par_mtx);
+
+    # Long enough that overlapping is observable — the whole point of the
+    # feature is steps far heavier than the ~89us spawn cost.
+    var ts[16];
+    store64(&ts, 0);
+    store64(&ts + 8, 40000000);
+    syscall(35, &ts, 0);
+
+    mutex_lock(_par_mtx);
+    _par_concurrent = _par_concurrent - 1;
+    mutex_unlock(_par_mtx);
+    return step_result_new(STEP_COMPLETED, 0, "ok");
+}
+
+fn _par_reset() {
+    if (_par_mtx == 0) { _par_mtx = mutex_new(); }
+    _par_concurrent = 0;
+    _par_peak = 0;
+    _par_ran = 0;
+    return 0;
+}
+
+fn _par_def(n) {
+    var def = workflow_def_new("par", "parallel tier");
+    var i = 0;
+    while (i < n) {
+        # Distinct ids, no dependencies -> all in ONE tier.
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "s");
+        str_builder_add_int(sb, i);
+        workflow_def_add_step(def, workflow_step_new(str_cstr(str_builder_build(sb)), "step"));
+        i = i + 1;
+    }
+    return def;
+}
+
+# Default is serial: peak concurrency must be exactly 1.
+fn test_dag_serial_by_default() {
+    _par_reset();
+    var def = _par_def(4);
+    assert_eq(workflow_def_max_parallel(def), 1, "default max_parallel is 1");
+    assert_eq(workflow_execute(def, &_par_step, 0), RUN_COMPLETED, "serial run completes");
+    assert_eq(_par_ran, 4, "all four steps ran");
+    assert_eq(_par_peak, 1, "peak concurrency is 1 — steps did NOT overlap");
+    println("  dag_serial_by_default: ok");
+}
+
+# Opting in actually overlaps steps.
+fn test_dag_parallel_overlaps() {
+    _par_reset();
+    var def = _par_def(4);
+    assert_eq(workflow_def_set_parallel(def, 4), 4, "parallel width stored");
+    assert_eq(workflow_execute(def, &_par_step, 0), RUN_COMPLETED, "parallel run completes");
+    assert_eq(_par_ran, 4, "all four steps ran");
+    assert(_par_peak > 1, "steps genuinely OVERLAPPED (peak > 1)");
+    println("  dag_parallel_overlaps: ok");
+}
+
+# The width is a cap, not a suggestion: 6 steps at width 2 must never show
+# more than 2 in flight.
+fn test_dag_parallel_respects_width() {
+    _par_reset();
+    var def = _par_def(6);
+    workflow_def_set_parallel(def, 2);
+    assert_eq(workflow_execute(def, &_par_step, 0), RUN_COMPLETED, "capped run completes");
+    assert_eq(_par_ran, 6, "all six steps ran");
+    assert(_par_peak <= 2, "concurrency never exceeded the width of 2");
+    assert(_par_peak > 1, "and it did use the width it was given");
+    println("  dag_parallel_respects_width: ok");
+}
+
+# A width below 1 is clamped rather than producing a zero-width batch loop
+# that would never make progress.
+fn test_dag_parallel_width_clamped() {
+    var def = _par_def(2);
+    assert_eq(workflow_def_set_parallel(def, 0), 1, "width 0 clamps to 1");
+    assert_eq(workflow_def_set_parallel(def, -5), 1, "negative width clamps to 1");
+    _par_reset();
+    assert_eq(workflow_execute(def, &_par_step, 0), RUN_COMPLETED, "clamped run still completes");
+    assert_eq(_par_ran, 2, "and both steps ran");
+    println("  dag_parallel_width_clamped: ok");
+}
+
 fn test_dag_rejects_cycle() {
     var def = workflow_def_new("cyc", "cyclic workflow");
     var a = workflow_step_new("a", "step a");
@@ -1677,6 +1773,10 @@ fn main() {
     test_pubsub_default_policy_is_block();
     test_pubsub_tombstone_compaction();
     test_transport_vtable_arity();
+    test_dag_serial_by_default();
+    test_dag_parallel_overlaps();
+    test_dag_parallel_respects_width();
+    test_dag_parallel_width_clamped();
     test_dag_rejects_cycle();
     test_dag_rejects_dangling_dep();
     test_dag_rejects_duplicate_ids();

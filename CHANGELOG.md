@@ -5,6 +5,123 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.0] — 2026-08-22 — finishing what the audits deferred
+
+**629** assertions green across four suites (core 299, expanded/backend 152,
+patra-queue 28, core-binary 150), 0 failed. Fuzz 3/3, soak 4/4, benchmarks
+17/17, examples 2/2, `cyrius deny` 0 violations.
+
+The four additive APIs the two hardening passes deferred. A MINOR because each
+adds public functions; **no existing signature changed** and no existing
+behaviour changed except where noted below.
+
+### `pubsub_unsubscribe` + per-subscriber lag policy
+
+The deferral both audits documented most carefully. Fan-out blocks by design —
+2.5.3 established that backpressure contract — so a subscriber ABANDONED
+without draining wedged publishes to its topic permanently, and there was no
+unsubscribe with which to break it.
+
+`chan_try_send` was tried during the first audit and rejected: it trades a
+wedge for silent message loss. So the policy is now per subscription and the
+caller's to choose, with **BLOCK remaining the default**:
+
+| Policy | On a full ring |
+|---|---|
+| `PUBSUB_LAG_BLOCK` | park until there is room (default, unchanged) |
+| `PUBSUB_LAG_DROP_NEWEST` | discard the message being published |
+| `PUBSUB_LAG_DROP_OLDEST` | evict the oldest queued message, then enqueue |
+| `PUBSUB_LAG_UNSUBSCRIBE` | self-heal: the subscription deactivates itself |
+
+New: `pubsub_unsubscribe`, `pubsub_unsubscribe_pattern`,
+`pubsub_subscribe_with_policy`, `pubsub_set_policy`, `pubsub_subscriber_count`,
+`pubsub_dropped_count`. Drops are counted per subscription, so a lagging
+consumer is observable rather than silent.
+
+**Unsubscribe tombstones, it does not remove.** `pubsub_publish` snapshots each
+subscriber list and walks it unlocked, which is sound only because pushes
+append and never shift — the invariant 2.5.3 relied on. A `vec_remove` would
+move live entries under an in-flight walk, so unsubscribe clears an `active`
+flag instead. Reclamation replaces the vec rather than shifting one, so an
+in-flight walk keeps reading valid memory.
+
+Consequence, documented on the function: **delivery stops promptly, not
+instantly.** A publish already walking its snapshot may deliver one more
+message, so the channel stays valid and caller-owned.
+
+### Parallel DAG tier execution — opt-in, and measured first
+
+`dag.cyr` executed tiers serially while the module header claimed
+`thread_create`/`join` parallelism. The roadmap gated this on a measurement
+rather than an intuition, so it was measured:
+
+| | |
+|---|---|
+| `thread_create` + `thread_join` | **89.4 µs** |
+| a CPU-bound step body | **0.184 µs** |
+| ratio | **~486×** |
+
+Break-even is a step lasting roughly 89 µs. Below that, parallel tiers are
+dramatically *slower*; above it — an HTTP call, a query — the spawn cost
+vanishes. majra cannot tell which kind of step it has, so **it does not
+choose: the default stays serial** and `workflow_def_set_parallel(def, n)`
+opts in, with the numbers recorded at the call site.
+
+Serial and parallel share one `_dag_run_step`, so retry, backoff and the
+null-result fallback cannot drift apart. Every step writes into its own job
+slot; nothing is shared between workers and **no worker touches the context**.
+Tier-mates are independent by construction, so deferring all context writes
+until the batch joins is equivalent to writing them as we go — and it means the
+executor never has to synchronise against majra's own state. `n` is a hard cap,
+applied as bounded batches rather than a thread per step.
+
+Two caveats stated in the code: the **executor must be thread-safe**, and
+**POLICY_FAIL is weaker under parallelism** — a failing step's tier-mates have
+already run by the time the failure is observed, so the run's outcome stays
+deterministic but a sibling's side effects are not prevented.
+
+### Type-tagged heartbeat trackers
+
+The residual half of a memory-safety finding carried across two releases.
+`chb_fleet_stats` reads a mutex pointer at offset 16, which on a basic
+`hb_tracker` was 8 bytes past the allocation — read, then locked. 2.6.9 added a
+caller-declared kind; 2.6.10 found the two-argument constructor still had to
+*trust* it, because the two tracker types were indistinguishable from their
+pointers.
+
+Both layouts now carry a magic at offset 0, so `majra_admin_new` **detects**.
+Detection also overrides an incorrect explicit kind passed to
+`majra_admin_new_ex`, so a caller can no longer reintroduce the out-of-bounds
+read by lying about its tracker.
+
+### Per-key rate-limit statistics
+
+`/ratelimit` reported the limiter's global counters regardless of the key, so
+an operator reading `/ratelimit?key=tenant-a` saw fleet-wide totals. 2.6.9
+labelled the response `"scope":"global"`; this is the actual answer.
+
+New: `ratelimit_stats_for_key`, the `ratelimit_key_*` accessors, and
+`ratelimit_stats_free`. `/ratelimit?key=<k>` is now `"scope":"key"`; an unseen
+key is reported unknown rather than as zeroes that would look like a quiet
+tenant.
+
+### Behavioural notes
+
+- `hb_tracker` 16 → 24 bytes, `chb_tracker` 24 → 32, `TokenBucket` 16 → 32,
+  Subscriber 16 → 40, WorkflowDefinition 32 → 40. All internal layouts; no
+  accessor signature changed.
+- The ratelimit eviction test probes freelist recycling with a size-matched
+  `fl_alloc`, which must track the TokenBucket's real size or it lands in a
+  different size class. Noted in place.
+
+### Testing
+
+582 → 629 assertions. Four of the new suites are **mutation-verified** — the
+tracker detection, the pubsub drop counter, the transport vtable arity, and the
+parallel-tier overlap each turn red when the fix is reverted. The parallel
+tests assert peak observed concurrency, so "it used the width it was given" and
+"it never exceeded it" are both checked rather than assumed.
+
 ## [2.6.10] — 2026-08-22 — repairing 115 findings introduced 50 new ones
 
 **560** assertions green across four suites (core 150, expanded 252, backend

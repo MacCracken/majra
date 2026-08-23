@@ -12,91 +12,19 @@ names the version it is aimed at and the condition that would move it.
 
 | Target | Theme |
 |---|---|
-| **2.7.0** | Finish what the audit deferred — the additive APIs 2.6.9 declined to invent mid-repair. |
 | **2.7 line** | Larger capabilities, each taking the next MINOR as its trigger fires. |
 | **Waiting on upstream** | Blocked outside this repo. Names the blocker. |
 | **Non-goals** | Deliberately out of scope, recorded so the question stops recurring. |
 
 > **Why these can't all be patch releases.** [`semver.md`](semver.md) reserves
 > PATCH for "bug fixes, performance, documentation — no API changes", so
-> anything adding a public function takes the next MINOR. "The 2.7.x line"
-> below is therefore a *development line*, not a run of patch numbers:
-> `pubsub_unsubscribe` and PostgreSQL SCRAM cannot share one. 2.7.0 batches the
-> four small additive items so they cost a single version between them.
+> anything adding a public function takes the next MINOR. "The 2.7 line" below
+> is therefore a *development line*, not a run of patch numbers — PostgreSQL
+> SCRAM and QUIC cannot share one.
 
 An item moves when its **trigger** fires — a consumer need, a dependency
 landing, or a measurement crossing a threshold. Triggers are written down so
 promotion is a decision rather than a mood.
-
----
-
-## 2.7.0 — finish what the audit deferred
-
-The additive APIs the two hardening passes deferred — 2.6.9 declined to invent
-them mid-repair, and 2.6.10 found one more. Batched into one MINOR because each
-adds a public function and each is individually small.
-
-### pubsub unsubscribe + per-subscriber lag policy
-
-The deferral the audit documented most carefully. Fan-out is a **blocking
-backpressure contract**: 2.5.3 established it and
-`test_pubsub_no_head_of_line_block` asserts it. The consequence is that a
-subscriber abandoned without draining wedges publishes to its topic
-permanently, because majra has no unsubscribe.
-
-`chan_try_send` was tried during the audit and rejected — it trades a wedge for
-silent message loss, the worse failure for a queue engine. The real fix is an
-unsubscribe path plus an explicit lag policy (drop-oldest, drop-newest, or
-disconnect) chosen by the caller rather than baked in.
-
-**Scope**: `pubsub_unsubscribe`, a per-subscription lag policy, and a decision
-on whether `relay` should share the mechanism — it already drops via
-`chan_try_send`, matching `tokio::sync::broadcast`.
-
-**Trigger**: already fired in principle — any consumer creating subscriptions
-dynamically hits it. Today's consumers subscribe at startup and hold for process
-life, which is the only reason it has not bitten.
-
-### Per-key rate-limit statistics
-
-`/ratelimit` returns the limiter's **global** counters regardless of the key
-requested. 2.6.9 marked the response `"scope":"global"` so it is
-self-describing, but an operator reading `/ratelimit?key=tenant-a` can still
-mistake fleet-wide totals for that tenant's.
-
-**Scope**: `ratelimit_stats_for_key(rl, key)` plus the admin route change.
-**Trigger**: a multi-tenant consumer using the admin endpoint for per-tenant
-observability.
-
-### Type-tag the heartbeat trackers
-
-`hb_tracker` (16 bytes) and `chb_tracker` (24 bytes, mutex at offset 16) are
-not distinguishable from their pointers, so `majra_admin_new` has to trust the
-caller. Passing a basic tracker to the two-argument form makes
-`chb_fleet_stats` read 8 bytes past the allocation and lock the result.
-
-2.6.9 added an `ADMIN_TRACKER_*` field to record the kind, and 2.6.10 found
-that the two-argument default still trusts the contract — defaulting it to
-BASIC instead would keep incorrect callers safe only by silently removing
-`/fleet` from every correct one.
-
-**Scope**: a type tag at a common offset in both tracker layouts, so
-`majra_admin_new` can detect rather than trust. Touches every heartbeat
-accessor, which is why it is not a patch.
-**Trigger**: scheduled — it is the residual half of a memory-safety finding.
-
-### Parallel DAG tier execution
-
-`dag.cyr` executes steps within a tier **serially**. The module header claimed
-`thread_create`/`join` parallelism and always had; the code calls neither, and
-2.6.9 corrected the header rather than the code. Tiers are a dependency-ordering
-construct today — a coherent design, just not the advertised one.
-
-**Scope**: thread-per-step within a tier, a bounded pool, and a decision on how
-a failing step affects its siblings.
-**Trigger**: a workflow whose tier width and per-step latency make serial
-execution the bottleneck. Needs a measurement, not an intuition — and it should
-be taken with the concurrency lessons of the 2.6.9 audit in hand.
 
 ---
 

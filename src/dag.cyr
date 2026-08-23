@@ -78,12 +78,46 @@ fn step_set_trigger_mode(step, mode) {
 #   offset 24: enabled (i64) — 0 or 1
 
 fn workflow_def_new(id, name) {
-    var d = fl_alloc(32);
+    var d = fl_alloc(40);
     store64(d, id);
     store64(d + 8, name);
     store64(d + 16, vec_new());
     store64(d + 24, 1);
+    store64(d + 32, 1);
     return d;
+}
+
+# Run up to `max_parallel` steps of a tier concurrently. 1 (the default) is
+# serial. Returns the value actually stored.
+#
+# ⚠ MEASURE BEFORE ENABLING THIS. On this toolchain `thread_create` +
+# `thread_join` costs **~89us**, while a CPU-bound step body costs well under
+# a microsecond — a ratio around 486x. The break-even is a step that takes
+# roughly 89us; below that, parallel tiers are dramatically SLOWER than serial
+# ones, which is why the default is 1 and why majra will not choose for you.
+#
+#   step ~10ms (an HTTP call, a query)  -> ~0.9% overhead, a large win
+#   step ~100us                         -> roughly break-even
+#   step ~1us (pure computation)        -> catastrophic; leave it serial
+#
+# ⚠ YOUR EXECUTOR MUST BE THREAD-SAFE. It is called from several threads at
+# once, and majra cannot check that.
+#
+# ⚠ POLICY_FAIL is weaker under parallelism. Serially, a POLICY_FAIL step
+# aborts the run before its later tier-mates start. In a parallel batch they
+# have already run by the time the failure is observed. Results are still
+# applied in tier order, so the run's outcome is deterministic — but the side
+# effects of a sibling are not prevented.
+fn workflow_def_set_parallel(def, max_parallel) {
+    if (def == 0) { return 1; }
+    if (max_parallel < 1) { max_parallel = 1; }
+    store64(def + 32, max_parallel);
+    return max_parallel;
+}
+
+fn workflow_def_max_parallel(def) {
+    if (def == 0) { return 1; }
+    return load64(def + 32);
 }
 
 fn workflow_def_add_step(def, step) {
@@ -243,6 +277,66 @@ fn workflow_context_free(ctx) {
     return 0;
 }
 
+# Run one step: retry loop and backoff. Returns a StepResult, never 0.
+#
+# Pure with respect to the context — it READS ctx (via the caller's dependency
+# check) but never writes it, which is what makes it safe to run several of
+# these on different threads. All context writes happen on the coordinating
+# thread after the batch joins.
+fn _dag_run_step(step, ctx, executor_fn) {
+    var max_retries = load64(step + 40);
+    var attempt = 0;
+    var result = 0;
+    while (attempt <= max_retries) {
+        result = fncall2(executor_fn, step, ctx);
+        if (result != 0 && load64(result) == STEP_COMPLETED) {
+            attempt = max_retries + 1;
+        } else {
+            attempt = attempt + 1;
+            if (attempt <= max_retries) {
+                #ifdef CYRIUS_TARGET_AGNOS
+                sys_sleep_ms(attempt * 10);
+                #endif
+                #ifndef CYRIUS_TARGET_AGNOS
+                # tv_nsec MUST be in [0, 999999999]. attempt * 10ms exceeds a
+                # second at attempt 100 and nanosleep then returns EINVAL
+                # immediately — the backoff silently stops backing off and the
+                # retry loop becomes a tight spin. Split into whole seconds +
+                # remainder, and retry on EINTR (-4) so a signal does not
+                # shorten the wait.
+                var total_ns = attempt * 10000000;
+                var ts[16];
+                var rem[16];
+                store64(&ts, total_ns / 1000000000);
+                store64(&ts + 8, total_ns - (total_ns / 1000000000) * 1000000000);
+                var sr = syscall(35, &ts, &rem);
+                while (sr == -4) {
+                    store64(&ts, load64(&rem));
+                    store64(&ts + 8, load64(&rem + 8));
+                    sr = syscall(35, &ts, &rem);
+                }
+                #endif
+            }
+        }
+    }
+    if (result == 0) {
+        result = step_result_new(STEP_FAILED, 0, "executor returned null");
+    }
+    return result;
+}
+
+# Job struct handed to a worker thread (40 bytes):
+#   offset  0: step
+#   offset  8: ctx
+#   offset 16: executor_fn
+#   offset 24: result   — the worker's OWN slot; no two jobs share one
+#   offset 32: skipped  — 1 if dependencies were unsatisfied
+fn _dag_worker(job) {
+    if (load64(job + 32) == 1) { return 0; }
+    store64(job + 24, _dag_run_step(load64(job), load64(job + 8), load64(job + 16)));
+    return 0;
+}
+
 # Execute a workflow definition with a given executor function and input.
 # executor_fn(step_ptr, ctx_ptr) -> StepResult ptr
 # Returns: RUN_COMPLETED, or RUN_FAILED (including for a malformed DAG).
@@ -271,77 +365,104 @@ fn workflow_execute(def, executor_fn, input) {
         var tier = vec_get(tiers, t);
         var tier_len = vec_len(tier);
 
-        # Execute all steps in this tier
+        # --- Run the tier ---
+        #
+        # Serial and parallel share _dag_run_step, so retry, backoff and the
+        # null-result fallback cannot drift between the two paths.
+        #
+        # Every step's result lands in its OWN job slot; nothing is shared
+        # between workers, and no worker touches the context. Steps in one tier
+        # are by construction independent — that is what a tier means — so
+        # deferring all context writes until after the batch joins is
+        # equivalent to writing them as we go, and it is what keeps the
+        # executor from needing to synchronise against majra's own state.
+        var width = load64(def + 32);
+        if (width < 1) { width = 1; }
+
+        var jobs = fl_alloc(tier_len * 8);
         var s = 0;
         while (s < tier_len) {
-            var step = vec_get(tier, s);
-            var step_id = load64(step);
-
-            # Check dependencies
-            if (_deps_satisfied(step, ctx) == 0) {
-                context_set_step_result(ctx, step_id, step_result_new(STEP_SKIPPED, 0, 0));
-                s = s + 1;
-                continue;
-            }
-
-            # Execute with retry
-            var max_retries = load64(step + 40);
-            var attempt = 0;
-            var result = 0;
-            while (attempt <= max_retries) {
-                result = fncall2(executor_fn, step, ctx);
-                if (result != 0 && load64(result) == STEP_COMPLETED) {
-                    break;
-                }
-                attempt = attempt + 1;
-                if (attempt <= max_retries) {
-                    # Backoff: sleep attempt * 10ms
-                    #ifdef CYRIUS_TARGET_AGNOS
-                    sys_sleep_ms(attempt * 10);
-                    #endif
-                    #ifndef CYRIUS_TARGET_AGNOS
-                    # tv_nsec MUST be in [0, 999999999]. attempt * 10ms
-                    # exceeds a second at attempt 100 and nanosleep then
-                    # returns EINVAL immediately — the backoff silently stops
-                    # backing off and the retry loop becomes a tight spin.
-                    # Split into whole seconds + remainder, and retry on EINTR
-                    # (-4) so a signal does not shorten the wait.
-                    var total_ns = attempt * 10000000;
-                    var ts[16];   # struct timespec = 2×i64 = 16 bytes (local = N bytes)
-                    var rem[16];
-                    store64(&ts, total_ns / 1000000000);
-                    store64(&ts + 8, total_ns - (total_ns / 1000000000) * 1000000000);
-                    var sr = syscall(35, &ts, &rem);
-                    while (sr == -4) {
-                        store64(&ts, load64(&rem));
-                        store64(&ts + 8, load64(&rem + 8));
-                        sr = syscall(35, &ts, &rem);
-                    }
-                    #endif
-                }
-            }
-
-            if (result == 0) {
-                result = step_result_new(STEP_FAILED, 0, "executor returned null");
-            }
-
-            context_set_step_result(ctx, step_id, result);
-
-            # Handle failure based on error policy
-            if (load64(result) == STEP_FAILED) {
-                var policy = load64(step + 32);
-                if (policy == POLICY_FAIL) {
-                    final_status = RUN_FAILED;
-                    return final_status;
-                }
-                if (policy == POLICY_SKIP) {
-                    context_set_step_result(ctx, step_id, step_result_new(STEP_SKIPPED, 0, 0));
-                }
-                # POLICY_CONTINUE: keep going
-            }
-
+            var step_j = vec_get(tier, s);
+            var job = fl_alloc(40);
+            store64(job, step_j);
+            store64(job + 8, ctx);
+            store64(job + 16, executor_fn);
+            store64(job + 24, 0);
+            var unsat = 0;
+            if (_deps_satisfied(step_j, ctx) == 0) { unsat = 1; }
+            store64(job + 32, unsat);
+            store64(jobs + s * 8, job);
             s = s + 1;
         }
+
+        if (width == 1 || tier_len == 1) {
+            s = 0;
+            while (s < tier_len) {
+                _dag_worker(load64(jobs + s * 8));
+                s = s + 1;
+            }
+        } else {
+            # Bounded batches rather than a thread per step: `width` is a
+            # concurrency cap, not a suggestion.
+            var base = 0;
+            while (base < tier_len) {
+                var n = width;
+                if (base + n > tier_len) { n = tier_len - base; }
+                var handles = fl_alloc(n * 8);
+                var k = 0;
+                while (k < n) {
+                    store64(handles + k * 8,
+                            thread_create(&_dag_worker, load64(jobs + (base + k) * 8)));
+                    k = k + 1;
+                }
+                k = 0;
+                while (k < n) {
+                    var h = load64(handles + k * 8);
+                    # A failed spawn must not be joined, and its step must
+                    # still run — inline it rather than silently skipping it.
+                    if (h == 0) { _dag_worker(load64(jobs + (base + k) * 8)); }
+                    else { thread_join(h); }
+                    k = k + 1;
+                }
+                fl_free(handles);
+                base = base + n;
+            }
+        }
+
+        # --- Apply results, in tier order ---
+        s = 0;
+        var abort = 0;
+        while (s < tier_len && abort == 0) {
+            var job2 = load64(jobs + s * 8);
+            var step2 = load64(job2);
+            var step_id = load64(step2);
+
+            if (load64(job2 + 32) == 1) {
+                context_set_step_result(ctx, step_id, step_result_new(STEP_SKIPPED, 0, 0));
+            } else {
+                var result = load64(job2 + 24);
+                context_set_step_result(ctx, step_id, result);
+
+                if (load64(result) == STEP_FAILED) {
+                    var policy = load64(step2 + 32);
+                    if (policy == POLICY_FAIL) {
+                        final_status = RUN_FAILED;
+                        abort = 1;
+                    }
+                    if (policy == POLICY_SKIP) {
+                        context_set_step_result(ctx, step_id, step_result_new(STEP_SKIPPED, 0, 0));
+                    }
+                    # POLICY_CONTINUE: keep going
+                }
+            }
+            s = s + 1;
+        }
+
+        s = 0;
+        while (s < tier_len) { fl_free(load64(jobs + s * 8)); s = s + 1; }
+        fl_free(jobs);
+
+        if (abort == 1) { return final_status; }
         t = t + 1;
     }
 
