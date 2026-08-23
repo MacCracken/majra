@@ -1,5 +1,15 @@
 # Migrating Ifran to majra
 
+> ⚠ **FROZEN at this consumer's adoption point — not current guidance.**
+>
+> This guide is kept as a record of how ifran migrated, not as a recipe to
+> follow verbatim today. majra has had breaking changes since; the inline ⚠
+> notes below flag the snippets a reader would otherwise copy and be bitten by.
+> For the current contract see
+> [`migration-2.6.9.md`](migration-2.6.9.md) and the module headers in `src/`.
+
+
+
 > Ifran manages model lifecycle (download, conversion, quantisation, indexing).
 > This guide covers replacing Ifran's internal queue, pub/sub, and heartbeat
 > with majra Cyrius modules.
@@ -26,6 +36,10 @@ var job = mq_enqueue(mq, PRIORITY_HIGH, job_data);
 
 # Dequeue highest priority
 var next = mq_dequeue(mq);
+# ⚠ mq_dequeue returns 0 in two ordinary cases: the queue is empty, AND the
+# queue is at its concurrency cap — which this very example sets to 4.
+# mq_complete has no null guard, so check before using it.
+if (next == 0) { return 0; }
 # ... process ...
 mq_complete(mq, next);
 ```
@@ -87,6 +101,8 @@ fleet_rebalance(fleet);
 ```cyrius
 include "src/postgres_backend.cyr"
 
+# ⚠ LOOPBACK ONLY — plaintext protocol, cleartext-password auth, no TLS.
+# See src/postgres_backend.cyr's header before using this off-host.
 var pg = pg_connect("127.0.0.1", 5432, "postgres", "ifran", "password");
 pg_init_workflow_tables(pg);
 pg_save_workflow_def(pg, "training-pipeline", "GPU training", "[]");

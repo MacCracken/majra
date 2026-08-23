@@ -25,7 +25,7 @@ Cyrius v2.0.0 vs Rust v1.0.4 — comparable operations measured on the same hard
 ### Where Cyrius wins
 
 - Zero startup time (no runtime initialization, no tokio scheduler)
-- 93 KB binary vs multi-MB Rust release binary
+- 93 KB binary vs multi-MB Rust release binary *(both as measured at the v2.0.0 cutover; majra's self-test binary has grown substantially since)*
 - No dependency tree to audit (0 vs 25 crates)
 
 ### Where Rust wins

@@ -4,8 +4,8 @@
 
 ```bash
 # One-time per checkout / after any toolchain or dep bump (cyrius 6.x):
-#   lib sync provisions the stdlib snapshot, deps overlays the git deps
-#   (sigil + sakshi). `--full` is load-bearing since cyrius 6.4.x — a bare
+#   lib sync provisions the stdlib snapshot; deps writes and verifies cyrius.lock
+#   (majra declares **zero** git deps since 2.6.8 — sigil and sakshi are folded stdlib modules, so `cyrius deps` resolves nothing and exists only for the lockfile). `--full` is load-bearing since cyrius 6.4.x — a bare
 #   `lib sync` copies only the declared `[deps].stdlib` subset and omits the
 #   toolchain modules sigil/sandhi reach into, which compile to a runtime
 #   `ud2` (SIGILL at runtime, not a build error).
@@ -33,15 +33,20 @@ cyrius build --no-deps tests/soak/soak_queue.cyr build/soak_queue && ./build/soa
 | Suite | File | Assertions | Coverage |
 |-------|------|-----------|----------|
 | Core | `src/main.cyr` | 150 | All 15 core modules + revived relay dedup |
-| Expanded | `tests/test_core.tcyr` | 200 | Deep: queue lifecycle, pubsub patterns, DAG retry, fleet routing, circuit breaker, integration, multi-threaded barrier, plus the 2.5.3 concurrency + wildcard-alignment regressions and the 2.6.x relay / ratelimit / priority-queue regressions |
-| Backends | `tests/test_backends.tcyr` | 43 | base64, SHA-1, AES-256-GCM, signed envelopes, admin endpoint, WebSocket, RESP, PG wire |
-| Patra queue | `tests/test_patra_queue.tcyr` | 17 | Durable enqueue / priority dequeue / complete / counts / reopen persistence |
-| Live | `tests/test_live.tcyr` | 36 | 7 Redis + 4 PostgreSQL categories (see below). **CI-only** — needs Redis on :6379 + PostgreSQL on :5432, so a dev-box "full matrix" run is 410, not 446 |
-| **Total** | | **446** (410 CI + 36 live) | |
+| Expanded | `tests/test_core.tcyr` | 299 | Deep: queue lifecycle, pubsub patterns, DAG retry, fleet routing, circuit breaker, integration, multi-threaded barrier, plus the 2.5.3 concurrency + wildcard-alignment regressions and the 2.6.x relay / ratelimit / priority-queue regressions |
+| Backends | `tests/test_backends.tcyr` | 152 | base64, SHA-1, AES-256-GCM, signed envelopes, admin endpoint, WebSocket, RESP, PG wire |
+| Patra queue | `tests/test_patra_queue.tcyr` | 28 | Durable enqueue / priority dequeue / complete / counts / reopen persistence |
+| Live | `tests/test_live.tcyr` | 36 | 7 Redis + 4 PostgreSQL categories (see below). **CI-only** — needs Redis on :6379 + PostgreSQL on :5432, so a dev-box "full matrix" run is 629, not 665 |
+| **Total** | | **665** (629 CI + 36 live) | |
 
 `test_patra_queue` is a separate entry point because adding it to `test_backends` blows the cc5 16384 fixup-table cap (patra pulls sakshi + io + fs transitively).
 
 ## Test Categories
+
+> Counts below are indicative of coverage SHAPE, not exact totals — they were
+> apportioned at 2.5.x and the suites have roughly doubled since. The
+> authoritative per-suite numbers are the table above and
+> [`../development/state.md`](../development/state.md).
 
 | Category | Where | Count |
 |----------|-------|-------|
@@ -67,7 +72,7 @@ cyrius build --no-deps tests/soak/soak_queue.cyr build/soak_queue && ./build/soa
 cyrius bench
 
 # Manual run
-cyrius build --no-deps benches/bench_all.cyr build/bench && ./build/bench
+cyrius build --no-deps benches/bench_all.bcyr build/bench_all && ./build/bench_all
 ```
 
 17 benchmarks covering: envelope creation, priority queue, pattern matching (4 variants), pubsub publish, direct channel, heartbeat, fleet stats, rate limiting, relay send, barrier cycle, circuit breaker, counter increment.
@@ -76,7 +81,7 @@ cyrius build --no-deps benches/bench_all.cyr build/bench && ./build/bench
 
 `tests/soak/` holds on-demand stress tests. Not in CI; run before releases or when a code change could plausibly affect a primary state machine. Each soak file is standalone: `fn main()`, returns 0 on pass, non-zero on invariant violation. See `tests/soak/README.md` for conventions and known limitations (bump-allocator-bounded iteration counts).
 
-Currently shipped:
+Currently shipped (all four are run before a release, not in CI):
 - `soak_queue.cyr` — 5k ops (1k rounds × 5 jobs) managed-queue lifecycle; asserts `mq_total_completed`, `mq_job_count`, and per-round `queued_count`/`running_count` invariants.
 
 ## Compiler Limitations

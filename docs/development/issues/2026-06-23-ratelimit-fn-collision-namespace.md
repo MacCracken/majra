@@ -1,5 +1,8 @@
 # `ratelimit_new` / `ratelimit_check` collide with consumer limiters — namespace as `majra_ratelimit_*`
 
+**Status:** 🔴 **OPEN** — reconfirmed at majra 2.7.0 (2026-08-22): `src/ratelimit.cyr`
+still defines the bare `ratelimit_new` / `ratelimit_check`, and no `majra_ratelimit_*`
+symbol exists anywhere in `src/`.
 **Filed:** 2026-06-23 (by a hoosh consumer — hoosh 2.4.7 toolchain bump to cyrius 6.2.37)
 **Severity:** Medium — `last-definition-wins` build warning today; **arity
 mismatch** makes a silent wrong-binding a real corruption risk if include order
@@ -10,6 +13,7 @@ ever flips.
 **majra's role: RECOMMENDED FIX OWNER.** majra's public limiter names are the
 generic ones; a consumer's own `ratelimit_*` is the natural keeper of the bare
 name. Part of the broader ecosystem namespacing effort (see Cross-references).
+**Filed against:** majra `2.4.7`
 **Repos:** majra `2.4.7` (sibling ERR_* enum issues filed in sigil/yukti/bote/
 sakshi/ai-hwaccel).
 

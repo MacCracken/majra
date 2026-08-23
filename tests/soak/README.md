@@ -9,10 +9,10 @@ heartbeat eviction.
 ## Running
 
 ```
-cyrius build tests/soak/soak_queue.cyr     build/soak_queue     && ./build/soak_queue
-cyrius build tests/soak/soak_pubsub.cyr    build/soak_pubsub    && ./build/soak_pubsub
-cyrius build tests/soak/soak_relay.cyr     build/soak_relay     && ./build/soak_relay
-cyrius build tests/soak/soak_heartbeat.cyr build/soak_heartbeat && ./build/soak_heartbeat
+cyrius build --no-deps tests/soak/soak_queue.cyr     build/soak_queue     && ./build/soak_queue
+cyrius build --no-deps tests/soak/soak_pubsub.cyr    build/soak_pubsub    && ./build/soak_pubsub
+cyrius build --no-deps tests/soak/soak_relay.cyr     build/soak_relay     && ./build/soak_relay
+cyrius build --no-deps tests/soak/soak_heartbeat.cyr build/soak_heartbeat && ./build/soak_heartbeat
 ```
 
 Each soak file prints a banner, runs to completion, and exits 0

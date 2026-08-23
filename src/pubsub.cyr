@@ -169,7 +169,10 @@ fn pubsub_subscribe(ps, topic) {
     # pointer twice, and one caller walked away with a channel that was never
     # registered: its chan_recv blocks forever while `delivered` counts it.
     # Measured before the fix: 1-7 orphaned channels per 800 concurrent
-    # subscribes. See CHANGELOG 2.5.3 and cyrius-quirks.md §8.
+    # subscribes. See CHANGELOG 2.5.3. (cyrius-quirks.md carried this as active quirk #8
+    # until 2.7.0; cyrius 6.5.19 made fl_alloc thread-safe and it moved to that
+    # file's resolved archive. The lock-before-allocate ordering here is kept
+    # because it also covers the _mq_next_job_id read-modify-write.)
     var mtx = load64(ps + 16);
     mutex_lock(mtx);
     var ch = chan_new(64);

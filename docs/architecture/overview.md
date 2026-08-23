@@ -6,7 +6,7 @@ is a `.cyr` file included via `include` directives in dependency order.
 ## Module Map
 
 ```
-majra (v2.4.x, ~5,500 lines across 22 modules)
+majra (v2.7.0, ~8,100 lines across 22 modules)
 │
 │ ── Core (always included) ────────────────────
 ├── error           Error codes (enum) + result helpers
@@ -18,6 +18,7 @@ majra (v2.4.x, ~5,500 lines across 22 modules)
 │ ── Primitives ────────────────────────────────
 ├── queue           5-tier priority queue + ManagedQueue with lifecycle
 ├── pubsub          MQTT wildcard matching + DirectChannel + HashedChannel
+│                   + unsubscribe and per-subscriber lag policy (2.7.0)
 ├── relay           Sequenced dedup relay with broadcast
 ├── barrier         N-way barrier (sync + concurrent with futex)
 ├── heartbeat       FSM health tracker + GPU telemetry + fleet stats
@@ -32,6 +33,7 @@ majra (v2.4.x, ~5,500 lines across 22 modules)
 │ ── Composition ───────────────────────────────
 ├── fleet           Distributed job queue with work-stealing
 ├── dag             DAG workflow engine (Kahn's sort, retry, error policies)
+│                   tiers serial by default; opt-in parallel (2.7.0)
 │
 │ ── Trust ([lib.signed] / [lib.backends]) ─────
 ├── signed_envelope Ed25519 signatures over canonical envelope encoding (sigil Ed25519)
@@ -42,6 +44,7 @@ majra (v2.4.x, ~5,500 lines across 22 modules)
 │ ── Backends ([lib.backends] profile only) ────
 ├── redis_backend    RESP2 protocol (SET/GET, ZADD, PUBLISH, HSET, EVAL)
 ├── postgres_backend PostgreSQL v3 wire protocol (startup, auth, query, CRUD)
+│                   ⚠ plaintext transport, cleartext auth only
 └── patra_queue      Durable priority queue backed by patra (survives restart)
 ```
 
@@ -58,11 +61,22 @@ Four bundles are produced by `cyrius distlib`. Consumers pick the smallest profi
 
 ## Design Principles
 
-1. **Zero core dependencies** — `dist/majra.cyr` pulls nothing beyond the Cyrius stdlib. Richer profiles (`signed`, `backends`) pull sigil — first-party, vendored, no external crates.
+1. **Zero core dependencies** — `dist/majra.cyr` pulls nothing beyond the Cyrius stdlib. Richer profiles (`signed`, `backends`) reach sigil — first-party, and since 2.6.8 a folded cyrius stdlib module rather than a git dep, no external crates.
 2. **Thread-safe by default** — concurrent variants use mutex + futex.
-3. **Globals for cross-call state** — cc5 is better than cc3, but deeply nested call chains can still clobber locals. Several modules (`postgres_backend`, `relay`, `barrier`) promote critical values to globals defensively.
+3. **Globals for cross-call state** — cc5 is better than cc3, but deeply nested
+   call chains can still clobber locals. `postgres_backend` still promotes its
+   connect-path values to globals (serialised behind `_pg_connect_mtx`).
+   `relay` and `barrier` **no longer do**: their result globals were removed at
+   2.6.1 and 2.6.9 respectively, because a global serialised only by a
+   per-object mutex is clobbered by a second object using a different lock.
+   Prefer a caller-provided out-buffer.
 4. **Fixed-point math** — no floating point; token buckets use x1000 scaling.
-5. **Eviction everywhere** — all collections support TTL/capacity-based eviction.
+5. **Eviction where it is asked for** — the keyed collections expose TTL
+   eviction (`ratelimit_evict_stale`, `sliding_window_evict_stale`,
+   `relay_evict_stale_dedup`), but **the caller must schedule it**; only
+   heartbeat evicts autonomously, via `eviction_cycles`. Pubsub releases
+   subscribers on explicit `pubsub_unsubscribe`, or bounds them per-subscriber
+   through a `PUBSUB_LAG_*` policy.
 6. **Multi-tenant ready** — Namespace module provides topic/key/node-ID scoping.
 7. **Vtable polymorphism** — traits replaced by function pointer structs.
 

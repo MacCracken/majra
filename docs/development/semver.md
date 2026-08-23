@@ -55,6 +55,25 @@ Renames taken under this exception:
 | `base64_encode` | `majra_base64_encode` | 2.6.8 | `lib/bayan.cyr` (wrapper over `bayan_base64_encode`) |
 | `base64_decode` | `majra_base64_decode` | 2.6.8 | `lib/bayan.cyr` — **return contracts disagreed**: majra returned a `{ptr, len}` struct, bayan returns a scalar `i64` |
 
+### Signature changes taken in 2.6.9 (a PATCH)
+
+The first P(-1) audit found three public signatures that could not be made
+correct in place. They shipped in **2.6.9**, a PATCH, because leaving them was
+worse than breaking them — each old form was actively wrong rather than merely
+inconvenient, and all three produce a **compile error** at the call site, so no
+consumer can pick the change up silently.
+
+| Symbol | Change | Why it could not stay |
+|---|---|---|
+| `encrypted_ipc_new` | gained a required `role` argument | Both directions derived nonces from independent counters under one key, so every message pair at the same counter reused `(key, nonce)` — keystream reuse plus GHASH subkey leakage. The 2-argument form cannot be made safe |
+| `majra_admin_serve` | `addr` is now a parsed dotted-quad string | It was forwarded to `sockaddr_in`, which wants a packed integer, so the documented `"127.0.0.1"` call bound to the low 32 bits of a `char*` |
+| `transport_send` / `transport_recv` | forward all 3 arguments | They dropped `len`, so an implementation written to the documented vtable contract read a garbage length |
+
+Behavioural changes in the same release, without a signature change:
+`namespace_new` rejects invalid prefixes (returns 0), `mq_job_count` counts
+live rather than cumulative jobs, and `patra_queue`'s payload column moved
+`STR` → `TEXT`. See [`../guides/migration-2.6.9.md`](../guides/migration-2.6.9.md).
+
 New public symbols should carry a module prefix (`queue_`, `relay_`,
 `majra_admin_`, …) precisely so this class of collision cannot recur. Check a
 proposed public name against the `lib/` snapshot before adding it:
@@ -75,4 +94,7 @@ under Documented exceptions above:
 | queue, pubsub, relay, barrier | 2.0.0 |
 | ipc, transport, fleet, dag | 2.0.0 |
 | redis_backend, postgres_backend, ws | 2.0.0 |
-| ipc_encrypted (framing only, crypto stub) | 2.0.0 |
+| ipc_encrypted (AES-256-GCM via sigil; framing, nonce/role separation, rekey) | 2.0.0 framing; role argument 2.6.9 — see Documented exceptions |
+| signed_envelope | 2.4.0 |
+| admin | 2.4.0 (`majra_admin_serve` signature changed at 2.6.9) |
+| patra_queue | 2.4.0 (payload column `STR` → `TEXT` at 2.6.9) |

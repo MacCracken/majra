@@ -38,7 +38,8 @@ cyrius deps                                            # write cyrius.lock; run 
 cyrius build --no-deps src/main.cyr build/majra && ./build/majra        # build + core tests
 cyrius build --no-deps tests/test_backends.tcyr build/test_backends && ./build/test_backends
 cyrius distlib && cyrius distlib signed && cyrius distlib admin && cyrius distlib backends  # regenerate 4 dist bundles
-cyrius audit                                           # full: self-host, test, fmt, lint, vet, deny, bench
+cyrius audit                                           # project sweep: fmt, lint, docs, tests, bench
+cyrius deny src/main.cyr                               # syscall/network policy (separate from audit)
 ```
 
 > **Cyrius 6.x build workflow (since 2.4.5).** Stdlib provisioning and

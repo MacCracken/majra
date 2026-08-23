@@ -2,30 +2,30 @@
 
 > مجرا (Arabic/Persian: conduit, channel) — Distributed queue & multiplex engine
 
-Majra provides shared messaging primitives for the [AGNOS](https://github.com/MacCracken) ecosystem, eliminating duplicate pub/sub, queue, relay, and heartbeat implementations across [AgnosAI](https://github.com/MacCracken/agnosai), [Ifran](https://github.com/MacCracken/synapse), [SecureYeoman](https://github.com/MacCracken/secureyeoman), and [daimon](https://github.com/agnostos/daimon).
+Majra provides shared messaging primitives for the [AGNOS](https://github.com/MacCracken) ecosystem, eliminating duplicate pub/sub, queue, relay, and heartbeat implementations across [AgnosAI](https://github.com/MacCracken/agnosai), [ifran](https://github.com/MacCracken/ifran), [SecureYeoman](https://github.com/MacCracken/secureyeoman), and [daimon](https://github.com/agnostos/daimon).
 
-**Written in [Cyrius](https://github.com/MacCracken/cyrius)** — compiles to a statically linked binary via `cyrius build`. Optional crypto surface (signed envelopes, encrypted IPC) pulls [sigil](https://github.com/MacCracken/sigil) — a folded cyrius stdlib module since the 6.5.x line, so it arrives with the toolchain rather than as a separate dep. The core profile has no crypto surface at all, and majra declares **zero git dependencies**.
+**Written in [Cyrius](https://github.com/MacCracken/cyrius)** — compiles to a statically linked binary via `cyrius build`. Optional crypto surface (signed envelopes, encrypted IPC) pulls [sigil](https://github.com/MacCracken/sigil), a folded cyrius stdlib module — since majra 2.6.8 it is declared under `[deps].stdlib` and arrives with the toolchain snapshot rather than as a separate git dep. The core profile has no crypto surface at all, and majra declares **zero git dependencies**.
 
 ## Modules
 
 | Module | Description |
 |--------|-------------|
-| **pubsub** | Three-tier pub/sub: DirectChannel, HashedChannel, PubSub with MQTT wildcard matching |
+| **pubsub** | Three-tier pub/sub: DirectChannel, HashedChannel, PubSub with MQTT wildcard matching. Unsubscribe + per-subscriber lag policy (`PUBSUB_LAG_BLOCK` is the default — a stalled subscriber blocks publishes to its own topic) |
 | **queue** | Multi-tier priority queue + ManagedQueue with job lifecycle management |
-| **relay** | Sequenced, deduplicated relay with broadcast and request-response |
+| **relay** | Sequenced, deduplicated relay — unicast (`relay_send`) and broadcast (`relay_broadcast`) |
 | **transport** | Transport vtable + connection pool with circuit breaker |
 | **ipc** | Length-prefixed framing over Unix domain sockets |
 | **ipc_encrypted** | AES-256-GCM encrypted IPC with key rotation and nonce tracking |
 | **heartbeat** | TTL-based node health: Online / Suspect / Offline with GPU telemetry and fleet stats |
 | **ratelimit** | Token bucket + sliding window rate limiters (fixed-point math) |
 | **barrier** | N-way barrier synchronisation with deadlock recovery |
-| **dag** | DAG workflow engine with tier-based scheduling, retry, error policies |
+| **dag** | DAG workflow engine — tier-based scheduling, retry, error policies. Tiers run **serially by default**; `workflow_def_set_parallel` opts in (break-even is a ~89µs step, and your executor must be thread-safe) |
 | **fleet** | Distributed job queue with work-stealing across nodes |
 | **namespace** | Multi-tenant scoping for topics, keys, and node IDs |
 | **metrics** | Pluggable metrics vtable with 22 hook points |
 | **redis_backend** | Cross-process pub/sub, sorted-set queues, hash-based rate limiter, heartbeat via RESP protocol |
 | **postgres_backend** | PostgreSQL workflow + queue storage via wire protocol v3 |
-| **ws** | WebSocket bridge — SHA-1 handshake, frame parsing, pub/sub fan-out |
+| **ws** | WebSocket framing primitives (RFC 6455) — SHA-1 upgrade handshake, frame read/write, ping/pong/close. **No pub/sub bridge**: drive `ws_recv_frame` / `ws_send_text` from your own accept loop |
 | **signed_envelope** | Ed25519 signatures over a canonical envelope encoding (via sigil) |
 | **admin** | Read-only HTTP admin/metrics endpoint (`/health`, `/fleet`, `/ratelimit`) |
 | **patra_queue** | Durable job queue backed by patra — survives process restart |
@@ -33,8 +33,22 @@ Majra provides shared messaging primitives for the [AGNOS](https://github.com/Ma
 ## Quick Start
 
 ```cyrius
+# The bundles carry no `include "lib/…"` lines of their own, so the entry
+# point supplies every stdlib module the code reaches into. This is the
+# minimum set for pubsub.
+include "lib/string.cyr"
+include "lib/fmt.cyr"
 include "lib/alloc.cyr"
 include "lib/freelist.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/hashmap.cyr"
+include "lib/syscalls.cyr"
+include "lib/tagged.cyr"
+include "lib/thread.cyr"
+
+include "src/error.cyr"
+include "src/counter.cyr"
 include "src/pubsub.cyr"
 
 fn main() {
@@ -75,6 +89,7 @@ mq_complete(mq, job);
 
 ```cyrius
 var ns = namespace_new("tenant-42");
+    if (ns == 0) { return 1; }   # refused: prefix held / : # + or a control byte
 
 # Scoped topics
 var topic = namespace_topic(ns, "events/created");
@@ -109,7 +124,7 @@ pg_save_workflow_def(conn, "wf-1", "my workflow", "[]");
 ## Architecture
 
 ```
-majra (v2.4.x, ~5,500 lines across 22 modules)
+majra (v2.7.0, ~8,100 lines across 22 modules)
 │
 │ ── Core ──────────────────────────────────────
 ├── error           Error codes + result helpers
@@ -151,7 +166,9 @@ majra (v2.4.x, ~5,500 lines across 22 modules)
 ## Building
 
 ```bash
-# One-time setup (cyrius 6.x): stdlib snapshot, then git deps.
+# One-time setup (cyrius 6.x): stdlib snapshot, then the lockfile.
+# majra declares ZERO git deps — `cyrius deps` resolves nothing, but it is what
+# writes and verifies cyrius.lock.
 # `--full` is load-bearing since 6.4.x — the bare form copies only the
 # declared [deps].stdlib subset and omits the toolchain modules sigil and
 # sandhi reach into.
@@ -163,7 +180,8 @@ cyrius build --no-deps src/main.cyr build/majra
 # Run core tests
 ./build/majra
 
-# Full test matrix (150 + 112 + 42 + 17 = 321 assertions)
+# Full test matrix — 629 assertions at 2.7.0.
+# Counts move every release; docs/development/state.md carries the current ones.
 cyrius build --no-deps tests/test_core.tcyr        build/test_core        && ./build/test_core
 cyrius build --no-deps tests/test_backends.tcyr    build/test_backends    && ./build/test_backends
 cyrius build --no-deps tests/test_patra_queue.tcyr build/test_patra_queue && ./build/test_patra_queue
@@ -174,7 +192,8 @@ cyrius build --no-deps benches/bench_all.bcyr build/bench_all && ./build/bench_a
 # Soak tests (on-demand, not in CI)
 cyrius build --no-deps tests/soak/soak_queue.cyr build/soak_queue && ./build/soak_queue
 
-# Full audit: self-host, test, fmt, lint, vet, deny, bench
+# Project sweep: fmt, lint, docs, tests, bench
+# (the syscall/network policy check is separate: cyrius deny src/main.cyr)
 cyrius audit
 
 # Regenerate all four distribution bundles (commit alongside src/ changes)
@@ -192,14 +211,14 @@ Downstream Cyrius projects wire majra into their `cyrius.cyml`:
 [deps.majra]
 git = "https://github.com/MacCracken/majra.git"
 tag = "<majra version>"
-modules = ["dist/majra.cyr"]           # core engine only — lean, no crypto
-# or pick a richer profile:
-modules = ["dist/majra-signed.cyr"]    # core + Ed25519-signed envelopes (pulls sigil)
-modules = ["dist/majra-admin.cyr"]     # core + HTTP admin/metrics endpoint
-modules = ["dist/majra-backends.cyr"]  # everything: all profiles + redis/pg/ws/encrypted IPC/patra_queue
+modules = ["dist/majra.cyr"]             # core engine only — lean, no crypto
+# or pick exactly ONE richer profile instead:
+# modules = ["dist/majra-signed.cyr"]    # core + Ed25519-signed envelopes (pulls sigil)
+# modules = ["dist/majra-admin.cyr"]     # core + HTTP admin/metrics endpoint
+# modules = ["dist/majra-backends.cyr"]  # everything: signed + admin + redis/pg/ws/encrypted IPC/patra_queue
 ```
 
-`cyrius deps` resolves the tag, copies the chosen bundle into `lib/majra_majra.cyr`, and you `include` it from your entry point.
+`cyrius deps` resolves the tag and copies the chosen bundle into `lib/` under its own name — `lib/majra.cyr`, `lib/majra-signed.cyr`, `lib/majra-admin.cyr` or `lib/majra-backends.cyr` — which you then `include` from your entry point.
 
 The bundles are **pure `src/` concatenation** — they carry no `include "lib/…"` lines of their own, so the consumer's entry point must supply every stdlib module the bundle (and sigil) reaches into. The `.deps` sidecar next to each bundle lists what *majra's own code* needs; the crypto profiles need more than that, because sigil reaches into the stdlib too. These sets are verified by building a clean consumer against each shipped bundle:
 
@@ -225,14 +244,16 @@ A `signed`-only consumer can pull sigil's per-primitive `dist/sigil-ed25519.cyr`
 | **hoosh** | queue, heartbeat, fleet |
 | **sutra** | heartbeat, fleet, dag |
 | **stiva** | dag, heartbeat, ipc |
+| **ifran** | queue, pubsub, heartbeat, fleet |
+| **secureyeoman** | signed_envelope, ipc |
 
 ## Ported from Rust
 
 Majra was originally a Rust library (v1.0.4, ~13,000 lines). It was ported to Cyrius via `cyrius port`, re-implementing all modules from scratch.
 
-| Metric | Rust v1.0.4 | Cyrius v2.6.x |
+| Metric | Rust v1.0.4 | Cyrius v2.7.x |
 |--------|-------------|---------------|
-| Source lines | 12,969 | ~5,800 |
+| Source lines | 12,969 | 8,093 |
 | Modules | 22 | 22 (QUIC deferred on sigil X25519) |
 | Dependencies | 25 crates | 0 — sigil is a folded stdlib module |
 | Toolchain | cargo + rustc + LLVM | cyrius 6.5.35 |

@@ -5,7 +5,7 @@ description: Toolchain-side gotchas that affect how majra code is written. Refre
 
 # Cyrius compiler quirks
 
-> **Toolchain floor**: cyrius 6.1.x (see [`state.md`](state.md) for the current exact pin) | **Refresh cadence**: when the pin moves or a new quirk surfaces. | **Last verified**: 6.5.35 (2.6.8) — the undefined-fn `ud2` rule re-confirmed empirically against a clean-room consumer build (it is what made the missing-`sigil` sidecar a runtime SIGILL rather than a build failure); snapshot count and `lib sync --full` note refreshed. **Prior**: 6.4.83 (2.5.2) — quirks #4 and #6 re-checked; #6 rewritten.
+> **Toolchain floor**: cyrius 6.4.65 (the folded sigil needs `thread_local_alloc`) — and 6.5.19 for a thread-safe `fl_alloc`, see the archive. Current exact pin in [`state.md`](state.md) | **Refresh cadence**: when the pin moves or a new quirk surfaces. | **Last verified**: 6.5.35 (2.7.0) — quirk #8 re-checked against `lib/freelist.cyr` and **archived**: upstream locked it at 6.5.19 (`_fl_lock`, a `_threads_active`-gated CAS spinlock). Bare-`lib sync` file count re-measured at 49. **Prior**: 6.5.35 (2.6.8) — the undefined-fn `ud2` rule re-confirmed empirically against a clean-room consumer build (it is what made the missing-`sigil` sidecar a runtime SIGILL rather than a build failure); snapshot count and `lib sync --full` note refreshed. **Prior**: 6.4.83 (2.5.2) — quirks #4 and #6 re-checked; #6 rewritten.
 
 Things about the cyrius compiler that affect how majra code is written. None of these are bug reports — they're *load-bearing facts about the toolchain*. If a pattern in `src/` looks weird, the answer is probably here.
 
@@ -78,61 +78,16 @@ The behavior has moved twice. cc5 made an undefined function a hard compile erro
 
 `cyrius deps` no longer provisions the stdlib — it only resolves `[deps.*]` git deps, and **majra has declared none since 2.6.8**, so the step exists purely to write/verify `cyrius.lock`. The version-pinned stdlib snapshot (**108 `.cyr` files under 6.5.31 and 6.5.35** — was 99 under 6.4.62–6.4.83, 97 under 6.2.11, 88 under 6.1.35, 94 under 6.1.24; the count tracks the toolchain — including the toolchain-internal `slice`/`ct`/`chrono`/`async`/`dynlib`/`fdlopen`/`tls` that sigil/sandhi reach into, and `sigil` itself since the 6.5.x fold) is copied into `./lib/` by **`cyrius lib sync --full`**. Run `lib sync --full` *before* `deps`.
 
-**`--full` is load-bearing since 6.4.x**: a bare `cyrius lib sync` copies only the modules named in `[deps].stdlib` (40 files) and omits exactly the toolchain-internal set above — which then hits quirk #6.
+**`--full` is load-bearing since 6.4.x**: a bare `cyrius lib sync` copies only the modules named in `[deps].stdlib` (49 files at the 6.5.35 pin) and omits exactly the toolchain-internal set above — which then hits quirk #6.
 
-**The snapshot can also shadow a declared dep.** `lib sync --full` ships bundled copies of some git-resolvable deps (e.g. `sakshi`), and the subsequent `cyrius deps` overlay *overwrites* them from whatever tag is resolved — including a tag inherited from another dep's manifest. When that inherited tag is **older** than the snapshot's copy, the overlay silently downgrades and the only signal is `warning: ./lib/ shadows version-pinned … <dep> <old> (pinned: <new>)`. majra hit this with sakshi at 2.5.2 and fixed it by declaring `[deps.sakshi]` at the top level. Don't dismiss that warning as cosmetic.
+**The snapshot can also shadow a declared dep.** `lib sync --full` ships bundled copies of some git-resolvable deps (e.g. `sakshi`), and the subsequent `cyrius deps` overlay *overwrites* them from whatever tag is resolved — including a tag inherited from another dep's manifest. When that inherited tag is **older** than the snapshot's copy, the overlay silently downgrades and the only signal is `warning: ./lib/ shadows version-pinned … <dep> <old> (pinned: <new>)`. majra hit this with sakshi at 2.5.2 and countered it by declaring `[deps.sakshi]`
+at the top level — a counter-move that was itself **retired at the 6.5.18 pin**,
+because on a library that publishes bundles a git dep makes `distlib` drop the
+module from the generated `.deps` sidecars (see the ⚠ at the top of
+[`dependency-watch.md`](dependency-watch.md)). **The current remedy is to declare
+nothing** and let the module ride the snapshot. Don't dismiss that warning as cosmetic.
 
 A `./lib/` that exists fully **shadows** the version snapshot (no per-file fallback), so a partial `./lib/` — e.g. one `cyrius deps` populated without a preceding `lib sync --full` — is missing `slice.cyr` and friends, and the reaching call sites then hit quirk #6.
 
 Build with **`cyrius build --no-deps`**: a plain `cyrius build` auto-runs `deps`, which re-resolves and perturbs the synced lib's include order enough to re-break the agnosys/slice resolution even when `slice.cyr` is present. Canonical sequence: `cyrius lib sync --full && cyrius deps && cyrius build --no-deps <src> <out>`.
 
-### 8. `fl_alloc` is NOT thread-safe; `alloc` is
-
-The two stdlib allocators have different concurrency contracts, and neither
-says so in its header:
-
-- **`alloc` (lib/alloc.cyr) is safe.** It carries a documented process-wide CAS
-  spinlock plus a `_threads_active` single-threaded fast path (`:28-48`).
-- **`fl_alloc` (lib/freelist.cyr) is not.** It pops the size-class free list
-  with a plain load/store pair — `head = load64(&_fl_heads + cls*8);
-  store64(&_fl_heads + cls*8, load64(head))` — with no lock, no CAS, no gate.
-  Two threads racing the same size class can be handed **the same block**.
-
-**This is load-bearing for majra**, because CLAUDE.md's own rule is "`fl_alloc`
-for structs, `alloc` for hashmaps" — so every majra struct comes from the
-*unsynchronized* allocator. At 2.5.3 this cost two silent data-loss bugs:
-`pubsub_subscribe` handed callers channels that were never registered (their
-`chan_recv` blocked forever), and `mq_enqueue` lost 4-12 jobs per 800 because
-two enqueues got the same block *and* the same job key.
-
-**The rule**: in any function reachable from more than one thread, take the
-object's mutex **before** `fl_alloc`, not after. Allocating outside the lock to
-"keep the critical section short" is exactly the bug. Note that `chan_new` and
-`mutex_new` are safe (they use `alloc`), so a pre-lock `chan_new` is *not*
-evidence of this bug — check which allocator actually runs.
-
-**Diagnosis**: N threads × M operations, then assert the observable count
-equals N×M and that no two returned pointers alias. The failure rate is low
-(0.1-1.5%) and entirely silent, so single-run tests will pass. Loop it.
-
-Upstream: `lib/freelist.cyr` gaining `lib/alloc.cyr`'s spinlock would dissolve
-the class. Until then majra defends itself with lock placement. Re-check this
-entry whenever the cyrius pin moves — verified present at **6.5.35**.
-
----
-
-## Resolved in cc5 (archive — don't re-introduce workarounds)
-
-These were live quirks in earlier majra cycles. Listed for archaeological context so a future agent reading old code or commit messages has the explanation.
-
-- ~~`\r` escape sequence broken~~ — works since cc4.x. Don't hand-emit byte 13 with `store8(buf, 13)`.
-- ~~Negative literals `-1`, `-N` broken~~ — work since 3.10.3. No need for `(0 - N)`.
-- ~~Compound assignment `+=`, `-=`, `*=` broken~~ — work since 3.10.3.
-- ~~Undefined functions silently produced NULL stubs~~ — became a compile-time error in cc5, **then reverted at cyrius 6.1.x to warn + runtime `ud2`** (see active quirk #6). Net: still not a NULL stub, but no longer build-fatal either — audit the warnings.
-- ~~256-initialized-global cap~~ — removed.
-- ~~Fixup table cap at 8192~~ — raised to 16384 (cap still exists; see active quirk #2).
-- ~~`map_get` after `map_set` corruption in deep call chains~~ — cc5 resolves.
-- ~~`thread_create` + futex correctness bugs~~ — fixed via `_thread_spawn` clone trampoline in `lib/thread.cyr` (cyrius 5.4.10) + aarch64 SP-alignment (5.4.11). Multi-threaded `cbarrier_arrive_and_wait` works under 5.4.10+.
-- ~~Str-keyed hashmaps colliding under `map_new()`~~ — use `map_new_str()`; see active quirk #3 for the working pattern.
-
-When the cyrius pin moves and an active quirk resolves, strikethrough-and-move it down here with the resolving version. Don't delete — the historical record is useful when the next consumer wonders "wait, doesn't X break?"

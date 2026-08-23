@@ -184,9 +184,21 @@ merely-racy read into a use-after-free.
 Release it with `chb_node_free`. Reading it without freeing leaks 40 bytes per
 call.
 
-## Nothing else moved
+## What this means per profile
 
-The pub/sub, queue, relay, barrier, DAG, fleet, metrics and counter APIs are
-signature-compatible. `dist/majra.cyr` (the core profile) gained no breaking
-change at all — every item above is in the `signed`, `admin` or `backends`
-surface, except `namespace_new`, `mq_job_count` and the transport vtable.
+Everything else is signature-compatible: pub/sub, relay, barrier, DAG, fleet,
+metrics and counter are untouched.
+
+**The core profile is NOT exempt.** `namespace.cyr`, `queue.cyr` and
+`transport.cyr` are all in `[lib]`, so a `dist/majra.cyr` consumer is affected
+by three of the changes above:
+
+| Change | Profile |
+|---|---|
+| `namespace_new` now returns 0 for an invalid prefix | **core** and up |
+| `mq_job_count` counts live jobs | **core** and up |
+| `transport_send` / `transport_recv` forward 3 args | **core** and up |
+| `majra_admin_serve` parses its address | `admin`, `backends` |
+| `encrypted_ipc_new` requires a role | `backends` |
+| `patra_queue` payload `STR` → `TEXT` | `backends` |
+| signed-envelope canonicalisation | `signed`, `backends` |

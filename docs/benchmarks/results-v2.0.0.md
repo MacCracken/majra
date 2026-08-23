@@ -26,8 +26,10 @@ Run: `cyrius bench`
 
 ## History
 
-Tracked automatically by `cyrius bench`. See `bench-history.csv` for trends.
+`cyrius bench` reports per-run figures. majra does **not** currently commit a
+`bench-history.csv` — compare against the frozen snapshots in this directory, or
+against the prior closeout run (see `CLAUDE.md` § Closeout Pass).
 
 ## Comparison
 
-See [benchmark-rustvcyrius2.md](benchmark-rustvcyrius2.md) for Rust v1.0.4 vs Cyrius v2.0.0 comparison.
+See [rust-vs-cyrius-v2.0.0.md](rust-vs-cyrius-v2.0.0.md) for Rust v1.0.4 vs Cyrius v2.0.0 comparison.

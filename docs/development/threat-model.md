@@ -28,7 +28,8 @@ covered by `cyrius.lock`'s 108 hashes and CI's `cyrius deps --verify`. See
 
 | Date | Scope | Result |
 |---|---|---|
-| 2026-08-22 | First P(-1) pass — all 23 `src/` modules, six review lenses, adversarial verification | 115 confirmed / 2 refuted; 2 critical, 30 high. [`../audit/2026-08-22-audit.md`](../audit/2026-08-22-audit.md) |
+| 2026-08-22 | First P(-1) pass — all 23 `src/` modules, six review lenses, adversarial verification | 115 confirmed / 2 refuted; 2 critical, 30 high (shipped as 2.6.9). [`../audit/2026-08-22-audit.md`](../audit/2026-08-22-audit.md) |
+| 2026-08-22 | Second P(-1) pass — adversarial re-review of the ~7,000 lines 2.6.9 rewrote | 68 confirmed / 10 refuted; 1 critical, 15 high. **50 of the 68 are 2.6.9's own regressions** (shipped as 2.6.10). [`../audit/2026-08-22-audit-pass2.md`](../audit/2026-08-22-audit-pass2.md) |
 
 > **IPC access control changed at 2.6.9.** `ipc_bind` now chmods the socket to
 > 0600. It previously inherited the ambient umask — world-connectable on a
@@ -63,14 +64,18 @@ covered by `cyrius.lock`'s 108 hashes and CI's `cyrius deps --verify`. See
 | ipc | Frame parsing | Oversized frames | 1 MB max frame size check |
 | ipc_encrypted | Nonce exhaustion | Key reuse | Counter tracking + `needs_rekey()` warning at 2^31 |
 | redis_backend | RESP protocol | Injection | Commands built via structured builder, not string concat |
-| postgres_backend | SQL queries | Injection | String-interpolated queries — **consumer must sanitize inputs** |
+| postgres_backend | Built-in workflow API (`pg_save`/`get`/`delete_workflow_def`) | Injection | Values quoted and escaped by `_pg_add_literal` since **2.6.10** (single quotes doubled). Simple query protocol only — no prepared statements, so escaping is the sole defence; relies on `standard_conforming_strings=on`, PostgreSQL's default since 9.1 |
+| postgres_backend | Raw `pg_query` / `pg_exec` | Injection | Caller-composed SQL — **the caller must escape.** `_pg_add_literal` is available for that |
+| postgres_backend | Wire transport + auth | Credential and data disclosure | **Plaintext protocol, cleartext password.** No SSLRequest, no TLS; the only auth implemented is `AuthenticationCleartextPassword` (type 3), so the password crosses the wire unencrypted alongside every query and result row. SCRAM (type 10) is **failed closed**, never downgraded. Deploy only over loopback or an already-confidential channel |
 | ws | HTTP upgrade | Malformed headers | Fixed header parsing with length limits (4 KB) |
 | ws | SHA-1 | Collision attacks | SHA-1 used only for WebSocket handshake (RFC 6455 requirement, not security-critical) |
 | signed_envelope | Ed25519 verify on untrusted input | Forgery | sigil's `ed25519_verify` rejects non-canonical S; canonical encoding is deterministic — tamper causes verify to fail |
 | signed_envelope | Key storage | Key leakage | `expected_pk` comparison via `ct_eq_bytes_lens` (stdlib `lib/ct.cyr`, constant-time); caller owns key lifetime |
-| admin | HTTP endpoint | Unauthorized access | **Localhost-only by design**. Binding 0.0.0.0 without fronting auth is a misuse — documented in `src/admin.cyr` header |
+| admin | HTTP endpoint | Unauthorized access | **No auth of any kind, and no default bind.** `majra_admin_serve` takes a caller-supplied dotted-quad string and returns `-1` if it will not parse, so it fails rather than binding somewhere unintended — but nothing enforces loopback. Pass `"127.0.0.1"` unless fronted by a proxy that authenticates. ⚠ Before **2.6.9** `addr` was forwarded raw to `sockaddr_in`, which wants a packed integer, so the documented `"127.0.0.1"` call bound to the low 32 bits of a `char*` |
 | admin | HTTP endpoint | Mutation | Read-only — no PUT/POST/DELETE routes exist |
-| patra_queue | SQL injection via payload | Injection | Payloads go into patra INSERT via string concat — **consumer must sanitize payload strings** before enqueue (same contract as `postgres_backend`) |
+| pubsub | Slow or stalled subscriber | Publisher stall / fan-out DoS | **`PUBSUB_LAG_BLOCK` is the default** — a subscriber that stops draining parks `pubsub_publish` for its topic. Since **2.7.0** a subscription can opt into `PUBSUB_LAG_DROP_NEWEST` / `_DROP_OLDEST` / `_UNSUBSCRIBE`, and `pubsub_dropped_count` reports what was lost. `pubsub_unsubscribe` breaks a wedge |
+| pubsub | Slow or stalled subscriber | Publisher stall / fan-out DoS | **`PUBSUB_LAG_BLOCK` is the default** — a subscriber that stops draining parks `pubsub_publish` for its topic. Since **2.7.0** a subscription can opt into `PUBSUB_LAG_DROP_NEWEST` / `_DROP_OLDEST` / `_UNSUBSCRIBE`, and `pubsub_dropped_count` reports what was lost. `pubsub_unsubscribe` breaks a wedge |
+| patra_queue | SQL injection via payload | Injection (closed) | Prepared statement with a bound parameter since **2.6.9** — `patra_prepare("INSERT INTO jobs VALUES (?, ?, ?, 0, ?)")` + `patra_bind_text`. The payload never enters the SQL text; no consumer sanitization required |
 | patra_queue | Unbounded disk growth | Disk exhaustion | Consumer responsibility — periodically sweep `completed`/`failed` rows |
 
 ## Memory Safety
@@ -86,8 +91,8 @@ Mitigations:
 
 ## Supply Chain
 
-- **Zero external dependencies for the core profile** — `dist/majra.cyr` uses only the Cyrius stdlib (resolved into `lib/` by `cyrius deps` from the version pinned in `cyrius.cyml`; `lib/` itself is gitignored, repopulated on every CI run + every developer build)
-- **Two first-party deps for the richer profiles** — `sigil` (the crypto boundary, resolved into `lib/sigil.cyr` via `[deps.sigil]`) and `sakshi` (structured logging, resolved into `lib/sakshi.cyr` via `[deps.sakshi]`; declared since 2.5.2 to pin a resolution that would otherwise be inherited — and silently downgraded — from sigil's own manifest). `cyrius.lock` carries a SHA-256 over every resolved file plus a commit-pin for sakshi, and CI's `cyrius deps --verify` enforces hash match. Both are in the same organization, bootstrapped from the same compiler; sigil is audited as part of the AGNOS crypto boundary. **Version-pinning note**: a transitive dep whose version is inherited from another dep's manifest is not pinned by majra — declaring it top-level is what makes the resolved bytes reviewable here
+- **Zero external dependencies, in every profile** — `dist/majra.cyr` and the three richer bundles all draw solely on the Cyrius stdlib snapshot (resolved into `lib/` by `cyrius deps` from the version pinned in `cyrius.cyml`; `lib/` itself is gitignored, repopulated on every CI run + every developer build)
+- **No git dependencies at all** — `sigil` (the crypto boundary, resolved into `lib/sigil.cyr` via `[deps.sigil]`) and `sakshi` (structured logging, resolved into `lib/sakshi.cyr` via `[deps.sakshi]`; declared since 2.5.2 to pin a resolution that would otherwise be inherited — and silently downgraded — from sigil's own manifest). `cyrius.lock` carries a SHA-256 over every resolved file plus a commit-pin for sakshi, and CI's `cyrius deps --verify` enforces hash match. Both are in the same organization, bootstrapped from the same compiler; sigil is audited as part of the AGNOS crypto boundary. **Version-pinning note**: a transitive dep whose version is inherited from another dep's manifest is not pinned by majra — declaring it top-level is what makes the resolved bytes reviewable here
 - **No package manager** — no supply chain attack vector via crate registries
 - **Compiler is self-hosting** — Cyrius bootstraps from a 29 KB seed binary
 - **Byte-identical verification** — compiler self-compilation produces identical output
