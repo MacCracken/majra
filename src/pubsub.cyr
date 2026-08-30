@@ -133,7 +133,12 @@ enum PubSubLagPolicy {
 # Reclamation happens by REPLACING the vec (see _pubsub_compact), never by
 # shifting one, so an in-flight snapshot keeps pointing at a still-valid
 # backing buffer.
-fn _sub_new(chan, filter_fn) {
+# Prefixed in 2.7.1: libro also defines `_sub_new`, with a DIFFERENT signature
+# (`(pattern)`) and a different allocation size (24 bytes via alloc, against
+# this one's 40 via fl_alloc). Cyrius has one flat function namespace, so in a
+# consumer linking both — daimon does — whichever was included last silently
+# answered the other's calls. Reported from daimon 2.1.1.
+fn _majra_sub_new(chan, filter_fn) {
     var s = fl_alloc(40);
     store64(s, chan);
     store64(s + 8, filter_fn);
@@ -176,7 +181,7 @@ fn pubsub_subscribe(ps, topic) {
     var mtx = load64(ps + 16);
     mutex_lock(mtx);
     var ch = chan_new(64);
-    var sub = _sub_new(ch, 0);
+    var sub = _majra_sub_new(ch, 0);
     var exact = load64(ps);
     var subs = map_get(exact, topic);
     if (subs == 0) {
@@ -194,7 +199,7 @@ fn pubsub_subscribe_pattern(ps, pattern) {
     var mtx = load64(ps + 16);
     mutex_lock(mtx);
     var ch = chan_new(64);
-    var sub = _sub_new(ch, 0);
+    var sub = _majra_sub_new(ch, 0);
     var patterns = load64(ps + 8);
     var subs = map_get(patterns, pattern);
     if (subs == 0) {
@@ -212,7 +217,7 @@ fn pubsub_subscribe_filtered(ps, topic, filter_fn) {
     var mtx = load64(ps + 16);
     mutex_lock(mtx);
     var ch = chan_new(64);
-    var sub = _sub_new(ch, filter_fn);
+    var sub = _majra_sub_new(ch, filter_fn);
     var exact = load64(ps);
     var subs = map_get(exact, topic);
     if (subs == 0) {

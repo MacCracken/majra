@@ -10,5 +10,6 @@ syscalls
 tagged
 fnptr
 thread
+chrono
 net
 sandhi

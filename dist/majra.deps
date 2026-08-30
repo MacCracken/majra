@@ -13,6 +13,8 @@ fnptr
 thread
 assert
 io
+chrono
+random
 net
 bench
 fs

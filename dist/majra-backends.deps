@@ -10,6 +10,7 @@ syscalls
 tagged
 fnptr
 thread
+chrono
 net
 patra
 sandhi

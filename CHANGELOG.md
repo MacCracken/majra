@@ -5,6 +5,58 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.1] - 2026-08-30
+
+Namespace and toolchain patch. No behaviour change: **479 assertions** pass
+across the three non-infra suites, and the 15-benchmark suite shows no
+regressions.
+
+### Fixed — flat-namespace collisions with libro and the stdlib
+
+Cyrius has one flat function namespace, so two libraries a consumer links that
+define the same name resolve by include order and the loser is silently
+shadowed. Three of majra's internal symbols were doing that:
+
+- **`_sub_new` → `_majra_sub_new`.** `libro` defines `_sub_new` too, with a
+  different signature *and* different semantics: `(pattern)` allocating 24 bytes
+  via `alloc`, against majra's `(chan, filter_fn)` allocating 40 via `fl_alloc`.
+  In a consumer linking both — daimon does — majra's won by include order, so
+  `libro.cyr`'s one-argument call reached majra's two-argument function with an
+  uninitialised second argument and the wrong allocation size. Reported from
+  daimon 2.1.1.
+
+- **`sha1` → `_majra_sha1`, `_sha1_rotl32` → `_majra_sha1_rotl32`.** The cyrius
+  stdlib now ships `lib/sha1.cyr`, whose `sha1` has a **different arity** —
+  `sha1(data, len, digest_out)` against majra's `sha1(data, len)`. A consumer
+  linking both would bind two-argument calls to a three-argument function.
+  Both symbols are internal to the WebSocket upgrade handshake, called from one
+  site in `src/ws.cyr`, and appear in no public API listing, so this is not a
+  breaking change.
+
+### Fixed — the build was broken
+
+`[deps].stdlib` never declared **`chrono`** or **`random`**, though `src/`
+calls `clock_now_ms`, `clock_now_ns`, `clock_epoch_secs`, `sleep_ms` and
+`random_bytes`. `cyrius build src/main.cyr` failed outright with *"refusing to
+emit binary with 2 reachable undefined function(s)"*. The manifest's own comment
+claimed the list was a "legacy hint" superseded by `lib sync --full` — it is
+not: the list still drives which modules are auto-prepended, so an undeclared
+module is vendored into `lib/` but never included. Both are now declared.
+
+### Changed
+
+- **Cyrius pin `6.5.35` → `6.5.36`**; `lib/` resynced with `lib sync --full`
+  (108 files). All four dist profiles regenerated.
+
+### Known issues
+
+- **`ws_recv_frame` and `ws_send_text` still collide with `lib/ws.cyr`**, and
+  majra's implementations differ from the stdlib's. Unlike the symbols fixed
+  above, these are **documented public API** — README points consumers at them
+  directly — so renaming them is a breaking change and belongs in a minor, not
+  this patch. Until then, a consumer that links both majra and the stdlib `ws`
+  module gets whichever came last in include order.
+
 ## [2.7.0] — 2026-08-22 — finishing what the audits deferred
 
 **629** assertions green across four suites (core 299, expanded/backend 152,

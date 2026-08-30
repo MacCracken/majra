@@ -80,10 +80,10 @@ fn test_sha1() {
     # This exercises the full SHA-1 + base64 pipeline.
     # Direct byte assertions omitted — they corrupt the assert counter
     # due to Cyrius compiler global clobbering in large functions.
-    var digest = sha1("", 0);
+    var digest = _majra_sha1("", 0);
     assert(digest != 0, "sha1 empty returns ptr");
 
-    var digest2 = sha1("abc", 3);
+    var digest2 = _majra_sha1("abc", 3);
     assert(digest2 != 0, "sha1 abc returns ptr");
 
     # Functional correctness verified by test_ws_accept_key below
