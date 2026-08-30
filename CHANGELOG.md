@@ -46,7 +46,17 @@ module is vendored into `lib/` but never included. Both are now declared.
 ### Changed
 
 - **Cyrius pin `6.5.35` → `6.5.36`**; `lib/` resynced with `lib sync --full`
-  (108 files). All four dist profiles regenerated.
+  (108 files), `cyrius.lock` regenerated, all four dist profiles rebuilt.
+
+  The lock regeneration is a required step here and easy to miss: `lib sync`
+  does not touch `cyrius.lock`, and `cyrius deps` only rewrites it after it
+  actually copies something. majra declares no `[deps.NAME]` git dependencies —
+  only `[deps].stdlib` — so `cyrius deps` is a no-op and nothing regenerates the
+  lock, leaving CI's `cyrius deps --verify` failing on the nine stdlib files that
+  changed between 6.5.35 and 6.5.36 (`io`, `sandhi`, `sankoch`, `sigil`,
+  `tls_native_hs12` and four `syscalls_*`). The fix is `cyrius deps --lock`,
+  which rehashes `lib/` directly. Sibling repos with git deps do not hit this,
+  because their `cyrius deps` run rewrites the lock as a side effect.
 
 ### Known issues
 
