@@ -307,10 +307,11 @@ fn encrypted_ipc_send(e, data, len) {
     # sharing one connection interleave ipc_send_frame's 4-byte header and its
     # payload, so the peer read a header from one message and a body from
     # another — the stream never resynchronises.
-    var rc = ipc_send_frame(load64(e), frame, frame_len);
+    var rc_t, rc_v = ipc_send_frame(load64(e), frame, frame_len);
     fl_free(frame);
     mutex_unlock(mtx);
-    return rc;
+    if (is_err_result(rc_t) == 1) { return Err(rc_v); }
+    return Ok(rc_v);
 }
 
 # Tear down a connection whose framing can no longer be trusted. Caller must
@@ -331,19 +332,19 @@ fn encrypted_ipc_recv(e) {
     mutex_lock(mtx);
     if (load64(e + 56) == 1) { mutex_unlock(mtx); return Err(ERR_IPC); }
 
-    var frame_result = ipc_recv_frame(load64(e));
-    if (is_err_result(frame_result) == 1) {
+    var frame_t, frame_v = ipc_recv_frame(load64(e));
+    if (is_err_result(frame_t) == 1) {
         # ERR_IPC_FRAME_TOO_LARGE is terminal: the oversized body is still
         # queued, so the framing can never resynchronise. We own the fd, so we
         # are the ones who close it — and we poison the handle so a later send
         # cannot write into a descriptor the kernel has since reassigned.
-        if (err_code_of(frame_result) == ERR_IPC_FRAME_TOO_LARGE) {
+        if (err_code_of(frame_t, frame_v) == ERR_IPC_FRAME_TOO_LARGE) {
             _encrypted_ipc_kill(e);
         }
         mutex_unlock(mtx);
-        return frame_result;
+        return Err(frame_v);
     }
-    var frame_ptr = payload(frame_result);
+    var frame_ptr = frame_v;
     var raw = load64(frame_ptr + 8);
     var raw_len = load64(frame_ptr);
     if (raw_len < AES_GCM_NONCE_SIZE + AES_GCM_TAG_SIZE) {

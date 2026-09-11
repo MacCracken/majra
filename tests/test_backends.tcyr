@@ -128,14 +128,14 @@ fn test_encrypted_ipc() {
 
     # --- Rekey must refuse a key identical to the installed one: resetting the
     # counter is only safe because the key changed.
-    var r_same = encrypted_ipc_rekey(eipc, &key);
-    assert_eq(is_err_result(r_same), 1, "rekey REFUSES an identical key");
+    var r_same_t, r_same_v = encrypted_ipc_rekey(eipc, &key);
+    assert_eq(is_err_result(r_same_t), 1, "rekey REFUSES an identical key");
     assert_eq(encrypted_ipc_messages_sent(eipc), 2, "refused rekey left counter alone");
 
     var key2[32];
     memset(&key2, 99, 32);
-    var r_new = encrypted_ipc_rekey(eipc, &key2);
-    assert_eq(is_err_result(r_new), 0, "rekey accepts a genuinely new key");
+    var r_new_t, r_new_v = encrypted_ipc_rekey(eipc, &key2);
+    assert_eq(is_err_result(r_new_t), 0, "rekey accepts a genuinely new key");
     assert_eq(encrypted_ipc_messages_sent(eipc), 0, "eipc rekey reset");
 
     println("  encrypted_ipc: ok");
@@ -371,21 +371,21 @@ fn test_ipc() {
     var b = load32(&sv + 4);
 
     # Round-trip a frame.
-    var sent = ipc_send_frame(a, "hello ipc", 9);
-    assert_eq(is_err_result(sent), 0, "ipc_send_frame ok");
-    var got = ipc_recv_frame(b);
-    assert_eq(is_err_result(got), 0, "ipc_recv_frame ok");
-    var f = payload(got);
+    var sent_t, sent_v = ipc_send_frame(a, "hello ipc", 9);
+    assert_eq(is_err_result(sent_t), 0, "ipc_send_frame ok");
+    var got_t, got_v = ipc_recv_frame(b);
+    assert_eq(is_err_result(got_t), 0, "ipc_recv_frame ok");
+    var f = got_v;
     assert_eq(load64(f), 9, "ipc frame length 9");
     assert_eq(memeq(load64(f + 8), "hello ipc", 9), 1, "ipc frame payload intact");
     ipc_frame_free(f);
 
     # A zero-length frame is legal and must round-trip.
     assert_eq(is_err_result(ipc_send_frame(a, "", 0)), 0, "ipc zero-length send ok");
-    var g0 = ipc_recv_frame(b);
-    assert_eq(is_err_result(g0), 0, "ipc zero-length recv ok");
-    assert_eq(load64(payload(g0)), 0, "ipc zero-length is 0");
-    ipc_frame_free(payload(g0));
+    var g0_t, g0_v = ipc_recv_frame(b);
+    assert_eq(is_err_result(g0_t), 0, "ipc zero-length recv ok");
+    assert_eq(load64(g0_v), 0, "ipc zero-length is 0");
+    ipc_frame_free(g0_v);
 
     # The send side now refuses what the receive side would reject, instead of
     # emitting a frame no majra receiver can accept.
@@ -402,15 +402,15 @@ fn test_ipc() {
     # umask-derived (0755 under a typical 022) while the module header promised
     # 0600. Nothing tested ipc_bind at all, which is why it shipped.
     sys_unlink("/tmp/majra_ipc_mode_test.sock");
-    var br = ipc_bind("/tmp/majra_ipc_mode_test.sock");
-    assert_eq(is_err_result(br), 0, "ipc_bind succeeded");
+    var br_t, br_v = ipc_bind("/tmp/majra_ipc_mode_test.sock");
+    assert_eq(is_err_result(br_t), 0, "ipc_bind succeeded");
     var st[144];
     memset(&st, 0, 144);
     # stat(2) = syscall 4; st_mode is a u32 at offset 24 in struct stat.
     assert_eq(syscall(4, "/tmp/majra_ipc_mode_test.sock", &st), 0, "stat on the bound socket");
     var mode = load32(&st + 24) & 511;
     assert_eq(mode, 384, "bound socket is 0600, not umask-derived");
-    ipc_close(payload(br));
+    ipc_close(br_v);
     sys_unlink("/tmp/majra_ipc_mode_test.sock");
 
     # An over-long or empty path must fail rather than truncate or bind

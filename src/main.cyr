@@ -47,9 +47,9 @@ fn test_error() {
     assert(ERR_QUEUE == 1, "ERR_QUEUE is 1");
     assert(ERR_PUBSUB == 2, "ERR_PUBSUB is 2");
 
-    var r = majra_err(ERR_QUEUE, str_from("queue full"));
-    assert(is_err_result(r) == 1, "majra_err returns Err");
-    assert(err_code_of(r) == ERR_QUEUE, "error code matches");
+    var r_t, r_v = majra_err(ERR_QUEUE, str_from("queue full"));
+    assert(is_err_result(r_t) == 1, "majra_err returns Err");
+    assert(err_code_of(r_t, r_v) == ERR_QUEUE, "error code matches");
 
     var msg = get_err_msg();
     assert(str_len(msg) == 10, "err msg length");

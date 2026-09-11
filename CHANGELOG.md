@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.2] - 2026-09-10
+
+Toolchain patch: **cyrius 6.5.36 → 6.6.2**, the `Result` / `Option` / `Either`
+*value form*. All **479 assertions** pass (core 299 · backends 152 · patra-queue
+28), three fuzz harnesses and the 15-benchmark suite are clean, and both
+examples build and run.
+
+### Fixed — `encrypted_ipc_send` returned a tag with a garbage payload
+
+⛔ **Silent, and the reason this is a Fixed rather than a Changed.** Since
+cyrius 6.6.0 a `Result` is a two-register `(tag, payload)` value. `src/ipc_encrypted.cyr`
+ended `encrypted_ipc_send` with:
+
+```
+var rc = ipc_send_frame(load64(e), frame, frame_len);
+fl_free(frame);
+mutex_unlock(mtx);
+return rc;
+```
+
+The single-value bind kept only the **tag**, so `return rc;` handed the caller a
+Result whose payload was whatever happened to be in `rdx`. On the `Ok` path that
+is a bogus byte count; on the `Err` path `err_code_of` reads a garbage error
+code. The frame must be freed and the mutex released before returning, so the
+Result cannot simply be forwarded — it is now rebuilt explicitly from both
+halves.
+
+`encrypted_ipc_recv` had the matching shape: `err_code_of(frame_result)` passed
+one argument to the stdlib's two-argument accessor, and `payload(frame_result)`
+called an accessor cyrius 6.6.0 deleted. Both now bind the pair.
+
+### Fixed — `./lib/` had 37 undeclared files shadowing the pinned stdlib
+
+`cyrius build` warned that seven bundled libs differed from the version-pinned
+snapshot (ganita, niyama, yukti, vani, mabda, sankoch, yantra — all *older* than
+the pin). The resolved `lib/` held **103** files against a manifest that declares
+**66**: the residue of a `cyrius lib sync --full`, which dumps the entire stdlib
+snapshot rather than the declared module set. Re-resolved from empty
+(`rm -rf lib && cyrius deps`); the built binary is byte-identical, so nothing
+was reaching the stale copies — but the lock *was* recording them:
+`cyrius.lock` had **108** entries and had not been rewritten since 2026-08-30,
+because majra declares no `[deps.NAME]` git entries and plain `cyrius deps`
+returns before the lock write. Regenerated with the explicit `cyrius deps --lock`;
+now 66 locked, 66 verified, 0 failed.
+
+### Changed — value-form migration
+
+`tests/test_backends.tcyr` binds both halves at six call sites
+(`encrypted_ipc_rekey` ×2, `ipc_send_frame`, `ipc_recv_frame` ×2, `ipc_bind`)
+and drops four `payload()` reads. `src/main.cyr`'s `test_error` uses the
+two-argument `err_code_of(tag, val)`.
+
+Note that `is_err_result(ipc_send_frame(a, "", 0))` — a Result passed directly
+as a call argument — needs no change: the tag lands in the first parameter
+register, which is exactly what `is_err_result` wants.
+
 ## [2.7.1] - 2026-08-30
 
 Namespace and toolchain patch. No behaviour change: **479 assertions** pass
