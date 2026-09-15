@@ -12,7 +12,6 @@ names the version it is aimed at and the condition that would move it.
 
 | Target | Theme |
 |---|---|
-| **2.9.0** | API and wire changes the 2.8.1 sweep deferred. |
 | **2.8 line** | Larger capabilities, each taking the next MINOR as its trigger fires — or the next PATCH, where it adds no API. |
 | **Waiting on upstream** | Blocked outside this repo. Names the blocker. |
 | **Non-goals** | Deliberately out of scope, recorded so the question stops recurring. |
@@ -28,34 +27,6 @@ landing, or a measurement crossing a threshold. Triggers are written down so
 promotion is a decision rather than a mood.
 
 ---
-
-## 2.9.0
-
-Fixes the 2.8.1 P(-1) sweep confirmed but could not take in a PATCH, because
-each needs a new public symbol, a signature change or a wire change. Details
-are in [`docs/audit/2026-09-15-audit.md`](../audit/2026-09-15-audit.md).
-
-- **Encrypted IPC cross-connection replay.** The replay window is per handle,
-  so a frame captured on one connection replays into a later one under the same
-  PSK. The fix needs a handshake (per-connection key or session id), which is a
-  wire change.
-- **Signed envelopes: domain separation and anchored verify.** The signed bytes
-  carry no version or domain prefix, and `signed_envelope_verify(se, 0)` returns
-  "valid" for any re-signed envelope. Add the prefix, and make `expected_pk`
-  mandatory or give the unanchored mode a distinct return code.
-- **WebSocket Origin check.** `_ws_accept_upgrade` discards the request, so a
-  consumer cannot reject a cross-site handshake. Expose the Origin header (or
-  an allowlist) on the upgrade API.
-- **Release functions for returned results**:
-  - `pg_rows_free` / `redis_reply_free` for the result vecs that `pg_query`,
-    `pg_exec` and Redis array replies return.
-  - A way to free the heartbeat status-sweep transitions vec.
-- **Relay subscribers**: `relay_unsubscribe`, and ownership rules for a
-  `RelayMessage` delivered to several subscribers.
-- **A distinct error code** for an encrypted-IPC frame that carries the
-  receiver's own role (today it is `MAJRA_ERR_IPC`).
-
-**Trigger**: already met. **Aimed at**: 2.9.0.
 
 ## 2.8 line — larger capabilities
 

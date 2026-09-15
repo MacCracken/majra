@@ -56,6 +56,9 @@ enum IpcErr {
     MAJRA_ERR_IPC_CONN_CLOSED = 101;
     MAJRA_ERR_IPC_IO = 102;
     MAJRA_ERR_IPC_JSON = 103;
+    # 2.9.0. No bare alias: the bare spellings are deprecated, so new codes
+    # carry the prefix only.
+    MAJRA_ERR_IPC_ROLE = 104;
 
     # Deprecated since 2.8.0 — same values, kept until 3.0.0. Use MAJRA_ERR_*.
     ERR_IPC_FRAME_TOO_LARGE = 100;
@@ -131,5 +134,6 @@ fn err_name(code) {
     if (code == MAJRA_ERR_IPC_CONN_CLOSED) { return "ipc_conn_closed"; }
     if (code == MAJRA_ERR_IPC_IO) { return "ipc_io"; }
     if (code == MAJRA_ERR_IPC_JSON) { return "ipc_json"; }
+    if (code == MAJRA_ERR_IPC_ROLE) { return "ipc_role"; }
     return "unknown";
 }

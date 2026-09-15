@@ -26,7 +26,8 @@ majra (v2.7.3, ~7,500 lines across 22 modules; state.md's `src/` total of 8,212 
 │
 │ ── Networking (ipc_encrypted, ws: [lib.backends] only) ─
 ├── ipc             Unix domain socket framing (4-byte BE length prefix)
-├── ipc_encrypted   AES-256-GCM framing with nonce management (sigil AES-GCM)
+├── ipc_encrypted   AES-256-GCM framing; per-connection key from a session
+│                   handshake + HKDF since 2.9.0 (sigil AES-GCM, HKDF)
 ├── transport       Transport vtable + circuit breaker + connection pool
 ├── ws              WebSocket (SHA-1 handshake, RFC 6455 framing)
 │
@@ -36,7 +37,8 @@ majra (v2.7.3, ~7,500 lines across 22 modules; state.md's `src/` total of 8,212 
 │                   tiers serial by default; opt-in parallel (2.7.0)
 │
 │ ── Trust ([lib.signed] / [lib.backends]) ─────
-├── signed_envelope Ed25519 signatures over canonical envelope encoding (sigil Ed25519)
+├── signed_envelope Ed25519 over a domain-prefixed canonical encoding
+│                   (`majra/signed-envelope/v1`, 2.9.0; sigil Ed25519)
 │
 │ ── Operations ([lib.admin] / [lib.backends]) ─
 ├── admin           HTTP admin/metrics endpoint (/health, /fleet, /ratelimit)

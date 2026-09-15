@@ -5,6 +5,104 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.0] - 2026-09-15
+
+The six items the 2.8.1 P(-1) sweep confirmed but could not take in a PATCH.
+**1,466 assertions** pass (core 203, expanded 645, backends 547, patra-queue
+71), natively and cross-built under `qemu-aarch64`.
+
+> ⛔ **TWO WIRE BREAKS. Both ends of a deployment upgrade together.** A 2.9.0
+> encrypted-IPC peer cannot talk to a 2.8.x one, and 2.8.x envelope signatures
+> do not verify on 2.9.0. Both are security fixes that have no compatible form;
+> [`semver.md`](docs/development/semver.md) gains the exception that permits
+> them in a MINOR, with the conditions that gate it. Migration:
+> [`docs/guides/migration-2.9.0.md`](docs/guides/migration-2.9.0.md).
+
+### Security — encrypted IPC replay across connections (wire break)
+
+Every connection under one PSK derived the same key, so a frame captured on one
+replayed into any later one. 2.8.1's per-handle nonce salt stopped the keystream
+reuse; the replay needed a handshake.
+
+- Each handle writes a **32-byte hello** at construction (`MJEIPCv1`, role,
+  16-byte CSPRNG salt) and reads the peer's before its first frame. The AES key
+  is `HKDF(PSK, initiator_salt || responder_salt, "majra-eipc-session-v1")`,
+  so it is unique per connection and a captured frame authenticates nowhere
+  else. Pinned by a test that replays a real captured frame into a second
+  connection under the same PSK and requires it to fail.
+- `encrypted_ipc_new` keeps its signature. Construction still does no blocking
+  I/O — the hello write is 32 bytes and the peer hello is read on first use —
+  so both ends of a socketpair can still be built in one thread.
+- **A role clash is caught at the handshake**, before any frame is encrypted,
+  and reports the new `MAJRA_ERR_IPC_ROLE` (104) rather than a generic
+  `MAJRA_ERR_IPC`.
+- `encrypted_ipc_rekey` installs the new PSK and **re-derives over the salts
+  already exchanged** — no second handshake, so a reader parked in `recv` is
+  never disturbed. It compares the new key against the PSK, not the derived
+  session key.
+
+### Security — signed envelopes (wire break + a fail-closed return)
+
+- **Domain separation.** The signing input now begins with the 24 bytes
+  `majra/signed-envelope/v1`, so an envelope signature cannot be confused with
+  another Ed25519 message under the same key. Canonical length grows by 24, and
+  the golden byte vectors move with it.
+- **`signed_envelope_verify(se, 0)` returns 4 (`SIGNED_ENV_SELF_CONSISTENT`),
+  not 0.** Unanchored, a 0 return had been indistinguishable from an anchored
+  pass, so `if (verify(se, 0) == 0)` trusted an envelope an attacker could
+  re-sign under their own key. The new code is non-zero on purpose: unchanged
+  callers now **fail closed**.
+- New `signed_envelope_verify_anchored(se, pk)` — a 0 key is a pk mismatch (2),
+  never a pass, so the unanchored mode cannot be reached by accident.
+
+### Security — WebSocket Origin policy
+
+`_ws_accept_upgrade` discarded the request, so no consumer could refuse a
+cross-site handshake (the CSWSH class). `ws_set_origin_check(fn)` installs a
+policy called with the Origin value (0 when the header is absent) **before** the
+101; refusing answers `403 Forbidden` and leaks no accept key.
+`ws_origin_check()` reads it back. The default is unchanged: with no policy
+installed, every Origin upgrades exactly as through 2.8.2.
+
+### Added — results you can release
+
+Values majra returned came off the bump allocator, which never reclaims, so a
+long-lived client grew without bound. They are freelist-backed now:
+
+- `pg_rows_free(rows)` — the `pg_query` / `pg_exec` rows and every cell.
+- `redis_array_free(arr)` for array replies of strings, and
+  `redis_array_free_shallow(arr)` for arrays of integers or nested arrays,
+  whose elements are values rather than pointers.
+- `hb_transitions_free(tr)` — the status-sweep transitions and their pairs. The
+  id pointers inside belong to the caller and are untouched.
+- Internally these use `_majra_vec_new` / `_majra_vec_push` / `_majra_vec_free`
+  in `src/counter.cyr`: the same `lib/vec.cyr` layout on the freelist, with a
+  push that frees the buffer a grow abandons (`vec_push` leaks it).
+
+### Added — relay unsubscribe and message ownership
+
+- `relay_unsubscribe(r, ch)` takes a channel out of the fan-out;
+  `relay_subscriber_count(r)` reports what is left. Until now the only exit was
+  to close the channel and wait for the next fan-out to notice.
+- A delivered `RelayMessage` is shared by every subscriber that accepted it and
+  nothing could free one. It carries a **refcount** now (appended at offset 64;
+  offsets 0-56 unchanged, struct 64 → 72 bytes): the fan-out takes one per
+  delivery, `relay_msg_release` drops one, and the last release frees it.
+  `relay_msg_retain` / `relay_msg_refcount` complete the set. A message no
+  subscriber accepted is freed by the relay, as before.
+
+### Notes
+
+- No public symbol was removed or changed in arity. The additions are
+  `MAJRA_ERR_IPC_ROLE`, `SIGNED_ENV_SELF_CONSISTENT`,
+  `signed_envelope_verify_anchored`, `ws_set_origin_check`, `ws_origin_check`,
+  `pg_rows_free`, `redis_array_free`, `redis_array_free_shallow`,
+  `hb_transitions_free`, `relay_unsubscribe`, `relay_subscriber_count`,
+  `relay_msg_retain`, `relay_msg_release`, `relay_msg_refcount`.
+- Every fix carries a test that fails without it: the replay test passes a
+  captured frame on a mutated build that skips HKDF, and the role, Origin,
+  ownership and release paths are each pinned.
+
 ## [2.8.2] - 2026-09-15
 
 The three PATCH-safe items the 2.8.1 sweep left for the next patch. **1,419

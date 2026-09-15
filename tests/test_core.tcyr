@@ -2574,24 +2574,73 @@ fn test_relay_bounded_dedup_no_uaf() {
 
 fn test_relay_send_frees_undelivered() {
     var r = relay_new("n1");
-    var a = fl_alloc(64);
+    # RelayMessage is 72 bytes since 2.9.0 (the appended refcount).
+    var a = fl_alloc(72);
     fl_free(a);
     relay_send(r, "n2", "t", 1);
-    var b = fl_alloc(64);
+    var b = fl_alloc(72);
     assert(b == a, "an undelivered relay message goes back to the freelist");
     fl_free(b);
 
     var ch = relay_subscribe(r);
-    var c = fl_alloc(64);
+    var c = fl_alloc(72);
     fl_free(c);
     relay_send(r, "n2", "t", 2);
     var got = chan_try_recv(ch);
     assert(got == c, "the delivered message is that block");
-    var probe = fl_alloc(64);
+    var probe = fl_alloc(72);
     assert(probe != c, "a delivered message is not freed");
     assert_eq(load64(got + 32), 2, "and its payload is intact");
+    assert_eq(relay_msg_refcount(got), 1, "the subscriber holds the only reference");
     fl_free(probe);
+
+    # 2.9.0: the last release returns the block.
+    assert_eq(relay_msg_release(got), 0, "releasing the last reference frees it");
+    var back = fl_alloc(72);
+    assert(back == got, "and the freed message is back on the freelist");
+    fl_free(back);
     println("  relay_send_frees_undelivered: ok");
+}
+
+# 2.9.0: a message delivered to several subscribers is shared, and only the
+# last release frees it. relay_unsubscribe takes a channel out of the fan-out.
+fn test_relay_msg_ownership_and_unsubscribe() {
+    var r = relay_new("n1");
+    var a = relay_subscribe(r);
+    var b = relay_subscribe(r);
+    var c = relay_subscribe(r);
+    assert_eq(relay_subscriber_count(r), 3, "three subscribers");
+
+    relay_send(r, "n2", "t", 7);
+    var ma = chan_try_recv(a);
+    var mb = chan_try_recv(b);
+    var mc = chan_try_recv(c);
+    assert(ma == mb && mb == mc, "every subscriber gets the same message pointer");
+    assert_eq(relay_msg_refcount(ma), 3, "one reference per delivery, the sender's already dropped");
+    assert_eq(relay_msg_release(ma), 2, "first release leaves two");
+    assert_eq(load64(mb + 32), 7, "the message is still readable by the others");
+    assert_eq(relay_msg_release(mb), 1, "second release leaves one");
+    var guard = fl_alloc(72);
+    fl_free(guard);
+    assert(guard != mc, "still not freed while a reference remains");
+    assert_eq(relay_msg_release(mc), 0, "the last release frees it");
+    var reused = fl_alloc(72);
+    assert(reused == mc, "freed back to the freelist");
+    fl_free(reused);
+
+    # Unsubscribe removes exactly one channel from the fan-out.
+    assert_eq(relay_unsubscribe(r, b), 1, "unsubscribe reports the removal");
+    assert_eq(relay_unsubscribe(r, b), 0, "unsubscribing twice reports nothing");
+    assert_eq(relay_subscriber_count(r), 2, "two subscribers left");
+    relay_send(r, "n2", "t", 8);
+    var a2 = chan_try_recv(a);
+    assert(a2 != 0, "a still receives");
+    assert_eq(chan_try_recv(b), 0, "the unsubscribed channel gets nothing");
+    assert_eq(relay_msg_refcount(a2), 2, "two deliveries, two references");
+    relay_msg_release(a2);
+    relay_msg_release(chan_try_recv(c));
+    assert_eq(relay_unsubscribe(r, 0), 0, "unsubscribing 0 is a no-op");
+    println("  relay_msg_ownership_and_unsubscribe: ok");
 }
 
 fn test_relay_null_sender_and_node_id() {
@@ -3579,6 +3628,7 @@ fn main() {
     test_relay_dedup_key_is_owned();
     test_relay_bounded_dedup_no_uaf();
     test_relay_send_frees_undelivered();
+    test_relay_msg_ownership_and_unsubscribe();
     test_relay_null_sender_and_node_id();
     test_relay_prunes_closed_subscribers();
     test_relay_evict_stale_dedup();

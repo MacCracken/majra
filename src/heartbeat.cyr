@@ -212,13 +212,31 @@ fn hb_deregister(ht, id) {
     return _hb_remove(load64(ht + 8), id);
 }
 
+# Release a transitions vector from hb_update_statuses / chb_update_statuses,
+# with its pairs. 2.9.0: the vec and its pairs used to come off the BUMP
+# allocator, so a tracker swept on a timer grew without bound and nothing could
+# give the memory back. The id pointers inside belong to the caller and are
+# left alone.
+fn hb_transitions_free(transitions) {
+    if (transitions == 0) { return 0; }
+    var i = 0;
+    while (i < vec_len(transitions)) {
+        var pair = vec_get(transitions, i);
+        if (pair != 0) { fl_free(pair); }
+        i = i + 1;
+    }
+    _majra_vec_free(transitions);
+    return 0;
+}
+
 # Sweep all nodes, return vec of (id_str, new_status) pairs for transitions.
 # Each pair is stored as a 16-byte struct: { id_ptr, status }.
+# Release it with hb_transitions_free.
 fn hb_update_statuses(ht) {
     var nodes = load64(ht + 8);
     var cfg = load64(ht + 16);
     var now = time_now_ns();
-    var transitions = vec_new();
+    var transitions = _majra_vec_new();
 
     # Walks the hashmap slot array directly. map_keys builds a vec from the
     # BUMP allocator on every call and this runs on every sweep, twice — the
@@ -251,7 +269,7 @@ fn hb_update_statuses(ht) {
                 var pair = fl_alloc(16);
                 store64(pair, id);
                 store64(pair + 8, new_status);
-                vec_push(transitions, pair);
+                _majra_vec_push(transitions, pair);
             }
         }
         i = i + 1;
@@ -446,7 +464,7 @@ fn chb_update_statuses(cht) {
     var nodes = load64(cht + 8);
     var cfg = load64(cht + 16);
     var now = time_now_ns();
-    var transitions = vec_new();
+    var transitions = _majra_vec_new();
 
     # Slot-array walk — see the note on the non-concurrent sweep above.
     var entries = map_entries(nodes);
@@ -475,7 +493,7 @@ fn chb_update_statuses(cht) {
                 var pair = fl_alloc(16);
                 store64(pair, id);
                 store64(pair + 8, new_status);
-                vec_push(transitions, pair);
+                _majra_vec_push(transitions, pair);
             }
         }
         i = i + 1;

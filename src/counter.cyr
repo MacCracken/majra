@@ -109,3 +109,62 @@ fn _majra_map_compact(m, empties) {
     fl_free(scratch);
     return 1;
 }
+
+# --- Releasable vectors (2.9.0) ---
+#
+# `vec_new` builds on the global BUMP allocator, which never reclaims, so any
+# vec majra hands back to a caller was unreclaimable memory — the leak the
+# 2.8.1 audit found behind pg_query's rows, Redis array replies and the
+# heartbeat status sweep. These build the same lib/vec.cyr layout on the
+# FREELIST instead, so `_majra_vec_free` really returns it.
+#
+# ⚠ Push through `_majra_vec_push`, never `vec_push`: the stdlib wrapper grows
+# via `default_alloc()` (bump) and abandons the old buffer. This one grows
+# through the freelist allocator and frees the buffer the grow abandoned —
+# safe because nothing else can hold it.
+var _majra_fl_allocator_v = 0;
+
+fn _majra_fl_alloc_fn(state, size)                     { return fl_alloc(size); }
+fn _majra_fl_free_fn(state, ptr)                       { if (ptr != 0) { fl_free(ptr); } return 0; }
+fn _majra_fl_reset_fn(state)                           { return 0; }
+
+fn _majra_fl_realloc_fn(state, old_ptr, old_size, new_size) {
+    var p = fl_alloc(new_size);
+    if (p == 0) { return 0; }
+    if (old_ptr != 0) {
+        var n = old_size;
+        if (new_size < n) { n = new_size; }
+        memcpy(p, old_ptr, n);
+        fl_free(old_ptr);
+    }
+    return p;
+}
+
+fn _majra_fl_allocator() {
+    if (_majra_fl_allocator_v == 0) {
+        _majra_fl_allocator_v = allocator_new(&_majra_fl_alloc_fn, &_majra_fl_realloc_fn,
+          &_majra_fl_free_fn, &_majra_fl_reset_fn, 0);
+    }
+    return _majra_fl_allocator_v;
+}
+
+fn _majra_vec_new() {
+    return vec_new_a(_majra_fl_allocator());
+}
+
+fn _majra_vec_push(v, val) {
+    if (v == 0) { return 0 - 1; }
+    var old = load64(v);
+    var rc = vec_push_a(_majra_fl_allocator(), v, val);
+    var now = load64(v);
+    if (rc == 0 && now != old && old != 0) { fl_free(old); }
+    return rc;
+}
+
+# Release a vector built by _majra_vec_new. Elements are the caller's business.
+fn _majra_vec_free(v) {
+    if (v == 0) { return 0; }
+    fl_free(load64(v));
+    fl_free(v);
+    return 0;
+}

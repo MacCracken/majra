@@ -259,7 +259,9 @@ fn test_signed_envelope() {
     # corruption, not an attacker who re-signs with their own key (pinned by
     # test_signed_envelope_unanchored).
     var rc = signed_envelope_verify(se, 0);
-    assert_eq(rc, 0, "signed envelope verifies clean");
+    assert_eq(rc, SIGNED_ENV_SELF_CONSISTENT, "unanchored verify reports self-consistency (2.9.0), not 0");
+    assert_eq(signed_envelope_verify_anchored(se, pk), 0, "anchored verify passes");
+    assert_eq(signed_envelope_verify_anchored(se, 0), 2, "anchored verify refuses a 0 key instead of passing");
 
     # Verify with matching expected_pk (identity binding)
     var rc2 = signed_envelope_verify(se, pk);
@@ -278,7 +280,7 @@ fn test_signed_envelope() {
     assert_eq(rc4, 3, "tampered signature rejected");
     # Restore
     store8(sig, load8(sig) ^ 1);
-    assert_eq(signed_envelope_verify(se, 0), 0, "restored sig verifies");
+    assert_eq(signed_envelope_verify(se, 0), SIGNED_ENV_SELF_CONSISTENT, "restored sig verifies");
 
     println("  signed_envelope: ok");
 }
@@ -321,7 +323,8 @@ fn test_signed_envelope_lengths() {
     var se = signed_envelope_new(e, sk, pk);
     assert(se != 0, "in-range envelope signs");
     # 32 fixed + three 4-byte prefixes + "node-a" + "t" + "pay 10".
-    assert_eq(signed_envelope_canon_len(se), 32 + 12 + 6 + 1 + 6, "in-range canonical length unchanged");
+    assert_eq(signed_envelope_canon_len(se), 24 + 32 + 12 + 6 + 1 + 6,
+      "canonical length = domain prefix + header + fields");
 
     var small = fl_alloc(16);
     var e2 = envelope_new(str_from("node-a"), TARGET_BROADCAST, 0, str_new(small, 4294967295));
@@ -342,7 +345,7 @@ fn test_signed_envelope_lengths() {
     store64(se, e2);
     assert_eq(signed_envelope_verify(se, 0), 3, "verify refuses an uncanonicalisable envelope");
     store64(se, e);
-    assert_eq(signed_envelope_verify(se, 0), 0, "restored envelope verifies");
+    assert_eq(signed_envelope_verify(se, 0), SIGNED_ENV_SELF_CONSISTENT, "restored envelope verifies");
     store64(se, 0);
     assert_eq(signed_envelope_verify(se, 0), 1, "null inner envelope is a malformed handle");
     store64(se, e);
@@ -350,7 +353,7 @@ fn test_signed_envelope_lengths() {
     store64(se + 8, 0);
     assert_eq(signed_envelope_verify(se, 0), 1, "null signature is a malformed handle");
     store64(se + 8, sig);
-    assert_eq(signed_envelope_verify(se, 0), 0, "restored handle verifies");
+    assert_eq(signed_envelope_verify(se, 0), SIGNED_ENV_SELF_CONSISTENT, "restored handle verifies");
     signed_envelope_free(se);
     println("  signed_envelope_lengths: ok");
 }
@@ -375,7 +378,8 @@ fn test_signed_envelope_unanchored() {
     var forged_e = envelope_new(from, TARGET_TOPIC, topic, str_from("pay 1000000"));
     var forged = signed_envelope_new(forged_e, ask, apk);
     assert(forged != 0, "attacker re-signs the modified envelope");
-    assert_eq(signed_envelope_verify(forged, 0), 0, "UNANCHORED verify accepts the forgery (self-consistency only)");
+    assert_eq(signed_envelope_verify(forged, 0), SIGNED_ENV_SELF_CONSISTENT,
+      "UNANCHORED verify reports self-consistency, not validity, for the forgery");
     assert_eq(signed_envelope_verify(forged, pk), 2, "anchored verify rejects the forgery");
     # Claiming the victim's key without its signature fails on the signature.
     memcpy(signed_envelope_signer_pk(forged), pk, 32);
@@ -404,7 +408,7 @@ fn test_signed_envelope_coverage() {
     var payload = str_from("payload");
     var e = envelope_new(str_from("node-a"), TARGET_TOPIC, str_from("topic-x"), payload);
     var se = signed_envelope_new(e, sk, pk);
-    assert_eq(signed_envelope_verify(se, 0), 0, "coverage envelope verifies");
+    assert_eq(signed_envelope_verify(se, 0), SIGNED_ENV_SELF_CONSISTENT, "coverage envelope verifies");
 
     assert(_tb_se_swap_rc(se, 0, load64(e) ^ 1) != 0, "id_hi is signed");
     assert(_tb_se_swap_rc(se, 8, load64(e + 8) ^ 1) != 0, "id_lo is signed");
@@ -417,17 +421,20 @@ fn test_signed_envelope_coverage() {
     store8(pd + 3, load8(pd + 3) ^ 1);
     assert(signed_envelope_verify(se, 0) != 0, "a payload byte flipped in place is detected");
     store8(pd + 3, load8(pd + 3) ^ 1);
-    assert_eq(signed_envelope_verify(se, 0), 0, "every field restored, verifies");
+    assert_eq(signed_envelope_verify(se, 0), SIGNED_ENV_SELF_CONSISTENT, "every field restored, verifies");
 
     # Null vs empty: a broadcast (to_name 0, payload 0) must not verify as "".
     var b = envelope_new(str_from("node-a"), TARGET_BROADCAST, 0, 0);
     var sb = signed_envelope_new(b, sk, pk);
-    assert_eq(signed_envelope_verify(sb, 0), 0, "null-field envelope verifies");
+    assert_eq(signed_envelope_verify(sb, 0), SIGNED_ENV_SELF_CONSISTENT, "null-field envelope verifies");
     assert(_tb_se_swap_rc(sb, 32, str_from("")) != 0, "to_name 0 and \"\" sign differently");
     assert(_tb_se_swap_rc(sb, 40, str_from("")) != 0, "payload 0 and \"\" sign differently");
     assert(_tb_se_swap_rc(sb, 16, 0) != 0, "from \"node-a\" and 0 sign differently");
     println("  signed_envelope_coverage: ok");
 }
+
+# The 24-byte domain prefix, in hex (2.9.0).
+var _TB_SE_DOM_HEX = "6d616a72612f7369676e65642d656e76656c6f70652f7631";
 
 # Golden canonical bytes. A silent change to the layout is a cross-version
 # signature break (2.6.9 shipped one); this pins it. Ids and timestamp are
@@ -443,9 +450,10 @@ fn test_envelope_canonical_golden() {
     store64(e + 48, 0x2122232425262728);
     var buf = _envelope_canonicalize(e);
     var n = rethi();
-    assert_eq(n, 50, "golden canonical length");
+    assert_eq(n, 24 + 50, "golden canonical length (24-byte domain prefix since 2.9.0)");
     assert_eq(_tb_hex_eq(buf, n,
-        "080706050403020118171615141312112827262524232221010000000000000000000002616200000001740000000378797a"),
+        _tb_cat(_TB_SE_DOM_HEX,
+          "080706050403020118171615141312112827262524232221010000000000000000000002616200000001740000000378797a")),
       1, "golden canonical bytes");
     fl_free(buf);
 
@@ -454,9 +462,10 @@ fn test_envelope_canonical_golden() {
     store64(e + 40, 0);
     var buf2 = _envelope_canonicalize(e);
     var n2 = rethi();
-    assert_eq(n2, 46, "golden absent-field length");
+    assert_eq(n2, 24 + 46, "golden absent-field length");
     assert_eq(_tb_hex_eq(buf2, n2,
-        "0807060504030201181716151413121128272625242322210200000000000000000000026162ffffffffffffffff"),
+        _tb_cat(_TB_SE_DOM_HEX,
+          "0807060504030201181716151413121128272625242322210200000000000000000000026162ffffffffffffffff")),
       1, "golden absent-field bytes");
     fl_free(buf2);
     println("  envelope_canonical_golden: ok");
@@ -926,6 +935,64 @@ fn test_ws_handshake_parse() {
 
 # 2.8.1: a header block that hit the 4 KB cap was answered 101 anyway, and its
 # unread tail then parsed as WebSocket frames.
+# 2.9.0 Origin gate. Default (no check installed) must behave exactly as 2.8.2.
+var _ws_seen_origin[64];
+var _ws_saw_null_origin = 0;
+
+fn _ws_origin_record(origin) {
+    if (origin == 0) {
+        _ws_saw_null_origin = 1;
+        store8(&_ws_seen_origin, 0);
+        return 1;
+    }
+    var n = strlen(origin);
+    if (n > 60) { n = 60; }
+    memcpy(&_ws_seen_origin, origin, n);
+    store8(&_ws_seen_origin + n, 0);
+    return 1;
+}
+
+fn _ws_origin_only_good(origin) {
+    if (origin == 0) { return 0; }
+    if (streq(origin, "https://good.example") == 1) { return 1; }
+    return 0;
+}
+
+fn test_ws_origin_gate() {
+    var req = _tb_cat("GET /chat HTTP/1.1\r\nHost: x\r\nOrigin: https://good.example\r\nUpgrade: websocket\r\n",
+      "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    var evil = _tb_cat("GET /chat HTTP/1.1\r\nHost: x\r\nOrigin: https://evil.example\r\nUpgrade: websocket\r\n",
+      "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    var noorigin = _tb_cat("GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n",
+      "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+
+    # No check installed: unchanged from 2.8.2 — every Origin upgrades.
+    assert_eq(ws_origin_check(), 0, "origin gate: none installed by default");
+    assert_eq(_ws_hsc(evil), 1, "origin gate off: a cross-site handshake still upgrades");
+    assert_eq(_ws_resp_has("101 Switching Protocols"), 1, "origin gate off: 101 sent");
+
+    # The header value reaches the policy verbatim.
+    ws_set_origin_check(&_ws_origin_record);
+    assert_eq(_ws_hsc(req), 1, "origin gate: accepting policy upgrades");
+    assert_eq(streq(&_ws_seen_origin, "https://good.example"), 1, "origin gate: the policy sees the Origin value");
+    _ws_saw_null_origin = 0;
+    assert_eq(_ws_hsc(noorigin), 1, "origin gate: a request without Origin still reaches the policy");
+    assert_eq(_ws_saw_null_origin, 1, "origin gate: absent Origin arrives as 0");
+
+    # A refusing policy answers 403 and does not switch protocols.
+    ws_set_origin_check(&_ws_origin_only_good);
+    assert_eq(_ws_hsc(evil), 0, "origin gate: a rejected handshake fails");
+    assert_eq(_ws_resp_has("403 Forbidden"), 1, "origin gate: rejection is a 403");
+    assert_eq(_ws_resp_has("101 Switching Protocols"), 0, "origin gate: no 101 on rejection");
+    assert_eq(_ws_resp_has("Sec-WebSocket-Accept"), 0, "origin gate: no accept key leaks on rejection");
+    assert_eq(_ws_hsc(req), 1, "origin gate: the allowed Origin still upgrades");
+    assert_eq(_ws_hsc(noorigin), 0, "origin gate: this policy refuses a missing Origin");
+
+    ws_set_origin_check(0);
+    assert_eq(_ws_hsc(evil), 1, "origin gate: clearing the check restores the default");
+    println("  ws_origin_gate: ok");
+}
+
 fn test_ws_handshake_oversize() {
     var head = "GET /chat HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
     head = _tb_cat(head, "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nCookie: ");
@@ -1306,12 +1373,91 @@ fn test_ipc_recv_errors() {
     println("  ipc_recv_errors: ok");
 }
 
+# 2.9.0: a handle writes a 32-byte hello at construction and reads the peer
+# one before its first frame. Tests that drive a RAW peer socket stand in for
+# that peer here: drain the handle's hello, then write one back.
+fn _tb_eipc_hs(peer_fd, peer_role) {
+    var drained[32];
+    _ipc_read_full(peer_fd, &drained, 32);
+    var h[32];
+    memcpy(&h, "MJEIPCv1", 8);
+    store8(&h + 8, peer_role);
+    var i = 9;
+    while (i < 16) { store8(&h + i, 0); i = i + 1; }
+    i = 16;
+    while (i < 32) { store8(&h + i, 7 * i + peer_role); i = i + 1; }
+    _ipc_write_full(peer_fd, &h, 32);
+    return 0;
+}
+
+# Both ends are real handles: each already wrote its hello, so nothing to do.
+fn _tb_eipc_pair_ready(x, y) { return 0; }
+
 # ---- encrypted IPC over real sockets ----
 # Before 2.8.1 no test ran encrypted_ipc_send/recv/close over a socket, so the
 # replay window, role check, kill and close paths were unverified.
 
 # 2.8.1: every connection under one PSK restarted its nonces at (role, 0) —
 # (key, nonce) reuse across connections. A per-handle salt fills bytes 1-7.
+# 2.9.0: the session handshake. Each connection derives its key from BOTH
+# sides' salts, so a frame captured on one connection is undecryptable on any
+# other under the same PSK — the cross-connection replay the 2.8.1 audit
+# confirmed and could not fix inside a PATCH.
+fn test_eipc_cross_connection_replay() {
+    var key[32];
+    memset(&key, 77, 32);
+
+    # Connection 1: both ends real. Capture the initiator hello and then the
+    # frame straight off the wire, before the responder reads either.
+    var a1 = _tb_pair();
+    var b1 = rethi();
+    var ini1 = encrypted_ipc_new(a1, &key, ENCRYPTED_IPC_INITIATOR);
+    var rsp1 = encrypted_ipc_new(b1, &key, ENCRYPTED_IPC_RESPONDER);
+    assert(ini1 != 0 && rsp1 != 0, "replay: connection 1 built");
+    assert_eq(is_err_result(encrypted_ipc_send(ini1, "secret", 6)), 0, "replay: frame sent on connection 1");
+    var hello1[32];
+    assert(_ipc_read_full(b1, &hello1, 32) >= 0, "replay: the initiator hello is on the wire");
+    assert_eq(memeq(&hello1, "MJEIPCv1", 8), 1, "replay: hello carries the magic");
+    assert_eq(load8(&hello1 + 8), ENCRYPTED_IPC_INITIATOR, "replay: hello announces the role");
+    var cap_t, cap_v = ipc_recv_frame(b1);
+    assert_eq(is_err_result(cap_t), 0, "replay: captured the ciphertext frame");
+
+    # Connection 2: fresh pair, same PSK. Replay connection 1's frame into it.
+    var a2 = _tb_pair();
+    var b2 = rethi();
+    var ini2 = encrypted_ipc_new(a2, &key, ENCRYPTED_IPC_INITIATOR);
+    var rsp2 = encrypted_ipc_new(b2, &key, ENCRYPTED_IPC_RESPONDER);
+    assert(ini2 != 0 && rsp2 != 0, "replay: connection 2 built");
+    ipc_send_frame(a2, load64(cap_v + 8), load64(cap_v));
+    var rp_t, rp_v = encrypted_ipc_recv(rsp2);
+    assert_eq(is_err_result(rp_t), 1, "REPLAY REFUSED: a frame from another connection does not authenticate");
+
+    # The same connection still works end to end.
+    assert_eq(is_err_result(encrypted_ipc_send(ini2, "fresh", 5)), 0, "replay: connection 2 sends");
+    var ok_t, ok_v = encrypted_ipc_recv(rsp2);
+    if (is_err_result(ok_t) == 0) {
+        assert_eq(memeq(load64(ok_v + 8), "fresh", 5), 1, "replay: its own frame decrypts");
+        encrypted_ipc_payload_free(ok_v);
+    }
+
+    # Two connections under one PSK derive different keys, so the same
+    # plaintext never produces the same ciphertext.
+    var k1 = load64(load64(ini1 + 8));
+    var k2 = load64(load64(ini2 + 8));
+    assert(k1 != k2, "replay: the two sessions derived different keys");
+
+    ipc_frame_free(cap_v);
+    encrypted_ipc_close(ini1);
+    encrypted_ipc_close(rsp1);
+    encrypted_ipc_close(ini2);
+    encrypted_ipc_close(rsp2);
+    encrypted_ipc_free(ini1);
+    encrypted_ipc_free(rsp1);
+    encrypted_ipc_free(ini2);
+    encrypted_ipc_free(rsp2);
+    println("  eipc_cross_connection_replay: ok");
+}
+
 fn test_eipc_nonce_salt() {
     var key[32];
     memset(&key, 42, 32);
@@ -1321,6 +1467,8 @@ fn test_eipc_nonce_salt() {
     var b2 = rethi();
     var h1 = encrypted_ipc_new(a1, &key, ENCRYPTED_IPC_INITIATOR);
     var h2 = encrypted_ipc_new(a2, &key, ENCRYPTED_IPC_INITIATOR);
+    _tb_eipc_hs(b1, ENCRYPTED_IPC_RESPONDER);
+    _tb_eipc_hs(b2, ENCRYPTED_IPC_RESPONDER);
     assert(h1 != 0 && h2 != 0, "two initiator handles under one PSK");
     assert_eq(is_err_result(encrypted_ipc_send(h1, "same", 4)), 0, "h1 sends");
     assert_eq(is_err_result(encrypted_ipc_send(h2, "same", 4)), 0, "h2 sends");
@@ -1348,25 +1496,18 @@ fn test_eipc_nonce_salt() {
         ipc_frame_free(f3_v);
     }
 
-    # A peer still decrypts the salted frame (wire-compatible).
-    var r1 = encrypted_ipc_new(b1, &key, ENCRYPTED_IPC_RESPONDER);
-    ipc_send_frame(a1, n1, load64(f1_v));
-    var g_t, g_v = encrypted_ipc_recv(r1);
-    assert_eq(is_err_result(g_t), 0, "responder decrypts a salted frame");
-    if (is_err_result(g_t) == 0) {
-        assert_eq(load64(g_v), 4, "decrypted length");
-        assert_eq(memeq(load64(g_v + 8), "same", 4), 1, "decrypted bytes");
-        encrypted_ipc_payload_free(g_v);
-    }
+    # 2.9.0: a frame captured here CANNOT be decrypted by a freshly built
+    # responder — the session key is derived per connection, which IS the
+    # cross-connection replay fix. The round trip is covered by the tests
+    # where both ends handshake with each other.
     ipc_frame_free(f1_v);
     ipc_frame_free(f2_v);
     encrypted_ipc_close(h1);
     encrypted_ipc_close(h2);
-    encrypted_ipc_close(r1);
+    syscall(SYS_CLOSE, b1);
     syscall(SYS_CLOSE, b2);
     encrypted_ipc_free(h1);
     encrypted_ipc_free(h2);
-    encrypted_ipc_free(r1);
     println("  eipc_nonce_salt: ok");
 }
 
@@ -1490,6 +1631,7 @@ fn test_eipc_volume_limit() {
     var a = _tb_pair();
     var b = rethi();
     var h = encrypted_ipc_new(a, &key, ENCRYPTED_IPC_INITIATOR);
+    _tb_eipc_hs(b, ENCRYPTED_IPC_RESPONDER);
     var vb = load64(h + 8);
     # One 1-byte frame costs 1 + 16 (one tag block).
     store64(vb + 40, _EIPC_VOLUME_HARD_BYTES - 16);
@@ -1525,9 +1667,17 @@ fn test_eipc_same_role_kill() {
     var b = rethi();
     var sender = encrypted_ipc_new(a, &key, ENCRYPTED_IPC_INITIATOR);
     var same = encrypted_ipc_new(b, &key, ENCRYPTED_IPC_INITIATOR);
-    assert_eq(is_err_result(encrypted_ipc_send(sender, "x", 1)), 0, "initiator frame sent");
+    # 2.9.0: each end announces its role in the handshake, so the clash is
+    # caught on the FIRST send — nothing is ever encrypted under a colliding
+    # nonce space.
+    var st, sv = encrypted_ipc_send(sender, "x", 1);
+    assert_eq(is_err_result(st), 1, "a same-role peer fails the handshake on the first send");
+    assert_eq(err_code_of(st, sv), MAJRA_ERR_IPC_ROLE, "the failed handshake reports MAJRA_ERR_IPC_ROLE");
+    assert_eq(load64(sender + 56), 1, "the sending handle is killed");
     var t, v = encrypted_ipc_recv(same);
     assert_eq(is_err_result(t), 1, "same-role frame rejected");
+    assert_eq(err_code_of(t, v), MAJRA_ERR_IPC_ROLE, "same-role frame reports MAJRA_ERR_IPC_ROLE (2.9.0)");
+    assert_eq(streq(err_name(MAJRA_ERR_IPC_ROLE), "ipc_role"), 1, "the role code has a name");
     assert_eq(load64(same + 56), 1, "same-role frame KILLS the handle");
     assert_eq(load64(same), b, "kill keeps the fd number (shutdown, not close)");
     assert(syscall(SYS_FCNTL, b, 1, 0) >= 0, "the descriptor is still open after the kill");
@@ -1555,6 +1705,7 @@ fn test_eipc_oversize_kill() {
     var a = _tb_pair();
     var b = rethi();
     var ov = encrypted_ipc_new(b, &key, ENCRYPTED_IPC_RESPONDER);
+    _tb_eipc_hs(a, ENCRYPTED_IPC_INITIATOR);
     var hdr[4];
     memset(&hdr, 255, 4);
     syscall(SYS_WRITE, a, &hdr, 4);
@@ -2216,6 +2367,7 @@ fn test_eipc_parked_close() {
     var a = _tb_pair_raw();
     var b = rethi();
     var e = encrypted_ipc_new(b, &key, ENCRYPTED_IPC_RESPONDER);
+    _tb_eipc_hs(a, ENCRYPTED_IPC_INITIATOR);
     _pr_e = e;
     _pr_done = 0;
     _tb_wd_arm();
@@ -2472,6 +2624,7 @@ fn main() {
     test_ipc_sigpipe();
     test_ipc_bind_safety();
     test_ipc_recv_errors();
+    test_eipc_cross_connection_replay();
     test_eipc_nonce_salt();
     test_eipc_rekey_salt();
     test_eipc_roundtrip();
@@ -2486,6 +2639,7 @@ fn main() {
     test_ws_frame_bytes();
     test_ws_sigpipe();
     test_ws_handshake_parse();
+    test_ws_origin_gate();
     test_ws_handshake_oversize();
     test_ws_handshake_heap();
     test_ws_recv_frame();

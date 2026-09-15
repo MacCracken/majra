@@ -192,7 +192,120 @@ var ENCRYPTED_IPC_RESPONDER = 1;
 # connection under the same key. Closing that needs a per-session key agreed in
 # a handshake, which is a wire-format change. Until then, give each connection
 # its own key wherever cross-connection replay matters.
-var _EIPC_KBLK_SIZE = 64;
+# Key block layout. Through 2.8.2 this held the working key, the nonce salt and
+# the counters; 2.9.0 appends the session handshake state.
+#   +0   working (session) key, 32 B — what AES-GCM uses
+#   +32  nonce salt (8 B), +40 bytes encrypted, +48 key mutex, +56 salt scratch
+#   +64  the caller's pre-shared key, 32 B — the HKDF input keying material
+#   +96  this handle's 16-byte handshake salt
+#   +112 the peer's 16-byte handshake salt
+#   +128 handshake state: 0 = own hello not written yet, 1 = hello written,
+#        2 = peer hello read and session key derived
+var _EIPC_KBLK_SIZE = 136;
+
+# Session handshake (2.9.0).
+#
+# ⚠ WIRE BREAK. Each side writes a 32-byte hello at construction and derives a
+# per-connection key from BOTH salts, so a frame captured on one connection no
+# longer decrypts on any later one under the same PSK — the cross-connection
+# replay the 2.8.1 audit confirmed and could not fix inside a PATCH. A 2.9.0
+# peer cannot talk to a 2.8.x peer: the hello arrives where 2.8.x expects a
+# frame header. Both ends upgrade together.
+#
+# hello = "MJEIPCv1" (8) | role (1) | 7 zero bytes | salt (16)
+var _EIPC_HELLO_MAGIC = "MJEIPCv1";
+var _EIPC_HELLO_LEN = 32;
+var _EIPC_HS_INFO = "majra-eipc-session-v1";
+
+# Draw `n` bytes of CSPRNG into `dst`. Fails closed: a predictable salt is the
+# (key, nonce) reuse this exists to prevent.
+fn _eipc_draw_bytes(dst, n) {
+    var got = 0;
+    var attempts = 0;
+    while (got < n && attempts < 8) {
+        var r = sys_getrandom(dst + got, n - got, 0);
+        if (r > 0) { got = got + r; }
+        attempts = attempts + 1;
+    }
+    if (got < n) { return -1; }
+    return 0;
+}
+
+# Write this handle's hello. Called once, from encrypted_ipc_new, before any
+# frame: 32 bytes into a fresh socket never block in practice, and deferring
+# the PEER hello to first use keeps construction I/O-free in the other
+# direction (so both ends of a socketpair can be built in one thread).
+fn _eipc_send_hello(fd, role, salt16) {
+    var hello[32];
+    memcpy(&hello, _EIPC_HELLO_MAGIC, 8);
+    store8(&hello + 8, role);
+    var i = 9;
+    while (i < 16) { store8(&hello + i, 0); i = i + 1; }
+    memcpy(&hello + 16, salt16, 16);
+    if (_ipc_write_full(fd, &hello, _EIPC_HELLO_LEN) < 0) { return -1; }
+    return 0;
+}
+
+# Read the peer hello and derive the session key. Caller holds the key mutex.
+# Returns 0 on success, -1 on a malformed/absent hello or a role clash.
+fn _eipc_derive_session(e) {
+    var blk = load64(e + 8);
+    if (load64(blk + 128) == 2) { return 0; }
+    # The hello is written at construction; retry here if that write failed
+    # (a handle built on a descriptor that was not yet a socket, say).
+    if (load64(blk + 128) == 0) {
+        if (_eipc_send_hello(load64(e), load64(e + 40), blk + 96) != 0) { return -1; }
+        store64(blk + 128, 1);
+    }
+    var hello[32];
+    if (_ipc_read_full(load64(e), &hello, _EIPC_HELLO_LEN) < 0) { return -1; }
+    if (memeq(&hello, _EIPC_HELLO_MAGIC, 8) != 1) { return -1; }
+    var own_role = load64(e + 40);
+    # Both ends built with the same role would collide their nonce spaces. The
+    # clash is caught HERE now, before a single frame goes out (2.9.0); -2 so
+    # the caller can report MAJRA_ERR_IPC_ROLE rather than a generic failure.
+    if (load8(&hello + 8) == own_role) { return 0 - 2; }
+    if (load8(&hello + 8) != 1 - own_role) { return -1; }
+    memcpy(blk + 112, &hello + 16, 16);
+
+    # salt = initiator salt || responder salt, so both ends feed HKDF the same
+    # 32 bytes regardless of which side derives first (see _eipc_derive_key).
+    if (_eipc_derive_key(e) != 0) { return -1; }
+    store64(blk + 128, 2);
+    return 0;
+}
+
+# Derive the working key from the PSK and the two exchanged salts. Called once
+# per handshake and again on every rekey — a rekey changes the input keying
+# material, not the salts, so it needs NO second exchange (2.9.0). That matters
+# for more than tidiness: a reader parked in read(2) owns the receive side, so
+# a rekey that tried to read a hello from the send path would deadlock against
+# it.
+fn _eipc_derive_key(e) {
+    var blk = load64(e + 8);
+    var salt[32];
+    if (load64(e + 40) == ENCRYPTED_IPC_INITIATOR) {
+        memcpy(&salt, blk + 96, 16);
+        memcpy(&salt + 16, blk + 112, 16);
+    } else {
+        memcpy(&salt, blk + 112, 16);
+        memcpy(&salt + 16, blk + 96, 16);
+    }
+    return hkdf(&salt, 32, blk + 64, 32, _EIPC_HS_INFO, strlen(_EIPC_HS_INFO), blk, 32);
+}
+
+# Ensure the session key exists. Takes the key mutex itself, so exactly one
+# caller consumes the 32 hello bytes and no frame read can interleave with it.
+fn _eipc_ensure_session(e) {
+    var blk = load64(e + 8);
+    if (load64(blk + 128) == 2) { return 0; }
+    var kmtx = load64(blk + 48);
+    mutex_lock(kmtx);
+    var rc = _eipc_derive_session(e);
+    mutex_unlock(kmtx);
+    if (rc != 0) { _encrypted_ipc_kill(e); }
+    return rc;
+}
 # Salt bits: nonce bytes 1-7, with byte 4's top bit clear so the receiver's
 # 64-bit view of bytes 4-11 stays positive.
 var _EIPC_SALT_MASK = 0x00FFFFFF7FFFFFFF;
@@ -223,10 +336,17 @@ fn encrypted_ipc_new(ipc_fd, key_ptr, role) {
     if (blk == 0) { fl_free(e); return 0; }
     memset(blk, 0, _EIPC_KBLK_SIZE);
     if (_eipc_draw_salt(blk) != 0) { fl_free(blk); fl_free(e); return 0; }
-    memcpy(blk, key_ptr, 32);
+    # The PSK is the HKDF input now, not the working key: the working key at
+    # +0 stays zero until the handshake derives it (2.9.0).
+    memcpy(blk + 64, key_ptr, 32);
+    if (_eipc_draw_bytes(blk + 96, 16) != 0) { fl_free(blk); fl_free(e); return 0; }
     store64(blk + 32, load64(blk + 56));
     store64(blk + 56, 0);
     store64(blk + 48, mutex_new());
+    # A failed hello here is not fatal: the handle may be an accessor-only one
+    # (no socket behind it yet), and the first send/recv retries the write.
+    store64(blk + 128, 0);
+    if (_eipc_send_hello(ipc_fd, role, blk + 96) == 0) { store64(blk + 128, 1); }
     store64(e, ipc_fd);
     store64(e + 8, blk);
     store64(e + 16, 0);
@@ -324,7 +444,10 @@ fn encrypted_ipc_rekey(e, new_key_ptr) {
         mutex_unlock(mtx);
         return Err(MAJRA_ERR_IPC);
     }
-    if (ct_eq_bytes_lens(blk, AES_256_KEY_SIZE, new_key_ptr, AES_256_KEY_SIZE) == 1) {
+    # Compare against the PRE-SHARED key at +64, not the derived session key at
+    # +0 (2.9.0): resetting the counter is safe only because the input keying
+    # material changed.
+    if (ct_eq_bytes_lens(blk + 64, AES_256_KEY_SIZE, new_key_ptr, AES_256_KEY_SIZE) == 1) {
         mutex_unlock(mtx);
         return Err(MAJRA_ERR_IPC);
     }
@@ -334,7 +457,22 @@ fn encrypted_ipc_rekey(e, new_key_ptr) {
     }
     var kmtx = load64(blk + 48);
     mutex_lock(kmtx);
-    memcpy(blk, new_key_ptr, 32);
+    # 2.9.0: a rekey is a fresh handshake. The new PSK goes in, a new salt is
+    # drawn and announced, and the session key is re-derived from both sides'
+    # new salts on the next send or recv. Both peers rekey in lockstep, as they
+    # always had to — each one's hello is waiting for the other.
+    # 2.9.0: install the new PSK and re-derive over the salts this connection
+    # already exchanged. No second hello — see _eipc_derive_key.
+    memcpy(blk + 64, new_key_ptr, 32);
+    if (load64(blk + 128) == 2) {
+        if (_eipc_derive_key(e) != 0) {
+            mutex_unlock(kmtx);
+            mutex_unlock(mtx);
+            return Err(MAJRA_ERR_IPC);
+        }
+    } else {
+        memset(blk, 0, 32);
+    }
     store64(blk + 32, load64(blk + 56));
     store64(blk + 56, 0);
     store64(blk + 40, 0);
@@ -359,6 +497,13 @@ fn encrypted_ipc_send(e, data, len) {
     mutex_lock(mtx);
     var blk = load64(e + 8);
     if (load64(e + 56) == 1 || blk == 0) { mutex_unlock(mtx); return Err(MAJRA_ERR_IPC); }
+    # 2.9.0: no frame goes out before the session key exists.
+    var hs = _eipc_ensure_session(e);
+    if (hs != 0) {
+        mutex_unlock(mtx);
+        if (hs == 0 - 2) { return Err(MAJRA_ERR_IPC_ROLE); }
+        return Err(MAJRA_ERR_IPC);
+    }
 
     var used = load64(blk + 40) + len + AES_BLOCK_SIZE;
     if (used > _EIPC_VOLUME_HARD_BYTES) { mutex_unlock(mtx); return Err(MAJRA_ERR_IPC); }
@@ -424,6 +569,14 @@ fn encrypted_ipc_recv(e) {
     var mtx = load64(e + 64);
     mutex_lock(mtx);
     if (load64(e + 56) == 1) { mutex_unlock(mtx); return Err(MAJRA_ERR_IPC); }
+    # 2.9.0: consume the peer hello before the first frame read, so the two
+    # never interleave on the socket.
+    var rhs = _eipc_ensure_session(e);
+    if (rhs != 0) {
+        mutex_unlock(mtx);
+        if (rhs == 0 - 2) { return Err(MAJRA_ERR_IPC_ROLE); }
+        return Err(MAJRA_ERR_IPC);
+    }
 
     var frame_t, frame_v = ipc_recv_frame(load64(e));
     if (is_err_result(frame_t) == 1) {
@@ -474,12 +627,18 @@ fn encrypted_ipc_recv(e) {
         # the same role — every counter then collides across the two directions
         # under one key — or a reflection. Dropping just the frame kept both
         # sides sending colliding nonces, so tear the connection down.
-        if (load8(nonce) == own_role) { _encrypted_ipc_kill(e); }
+        var role_err = MAJRA_ERR_IPC;
+        if (load8(nonce) == own_role) {
+            _encrypted_ipc_kill(e);
+            # 2.9.0: its own code, so a caller can tell a misconfigured peer
+            # (both ends built with the same role) from ordinary frame trouble.
+            role_err = MAJRA_ERR_IPC_ROLE;
+        }
         fl_free(raw);
         fl_free(frame_ptr);
         mutex_unlock(kmtx);
         mutex_unlock(mtx);
-        return Err(MAJRA_ERR_IPC);
+        return Err(role_err);
     }
     var seen = (load8(nonce + 4) << 56) | (load8(nonce + 5) << 48)
     | (load8(nonce + 6) << 40) | (load8(nonce + 7) << 32)

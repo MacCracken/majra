@@ -40,6 +40,22 @@ var SIGNED_ENV_PK_LEN = 32;
 # Returns a buffer pointer; length returned via ret2/rethi. Returns 0 (length
 # 0) when a field's length cannot be encoded — see the length guard below.
 # Canonical = deterministic: same envelope → same bytes.
+# Verify's fourth result (2.9.0): the signature checks out but nothing anchored
+# it to a known key. Deliberately NON-ZERO so an unchanged `== 0` caller fails
+# closed rather than trusting an envelope an attacker could have re-signed.
+var SIGNED_ENV_SELF_CONSISTENT = 4;
+
+# Domain separation prefix (2.9.0). The signing input starts with these 24
+# bytes, so a majra envelope signature cannot be confused with another Ed25519
+# message signed under the same key: majra's canonical form is not
+# self-describing, and a raw-signature key is otherwise usable for any shape.
+#
+# WIRE BREAK: a 2.8.x signature does not verify here, and a 2.9.0 signature
+# does not verify on 2.8.x. Both sides of a signing deployment upgrade
+# together. See CHANGELOG [2.9.0].
+var SIGNED_ENV_DOMAIN = "majra/signed-envelope/v1";
+var SIGNED_ENV_DOMAIN_LEN = 24;
+
 fn _envelope_canonicalize(e) {
     var from = envelope_from(e);
     var to_name = envelope_to_name(e);
@@ -70,16 +86,17 @@ fn _envelope_canonicalize(e) {
     if (to_len < 0 || to_len >= 4294967295) { ret2(0, 0); }
     if (pay_len < 0 || pay_len >= 4294967295) { ret2(0, 0); }
 
-    var hdr = 8 + 8 + 8 + 8 + 4 + 4 + 4;
+    var hdr = SIGNED_ENV_DOMAIN_LEN + 8 + 8 + 8 + 8 + 4 + 4 + 4;
     var total = hdr + from_len + to_len + pay_len;
     var buf = fl_alloc(total);
 
-    store64(buf, envelope_id_hi(e));
-    store64(buf + 8, envelope_id_lo(e));
-    store64(buf + 16, envelope_timestamp(e));
-    store64(buf + 24, envelope_to_kind(e));
+    memcpy(buf, SIGNED_ENV_DOMAIN, SIGNED_ENV_DOMAIN_LEN);
+    store64(buf + SIGNED_ENV_DOMAIN_LEN, envelope_id_hi(e));
+    store64(buf + SIGNED_ENV_DOMAIN_LEN + 8, envelope_id_lo(e));
+    store64(buf + SIGNED_ENV_DOMAIN_LEN + 16, envelope_timestamp(e));
+    store64(buf + SIGNED_ENV_DOMAIN_LEN + 24, envelope_to_kind(e));
 
-    var pos = 32;
+    var pos = SIGNED_ENV_DOMAIN_LEN + 32;
     # Write u32 big-endian length + bytes for each variable field
     store8(buf + pos, (from_tag >> 24) & 0xFF);
     store8(buf + pos + 1, (from_tag >> 16) & 0xFF);
@@ -160,7 +177,9 @@ fn signed_envelope_new(e, sk_ptr, pk_ptr) {
 # canonical encoding of the inner envelope and the stored public key.
 # Returns non-zero on any failure: 1 malformed handle, 2 pk mismatch
 # (expected_pk != 0), 3 bad signature / mismatched content / a field length
-# that cannot be canonicalised.
+# that cannot be canonicalised — and, since 2.9.0, 4
+# (SIGNED_ENV_SELF_CONSISTENT) when the signature is valid but no expected_pk
+# was given, which proves self-consistency and NOT authenticity.
 #
 # expected_pk: if non-zero, verify that the signer_pk matches this
 #              specific key (trust anchoring). PASS IT whenever the result
@@ -194,7 +213,20 @@ fn signed_envelope_verify(se, expected_pk) {
     # otherwise leak a payload-sized buffer per attempt.
     fl_free(canon);
     if (ok == 0) { return 3; }
+    # 2.9.0: the unanchored pass has its OWN code. Through 2.8.2 it returned 0,
+    # indistinguishable from an anchored pass, so a caller checking `== 0`
+    # trusted an envelope an attacker could have re-signed under their own key.
+    if (expected_pk == 0) { return SIGNED_ENV_SELF_CONSISTENT; }
     return 0;
+}
+
+# Verify against a known key. Identical to signed_envelope_verify with a
+# non-zero expected_pk, except that it cannot be called unanchored by accident:
+# a 0 key is a pk mismatch (2), never a pass. Prefer this wherever the result
+# gates an action.
+fn signed_envelope_verify_anchored(se, expected_pk) {
+    if (expected_pk == 0) { return 2; }
+    return signed_envelope_verify(se, expected_pk);
 }
 
 # Release a SignedEnvelope produced by signed_envelope_new. Does NOT free the

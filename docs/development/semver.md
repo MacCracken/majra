@@ -92,6 +92,36 @@ proposed public name against the `lib/` snapshot before adding it:
 grep -rn "^fn <name>\b" lib/
 ```
 
+### Security fixes that require a wire change (added 2.9.0)
+
+A defect in a wire format cannot always be fixed compatibly: cross-connection
+replay in encrypted IPC needs a handshake, and signature confusion needs a
+domain prefix in the signed bytes. Both change what goes over the wire, which
+the table above calls breaking, i.e. 3.0.0 — and holding a confirmed security
+defect for an indefinite major was judged worse than breaking the format.
+
+So: **a MINOR may change a wire format when the change fixes a confirmed
+security defect that cannot be fixed compatibly.** Three conditions gate it,
+and all three must hold:
+
+1. The defect is **confirmed**, not theoretical, and named in an audit report
+   or issue.
+2. There is **no compatible fix** — an opt-in flag would leave the default
+   vulnerable, which is the state the fix exists to end.
+3. The release ships a **migration guide** naming what breaks, and the
+   CHANGELOG entry leads with it.
+
+⚠ The consequence is real and must be stated plainly every time: peers on the
+two versions cannot talk to each other, so every end of a deployment upgrades
+together. A rolling upgrade across the break needs a second channel, or a stop.
+
+Wire breaks taken under this exception:
+
+| Release | What changed | Defect it closes |
+|---|---|---|
+| 2.9.0 | Encrypted IPC: a 32-byte session hello per connection, and the AES key is HKDF-derived from the PSK plus both salts | Frames captured on one connection replayed into any later connection under the same PSK |
+| 2.9.0 | Signed envelopes: the signing input is prefixed with `majra/signed-envelope/v1` | A majra envelope signature could be confused with another Ed25519 message signed under the same key |
+
 ## Deprecations
 
 Deprecated names keep compiling, with unchanged values and behaviour, for the
@@ -115,6 +145,8 @@ under Documented exceptions above:
 | queue, pubsub, relay, barrier | 2.0.0 |
 | ipc, transport, fleet, dag | 2.0.0 |
 | redis_backend, postgres_backend, ws | 2.0.0 (`ws_send_text` / `ws_recv_frame` renamed `majra_ws_*` at 2.8.0 — see Documented exceptions) |
+| ipc_encrypted wire format | 2.0.0 framing; **session handshake at 2.9.0** — see Security fixes that require a wire change |
+| signed_envelope signing input | 2.4.0; **domain prefix at 2.9.0** — same exception |
 | ipc_encrypted (AES-256-GCM via sigil; framing, nonce/role separation, rekey) | 2.0.0 framing; role argument 2.6.9 — see Documented exceptions |
 | signed_envelope | 2.4.0 |
 | admin | 2.4.0 (`majra_admin_serve` signature changed at 2.6.9) |

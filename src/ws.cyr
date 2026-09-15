@@ -556,6 +556,27 @@ fn _majra_ws_key_ok(p, len) {
 # Reads HTTP headers, extracts Sec-WebSocket-Key, sends 101 response.
 # Returns 1 on success, 0 on failure. Nothing is written on failure; the
 # caller closes the fd.
+# Origin policy hook (2.9.0). `fn(origin_cstr)` returns 1 to accept the
+# handshake, anything else to refuse it with 403. `origin_cstr` is 0 when the
+# request carried no Origin header (a non-browser client), which a policy may
+# accept or refuse as it sees fit. Process-wide, like the rest of this module's
+# configuration; install it once at startup.
+var _ws_origin_check = 0;
+
+fn ws_set_origin_check(fn_ptr) {
+    _ws_origin_check = fn_ptr;
+    return 0;
+}
+
+fn ws_origin_check() { return _ws_origin_check; }
+
+# Refuse the upgrade. Plain 403 with a zero-length body: the client never
+# switched protocols, so this is still an HTTP response.
+fn _ws_send_forbidden(fd) {
+    var r = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    return _ws_write_full(fd, r, strlen(r));
+}
+
 fn _ws_accept_upgrade(fd) {
     # Read HTTP request (up to 4KB)
     var buf = fl_alloc(4096);
@@ -598,6 +619,9 @@ fn _ws_accept_upgrade(fd) {
     var have_upgrade = 0;
     var have_conn = 0;
     var have_ver = 0;
+    var origin_pos = 0;
+    var origin_len = 0;
+    var have_origin = 0;
     var p = 0;
     while (p < total && load8(buf + p) != 10) { p = p + 1; }
     p = p + 1;
@@ -628,6 +652,10 @@ fn _ws_accept_upgrade(fd) {
             if (_majra_ws_has_token(buf + vs, ve - vs, "upgrade") == 1) { have_conn = 1; }
         } elif (_majra_ws_ieq(buf + p, nlen, "sec-websocket-version") == 1) {
             if (_majra_ws_ieq(buf + vs, ve - vs, "13") == 1) { have_ver = 1; }
+        } elif (_majra_ws_ieq(buf + p, nlen, "origin") == 1) {
+            origin_pos = vs;
+            origin_len = ve - vs;
+            have_origin = 1;
         }
         p = eol + 1;
     }
@@ -637,6 +665,31 @@ fn _ws_accept_upgrade(fd) {
         fl_free(buf);
         return 0;
     }
+    # ⚠ Origin gate (2.9.0), before the 101. A browser sends Origin on every
+    # cross-site WebSocket handshake and the same-origin policy does NOT stop
+    # the connection, so a handshake accepted without checking it is the
+    # cross-site hijacking (CSWSH) class. Default is unchanged — no check
+    # installed means every Origin is accepted, exactly as through 2.8.2 —
+    # but a server that answers anything a browser can reach should install
+    # one with ws_set_origin_check.
+    var check = _ws_origin_check;
+    if (check != 0) {
+        var origin = 0;
+        if (have_origin == 1) {
+            origin = fl_alloc(origin_len + 1);
+            if (origin == 0) { fl_free(buf); return 0; }
+            memcpy(origin, buf + origin_pos, origin_len);
+            store8(origin + origin_len, 0);
+        }
+        var verdict = fncall1(check, origin);
+        if (origin != 0) { fl_free(origin); }
+        if (verdict != 1) {
+            fl_free(buf);
+            _ws_send_forbidden(fd);
+            return 0;
+        }
+    }
+
     var client_key = fl_alloc(key_len + 1);
     if (client_key == 0) { fl_free(buf); return 0; }
     memcpy(client_key, buf + key_pos, key_len);

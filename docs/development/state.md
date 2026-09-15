@@ -6,7 +6,7 @@ type: state
 
 # Current State — majra
 
-> **Last refresh**: 2026-09-15 (post-2.8.2) | **Refresh cadence**: every release (ideally bumped by the release post-hook).
+> **Last refresh**: 2026-09-15 (post-2.9.0) | **Refresh cadence**: every release (ideally bumped by the release post-hook).
 > **What this file is**: volatile state. The companion `CLAUDE.md` holds durable rules; this file holds whatever drifts release-to-release. Per [first-party-documentation § CLAUDE.md](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/first-party-documentation.md#claudemd), version numbers, test counts, consumer lists, and in-flight work all live here, not in `CLAUDE.md`.
 
 ---
@@ -15,9 +15,9 @@ type: state
 
 | File | Value | Source |
 |---|---|---|
-| `VERSION` | **2.8.2** | single source of truth |
+| `VERSION` | **2.9.0** | single source of truth |
 | `cyrius.cyml [package].version` | `${file:VERSION}` | reads `VERSION` |
-| Latest git tag | `2.8.1` (2.8.2 pending tag) | release workflow asserts `VERSION == tag` |
+| Latest git tag | `2.8.2` (2.9.0 pending tag) | release workflow asserts `VERSION == tag` |
 
 ## Toolchain
 
@@ -92,11 +92,11 @@ provisions. CI's `cyrius deps --verify` enforces match: 110 verified, 0 failed.
 
 | Target | Lines | Bytes |
 |---|---|---|
-| `dist/majra.cyr` (core) | 5,822 | 209 KB |
-| `dist/majra-signed.cyr` | 6,043 | 218 KB |
-| `dist/majra-admin.cyr` | 6,126 | 221 KB |
-| `dist/majra-backends.cyr` | 9,378 | 340 KB |
-| `src/` total | 10,179 lines across 23 files | — |
+| `dist/majra.cyr` (core) | 5,978 | 214 KB |
+| `dist/majra-signed.cyr` | 6,231 | 226 KB |
+| `dist/majra-admin.cyr` | 6,282 | 226 KB |
+| `dist/majra-backends.cyr` | 9,830 | 358 KB |
+| `src/` total | 10,631 lines across 23 files | — |
 
 > **Both hardening passes moved every bundle.** `src/` grew 5,813 → 7,166
 > (2.6.9) → 7,633 lines (2.6.10), much of it rationale comments recording what
@@ -109,8 +109,8 @@ provisions. CI's `cyrius deps --verify` enforces match: 110 verified, 0 failed.
 | Suite | Entry point | Assertions | Notes |
 |---|---|---|---|
 | Core | `src/main.cyr` (binary self-tests) | 203 | runs as part of `cyrius build` smoke. 150 → 153 at 2.7.3; 154 at 2.8.0; 199 at 2.8.1 (P(-1) sweep regressions); 203 at 2.8.2 (heartbeat owned keys) |
-| Expanded | `tests/test_core.tcyr` | 626 | broader unit coverage; grew across the 2.6.x relay/ratelimit/queue fix arc. 299 → 304 at 2.7.3 — the barrier checks now prove *blocking*, not a counter; 623 at 2.8.1 (P(-1) sweep; 621 under qemu, where one 47-second test is x86-only); 626 at 2.8.2 (relay dedup tombstone compaction; 624 under qemu) |
-| Backends | `tests/test_backends.tcyr` | 519 | redis / pg / ws / aes-gcm / signed_envelope / admin — 152 → 519 at 2.8.1 (P(-1) sweep: admin routes, SIGPIPE, ws handshake, encrypted-IPC salt/close) |
+| Expanded | `tests/test_core.tcyr` | 645 | broader unit coverage; grew across the 2.6.x relay/ratelimit/queue fix arc. 299 → 304 at 2.7.3 — the barrier checks now prove *blocking*, not a counter; 623 at 2.8.1 (P(-1) sweep; 621 under qemu, where one 47-second test is x86-only); 626 at 2.8.2 (relay dedup tombstone compaction; 624 under qemu); 645 at 2.9.0 (relay ownership + unsubscribe) |
+| Backends | `tests/test_backends.tcyr` | 547 | redis / pg / ws / aes-gcm / signed_envelope / admin — 152 → 519 at 2.8.1 (P(-1) sweep: admin routes, SIGPIPE, ws handshake, encrypted-IPC salt/close); 547 at 2.9.0 (session handshake, Origin gate, anchored verify) |
 | Patra-queue | `tests/test_patra_queue.tcyr` | 71 | separate entry — split out at 2.4.0 to stay under the then-16384 cc5 fixup cap (1,048,576 at the 6.6.4 pin); split kept as documented architecture |
 | **CI total** | | **637** | |
 | Live integration | `tests/test_live.tcyr` | 36 | requires Redis + PostgreSQL. **CI-only** — not runnable on a dev box without `redis:7-alpine` + `postgres:16-alpine` up; 7 Redis + 4 PostgreSQL categories |
@@ -169,6 +169,7 @@ profiles (all three named sidecars list `sigil` — admin reaches it through
 
 | Tag | Date | Headline |
 |---|---|---|
+| 2.9.0 | 2026-09-15 | **Two wire breaks, both security fixes** (semver.md gains the exception that permits them in a MINOR). Encrypted IPC derives a per-connection key from a 32-byte session handshake, closing cross-connection replay; signed envelopes gain a domain prefix and `verify(se, 0)` now returns 4 so unanchored callers fail closed. Adds a WebSocket Origin policy, `pg_rows_free` / `redis_array_free` / `hb_transitions_free`, relay unsubscribe and message refcounting. 1,466 assertions. |
 | 2.8.2 | 2026-09-15 | Heartbeat trackers own their node-id keys (transitions still return the caller's pointer). Relay dedup eviction compacts tombstones, with the helper shared in `counter.cyr`. Fuzz harnesses gain model oracles, CI's iteration arg and a printed seed. New `mq_lifecycle` / `mq_enqueue_4producers` benches; `soak_queue` at 500k ops. 1,419 assertions. |
 | 2.8.1 | 2026-09-15 | **P(-1) hardening sweep: 130 findings (3 critical, 17 high).** Encrypted IPC reused `(key, nonce)` across connections (per-handle salt, wire-compatible). Every admin route 404'd. Peers' disconnects SIGPIPE-killed the process. Relay dedup and pubsub keys were borrowed. Test binaries could exit 0 on failure. 1,412 assertions; cross-connection replay and 4 other API/wire items queued for 2.9.0. |
 | 2.8.0 | 2026-09-15 | **Namespace minor.** Error codes gain `MAJRA_ERR_*` (the bare `ERR_*` stay as deprecated same-value aliases until 3.0.0). `ws_send_text` / `ws_recv_frame` → `majra_ws_*` under the semver collision exception: next to `lib/ws.cyr`, the 2.7.3 backends bundle did not build under 6.6.4 because of an arity disagreement. The hoosh `ratelimit_*` issue was deleted, since hoosh renamed its own limiter on 2026-07-23. P(-1) sweep moved to 2.8.1. |

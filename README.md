@@ -25,7 +25,7 @@ Majra provides shared messaging primitives for the [AGNOS](https://github.com/Ma
 | **metrics** | Pluggable metrics vtable with 22 hook points |
 | **redis_backend** | Cross-process pub/sub, sorted-set queues, hash-based rate limiter, heartbeat via RESP protocol |
 | **postgres_backend** | PostgreSQL workflow + queue storage via wire protocol v3 |
-| **ws** | WebSocket framing primitives (RFC 6455) — SHA-1 upgrade handshake, frame read/write, ping/pong/close. **No pub/sub bridge**: drive `majra_ws_recv_frame` / `majra_ws_send_text` from your own accept loop |
+| **ws** | WebSocket framing primitives (RFC 6455) — SHA-1 upgrade handshake, frame read/write, ping/pong/close, optional Origin policy (`ws_set_origin_check`, 2.9.0). **No pub/sub bridge**: drive `majra_ws_recv_frame` / `majra_ws_send_text` from your own accept loop |
 | **signed_envelope** | Ed25519 signatures over a canonical envelope encoding (via sigil) |
 | **admin** | Read-only HTTP admin/metrics endpoint (`/health`, `/fleet`, `/ratelimit`) |
 | **patra_queue** | Durable job queue backed by patra — survives process restart |

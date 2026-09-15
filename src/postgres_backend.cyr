@@ -566,14 +566,14 @@ fn _pg_parse_row(data, data_len) {
         if (col_len > 0) { pos = pos + col_len; }
         ci = ci + 1;
     }
-    var row = vec_new();
+    var row = _majra_vec_new();
     pos = 2;
     ci = 0;
     while (ci < col_count) {
         var cl = _pg_read_i32(data, pos);
         pos = pos + 4;
         if (cl < 0) {
-            vec_push(row, 0);
+            _majra_vec_push(row, 0);
         } else {
             var val = fl_alloc(cl + 1);
             if (val == 0) {
@@ -587,7 +587,7 @@ fn _pg_parse_row(data, data_len) {
             }
             memcpy(val, data + pos, cl);
             store8(val + cl, 0);
-            vec_push(row, val);
+            _majra_vec_push(row, val);
             pos = pos + cl;
         }
         ci = ci + 1;
@@ -608,7 +608,7 @@ fn _pg_parse_row(data, data_len) {
 # sync point, and it drains to it.
 fn _pg_query_st(conn, sql, collect) {
     var rows = 0;
-    if (collect == 1) { rows = vec_new(); }
+    if (collect == 1) { rows = _majra_vec_new(); }
     if (conn == 0 || sql == 0) { ret2(rows, -1); }
     var fd = load64(conn);
     if (fd < 0) { ret2(rows, -1); }
@@ -642,7 +642,7 @@ fn _pg_query_st(conn, sql, collect) {
                     _pg_poison(conn);
                     ret2(rows, -1);
                 }
-                vec_push(rows, row);
+                _majra_vec_push(rows, row);
             }
         }
         elif (mtype == PG_MSG_ERROR) {
@@ -679,6 +679,32 @@ fn pg_query(conn, sql) {
 # Execute a SQL statement (no result rows expected).
 fn pg_exec(conn, sql) {
     return pg_query(conn, sql);
+}
+
+# Release the rows vector `pg_query` / `pg_exec` returned, with every cell.
+#
+# 2.9.0. Before this, rows and cells came off the BUMP allocator and a
+# long-lived client grew without bound; they are freelist-backed now, and this
+# is how a caller gives them back. Each cell is a NUL-terminated buffer (0 for
+# SQL NULL), so a caller that kept a cell pointer must copy it first.
+fn pg_rows_free(rows) {
+    if (rows == 0) { return 0; }
+    var i = 0;
+    while (i < vec_len(rows)) {
+        var row = vec_get(rows, i);
+        if (row != 0) {
+            var c = 0;
+            while (c < vec_len(row)) {
+                var cell = vec_get(row, c);
+                if (cell != 0) { fl_free(cell); }
+                c = c + 1;
+            }
+            _majra_vec_free(row);
+        }
+        i = i + 1;
+    }
+    _majra_vec_free(rows);
+    return 0;
 }
 
 # --- Workflow Storage over PostgreSQL ---

@@ -312,7 +312,7 @@ fn _resp_read_reply_d(rc, depth) {
         # socket has stopped producing, and unbounded nesting turns
         # server-controlled depth into call-stack depth.
         if (count > RESP_MAX_ARRAY) { _resp_poison(rc); return 0; }
-        var arr = vec_new();
+        var arr = _majra_vec_new();
         var j = 0;
         while (j < count) {
             # ⚠ Do NOT treat a 0 element as a parse failure.
@@ -330,7 +330,7 @@ fn _resp_read_reply_d(rc, depth) {
             # failure apart by the connection state instead: an element that
             # poisoned the handle aborts the array like every other failure,
             # rather than padding it out to `count` with zeros.
-            vec_push(arr, _resp_read_reply_d(rc, depth + 1));
+            _majra_vec_push(arr, _resp_read_reply_d(rc, depth + 1));
             if (load64(rc) < 0) { return 0; }
             j = j + 1;
         }
@@ -346,6 +346,32 @@ fn _resp_read_reply_d(rc, depth) {
 # Release a Str reply returned by _resp_read_reply for a simple string, an
 # error, or a bulk string — its buffer and its header. Integers are values,
 # arrays are vecs from the bump allocator; neither needs this.
+# Release an ARRAY reply (a vec) whose elements are all bulk/simple strings —
+# `redis_keys`, `redis_zpopmin`, and EVAL replies known to return strings.
+# 2.9.0: array replies are freelist-backed, so they can finally be returned.
+#
+# ⚠ An array whose elements are INTEGER replies must use
+# `redis_array_free_shallow`: an integer reply is the value itself, not a
+# pointer, and freeing it would corrupt the freelist.
+fn redis_array_free(arr) {
+    if (arr == 0) { return 0; }
+    var i = 0;
+    while (i < vec_len(arr)) {
+        resp_reply_free(vec_get(arr, i));
+        i = i + 1;
+    }
+    _majra_vec_free(arr);
+    return 0;
+}
+
+# Release just the array's own storage, leaving the elements alone. Use this
+# for arrays of integers, for nested arrays, or when the elements were handed
+# on to someone else.
+fn redis_array_free_shallow(arr) {
+    _majra_vec_free(arr);
+    return 0;
+}
+
 fn resp_reply_free(reply) {
     if (reply != 0) {
         fl_free(str_data(reply));
