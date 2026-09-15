@@ -399,9 +399,11 @@ fn relay_receive_ex(r, msg) {
         var dcap = map_cap(seen);
         var oldest_sp = 0;
         var oldest_time = 0;
+        var dempties = 0;
         var i = 0;
         while (i < dcap) {
             var sp = dent + i * 24;
+            if (load64(sp + 16) == 0) { dempties = dempties + 1; }
             # Never evict the sender this call just recorded: `now` is read
             # before the lock, so under contention its stamp can be older than
             # entries other threads stamped first.
@@ -421,6 +423,8 @@ fn relay_receive_ex(r, msg) {
             # table's memory leaked one block per eviction.
             _relay_dedup_drop_slot(seen, oldest_sp);
             counter_inc(load64(r + 72));
+            # Drops leave tombstones lib/hashmap.cyr never reclaims (2.8.2).
+            _majra_map_compact(seen, dempties);
         }
     }
 
@@ -512,9 +516,11 @@ fn relay_evict_stale_dedup(r, max_idle_ns) {
     var entries = map_entries(seen);
     var cap = map_cap(seen);
     var count = 0;
+    var empties = 0;
     var i = 0;
     while (i < cap) {
         var sp = entries + i * 24;
+        if (load64(sp + 16) == 0) { empties = empties + 1; }
         if (load64(sp + 16) == 1) {
             var e = load64(sp + 8);
             if (now - load64(e + 8) > max_idle_ns) {
@@ -528,6 +534,8 @@ fn relay_evict_stale_dedup(r, max_idle_ns) {
     }
     if (count > 0) {
         counter_add(load64(r + 72), count);
+        # Deletes only write tombstones, so `empties` is still exact here.
+        _majra_map_compact(seen, empties);
     }
     mutex_unlock(mtx);
     return count;

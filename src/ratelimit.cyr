@@ -88,48 +88,6 @@ fn _ratelimit_projected(rl, bucket_ptr, now) {
     return tokens;
 }
 
-# Rebuild `m` in place when tombstones have eaten its empty slots. `empties` is
-# the count of state-0 slots the caller's sweep walk just saw. Returns 1 if it
-# rebuilt.
-#
-# ⚠ lib/hashmap.cyr grows on LIVE count only and never rehashes tombstones out,
-# and `_map_find` stops only at an empty slot — so under key churn the empties
-# trend to zero and every miss (each new client's first check) probes all `cap`
-# slots while holding the limiter mutex. Below cap/4 empties, copy the live
-# pairs out, map_clear, and re-insert: the live count already fit this capacity,
-# so no grow and no bump allocation. Key/value pointers are re-stored as-is.
-fn _rl_map_compact(m, empties) {
-    var cap = map_cap(m);
-    if (empties * 4 >= cap) { return 0; }
-    var live = map_size(m);
-    if (live == 0) {
-        map_clear(m);
-        return 1;
-    }
-    var scratch = fl_alloc(live * 16);
-    if (scratch == 0) { return 0; }
-    var entries = map_entries(m);
-    var n = 0;
-    var i = 0;
-    while (i < cap) {
-        var ep = entries + i * 24;
-        if (load64(ep + 16) == 1 && n < live) {
-            store64(scratch + n * 16, load64(ep));
-            store64(scratch + n * 16 + 8, load64(ep + 8));
-            n = n + 1;
-        }
-        i = i + 1;
-    }
-    map_clear(m);
-    i = 0;
-    while (i < n) {
-        map_set(m, load64(scratch + i * 16), load64(scratch + i * 16 + 8));
-        i = i + 1;
-    }
-    fl_free(scratch);
-    return 1;
-}
-
 # Check if a request for key is allowed. Consumes one token if yes.
 #
 # ⚠ `key` is a **cstr** (null-terminated `char*`), not a `Str`. The map is
@@ -309,7 +267,7 @@ fn ratelimit_evict_stale(rl, max_idle_ns) {
         i = i + 1;
     }
     # Deletes only write tombstones, so `empties` is still exact here.
-    _rl_map_compact(buckets, empties);
+    _majra_map_compact(buckets, empties);
     counter_add(load64(rl + 48), evicted);
 
     mutex_unlock(mtx);
@@ -465,7 +423,7 @@ fn sliding_window_evict_stale(sw, max_idle_ns) {
         }
         i = i + 1;
     }
-    _rl_map_compact(windows, empties);
+    _majra_map_compact(windows, empties);
 
     mutex_unlock(mtx);
     return evicted;

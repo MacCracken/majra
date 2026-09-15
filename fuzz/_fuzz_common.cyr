@@ -1,0 +1,48 @@
+# Shared fuzz harness plumbing: argv, seed, PRNG, failure report.
+# Usage: build/<harness> [iterations] [seed]. CI passes the iteration count;
+# the seed is printed every run so any failure reproduces exactly.
+
+var _fuzz_state = 0;
+var _fuzz_seed = 0;
+
+fn _fuzz_rand() {
+    _fuzz_state = _fuzz_state * 6364136223846793005 + 1442695040888963407;
+    return _fuzz_state;
+}
+
+fn _fuzz_rand_range(lo, hi) {
+    var r = (_fuzz_rand() >> 16) & 0x7FFFFFFFFFFF;
+    return lo + (r % (hi - lo + 1));
+}
+
+fn _fuzz_puts(s) { syscall(SYS_WRITE, 1, s, strlen(s)); return 0; }
+
+# Parses argv and seeds the PRNG. Returns the iteration count.
+fn fuzz_setup(name, default_iters) {
+    args_init();
+    var iters = default_iters;
+    if (argc() > 1) { iters = atoi(argv(1)); }
+    if (iters <= 0) { iters = default_iters; }
+    _fuzz_seed = time_now_ns();
+    if (argc() > 2) { _fuzz_seed = atoi(argv(2)); }
+    _fuzz_state = _fuzz_seed;
+    _fuzz_puts(name);
+    _fuzz_puts(": seed=");
+    fmt_int(_fuzz_seed);
+    _fuzz_puts(" iters=");
+    fmt_int(iters);
+    println("");
+    return iters;
+}
+
+# Report an oracle violation with everything needed to reproduce it.
+fn fuzz_fail(what, step) {
+    _fuzz_puts("FUZZ FAIL: ");
+    _fuzz_puts(what);
+    _fuzz_puts(" at step ");
+    fmt_int(step);
+    _fuzz_puts(" (rerun with this seed: ");
+    fmt_int(_fuzz_seed);
+    println(")");
+    return 1;
+}

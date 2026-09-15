@@ -1,5 +1,6 @@
-# Fuzz: priority queue enqueue/dequeue with random priorities and payloads
-# Fuzz target: queue operations
+# Fuzz: priority queue + managed queue under random operations, checked
+# against a model: highest tier first, FIFO within a tier, exact lengths.
+# Usage: build/fuzz_queue [iterations] [seed]
 
 include "lib/string.cyr"
 include "lib/fmt.cyr"
@@ -13,80 +14,93 @@ include "lib/chrono.cyr"
 include "lib/tagged.cyr"
 include "lib/fnptr.cyr"
 include "lib/thread.cyr"
+include "lib/args.cyr"
 
 include "src/error.cyr"
 include "src/counter.cyr"
 include "src/envelope.cyr"
 include "src/metrics.cyr"
 include "src/queue.cyr"
+include "fuzz/_fuzz_common.cyr"
 
-var _fuzz_state = 12345;
+# Model: per-tier FIFO of payload tokens (ring of `iters` slots per tier).
+var _mq_buf[5];
+var _mq_head[5];
+var _mq_tail[5];
 
-fn _fuzz_rand() {
-    _fuzz_state = _fuzz_state * 6364136223846793005 + 1442695040888963407;
-    return _fuzz_state;
+fn _model_push(t, v) {
+    store64(load64(&_mq_buf + t * 8) + load64(&_mq_tail + t * 8) * 8, v);
+    store64(&_mq_tail + t * 8, load64(&_mq_tail + t * 8) + 1);
+    return 0;
 }
 
-fn _fuzz_rand_range(lo, hi) {
-    var r = _fuzz_rand();
-    if (r < 0) { r = 0 - r; }
-    return lo + (r % (hi - lo + 1));
+fn _model_total() {
+    var n = 0;
+    var t = 0;
+    while (t < 5) { n = n + load64(&_mq_tail + t * 8) - load64(&_mq_head + t * 8); t = t + 1; }
+    return n;
 }
 
-fn _parse_argv1() {
-    # Read argv[1] manually: argc is at [rsp] on entry, argv at [rsp+8+i*8]
-    # For simplicity, default to 1000 iterations
-    return 1000;
+# Pop one item and check it against the model. Returns 0 or 1 (violation).
+fn _check_dequeue(pq, step) {
+    var item = pq_dequeue(pq);
+    var t = 0;
+    while (t < 5 && load64(&_mq_head + t * 8) == load64(&_mq_tail + t * 8)) { t = t + 1; }
+    if (t == 5) {
+        if (item != 0) { return fuzz_fail("pq_dequeue returned an item from an empty model", step); }
+        return 0;
+    }
+    if (item == 0) { return fuzz_fail("pq_dequeue returned 0 with items queued", step); }
+    var h = load64(&_mq_head + t * 8);
+    var want = load64(load64(&_mq_buf + t * 8) + h * 8);
+    store64(&_mq_head + t * 8, h + 1);
+    if (queue_item_priority(item) != t) { return fuzz_fail("dequeued a lower tier before a higher one", step); }
+    if (queue_item_payload(item) != want) { return fuzz_fail("FIFO order broken within a tier", step); }
+    queue_item_free(item);
+    return 0;
 }
 
 fn main() {
     alloc_init();
     fl_init();
-
-    var iters = _parse_argv1();
-
-    _fuzz_state = time_now_ns();
+    var iters = fuzz_setup("fuzz_queue", 1000);
+    var t = 0;
+    while (t < 5) { store64(&_mq_buf + t * 8, fl_alloc(iters * 8 + 8)); t = t + 1; }
 
     var pq = pq_new();
     var mq = mq_new("fuzz", 8);
+    var token = 1;
+    var finished = 0;
+    var bad = 0;
     var i = 0;
-
-    while (i < iters) {
+    while (i < iters && bad == 0) {
         var op = _fuzz_rand_range(0, 5);
         var pri = _fuzz_rand_range(0, 4);
-        var payload = _fuzz_rand();
-
-        if (op == 0 || op == 1 || op == 2) {
-            # Enqueue
-            pq_enqueue(pq, queue_item_new(pri, payload));
-        }
-        elif (op == 3) {
-            # Dequeue
-            pq_dequeue(pq);
-        }
-        elif (op == 4) {
-            # Managed enqueue
-            mq_enqueue(mq, pri, payload);
-        }
-        elif (op == 5) {
-            # Managed dequeue + complete
+        if (op <= 2) {
+            pq_enqueue(pq, queue_item_new(pri, token));
+            _model_push(pri, token);
+            token = token + 1;
+        } elif (op == 3) {
+            bad = _check_dequeue(pq, i);
+        } elif (op == 4) {
+            mq_enqueue(mq, pri, _fuzz_rand());
+        } else {
             var job = mq_dequeue(mq);
             if (job != 0) {
-                if (_fuzz_rand_range(0, 1) == 0) {
-                    mq_complete(mq, job);
-                } else {
-                    mq_fail(mq, job);
-                }
+                if (_fuzz_rand_range(0, 1) == 0) { mq_complete(mq, job); finished = finished + 1; }
+                else { mq_fail(mq, job); }
+                queue_item_free(job);
             }
         }
-
+        if (bad == 0 && pq_len(pq) != _model_total()) { bad = fuzz_fail("pq_len disagrees with the model", i); }
         i = i + 1;
     }
-
-    # Drain
-    while (pq_dequeue(pq) != 0) {}
-
-    return 0;
+    while (bad == 0 && _model_total() > 0) { bad = _check_dequeue(pq, iters); }
+    if (bad == 0 && pq_dequeue(pq) != 0) { bad = fuzz_fail("items left after the model drained", iters); }
+    if (bad == 0 && mq_total_completed(mq) != finished) {
+        bad = fuzz_fail("mq_total_completed disagrees with completions", iters);
+    }
+    return bad;
 }
 
 var r = main();

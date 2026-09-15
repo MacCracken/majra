@@ -1,5 +1,7 @@
-# Fuzz: pattern matching with random topic/pattern combinations
-# Fuzz target: pattern matching
+# Fuzz: pubsub topic/pattern matching. Every pair — random strings over the
+# alphabet [a b / + #] plus a fixed pool of realistic topics — must agree with a
+# frozen copy of the 2.8.0 matcher (the same oracle tests/test_core.tcyr uses).
+# Usage: build/fuzz_pubsub [iterations] [seed]
 
 include "lib/string.cyr"
 include "lib/fmt.cyr"
@@ -13,87 +15,129 @@ include "lib/chrono.cyr"
 include "lib/tagged.cyr"
 include "lib/fnptr.cyr"
 include "lib/thread.cyr"
-
 include "src/error.cyr"
 include "src/counter.cyr"
 include "src/envelope.cyr"
 include "src/pubsub.cyr"
+include "lib/args.cyr"
+include "fuzz/_fuzz_common.cyr"
 
-var _fuzz_state = 67890;
-
-fn _fuzz_rand() {
-    _fuzz_state = _fuzz_state * 6364136223846793005 + 1442695040888963407;
-    return _fuzz_state;
+# Frozen copy of the 2.8.0 strlen-bounded matches_pattern. Do not "fix" it:
+# equivalence is the property under test.
+fn _ref_matches(topic, pattern) {
+    var td = topic;
+    var tlen = strlen(topic);
+    var pd = pattern;
+    var plen = strlen(pattern);
+    var ti = 0;
+    var pi = 0;
+    while (pi < plen) {
+        var pc = load8(pd + pi);
+        if (pc == 35) {
+            var hash_aligned = 0;
+            if (pi == 0) { hash_aligned = 1; }
+            if (pi > 0 && load8(pd + pi - 1) == 47) { hash_aligned = 1; }
+            if (hash_aligned == 1 && pi + 1 == plen) { return 1; }
+        }
+        if (pc == 43) {
+            var plus_aligned = 0;
+            if (pi == 0) { plus_aligned = 1; }
+            if (pi > 0 && load8(pd + pi - 1) == 47) { plus_aligned = 1; }
+            var plus_ok = 0;
+            if (plus_aligned == 1) {
+                if (pi + 1 == plen) { plus_ok = 1; }
+                if (pi + 1 < plen && load8(pd + pi + 1) == 47) { plus_ok = 1; }
+            }
+            if (plus_ok == 1) {
+                while (ti < tlen) {
+                    if (load8(td + ti) == 47) { break; }
+                    ti = ti + 1;
+                }
+                pi = pi + 1;
+                if (pi < plen && ti < tlen) {
+                    if (load8(pd + pi) == 47 && load8(td + ti) == 47) {
+                        pi = pi + 1;
+                        ti = ti + 1;
+                    }
+                }
+                continue;
+            }
+        }
+        if (ti >= tlen) {
+            if (pc == 47 && pi + 2 == plen && load8(pd + pi + 1) == 35) { return 1; }
+            return 0;
+        }
+        if (pc != load8(td + ti)) { return 0; }
+        pi = pi + 1;
+        ti = ti + 1;
+    }
+    return ti >= tlen;
 }
 
-fn _fuzz_rand_range(lo, hi) {
-    var r = _fuzz_rand();
-    if (r < 0) { r = 0 - r; }
-    return lo + (r % (hi - lo + 1));
+var _pool[16];
+
+fn _init_pool() {
+    store64(&_pool, "a");
+    store64(&_pool + 8, "a/b/c");
+    store64(&_pool + 16, "events/created");
+    store64(&_pool + 24, "sensors/room/temp");
+    store64(&_pool + 32, "a/+");
+    store64(&_pool + 40, "a/+/c");
+    store64(&_pool + 48, "#");
+    store64(&_pool + 56, "events/#");
+    store64(&_pool + 64, "+/+/+");
+    store64(&_pool + 72, "+/room/+");
+    store64(&_pool + 80, "");
+    store64(&_pool + 88, "/");
+    store64(&_pool + 96, "a//b");
+    store64(&_pool + 104, "+/#");
+    store64(&_pool + 112, "a/b/c/d/e/f/g/h");
+    store64(&_pool + 120, "long/topic/with/many/segments/here");
+    return 0;
 }
 
-# Pre-built topic and pattern pools (avoids repeated allocation)
-var _topics[16];
-var _patterns[16];
-
-fn _init_pools() {
-    store64(&_topics, "a");
-    store64(&_topics + 8, "a/b");
-    store64(&_topics + 16, "a/b/c");
-    store64(&_topics + 24, "a/b/c/d");
-    store64(&_topics + 32, "events/created");
-    store64(&_topics + 40, "events/deleted");
-    store64(&_topics + 48, "sensors/temp");
-    store64(&_topics + 56, "sensors/room/temp");
-    store64(&_topics + 64, "x/y/z/w/v");
-    store64(&_topics + 72, "long/topic/with/many/segments/here");
-    store64(&_topics + 80, "z");
-    store64(&_topics + 88, "single");
-    store64(&_topics + 96, "a/b/c/d/e/f/g/h");
-    store64(&_topics + 104, "foo/bar");
-    store64(&_topics + 112, "test");
-    store64(&_topics + 120, "deep/nest/of/topics/goes/on");
-
-    store64(&_patterns, "a");
-    store64(&_patterns + 8, "a/+");
-    store64(&_patterns + 16, "a/+/c");
-    store64(&_patterns + 24, "#");
-    store64(&_patterns + 32, "events/#");
-    store64(&_patterns + 40, "+/+/+");
-    store64(&_patterns + 48, "sensors/+");
-    store64(&_patterns + 56, "+/room/+");
-    store64(&_patterns + 64, "x/#");
-    store64(&_patterns + 72, "+/+/+/+/+/+");
-    store64(&_patterns + 80, "m");
-    store64(&_patterns + 88, "+");
-    store64(&_patterns + 96, "a/b/c/d/e/f/g/h");
-    store64(&_patterns + 104, "foo/+");
-    store64(&_patterns + 112, "no/match/ever");
-    store64(&_patterns + 120, "+/+/#");
+# A random string of 0..12 bytes over "ab/+#" in a fresh 16-byte buffer.
+fn _rand_str(buf) {
+    var n = _fuzz_rand_range(0, 12);
+    var i = 0;
+    while (i < n) {
+        var c = _fuzz_rand_range(0, 4);
+        var ch = 97;
+        if (c == 1) { ch = 98; }
+        if (c == 2) { ch = 47; }
+        if (c == 3) { ch = 43; }
+        if (c == 4) { ch = 35; }
+        store8(buf + i, ch);
+        i = i + 1;
+    }
+    store8(buf + n, 0);
+    return buf;
 }
 
 fn main() {
     alloc_init();
     fl_init();
-
-    var iters = 1000;
-    _fuzz_state = time_now_ns();
-    _init_pools();
-
-    # Fuzz pattern matching
+    var iters = fuzz_setup("fuzz_pubsub", 1000);
+    _init_pool();
+    var tb = fl_alloc(16);
+    var pb = fl_alloc(16);
+    var bad = 0;
     var i = 0;
-    while (i < iters) {
-        var ti = _fuzz_rand_range(0, 15);
-        var pi = _fuzz_rand_range(0, 15);
-        var topic = load64(&_topics + ti * 8);
-        var pattern = load64(&_patterns + pi * 8);
-        matches_pattern(topic, pattern);
+    while (i < iters && bad == 0) {
+        var topic = 0;
+        var pattern = 0;
+        if (_fuzz_rand_range(0, 1) == 0) { topic = _rand_str(tb); }
+        else { topic = load64(&_pool + _fuzz_rand_range(0, 15) * 8); }
+        if (_fuzz_rand_range(0, 1) == 0) { pattern = _rand_str(pb); }
+        else { pattern = load64(&_pool + _fuzz_rand_range(0, 15) * 8); }
+        if (matches_pattern(topic, pattern) != _ref_matches(topic, pattern)) {
+            println(topic);
+            println(pattern);
+            bad = fuzz_fail("matches_pattern disagrees with the 2.8.0 oracle", i);
+        }
         i = i + 1;
     }
-
-    # Pub/sub publish removed — pattern matching is the fuzz target
-
-    return 0;
+    return bad;
 }
 
 var r = main();

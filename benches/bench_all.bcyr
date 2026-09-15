@@ -38,6 +38,17 @@ include "src/relay.cyr"
 include "src/barrier.cyr"
 include "src/transport.cyr"
 
+# mq_enqueue_4producers worker: arg = jobs to enqueue into the shared queue.
+var _bench_mq = 0;
+fn _bench_mq_producer(n) {
+    var j = 0;
+    while (j < n) {
+        mq_enqueue(_bench_mq, PRIORITY_NORMAL, j);
+        j = j + 1;
+    }
+    return 0;
+}
+
 fn main() {
     alloc_init();
     fl_init();
@@ -251,6 +262,37 @@ fn main() {
         counter_inc(ctr);
         i = i + 1;
     }
+    bench_batch_stop(b, N);
+    vec_push(benches, b);
+
+    # --- ManagedQueue full lifecycle: enqueue, dequeue, complete, release ---
+    var lmq = mq_new("bench", 0);
+    b = bench_new("mq_lifecycle");
+    bench_batch_start(b);
+    i = 0;
+    while (i < N) {
+        mq_enqueue(lmq, PRIORITY_NORMAL, i);
+        var job = mq_dequeue(lmq);
+        mq_complete(lmq, job);
+        queue_item_free(job);
+        i = i + 1;
+    }
+    bench_batch_stop(b, N);
+    vec_push(benches, b);
+
+    # --- ManagedQueue enqueue from 4 producer threads (per enqueue, wall clock;
+    # includes 4 thread spawns, ~0.4 ms of the ~6 ms batch) ---
+    _bench_mq = mq_new("bench4", 0);
+    b = bench_new("mq_enqueue_4producers");
+    bench_batch_start(b);
+    var t1 = thread_create(&_bench_mq_producer, N / 4);
+    var t2 = thread_create(&_bench_mq_producer, N / 4);
+    var t3 = thread_create(&_bench_mq_producer, N / 4);
+    var t4 = thread_create(&_bench_mq_producer, N / 4);
+    thread_join(t1);
+    thread_join(t2);
+    thread_join(t3);
+    thread_join(t4);
     bench_batch_stop(b, N);
     vec_push(benches, b);
 

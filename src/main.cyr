@@ -276,20 +276,35 @@ fn test_heartbeat() {
     var online = hb_online(ht);
     assert_eq(vec_len(online), 1, "hb online count");
 
-    # Re-registering an id frees the previous 40-byte NodeState (map_set only
-    # replaced the value and abandoned it). The freelist is LIFO per size
-    # class, so the next fl_alloc(40) must hand back exactly that block.
+    # Re-registering an id refreshes the node IN PLACE (2.8.2) and frees the
+    # scratch NodeState it built. The freelist is LIFO per size class, so the
+    # block re-register borrowed must come straight back.
     var htr = hb_tracker_new(heartbeat_config_default());
     hb_register(htr, "n1", 1);
     var old_ns = hb_get(htr, "n1");
     assert(old_ns != 0, "hb re-register: first NodeState");
+    var spare = fl_alloc(56);
+    fl_free(spare);
     hb_register(htr, "n1", 2);
-    var probe = fl_alloc(40);
-    assert_eq(probe, old_ns, "hb re-register freed previous NodeState");
+    var probe = fl_alloc(56);
+    assert_eq(probe, spare, "hb re-register frees its scratch NodeState");
     fl_free(probe);
-    assert(hb_get(htr, "n1") != old_ns, "hb re-register installed a new NodeState");
+    assert_eq(hb_get(htr, "n1"), old_ns, "hb re-register refreshes the node in place");
     assert_eq(load64(hb_get(htr, "n1") + 16), 2, "hb re-register new metadata");
     assert_eq(hb_len(htr), 1, "hb re-register keeps one node");
+
+    # 2.8.2: the tracker owns its key. Register from a buffer the caller then
+    # overwrites and frees; the node must still be found by content.
+    var hto = hb_tracker_new(heartbeat_config_default());
+    var buf = fl_alloc(16);
+    memcpy(buf, "node-owned", 11);
+    hb_register(hto, buf, 7);
+    memcpy(buf, "XXXX-XXXXX", 11);
+    fl_free(buf);
+    assert(hb_get(hto, "node-owned") != 0, "hb key survives the caller freeing its id buffer");
+    assert_eq(hb_heartbeat(hto, "node-owned"), 1, "hb heartbeat finds the owned key");
+    assert_eq(hb_deregister(hto, "node-owned"), 1, "hb deregister by content");
+    assert_eq(hb_len(hto), 0, "hb owned-key node removed");
 
     println("  heartbeat: ok");
 }

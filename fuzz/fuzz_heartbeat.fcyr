@@ -1,5 +1,11 @@
-# Fuzz: heartbeat operations with random sequences
-# Fuzz target: heartbeat operations
+# Fuzz: heartbeat trackers under random register / heartbeat / deregister /
+# sweep / list operations, checked against a membership model.
+#   Phase A (basic tracker): ids are stable pool strings, so every id pointer a
+#     sweep or list returns must be exactly the pointer that was registered.
+#   Phase B (concurrent tracker): each register passes an id in a scratch buffer
+#     that is overwritten and freed at once, so lookups by content prove the
+#     tracker owns its keys.
+# Usage: build/fuzz_heartbeat [iterations] [seed]
 
 include "lib/string.cyr"
 include "lib/fmt.cyr"
@@ -17,98 +23,166 @@ include "src/error.cyr"
 include "src/counter.cyr"
 include "src/envelope.cyr"
 include "src/heartbeat.cyr"
+include "lib/args.cyr"
+include "fuzz/_fuzz_common.cyr"
 
-var _fuzz_state = 24680;
+var NIDS = 32;
+var _ids = 0;      # NIDS stable id strings
+var _model = 0;    # NIDS flags: 1 = registered
 
-fn _fuzz_rand() {
-    _fuzz_state = _fuzz_state * 6364136223846793005 + 1442695040888963407;
-    return _fuzz_state;
+fn _id(n) { return load64(_ids + n * 8); }
+fn _in(n) { return load64(_model + n * 8); }
+fn _set(n, v) { store64(_model + n * 8, v); return 0; }
+
+fn _model_count() {
+    var c = 0;
+    var n = 0;
+    while (n < NIDS) { c = c + _in(n); n = n + 1; }
+    return c;
 }
 
-fn _fuzz_rand_range(lo, hi) {
-    var r = _fuzz_rand();
-    if (r < 0) { r = 0 - r; }
-    return lo + (r % (hi - lo + 1));
+# Index of the pool string at pointer p, or -1.
+fn _pool_index(p) {
+    var n = 0;
+    while (n < NIDS) {
+        if (_id(n) == p) { return n; }
+        n = n + 1;
+    }
+    return 0 - 1;
 }
 
-fn _fuzz_node_id(n) {
-    return str_data(str_from_int(n));
+# Eviction may remove nodes during a sweep; nodes must never appear from nowhere.
+fn _resync_basic(ht, step) {
+    var n = 0;
+    while (n < NIDS) {
+        var present = 0;
+        if (hb_get(ht, _id(n)) != 0) { present = 1; }
+        if (present == 1 && _in(n) == 0) { return fuzz_fail("a node appeared that was never registered", step); }
+        _set(n, present);
+        n = n + 1;
+    }
+    return 0;
+}
+
+fn _phase_basic(cfg, iters) {
+    var ht = hb_tracker_new(cfg);
+    var i = 0;
+    while (i < iters) {
+        var op = _fuzz_rand_range(0, 6);
+        var n = _fuzz_rand_range(0, NIDS - 1);
+        if (op <= 1) {
+            hb_register(ht, _id(n), i);
+            _set(n, 1);
+            if (hb_get(ht, _id(n)) == 0) { return fuzz_fail("registered node not found", i); }
+        } elif (op == 2) {
+            if (hb_heartbeat(ht, _id(n)) != _in(n)) { return fuzz_fail("hb_heartbeat disagrees with membership", i); }
+        } elif (op == 3) {
+            if (hb_deregister(ht, _id(n)) != _in(n)) { return fuzz_fail("hb_deregister disagrees with membership", i); }
+            _set(n, 0);
+        } elif (op == 4) {
+            var tr = hb_update_statuses(ht);
+            var k = 0;
+            while (k < vec_len(tr)) {
+                var pair = vec_get(tr, k);
+                if (_pool_index(load64(pair)) < 0) {
+                    return fuzz_fail("a transition returned an id pointer that was never registered", i);
+                }
+                if (load64(pair + 8) < 0 || load64(pair + 8) > 2) {
+                    return fuzz_fail("a transition carries an invalid status", i);
+                }
+                k = k + 1;
+            }
+            if (_resync_basic(ht, i) != 0) { return 1; }
+        } else {
+            var total = 0;
+            var s = 0;
+            while (s < 3) {
+                var lst = hb_list_by_status(ht, s);
+                var k2 = 0;
+                while (k2 < vec_len(lst)) {
+                    var ix = _pool_index(vec_get(lst, k2));
+                    if (ix < 0 || _in(ix) == 0) {
+                        return fuzz_fail("list_by_status returned an unregistered id pointer", i);
+                    }
+                    k2 = k2 + 1;
+                }
+                total = total + vec_len(lst);
+                s = s + 1;
+            }
+            if (total != hb_len(ht)) { return fuzz_fail("list_by_status totals disagree with hb_len", i); }
+        }
+        if (hb_len(ht) != _model_count()) { return fuzz_fail("hb_len disagrees with the model", i); }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _phase_concurrent(cfg, iters) {
+    var cht = chb_tracker_new(cfg);
+    var n = 0;
+    while (n < NIDS) { _set(n, 0); n = n + 1; }
+    var i = 0;
+    while (i < iters) {
+        var op = _fuzz_rand_range(0, 5);
+        var k = _fuzz_rand_range(0, NIDS - 1);
+        if (op <= 1) {
+            # Register from a scratch copy, then scribble over it and free it.
+            var len = strlen(_id(k));
+            var tmp = fl_alloc(len + 1);
+            memcpy(tmp, _id(k), len + 1);
+            chb_register(cht, tmp, i);
+            memset(tmp, 88, len);
+            fl_free(tmp);
+            _set(k, 1);
+        } elif (op == 2) {
+            if (chb_heartbeat(cht, _id(k)) != _in(k)) {
+                return fuzz_fail("chb_heartbeat disagrees with membership (key not owned?)", i);
+            }
+        } elif (op == 3) {
+            if (chb_deregister(cht, _id(k)) != _in(k)) {
+                return fuzz_fail("chb_deregister disagrees with membership", i);
+            }
+            _set(k, 0);
+        } elif (op == 4) {
+            chb_update_statuses(cht);
+            var m = 0;
+            while (m < NIDS) {
+                var c = chb_get(cht, _id(m));
+                if (c != 0 && _in(m) == 0) { return fuzz_fail("a node appeared that was never registered", i); }
+                if (c == 0) { _set(m, 0); } else { chb_node_free(c); }
+                m = m + 1;
+            }
+        } else {
+            var st = chb_fleet_stats(cht);
+            if (load64(st) != chb_len(cht)) { return fuzz_fail("fleet_stats total disagrees with chb_len", i); }
+            if (load64(st + 8) + load64(st + 16) + load64(st + 24) != load64(st)) {
+                return fuzz_fail("fleet_stats statuses do not sum to total", i);
+            }
+            fl_free(st);
+        }
+        if (chb_len(cht) != _model_count()) { return fuzz_fail("chb_len disagrees with the model", i); }
+        i = i + 1;
+    }
+    return 0;
 }
 
 fn main() {
     alloc_init();
     fl_init();
-
-    var iters = 1000;
-
-    _fuzz_state = time_now_ns();
-
-    # Random config
-    var suspect_ns = _fuzz_rand_range(1000000, 100000000);
-    var offline_ns = suspect_ns * 3;
-    var eviction = _fuzz_rand_range(0, 5);
-    var cfg = heartbeat_config_new(suspect_ns, offline_ns, eviction);
-
-    # Single-threaded tracker
-    var ht = hb_tracker_new(cfg);
-
-    var i = 0;
-    while (i < iters) {
-        var op = _fuzz_rand_range(0, 6);
-        var node = _fuzz_node_id(_fuzz_rand_range(0, 50));
-
-        if (op == 0 || op == 1) {
-            # Register
-            hb_register(ht, node, _fuzz_rand());
-        }
-        elif (op == 2 || op == 3) {
-            # Heartbeat
-            hb_heartbeat(ht, node);
-        }
-        elif (op == 4) {
-            # Deregister
-            hb_deregister(ht, node);
-        }
-        elif (op == 5) {
-            # Update statuses
-            hb_update_statuses(ht);
-        }
-        elif (op == 6) {
-            # List by status
-            hb_list_by_status(ht, _fuzz_rand_range(0, 2));
-        }
-
-        i = i + 1;
+    var iters = fuzz_setup("fuzz_heartbeat", 1000);
+    _ids = fl_alloc(NIDS * 8);
+    _model = fl_alloc(NIDS * 8);
+    var n = 0;
+    while (n < NIDS) {
+        store64(_ids + n * 8, str_cstr(str_from_int(1000 + n)));
+        _set(n, 0);
+        n = n + 1;
     }
-
-    # Concurrent tracker
-    var cht = chb_tracker_new(cfg);
-
-    i = 0;
-    while (i < iters) {
-        var op = _fuzz_rand_range(0, 5);
-        var node = _fuzz_node_id(_fuzz_rand_range(0, 30));
-
-        if (op == 0) {
-            chb_register(cht, node, _fuzz_rand());
-        }
-        elif (op == 1 || op == 2) {
-            chb_heartbeat(cht, node);
-        }
-        elif (op == 3) {
-            chb_deregister(cht, node);
-        }
-        elif (op == 4) {
-            chb_update_statuses(cht);
-        }
-        elif (op == 5) {
-            chb_fleet_stats(cht);
-        }
-
-        i = i + 1;
-    }
-
-    return 0;
+    # Short windows so sweeps really see SUSPECT / OFFLINE and evictions.
+    var suspect_ns = _fuzz_rand_range(10000, 2000000);
+    var cfg = heartbeat_config_new(suspect_ns, suspect_ns * 3, _fuzz_rand_range(0, 3));
+    if (_phase_basic(cfg, iters) != 0) { return 1; }
+    return _phase_concurrent(cfg, iters);
 }
 
 var r = main();

@@ -6,7 +6,7 @@ type: state
 
 # Current State — majra
 
-> **Last refresh**: 2026-09-15 (post-2.8.1) | **Refresh cadence**: every release (ideally bumped by the release post-hook).
+> **Last refresh**: 2026-09-15 (post-2.8.2) | **Refresh cadence**: every release (ideally bumped by the release post-hook).
 > **What this file is**: volatile state. The companion `CLAUDE.md` holds durable rules; this file holds whatever drifts release-to-release. Per [first-party-documentation § CLAUDE.md](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/first-party-documentation.md#claudemd), version numbers, test counts, consumer lists, and in-flight work all live here, not in `CLAUDE.md`.
 
 ---
@@ -15,9 +15,9 @@ type: state
 
 | File | Value | Source |
 |---|---|---|
-| `VERSION` | **2.8.1** | single source of truth |
+| `VERSION` | **2.8.2** | single source of truth |
 | `cyrius.cyml [package].version` | `${file:VERSION}` | reads `VERSION` |
-| Latest git tag | `2.8.0` (2.8.1 pending tag) | release workflow asserts `VERSION == tag` |
+| Latest git tag | `2.8.1` (2.8.2 pending tag) | release workflow asserts `VERSION == tag` |
 
 ## Toolchain
 
@@ -92,11 +92,11 @@ provisions. CI's `cyrius deps --verify` enforces match: 110 verified, 0 failed.
 
 | Target | Lines | Bytes |
 |---|---|---|
-| `dist/majra.cyr` (core) | 5,838 | 209 KB |
-| `dist/majra-signed.cyr` | 6,059 | 219 KB |
-| `dist/majra-admin.cyr` | 6,142 | 221 KB |
-| `dist/majra-backends.cyr` | 9,394 | 341 KB |
-| `src/` total | 10,180 lines across 23 files | — |
+| `dist/majra.cyr` (core) | 5,822 | 209 KB |
+| `dist/majra-signed.cyr` | 6,043 | 218 KB |
+| `dist/majra-admin.cyr` | 6,126 | 221 KB |
+| `dist/majra-backends.cyr` | 9,378 | 340 KB |
+| `src/` total | 10,179 lines across 23 files | — |
 
 > **Both hardening passes moved every bundle.** `src/` grew 5,813 → 7,166
 > (2.6.9) → 7,633 lines (2.6.10), much of it rationale comments recording what
@@ -108,14 +108,14 @@ provisions. CI's `cyrius deps --verify` enforces match: 110 verified, 0 failed.
 
 | Suite | Entry point | Assertions | Notes |
 |---|---|---|---|
-| Core | `src/main.cyr` (binary self-tests) | 199 | runs as part of `cyrius build` smoke. 150 → 153 at 2.7.3; 154 at 2.8.0; 199 at 2.8.1 (P(-1) sweep regressions) |
-| Expanded | `tests/test_core.tcyr` | 623 | broader unit coverage; grew across the 2.6.x relay/ratelimit/queue fix arc. 299 → 304 at 2.7.3 — the barrier checks now prove *blocking*, not a counter; 623 at 2.8.1 (P(-1) sweep; 621 under qemu, where one 47-second test is x86-only) |
+| Core | `src/main.cyr` (binary self-tests) | 203 | runs as part of `cyrius build` smoke. 150 → 153 at 2.7.3; 154 at 2.8.0; 199 at 2.8.1 (P(-1) sweep regressions); 203 at 2.8.2 (heartbeat owned keys) |
+| Expanded | `tests/test_core.tcyr` | 626 | broader unit coverage; grew across the 2.6.x relay/ratelimit/queue fix arc. 299 → 304 at 2.7.3 — the barrier checks now prove *blocking*, not a counter; 623 at 2.8.1 (P(-1) sweep; 621 under qemu, where one 47-second test is x86-only); 626 at 2.8.2 (relay dedup tombstone compaction; 624 under qemu) |
 | Backends | `tests/test_backends.tcyr` | 519 | redis / pg / ws / aes-gcm / signed_envelope / admin — 152 → 519 at 2.8.1 (P(-1) sweep: admin routes, SIGPIPE, ws handshake, encrypted-IPC salt/close) |
 | Patra-queue | `tests/test_patra_queue.tcyr` | 71 | separate entry — split out at 2.4.0 to stay under the then-16384 cc5 fixup cap (1,048,576 at the 6.6.4 pin); split kept as documented architecture |
 | **CI total** | | **637** | |
 | Live integration | `tests/test_live.tcyr` | 36 | requires Redis + PostgreSQL. **CI-only** — not runnable on a dev box without `redis:7-alpine` + `postgres:16-alpine` up; 7 Redis + 4 PostgreSQL categories |
-| Fuzz harnesses | `fuzz/*.fcyr` | 3 binaries | 500-iter run × 10s timeout per harness in CI |
-| Benchmarks | `benches/bench_all.bcyr` | 17 targets | history tracked via `bench-history.csv` (never committed — **not present on a fresh clone**, so cross-release comparison means rebuilding the prior pin, as 2.6.8 and 2.7.3 did) |
+| Fuzz harnesses | `fuzz/*.fcyr` | 3 binaries | model/oracle-checked since 2.8.2; `<harness> [iterations] [seed]`, seed printed; CI runs 500 iterations × 10 s timeout |
+| Benchmarks | `benches/bench_all.bcyr` | 19 targets (`mq_lifecycle` + `mq_enqueue_4producers` since 2.8.2) | history tracked via `bench-history.csv` (never committed — **not present on a fresh clone**, so cross-release comparison means rebuilding the prior pin, as 2.6.8 and 2.7.3 did) |
 | Examples | `examples/*.cyr` | 2 binaries | `managed_queue`, `pubsub_tiers`; CI builds + runs both |
 | Soak | `tests/soak/soak_*.cyr` (4 files) | queue 5k ops, pubsub 2k topics, relay dedup+evict, heartbeat 100×20 + auto-evict | on-demand; all 4 clean under 6.6.4 at 2.7.3, natively and under `qemu-aarch64`. `soak_queue`'s job_count assertion was rewritten at 2.6.9 — it had been asserting the unbounded-growth leak |
 | **aarch64, cross-built** | every entry above via `cyrius build --aarch64 --no-deps <entry> build/<name>_aarch64 && qemu-aarch64 ./build/<name>_aarch64` | same counts | **verified locally at 2.7.3; CI cross-builds the four suites (build-only gate), the run lane is still unwired.** All four suites + fuzz + soak + both examples pass. Expanded suite looped 100× under qemu and 200× natively with 0 crashes; core / backends / patra-queue 25× under qemu and 40× natively with 0 failures. At 2.7.2 the expanded suite SIGSEGV'd 14/200 natively (~7 %) from the `cbarrier_arrive_and_wait` bug. Needs `qemu-user` on the runner; recipe in [`../guides/testing.md`](../guides/testing.md) |
@@ -169,6 +169,7 @@ profiles (all three named sidecars list `sigil` — admin reaches it through
 
 | Tag | Date | Headline |
 |---|---|---|
+| 2.8.2 | 2026-09-15 | Heartbeat trackers own their node-id keys (transitions still return the caller's pointer). Relay dedup eviction compacts tombstones, with the helper shared in `counter.cyr`. Fuzz harnesses gain model oracles, CI's iteration arg and a printed seed. New `mq_lifecycle` / `mq_enqueue_4producers` benches; `soak_queue` at 500k ops. 1,419 assertions. |
 | 2.8.1 | 2026-09-15 | **P(-1) hardening sweep: 130 findings (3 critical, 17 high).** Encrypted IPC reused `(key, nonce)` across connections (per-handle salt, wire-compatible). Every admin route 404'd. Peers' disconnects SIGPIPE-killed the process. Relay dedup and pubsub keys were borrowed. Test binaries could exit 0 on failure. 1,412 assertions; cross-connection replay and 4 other API/wire items queued for 2.9.0. |
 | 2.8.0 | 2026-09-15 | **Namespace minor.** Error codes gain `MAJRA_ERR_*` (the bare `ERR_*` stay as deprecated same-value aliases until 3.0.0). `ws_send_text` / `ws_recv_frame` → `majra_ws_*` under the semver collision exception: next to `lib/ws.cyr`, the 2.7.3 backends bundle did not build under 6.6.4 because of an arity disagreement. The hoosh `ratelimit_*` issue was deleted, since hoosh renamed its own limiter on 2026-07-23. P(-1) sweep moved to 2.8.1. |
 | 2.7.3 | 2026-09-14 | **Raw x86_64 syscall numbers ran as DIFFERENT syscalls on aarch64-Linux — three independent failures in shipped code**, filed by daimon from a `cyrius build --aarch64` of the vendored bundle. cyrius's aarch64 backend renumbers 38 x86_64 syscall numbers at runtime (44 `ESYSXLAT` rows counting its six cyrius-private aliases) and passes every other number through verbatim, so `ipc_bind`'s fchmod, `uuid_generate`'s getrandom and the DAG backoff's nanosleep each did something else; only one of the three ever warned. majra now spells no *unrouted* syscall number in arch-neutral code (only `src/ipc.cyr`'s `ESYSXLAT`-routed networking vars and its per-arch sendto remain). The aarch64 run also surfaced an arch-independent `cbarrier_arrive_and_wait` defect as old as `src/barrier.cyr` (2.0.0) that two hardening passes walked past. Pin 6.6.2 → 6.6.4; `sys` joins `[deps].stdlib`; the lock is 110 sorted hashes plus a `cyrius\t6.6.4` trailer. Tests 629 → 637, mutation-verified; every suite, fuzz harness, soak and example also passes cross-built under `qemu-aarch64` (verified locally — CI gained a build-only cross-build gate and a raw-syscall grep gate; the run lane is still unwired). Benchmarks within noise of a 6.6.2 head-to-head. One agnos behaviour change (`time_now_ns` reads #95, not the tick-frozen #40). Full account: `CHANGELOG.md` § [2.7.3]. |

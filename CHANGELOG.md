@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.2] - 2026-09-15
+
+The three PATCH-safe items the 2.8.1 sweep left for the next patch. **1,419
+assertions** pass (core 203, expanded 626, backends 519, patra-queue 71). No
+public symbol changed.
+
+### Fixed
+
+- **Heartbeat trackers keyed their node map on the caller's id pointer.**
+  `map_set` stores keys by reference, so a caller that registered an id from a
+  per-request or reused buffer left the map probing freed or rewritten bytes.
+  The tracker now owns a copy of each key and frees it on deregister and on
+  eviction.
+  - Transition pairs and `hb_list_by_status` / `chb_list_by_status` still
+    return the caller's own id pointer. That is exactly what they returned
+    before, and a node evicted in the same sweep that reports it never hands
+    out a freed key.
+  - Re-registering an id refreshes the node in place, so a pointer from
+    `hb_get` stays valid. The node state grew from 40 to 56 bytes by appending
+    fields; offsets 0-32 and `chb_get`'s 40-byte copy are unchanged.
+- **Relay dedup eviction left hashmap tombstones that were never reclaimed.**
+  Under sender churn, a bounded table ran out of empty slots, and every new
+  sender's lookup probed the whole map under the relay mutex. Both eviction
+  paths now compact.
+  - The compaction helper moved to `src/counter.cyr` as `_majra_map_compact`,
+    shared by ratelimit, heartbeat and relay. Heartbeat's duplicate copy is
+    gone.
+
+### Changed — fuzz, bench, soak
+
+- **The fuzz harnesses now check results.**
+  - They read CI's iteration argument (`build/<harness> [iterations] [seed]`)
+    and print their seed, and an oracle violation exits 1 with the seed and
+    step.
+  - `fuzz_queue` models the priority queue: highest tier first, FIFO within a
+    tier, exact lengths.
+  - `fuzz_pubsub` checks `matches_pattern` against the frozen 2.8.0 matcher,
+    over random strings on `[a b / + #]` as well as a topic pool.
+  - `fuzz_heartbeat` models membership. One phase checks that every id pointer
+    a sweep or list returns is the one registered; the other registers from
+    buffers that are overwritten and freed at once.
+  - Each oracle was mutation-checked: a broken tier order, a broken `+`
+    match, and borrowed heartbeat keys each fail within 100 steps.
+- `benches/bench_all.bcyr` gains `mq_lifecycle` (enqueue, dequeue, complete,
+  release) and `mq_enqueue_4producers`.
+- `soak_queue` runs 100,000 rounds (500k operations, was 1,000) and releases
+  completed jobs.
+
 ## [2.8.1] - 2026-09-15
 
 The P(-1) hardening sweep, run against 2.8.0. It confirmed **130 findings: 3

@@ -105,9 +105,9 @@ cyrius build --aarch64 --no-deps src/main.cyr                build/majra_aarch64
 cyrius build --aarch64 --no-deps tests/test_core.tcyr        build/test_core_aarch64        && qemu-aarch64 ./build/test_core_aarch64
 cyrius build --aarch64 --no-deps tests/test_backends.tcyr    build/test_backends_aarch64    && qemu-aarch64 ./build/test_backends_aarch64
 cyrius build --aarch64 --no-deps tests/test_patra_queue.tcyr build/test_patra_queue_aarch64 && qemu-aarch64 ./build/test_patra_queue_aarch64
-cyrius build --aarch64 --no-deps benches/bench_all.bcyr      build/bench_all_aarch64        && qemu-aarch64 ./build/bench_all_aarch64   # all 17 targets print; the numbers are TCG's, not the CPU's
+cyrius build --aarch64 --no-deps benches/bench_all.bcyr      build/bench_all_aarch64        && qemu-aarch64 ./build/bench_all_aarch64   # all 19 targets print; the numbers are TCG's, not the CPU's
 
-for f in fuzz/*.fcyr; do            # each harness runs its built-in 1000 iterations — argv is ignored (CI's `500` is inert too)
+for f in fuzz/*.fcyr; do            # usage: <harness> [iterations] [seed]; the seed is printed, and an oracle failure exits 1 with it
   n=$(basename "$f" .fcyr); cyrius build --aarch64 --no-deps "$f" "build/${n}_aarch64" && qemu-aarch64 "./build/${n}_aarch64" || { echo "FUZZ CRASH: $n"; exit 1; }
 done
 for f in tests/soak/*.cyr examples/*.cyr; do
@@ -129,6 +129,13 @@ for i in $(seq 1 100); do
 done
 echo "SIGSEGV: $crashes / 100"
 ```
+
+⚠ **Run the loop sequentially, one suite at a time.** The suites use fixed
+paths — `/tmp/majra_patra_*.patra`, the `ipc_bind` socket paths,
+`/tmp/majra_ipc_mode_test.sock` — so concurrent copies of the same suite
+overwrite each other's files. A `xargs -P8` loop at 2.8.2 reported 24/25
+patra-queue failures and two SIGSEGVs that were pure self-interference; the same
+binaries were 0/25 run one at a time.
 
 2.7.3 baseline: `test_core` 0 / 100 under qemu and 0 / 200 native; core / backends / patra-queue 25× under qemu and 40× native, 0 failures. A non-zero count is a finding even when the plain run passes.
 

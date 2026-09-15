@@ -2624,6 +2624,45 @@ fn test_relay_prunes_closed_subscribers() {
     println("  relay_prunes_closed_subscribers: ok");
 }
 
+# 2.8.2: relay dedup drops left tombstones lib/hashmap.cyr never reclaims, so a
+# bounded table under sender churn ran out of empty slots and every new
+# sender's lookup probed the whole map under the relay mutex.
+fn test_relay_dedup_churn_reclaims_tombstones() {
+    # Cap-eviction path: max 8 senders, 3000 distinct senders, one message each.
+    var r = relay_new("recv");
+    relay_set_max_dedup(r, 8);
+    var seen = load64(r + 16);
+    var starved = 0;
+    var i = 0;
+    while (i < 3000) {
+        var inc = relay_receive_ex(r, relay_msg_new(1, _t8_intkey(900000 + i), 0, "t", i));
+        incoming_msg_free(inc);
+        if (_t8_empty_slots(seen) * 8 < map_cap(seen)) { starved = starved + 1; }
+        i = i + 1;
+    }
+    assert_eq(starved, 0, "relay churn: cap eviction keeps >= cap/8 empty slots");
+    assert_eq(relay_dedup_table_size(r), 8, "relay churn: table stays at its cap");
+
+    # Stale-sweep path: 8 new senders per round, swept after 1 ms.
+    var r2 = relay_new("recv2");
+    var seen2 = load64(r2 + 16);
+    var clean = 1;
+    var round = 0;
+    while (round < 100) {
+        var j = 0;
+        while (j < 8) {
+            incoming_msg_free(relay_receive_ex(r2, relay_msg_new(1, _t8_intkey(950000 + round * 100 + j), 0, "t", j)));
+            j = j + 1;
+        }
+        _majra_sleep_ns(1000000);
+        relay_evict_stale_dedup(r2, 0);
+        if (_t8_empty_slots(seen2) * 4 < map_cap(seen2)) { clean = 0; }
+        round = round + 1;
+    }
+    assert_eq(clean, 1, "relay churn: every stale sweep leaves >= cap/4 empty slots");
+    println("  relay_dedup_churn_reclaims_tombstones: ok");
+}
+
 fn test_relay_evict_stale_dedup() {
     var r = relay_new("n1");
     relay_receive(r, relay_msg_new(1, "n2", 0, "t", 1));
@@ -3543,6 +3582,7 @@ fn main() {
     test_relay_null_sender_and_node_id();
     test_relay_prunes_closed_subscribers();
     test_relay_evict_stale_dedup();
+    test_relay_dedup_churn_reclaims_tombstones();
     test_relay_threaded_stress();
 
     # Barrier

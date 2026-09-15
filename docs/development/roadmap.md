@@ -13,7 +13,6 @@ names the version it is aimed at and the condition that would move it.
 | Target | Theme |
 |---|---|
 | **2.9.0** | API and wire changes the 2.8.1 sweep deferred. |
-| **Next patch** | PATCH-safe leftovers from the 2.8.1 sweep. |
 | **2.8 line** | Larger capabilities, each taking the next MINOR as its trigger fires — or the next PATCH, where it adds no API. |
 | **Waiting on upstream** | Blocked outside this repo. Names the blocker. |
 | **Non-goals** | Deliberately out of scope, recorded so the question stops recurring. |
@@ -57,20 +56,6 @@ are in [`docs/audit/2026-09-15-audit.md`](../audit/2026-09-15-audit.md).
   receiver's own role (today it is `MAJRA_ERR_IPC`).
 
 **Trigger**: already met. **Aimed at**: 2.9.0.
-
-## Next patch
-
-These can be fixed without an API change; the 2.8.1 sweep didn't reach them:
-
-- Heartbeat node-id key ownership (`hb_register` / `chb_register` keep a
-  borrowed key; `fleet.cyr` already owns its copy).
-- Relay dedup eviction leaves hashmap tombstones that are never cleared (the
-  ratelimit maps got compaction in 2.8.1).
-- Fuzz harnesses: no oracle, an unprinted time-based seed, and CI's iteration
-  argument is ignored. Also add `mq_lifecycle` / multi-producer bench rows and a
-  longer `soak_queue`.
-
----
 
 ## 2.8 line — larger capabilities
 

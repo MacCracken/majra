@@ -36,12 +36,10 @@ include "src/ratelimit.cyr"
 include "src/heartbeat.cyr"
 include "src/queue.cyr"
 
-# ITERS cap at 1000 rounds × 5 jobs = 5k ops. Beyond that the bump
-# allocator exhausts because `str_from_int` in `_next_job_key` leaks
-# 24 bytes per enqueue (bump-allocated, no free). Soak revealed this;
-# a proper fix would route job keys through freelist allocation or
-# use i64 job IDs once the hashmap supports non-Str keys.
-var ITERS = 1000;
+# 100k rounds × 5 jobs = 500k ops. Job keys have been freelist-allocated since
+# 2.8.1 (they were bump-allocated, which capped this soak at 1000 rounds), and
+# each completed job is released, so memory is flat across the run.
+var ITERS = 100000;
 var BATCH = 5;
 
 fn main() {
@@ -73,6 +71,7 @@ fn main() {
                 return 1;
             }
             mq_complete(mq, job);
+            queue_item_free(job);
             i = i + 1;
         }
 
