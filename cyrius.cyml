@@ -11,22 +11,8 @@ cyrius = "6.6.4"
 entry = "src/main.cyr"
 output = "build/majra"
 
-# `[lib]` exists so `cyrius distlib` knows what to concatenate into
-# dist/majra.cyr for downstream consumers (daimon, AgnosAI, hoosh,
-# sutra, stiva). Order mirrors the include order in src/main.cyr —
-# critical for Cyrius single-pass forward-reference resolution.
-#
-# Note: backend modules (redis_backend, postgres_backend, ipc_encrypted,
-# ws) are intentionally excluded from the default profile. They are
-# compiled via separate test entry points (tests/test_backends.tcyr,
-# tests/test_live.tcyr). The `backends` profile bundles them for
-# consumers that want the full surface.
-#
-# Profiles (Cyrius 5.4.6+):
-#   cyrius distlib           → dist/majra.cyr           (default [lib], core engine)
-#   cyrius distlib signed    → dist/majra-signed.cyr    ([lib.signed],   +signed_envelope)
-#   cyrius distlib admin     → dist/majra-admin.cyr     ([lib.admin],    +admin endpoint)
-#   cyrius distlib backends  → dist/majra-backends.cyr  ([lib.backends], everything)
+# `cyrius distlib [<profile>]` bundles these into dist/majra[-<profile>].cyr.
+# Order must match src/main.cyr's include order (single-pass compiler).
 [lib]
 modules = [
     "src/error.cyr",
@@ -72,9 +58,6 @@ modules = [
     "src/patra_queue.cyr",
 ]
 
-# Admin-endpoint profile — core engine plus the HTTP admin/metrics
-# endpoint. For operators who want /health + /fleet + /ratelimit
-# observability without pulling the full network-backends set.
 [lib.admin]
 modules = [
     "src/error.cyr",
@@ -95,10 +78,6 @@ modules = [
     "src/admin.cyr",
 ]
 
-# Signed-envelope profile — core engine plus Ed25519-backed envelope
-# integrity. For consumers who want cross-node signature verification
-# without pulling in the network backends (redis/pg/ws). Requires
-# sigil (via lib/sigil.cyr) at consume-time.
 [lib.signed]
 modules = [
     "src/error.cyr",
@@ -119,28 +98,10 @@ modules = [
     "src/dag.cyr",
 ]
 
-# ── Dependencies ─────────────────────────────────────────────────
-# Cyrius-stdlib modules vendored into lib/ by `cyrius deps`. majra
-# includes them directly via `include "lib/<name>.cyr"`; the list
-# here mirrors the top of src/main.cyr so the manifest stays
-# load-bearing for CI completeness checks.
+# Load-bearing: auto-prepended by plain build/audit/bench and mirrored into dist/*.deps.
+# Folded modules (sigil, sakshi, …) go here — never as [deps.<name>] git blocks.
+# Why: docs/development/dependency-watch.md.
 [deps]
-# Stdlib modules majra's entry points reach. Under cyrius 6.x the whole
-# snapshot lands in ./lib/ via `cyrius lib sync --full` (file count in
-# docs/development/state.md), so this list does NOT decide what is on disk —
-# but it is still load-bearing (2.7.1 learned this the hard way): it is what
-# a plain `cyrius build` / `cyrius audit` / `cyrius bench` auto-prepends, what
-# a bare `cyrius lib sync` copies, and what `dist/majra.deps` mirrors. A
-# `--no-deps` build (CI) ignores it and uses each entry point's explicit
-# `include` lines, so a module named here must ALSO be included there.
-# (Don't add toolchain-internal modules like `slice`/`ct` here: they aren't
-# separately resolvable as [deps] stdlib names — `cyrius deps` errors with
-# "cannot read ./lib/<name>.cyr". lib sync provides them.)
-# (`sandhi` ships the HTTP server surface — folded into the cyrius
-# stdlib post-M6. `src/admin.cyr` consumes `HTTP_BAD_REQUEST` /
-# `sandhi_server_send_status` / `sandhi_server_run` from there. The
-# pre-6.x `http_send_status` / `http_server_run` names were renamed to
-# the `sandhi_server_*` namespace in the cyrius 6.x stdlib reorg.)
 stdlib = [
     "assert",
     "alloc",
@@ -170,46 +131,3 @@ stdlib = [
     "sys",
     "sigil",
 ]
-
-# sigil provides Ed25519 (`src/signed_envelope.cyr`) and AES-256-GCM
-# (`src/ipc_encrypted.cyr`) — 6 symbols total. The core engine has no crypto
-# surface; only the `signed` and `backends` profiles reach for it.
-#
-# sigil moved from `[deps.sigil]` into `[deps].stdlib` at the 6.5.35 pin —
-# the same move sakshi made at 6.5.18, and for the second half of the same
-# reason. 2.6.7 swept every `[deps.X]` where X is a folded stdlib module and
-# corrected sigil's *version* lag (3.12.7 → 3.12.9); it left the *declaration
-# shape*, which is the half that was actually load-bearing here.
-#
-# A git dep makes `distlib` reclassify the module out of the **stdlib leaves**,
-# so `dist/majra-signed.deps` and `dist/majra-backends.deps` shipped without
-# naming `sigil` at all. A consumer provisioning strictly from the sidecar got
-# undefined `ed25519_init` / `ed25519_sign` / `ed25519_verify` — and an
-# undefined fn compiles to a trapping `ud2`, so the build reported **OK** and
-# the failure landed at runtime as a SIGILL. Verified in a clean room before
-# the move, and closed by it: both sidecars now carry `sigil`.
-#
-# ⚠ Do NOT re-add a `[deps.sigil]` block to "pin" sigil independently. The pin
-# it would buy is worth less than the sidecar it costs; sigil tracks the
-# toolchain fold, and the cyrius pin is the knob that moves it.
-
-# sakshi moved from `[deps.sakshi]` into `[deps].stdlib` at the 6.5.18 pin.
-#
-# This was a *defensive* git pin, and its whole reason has gone away. It existed
-# because **sigil's own manifest declared `[deps.sakshi]`**, and `cyrius deps`
-# overlays a git dep's resolution on top of the `lib sync --full` snapshot — so
-# left implicit, sigil silently downgraded `lib/sakshi.cyr` on every build and
-# printed an unnamed "1 bundled lib(s) differ" shadow warning. Pinning it here
-# forward was the counter-move.
-#
-# **sigil 3.12.7 dropped its `[deps.sakshi]`** (sakshi is folded into the
-# toolchain stdlib now), so there is nothing left to counteract: `patra` reaches
-# majra as a stdlib module from the snapshot, not as a git dep, so its manifest
-# is never consulted. majra's own `src/` calls no sakshi symbol and none of the
-# four `dist/` bundles reference one.
-#
-# Declaring it in `[deps].stdlib` instead means it simply tracks the toolchain.
-# ⚠ Do NOT re-add a `[deps.sakshi]` here to "pin" it: on a library that
-# publishes bundles, a git dep makes `distlib` reclassify the module out of the
-# **stdlib leaves**, dropping it from the `.deps` sidecars and breaking
-# clean-room consumers. kavach hit exactly that.

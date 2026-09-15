@@ -37,6 +37,12 @@ rule, stated once here:
 
 ## Cyrius stdlib modules used
 
+**`cyrius.cyml [deps].stdlib` is load-bearing, even though `lib sync --full` puts the whole snapshot on disk.**
+- It is the list that a plain `cyrius build` / `cyrius audit` / `cyrius bench` auto-prepends, that a bare `cyrius lib sync` copies, and that `dist/majra.deps` mirrors. 2.7.1's build broke because `chrono` and `random` were missing from it.
+- A `--no-deps` build, which is what CI runs, ignores it and uses each entry point's explicit `include` lines, so a module named there must also be included there.
+- Toolchain-internal modules (`slice`, `ct`, …) don't belong in the list: they aren't resolvable as `[deps]` names, and `cyrius deps` fails with `cannot read ./lib/<name>.cyr`.
+- Folded modules (sigil, sakshi, patra, sandhi) are declared here, never as `[deps.<name>]` git blocks. See § First-party deps for why.
+
 | Module | Purpose | Profiles |
 |--------|---------|----------|
 | `string.cyr`     | C string operations (strlen, streq, memcpy, memset) | all |

@@ -56,8 +56,8 @@ cyrius deny src/main.cyr                               # syscall/network policy 
 >
 > **Since 2.6.8 majra declares no git deps at all** — sigil was the last one,
 > and it moved into `[deps].stdlib` because a git dep on a *folded* stdlib
-> module makes `distlib` drop it from the published `.deps` sidecars. See the
-> ⚠ notes in `cyrius.cyml [deps]`; do not re-add a `[deps.<folded-module>]`
+> module makes `distlib` drop it from the published `.deps` sidecars. See
+> [`dependency-watch.md`](docs/development/dependency-watch.md); do not re-add a `[deps.<folded-module>]`
 > block to "pin" one.
 
 Full test matrix + soak + fuzz + bench commands in [`docs/guides/testing.md`](docs/guides/testing.md).
