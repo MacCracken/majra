@@ -22,7 +22,12 @@ enum TargetKind {
 #   offset 16: from      (i64) — Str pointer (sender ID)
 #   offset 24: to_kind   (i64) — TargetKind enum value
 #   offset 32: to_name   (i64) — Str pointer (node/topic name, 0 for broadcast)
-#   offset 40: payload   (i64) — pointer to payload data (Str or json)
+#   offset 40: payload   (i64) — pointer to payload data (opaque to majra).
+#                                ⚠ The struct has no payload length, so
+#                                signed_envelope reads it from a Str header:
+#                                an envelope that will be SIGNED must carry a
+#                                Str (or 0) in from, to_name and payload —
+#                                never a cstr, an integer or a json object.
 #   offset 48: timestamp (i64) — nanoseconds since CLOCK_MONOTONIC
 
 # Get current monotonic time in nanoseconds.
@@ -163,7 +168,7 @@ fn uuid_generate() {
 # from_str: Str pointer for sender ID
 # to_kind: TargetKind enum value
 # to_name: Str pointer for target name (0 for broadcast)
-# payload: pointer to payload data
+# payload: pointer to payload data (must be a Str or 0 if it will be signed)
 fn envelope_new(from_str, to_kind, to_name, payload) {
     var e = fl_alloc(56);
     var hi = uuid_generate();

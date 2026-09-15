@@ -34,6 +34,26 @@ var _SYS_BIND = 49;
 var _SYS_LISTEN = 50;
 var _SOCK_STREAM = 1;
 var _AF_UNIX = 1;
+# shutdown(2): 48 is also an ESYSXLAT row (48→210). On agnos 48 is
+# SYS_SOCK_SEND, so `_ipc_shutdown` never issues it there.
+var _SYS_SHUTDOWN = 48;
+var _SHUT_RDWR = 2;
+# Linux SOCK_CLOEXEC — same value on both Linux arches. Darwin rejects it in
+# socket(2)'s type argument, so macOS sets FD_CLOEXEC with fcntl instead.
+var _SOCK_CLOEXEC = 524288;
+
+# ⚠ sendto(2) is NOT an ESYSXLAT row: raw 44 is fstatfs on aarch64, so it is
+# spelled per arch (sakshi does the same). Used only on Linux — see
+# `_ipc_write_full`.
+#ifdef CYRIUS_TARGET_LINUX
+#ifdef CYRIUS_ARCH_X86
+var _IPC_SYS_SENDTO = 44;
+#endif
+#ifdef CYRIUS_ARCH_AARCH64
+var _IPC_SYS_SENDTO = 206;
+#endif
+#endif
+var _MSG_NOSIGNAL = 16384;
 
 # Largest frame either direction will accept or emit. The receive side always
 # had this cap; the send side did not, so majra could emit a frame that every
@@ -104,6 +124,101 @@ fn _sockaddr_un_len(path) {
     return 2 + strlen(path) + 1;
 }
 
+# macOS-only hardening for a fresh socket fd: FD_CLOEXEC (Darwin has no
+# SOCK_CLOEXEC) and SO_NOSIGPIPE (Darwin has no MSG_NOSIGNAL).
+fn _ipc_fd_harden(fd) {
+    #ifdef CYRIUS_TARGET_MACOS
+    syscall(SYS_FCNTL, fd, 2, 1);                       # F_SETFD FD_CLOEXEC
+    var one[8];
+    memset(&one, 0, 8);
+    store32(&one, 1);
+    sys_setsockopt(fd, 65535, 4130, &one, 4);           # SOL_SOCKET, SO_NOSIGPIPE
+    #endif
+    return 0;
+}
+
+# socket(AF_UNIX, SOCK_STREAM) that is close-on-exec.
+#
+# ⚠ Without it an exec'd child (a sandboxed tool, a helper) inherited the
+# listener and every live connection: it could accept() connections meant for
+# the server — and connecting IS authenticating here — around the 0600 mode.
+fn _ipc_socket() {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return -1;
+    #endif
+    #ifdef CYRIUS_TARGET_LINUX
+    return syscall(_SYS_SOCKET, _AF_UNIX, _SOCK_STREAM | _SOCK_CLOEXEC, 0);
+    #endif
+    #ifdef CYRIUS_TARGET_MACOS
+    var fd = syscall(_SYS_SOCKET, _AF_UNIX, _SOCK_STREAM, 0);
+    if (fd >= 0) { _ipc_fd_harden(fd); }
+    return fd;
+    #endif
+    #ifdef CYRIUS_TARGET_WIN
+    return -1;
+    #endif
+}
+
+# shutdown(fd, SHUT_RDWR). Wakes a thread parked in read(2)/write(2) on `fd`
+# and fails every later I/O on it, WITHOUT releasing the descriptor number —
+# which is what makes it safe to call while another thread may still hold that
+# number. agnos has no AF_UNIX sockets and no half-close: no-op there.
+fn _ipc_shutdown(fd) {
+    if (fd < 0) { return 0; }
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return syscall(_SYS_SHUTDOWN, fd, _SHUT_RDWR);
+    #endif
+}
+
+# Make `path` bindable. Returns 0 when nothing is there or a STALE socket was
+# removed, -1 when the path must not be touched.
+#
+# ⚠ ipc_bind used to unlink the path unconditionally. A misconfigured path
+# naming a regular file deleted that file; a second instance binding a LIVE
+# server's path unlinked its inode and silently took over every new client,
+# orphaning the first server with no error on either side. Now: not a socket
+# → refuse; a socket that accepts a connection → live, refuse; only a refused
+# (or vanished) connect proves it stale. The lstat→unlink window is a TOCTOU
+# accepted for this purpose. Anything unexpected fails closed. A live server
+# refused this way sees one connection that closes without sending a byte.
+fn _ipc_clear_stale(path, sa) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return -1;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    var st = fl_alloc(256);
+    if (st == 0) { return -1; }
+    memset(st, 0, 256);
+    var lr = sys_lstat(path, st);
+    var mode = load32(st + STAT_MODE);
+    fl_free(st);
+    if (lr < 0) { return 0; }                       # absent (or bind will say why)
+    if ((mode & 61440) != 49152) { return -1; }     # S_IFMT != S_IFSOCK
+    var probe = -1;
+    #ifdef CYRIUS_TARGET_LINUX
+    # Non-blocking (SOCK_NONBLOCK 2048): a live listener with a full backlog
+    # would otherwise park this connect until it accepts. -EAGAIN counts as live.
+    probe = syscall(_SYS_SOCKET, _AF_UNIX, _SOCK_STREAM | _SOCK_CLOEXEC | 2048, 0);
+    #endif
+    #ifndef CYRIUS_TARGET_LINUX
+    probe = _ipc_socket();
+    #endif
+    if (probe < 0) { return -1; }
+    var cr = syscall(_SYS_CONNECT, probe, sa, _sockaddr_un_len(path));
+    syscall(SYS_CLOSE, probe);
+    var refused = -111;                             # Linux ECONNREFUSED
+    #ifdef CYRIUS_TARGET_MACOS
+    refused = -61;
+    #endif
+    if (cr != refused && cr != -2) { return -1; }   # live, or unknown: keep it
+    sys_unlink(path);
+    return 0;
+    #endif
+}
+
 # IPC Server: bind to a Unix socket path, listen.
 # agnos has no AF_UNIX domain sockets — the whole ipc transport fail-closes
 # there (callers fall back to an in-process or network path). Guarding the
@@ -117,7 +232,7 @@ fn ipc_bind(path) {
     #ifndef CYRIUS_TARGET_AGNOS
     var sa = _sockaddr_un(path);
     if (sa == 0) { return Err(MAJRA_ERR_IPC); }
-    var fd = syscall(_SYS_SOCKET, _AF_UNIX, _SOCK_STREAM, 0);
+    var fd = _ipc_socket();
     if (fd < 0) { fl_free(sa); return Err(MAJRA_ERR_IPC); }
 
     # ⚠ fchmod MUST happen BEFORE bind, and 2.6.9 had it after.
@@ -146,7 +261,11 @@ fn ipc_bind(path) {
         return Err(MAJRA_ERR_IPC);
     }
 
-    sys_unlink(path);
+    if (_ipc_clear_stale(path, sa) != 0) {
+        syscall(SYS_CLOSE, fd);
+        fl_free(sa);
+        return Err(MAJRA_ERR_IPC);
+    }
     var ret = syscall(_SYS_BIND, fd, sa, _sockaddr_un_len(path));
     fl_free(sa);
     # Every one of these paths used to leak both the fd and the sockaddr.
@@ -163,8 +282,14 @@ fn ipc_accept(server_fd) {
     return Err(MAJRA_ERR_IPC);
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var fd = syscall(_SYS_ACCEPT, server_fd, 0, 0);
+    # accept4(SOCK_CLOEXEC): the accepted fd must not leak into exec'd children
+    # any more than the listener (see `_ipc_socket`). sys_accept4 composes it
+    # from accept + fcntl on macOS.
+    var fd = sys_accept4(server_fd, 0, 0, _SOCK_CLOEXEC);
     if (fd < 0) { return Err(MAJRA_ERR_IPC); }
+    #ifdef CYRIUS_TARGET_MACOS
+    _ipc_fd_harden(fd);
+    #endif
     return Ok(fd);
     #endif
 }
@@ -177,7 +302,7 @@ fn ipc_connect(path) {
     #ifndef CYRIUS_TARGET_AGNOS
     var sa = _sockaddr_un(path);
     if (sa == 0) { return Err(MAJRA_ERR_IPC); }
-    var fd = syscall(_SYS_SOCKET, _AF_UNIX, _SOCK_STREAM, 0);
+    var fd = _ipc_socket();
     if (fd < 0) { fl_free(sa); return Err(MAJRA_ERR_IPC); }
     var ret = syscall(_SYS_CONNECT, fd, sa, _sockaddr_un_len(path));
     fl_free(sa);
@@ -188,10 +313,25 @@ fn ipc_connect(path) {
 
 # Write exactly `len` bytes, retrying on EINTR (-4) and on short writes.
 # A signal used to tear down the connection mid-frame.
+#
+# ⚠ On Linux this is sendto(MSG_NOSIGNAL), not write(2). A plain write to a
+# socket whose peer has gone raises SIGPIPE, whose default action KILLS the
+# process — so one local client that connects and leaves took down a whole
+# ipc_accept daemon instead of getting Err(MAJRA_ERR_IPC). The library does not
+# install SIG_IGN process-wide. A non-socket fd (-ENOTSOCK) falls back to
+# write(2); macOS sets SO_NOSIGPIPE on the sockets majra creates instead.
 fn _ipc_write_full(fd, buf, len) {
     var total = 0;
+    var use_send = 1;
     while (total < len) {
-        var w = syscall(SYS_WRITE, fd, buf + total, len - total);
+        var w = -88;
+        #ifdef CYRIUS_TARGET_LINUX
+        if (use_send == 1) {
+            w = syscall(_IPC_SYS_SENDTO, fd, buf + total, len - total, _MSG_NOSIGNAL, 0, 0);
+            if (w == -88) { use_send = 0; }         # ENOTSOCK: a pipe or file
+        }
+        #endif
+        if (w == -88) { w = syscall(SYS_WRITE, fd, buf + total, len - total); }
         if (w == -4) { w = 0; }
         elif (w <= 0) { return -1; }
         total = total + w;

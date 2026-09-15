@@ -231,6 +231,21 @@ fn test_ratelimit() {
     assert_eq(sliding_window_total_rejected(sw), 1, "sw total_rejected");
     assert_eq(sliding_window_key_count(sw), 1, "sw key_count");
 
+    # A null limiter or key fails closed. ratelimit_check(rl, 0) reached
+    # strlen(0) via map_get and SIGSEGVed the process (2.8.1).
+    var rln = ratelimit_new(1000, 1);
+    assert_eq(ratelimit_check(rln, 0), 0, "rl null key rejected");
+    assert_eq(ratelimit_check(0, "k"), 0, "null rl rejected");
+    assert_eq(ratelimit_key_count(rln), 0, "rl null key created no bucket");
+    var swn = sliding_window_new(1, 1000000000);
+    assert_eq(sliding_window_check(swn, 0), 0, "sw null key rejected");
+    assert_eq(sliding_window_check(0, "k"), 0, "null sw rejected");
+    assert_eq(sliding_window_key_count(swn), 0, "sw null key created no entry");
+    assert_eq(ratelimit_evict_stale(0, 0), 0, "null rl evict");
+    assert_eq(sliding_window_evict_stale(0, 0), 0, "null sw evict");
+    # The guards must not have eaten a real key's first check.
+    assert_eq(ratelimit_check(rln, "k"), 1, "rl real key still allowed after null probes");
+
     println("  ratelimit: ok");
 }
 
@@ -260,6 +275,21 @@ fn test_heartbeat() {
     # List by status
     var online = hb_online(ht);
     assert_eq(vec_len(online), 1, "hb online count");
+
+    # Re-registering an id frees the previous 40-byte NodeState (map_set only
+    # replaced the value and abandoned it). The freelist is LIFO per size
+    # class, so the next fl_alloc(40) must hand back exactly that block.
+    var htr = hb_tracker_new(heartbeat_config_default());
+    hb_register(htr, "n1", 1);
+    var old_ns = hb_get(htr, "n1");
+    assert(old_ns != 0, "hb re-register: first NodeState");
+    hb_register(htr, "n1", 2);
+    var probe = fl_alloc(40);
+    assert_eq(probe, old_ns, "hb re-register freed previous NodeState");
+    fl_free(probe);
+    assert(hb_get(htr, "n1") != old_ns, "hb re-register installed a new NodeState");
+    assert_eq(load64(hb_get(htr, "n1") + 16), 2, "hb re-register new metadata");
+    assert_eq(hb_len(htr), 1, "hb re-register keeps one node");
 
     println("  heartbeat: ok");
 }
@@ -366,6 +396,90 @@ fn test_queue() {
     mq_complete(mq, dq1);
     assert_eq(mq_running_count(mq), 0, "mq running 0 after complete");
     assert_eq(mq_total_completed(mq), 1, "mq completed 1");
+
+    # Null and keyless items are no-ops, never a fault. mq_dequeue returns 0
+    # both when empty and at the concurrency cap, so
+    # `mq_complete(mq, mq_dequeue(mq))` read address 0x20 and SIGSEGVed.
+    var mqn = mq_new("ng", 1);
+    mq_complete(mqn, 0);
+    mq_fail(mqn, 0);
+    mq_cancel(mqn, 0);
+    mq_complete(0, 0);
+    mq_complete(mqn, mq_dequeue(mqn));
+    assert_eq(mq_running_count(mqn), 0, "mq null terminal on empty queue is a no-op");
+    var na = mq_enqueue(mqn, PRIORITY_NORMAL, 1);
+    var nb = mq_enqueue(mqn, PRIORITY_NORMAL, 2);
+    var nd = mq_dequeue(mqn);
+    assert_eq(nd, na, "mq capped: first dequeue");
+    assert_eq(mq_running_count(mqn), 1, "mq capped: one running");
+    var ncap = mq_dequeue(mqn);
+    assert_eq(ncap, 0, "mq capped: dequeue at cap returns 0");
+    mq_complete(mqn, ncap);
+    mq_fail(mqn, ncap);
+    # A null queue with a live item is a no-op too.
+    mq_complete(0, nd);
+    mq_fail(0, nd);
+    mq_cancel(0, nb);
+    assert_eq(mq_running_count(mqn), 1, "mq null terminal at cap is a no-op");
+    # Double terminal on the same item: only the first counts.
+    mq_complete(mqn, nd);
+    mq_complete(mqn, nd);
+    mq_fail(mqn, nd);
+    mq_cancel(mqn, nd);
+    assert_eq(mq_running_count(mqn), 0, "mq double terminal no-op");
+    assert_eq(mq_total_completed(mqn), 1, "mq double complete counted once");
+    # A bare queue_item_new has no job key; it is not tracked by any queue.
+    # hash_str_v(0) is 0, so the lookup probes from slot 0 and faults only when
+    # it meets a live entry to key-compare against — so get slot 0 of a jobs map
+    # live first, making that deterministic rather than 1-in-16 per hash seed.
+    # At most 12 jobs per queue, so its 16-slot map never grows (a grow rehashes
+    # and can empty slot 0 again); a queue that misses is drained and replaced.
+    # P(all 32 queues miss) is ~0.25^32.
+    var mqk = 0;
+    var nk = 0;
+    var nq = 0;
+    var slot0 = 0;
+    while (slot0 == 0 && nq < 32) {
+        mqk = mq_new("kl", 0);
+        nk = 0;
+        while (slot0 == 0 && nk < 12) {
+            mq_enqueue(mqk, PRIORITY_NORMAL, nk);
+            nk = nk + 1;
+            slot0 = load64(map_entries(load64(mqk + 8)) + 16) == 1;
+        }
+        if (slot0 == 0) {
+            var nx = mq_take_queued(mqk);
+            while (nx != 0) {
+                queue_item_free(nx);
+                nx = mq_take_queued(mqk);
+            }
+        }
+        nq = nq + 1;
+    }
+    assert_eq(slot0, 1, "mq keyless probe: jobs slot 0 live");
+    var nraw = queue_item_new(PRIORITY_NORMAL, 5);
+    mq_complete(mqk, nraw);
+    mq_fail(mqk, nraw);
+    mq_cancel(mqk, nraw);
+    mq_complete(mqn, nraw);
+    mq_cancel(mqn, nraw);
+    queue_item_free(nraw);
+    assert_eq(mq_job_count(mqk), nk, "mq keyless item left every tracked job alone");
+    assert_eq(mq_running_count(mqn), 0, "mq keyless item terminal no-op");
+    assert_eq(mq_job_count(mqn), 1, "mq keyless item left the queued job alone");
+    var nt = mq_take_queued(mqk);
+    while (nt != 0) {
+        queue_item_free(nt);
+        nt = mq_take_queued(mqk);
+    }
+    assert_eq(mq_job_count(mqk), 0, "mq keyless probe queue drained");
+    var nd2 = mq_dequeue(mqn);
+    assert_eq(nd2, nb, "mq second job dequeues after the no-ops");
+    mq_complete(mqn, nd2);
+    assert_eq(mq_running_count(mqn), 0, "mq running 0 after second complete");
+    assert_eq(mq_total_completed(mqn), 2, "mq completed 2");
+    queue_item_free(nd);
+    queue_item_free(nd2);
 
     println("  queue: ok");
 }
@@ -566,6 +680,44 @@ fn test_barrier() {
     var cr2 = cbarrier_arrive(cbs, "csync", "y");
     assert_eq(load64(cr2), BARRIER_RELEASED, "cbarrier released");
 
+    # Set bookkeeping after release. cbarrier_complete runs _cbarrier_cancel on
+    # the displaced state, which must leave an already-released flag at 1.
+    var cstate = map_get(load64(cbs), "csync");
+    assert(cstate != 0, "cbarrier state present before complete");
+    assert_eq(cbarrier_len(cbs), 1, "cbarrier_len 1");
+    assert_eq(cbarrier_complete(cbs, "csync"), 1, "cbarrier_complete found");
+    assert_eq(cbarrier_is_empty(cbs), 1, "cbarrier set empty after complete");
+    assert_eq(load64(cstate + 24), 1, "cbarrier complete keeps a released state released");
+    assert_eq(cbarrier_complete(cbs, "csync"), 0, "second cbarrier_complete is 0");
+    var bsl = barrier_set_new();
+    barrier_create(bsl, "l", cp);
+    assert_eq(barrier_set_len(bsl), 1, "barrier_set_len 1");
+    assert_eq(barrier_complete(bsl, "l"), 1, "barrier_complete found");
+    assert_eq(barrier_set_len(bsl), 0, "barrier_set_len 0");
+
+    # Duplicate participants are deduplicated on create. With ['a','a','b'],
+    # force('a') removed only the first 'a', so the barrier never released and
+    # `expected` reported 3 — a count no arrival could reach.
+    var dp = vec_new();
+    vec_push(dp, "a");
+    vec_push(dp, "a");
+    vec_push(dp, "b");
+    var bsd = barrier_set_new();
+    barrier_create(bsd, "dup", dp);
+    var rdb = barrier_arrive(bsd, "dup", "b");
+    assert_eq(load64(rdb), BARRIER_WAITING, "dup participants: waiting after b");
+    assert_eq(load64(rdb + 16), 2, "duplicate participants are deduplicated");
+    assert_eq(load64(barrier_force(bsd, "dup", "a")), BARRIER_RELEASED,
+      "force(a) releases with duplicate participants");
+    assert_eq(vec_len(dp), 3, "caller's participant vec untouched");
+    var cbd = cbarrier_set_new();
+    cbarrier_create(cbd, "dup", dp);
+    var crdb = cbarrier_arrive(cbd, "dup", "b");
+    assert_eq(load64(crdb), BARRIER_WAITING, "cbarrier dup participants: waiting after b");
+    assert_eq(load64(crdb + 16), 2, "cbarrier duplicate participants are deduplicated");
+    assert_eq(load64(cbarrier_force(cbd, "dup", "a")), BARRIER_RELEASED,
+      "cbarrier force(a) releases with duplicate participants");
+
     println("  barrier: ok");
 }
 
@@ -702,4 +854,4 @@ fn main() {
 }
 
 var r = main();
-syscall(SYS_EXIT, r);
+sys_exit_group(r);

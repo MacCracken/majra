@@ -48,6 +48,88 @@ fn _ratelimit_key_own(key) {
     return p;
 }
 
+# Refill (tokens_x1000) earned over `elapsed_ns` at `rate_x1000` tokens/s.
+# Shared by ratelimit_check and the read-only projections (eviction, per-key
+# stats) so all three agree on what a bucket holds.
+#
+# `elapsed_sec * rate_x1000` and `elapsed_rem * rate_x1000` both overflow i64
+# for a high rate; each arm divides first where it must.
+# ⚠ Past burst/rate whole seconds the refill clamps to burst anyway, so return
+# burst there BEFORE the multiply — a high rate after a long idle wrapped it
+# negative and stored a negative token count.
+# ⚠ Above rate_x1000 9e9 the old `elapsed_rem / 1000000000 * rate_x1000` was
+# ALWAYS 0 (elapsed_rem < 1e9), so the whole sub-second refill was lost and a
+# 10M/s limiter admitted only its burst per second. Scale the rate down, not
+# the elapsed time: exact to 1/1000 token, no wrap below ~9.2e18.
+fn _ratelimit_refill(rate_x1000, burst_x1000, elapsed_ns) {
+    if (elapsed_ns <= 0 || rate_x1000 <= 0) { return 0; }
+    var elapsed_sec = elapsed_ns / 1000000000;
+    if (elapsed_sec > burst_x1000 / rate_x1000) { return burst_x1000; }
+    var elapsed_rem = elapsed_ns - elapsed_sec * 1000000000;
+    var rem_refill = 0;
+    if (rate_x1000 > 9000000000000) {
+        rem_refill = elapsed_rem / 1000 * (rate_x1000 / 1000000);
+    } elif (rate_x1000 > 9000000000) {
+        rem_refill = elapsed_rem * (rate_x1000 / 1000) / 1000000;
+    } else {
+        rem_refill = elapsed_rem * rate_x1000 / 1000000000;
+    }
+    return elapsed_sec * rate_x1000 + rem_refill;
+}
+
+# Tokens (x1000) `bucket_ptr` would hold at `now`, capped at burst. Read-only:
+# neither the bucket nor its clock is touched. Caller holds the limiter mutex.
+fn _ratelimit_projected(rl, bucket_ptr, now) {
+    var burst_x1000 = load64(rl + 8);
+    var elapsed_ns = now - load64(bucket_ptr + 8);
+    if (elapsed_ns < 0) { elapsed_ns = 0; }
+    var tokens = load64(bucket_ptr) + _ratelimit_refill(load64(rl), burst_x1000, elapsed_ns);
+    if (tokens > burst_x1000) { tokens = burst_x1000; }
+    return tokens;
+}
+
+# Rebuild `m` in place when tombstones have eaten its empty slots. `empties` is
+# the count of state-0 slots the caller's sweep walk just saw. Returns 1 if it
+# rebuilt.
+#
+# ⚠ lib/hashmap.cyr grows on LIVE count only and never rehashes tombstones out,
+# and `_map_find` stops only at an empty slot — so under key churn the empties
+# trend to zero and every miss (each new client's first check) probes all `cap`
+# slots while holding the limiter mutex. Below cap/4 empties, copy the live
+# pairs out, map_clear, and re-insert: the live count already fit this capacity,
+# so no grow and no bump allocation. Key/value pointers are re-stored as-is.
+fn _rl_map_compact(m, empties) {
+    var cap = map_cap(m);
+    if (empties * 4 >= cap) { return 0; }
+    var live = map_size(m);
+    if (live == 0) {
+        map_clear(m);
+        return 1;
+    }
+    var scratch = fl_alloc(live * 16);
+    if (scratch == 0) { return 0; }
+    var entries = map_entries(m);
+    var n = 0;
+    var i = 0;
+    while (i < cap) {
+        var ep = entries + i * 24;
+        if (load64(ep + 16) == 1 && n < live) {
+            store64(scratch + n * 16, load64(ep));
+            store64(scratch + n * 16 + 8, load64(ep + 8));
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    map_clear(m);
+    i = 0;
+    while (i < n) {
+        map_set(m, load64(scratch + i * 16), load64(scratch + i * 16 + 8));
+        i = i + 1;
+    }
+    fl_free(scratch);
+    return 1;
+}
+
 # Check if a request for key is allowed. Consumes one token if yes.
 #
 # ⚠ `key` is a **cstr** (null-terminated `char*`), not a `Str`. The map is
@@ -57,15 +139,24 @@ fn _ratelimit_key_own(key) {
 # with identical content but different allocations hash differently and the
 # limiter silently grants every request its own full-burst bucket. Callers
 # holding a `Str` must pass `str_cstr(s)`, not `s`.
-# Returns 1 (allowed) or 0 (rejected).
+# Returns 1 (allowed) or 0 (rejected). A null `rl` or `key` is rejected — a
+# null key reached strlen(0) via map_get / _ratelimit_key_own and SIGSEGVed.
 fn ratelimit_check(rl, key) {
-    var now = time_now_ns();
+    if (rl == 0 || key == 0) { return 0; }
     var rate_x1000 = load64(rl);
     var burst_x1000 = load64(rl + 8);
     var buckets = load64(rl + 16);
     var mtx = load64(rl + 24);
 
     mutex_lock(mtx);
+
+    # ⚠ Read the clock UNDER the lock. Read before it, a caller that lost the
+    # race carried a `now` OLDER than the clock the winner had just advanced:
+    # elapsed_ns went negative, the refill SUBTRACTED credit already counted,
+    # no clock branch ran, and the stored deficit locked out every caller on a
+    # shared key — long after the contention stopped. Serialised reads of a
+    # monotonic clock cannot go backwards; the clamp below is the backstop.
+    var now = time_now_ns();
 
     var bucket_ptr = map_get(buckets, key);
     if (bucket_ptr == 0) {
@@ -86,25 +177,11 @@ fn ratelimit_check(rl, key) {
     # Refill tokens based on elapsed time
     var last_ns = load64(bucket_ptr + 8);
     var elapsed_ns = now - last_ns;
+    if (elapsed_ns < 0) { elapsed_ns = 0; }
     var tokens = load64(bucket_ptr);
 
-    # refill = elapsed_ns * rate_x1000 / 1_000_000_000
-    # To avoid overflow: split into seconds and remainder.
-    #
-    # elapsed_rem is up to 999,999,999, so `elapsed_rem * rate_x1000` still
-    # overflows i64 once rate_x1000 exceeds ~9.2e9 (a rate around 9.2M/sec).
-    # Divide first in that case: the precision loss is irrelevant at a rate
-    # that high, whereas the wrap produced a NEGATIVE refill and starved the
-    # bucket permanently.
-    var elapsed_sec = elapsed_ns / 1000000000;
-    var elapsed_rem = elapsed_ns - elapsed_sec * 1000000000;
-    var rem_refill = 0;
-    if (rate_x1000 > 9000000000) {
-        rem_refill = elapsed_rem / 1000000000 * rate_x1000;
-    } else {
-        rem_refill = elapsed_rem * rate_x1000 / 1000000000;
-    }
-    var refill = elapsed_sec * rate_x1000 + rem_refill;
+    # refill = elapsed_ns * rate_x1000 / 1_000_000_000, overflow-safe.
+    var refill = _ratelimit_refill(rate_x1000, burst_x1000, elapsed_ns);
 
     tokens = tokens + refill;
     if (tokens > burst_x1000) {
@@ -168,8 +245,15 @@ fn ratelimit_key_count(rl) {
     return map_size(load64(rl + 16));
 }
 
-# Evict keys idle longer than max_idle_ns.
+# Evict keys idle longer than max_idle_ns whose bucket has refilled to burst.
 # Returns number of keys evicted.
+#
+# ⚠ Only a FULL bucket is evicted. A full bucket is indistinguishable from a
+# missing one, so eviction is lossless; evicting a partly-drained bucket handed
+# the client a fresh full burst on its next request, raising its effective rate
+# to burst/max_idle_ns (5x for burst 5 at 1 token/s swept at 1 s idle). Memory
+# is still bounded — by time-to-full rather than by max_idle_ns alone. A
+# rate-0 limiter never refills, so only never-spent buckets qualify there.
 #
 # ⚠ **Allocates nothing.** The obvious shape — `map_keys` into a vec, a second
 # vec of victims, then delete — leaked both vecs on every sweep: `vec_new` is
@@ -186,34 +270,46 @@ fn ratelimit_key_count(rl) {
 # at the slot it finds — it never moves, reallocs or rehashes — so the array
 # this loop holds stays valid to the end.
 fn ratelimit_evict_stale(rl, max_idle_ns) {
-    var now = time_now_ns();
+    if (rl == 0) { return 0; }
+    var burst_x1000 = load64(rl + 8);
     var buckets = load64(rl + 16);
     var mtx = load64(rl + 24);
 
     mutex_lock(mtx);
+    # Clock under the lock, as in ratelimit_check.
+    var now = time_now_ns();
 
     var entries = map_entries(buckets);
     var cap = map_cap(buckets);
     var evicted = 0;
+    var empties = 0;
     var i = 0;
     while (i < cap) {
         var ep = entries + i * 24;
-        if (load64(ep + 16) == 1) {
+        var st = load64(ep + 16);
+        if (st == 0) {
+            empties = empties + 1;
+        } elif (st == 1) {
             var bucket_ptr = load64(ep + 8);
             if (now - load64(bucket_ptr + 8) >= max_idle_ns) {
-                var k = load64(ep);
-                map_delete(buckets, k);
-                # Free strictly AFTER the delete, which needs the key to find
-                # the entry. The tombstone it leaves is never key-compared
-                # (`_map_find` skips `st == 2`) and `_map_grow_a` rehashes only
-                # live entries, so the stale pointer in the slot is never read.
-                fl_free(bucket_ptr);
-                fl_free(k);
-                evicted = evicted + 1;
+                if (_ratelimit_projected(rl, bucket_ptr, now) >= burst_x1000) {
+                    var k = load64(ep);
+                    map_delete(buckets, k);
+                    # Free strictly AFTER the delete, which needs the key to
+                    # find the entry. The tombstone it leaves is never
+                    # key-compared (`_map_find` skips `st == 2`) and
+                    # `_map_grow_a` rehashes only live entries, so the stale
+                    # pointer in the slot is never read.
+                    fl_free(bucket_ptr);
+                    fl_free(k);
+                    evicted = evicted + 1;
+                }
             }
         }
         i = i + 1;
     }
+    # Deletes only write tombstones, so `empties` is still exact here.
+    _rl_map_compact(buckets, empties);
     counter_add(load64(rl + 48), evicted);
 
     mutex_unlock(mtx);
@@ -238,8 +334,13 @@ fn ratelimit_stats(rl) {
 # has never been seen:
 #   offset  0: allowed        — requests this key was granted
 #   offset  8: rejected       — requests this key was refused
-#   offset 16: tokens_x1000   — credit remaining right now
-#   offset 24: last_access_ns — when the bucket last refilled
+#   offset 16: tokens_x1000   — credit available right now: the stored count
+#                               plus the refill earned since, capped at burst
+#                               (computed read-only; the bucket is untouched)
+#   offset 24: last_access_ns — the bucket's credited-until clock: refill has
+#                               been counted up to this instant. NOT the time of
+#                               the last request — it lags that by any
+#                               fractional credit carried forward.
 #
 # The admin endpoint's /ratelimit route reported the limiter's GLOBAL counters
 # for whatever key it was handed, so an operator reading
@@ -259,7 +360,9 @@ fn ratelimit_stats_for_key(rl, key) {
         if (out != 0) {
             store64(out, load64(b + 16));
             store64(out + 8, load64(b + 24));
-            store64(out + 16, load64(b));
+            # The STORED count is as of the last check; a key idle for an hour
+            # read as still drained. Project it to now, under the lock.
+            store64(out + 16, _ratelimit_projected(rl, b, time_now_ns()));
             store64(out + 24, load64(b + 8));
         }
     }
@@ -309,8 +412,8 @@ fn sliding_window_new(max_requests, window_ns) {
     return sw;
 }
 
-# Evict sliding-window entries whose window has not advanced in max_idle_ns.
-# Returns the number evicted.
+# Evict sliding-window entries whose window started at least
+# max(max_idle_ns, 2 * window_ns) ago. Returns the number evicted.
 #
 # The sliding-window limiter had NO eviction sweep, so every distinct key ever
 # seen retained an owned key copy plus a 24-byte WindowCounter for the life of
@@ -318,23 +421,39 @@ fn sliding_window_new(max_requests, window_ns) {
 # a tenant, a request id). The token-bucket limiter grew this sweep at 2.6.4;
 # this is the same shape, and likewise allocation-free: it walks the hashmap
 # slot array directly rather than calling map_keys.
+#
+# ⚠ The `2 * window_ns` floor is load-bearing. window_start moves only at window
+# boundaries, so its age is NOT idleness: an entry being actively rejected looks
+# `max_idle_ns` old after `max_idle_ns`, and evicting it handed the client a
+# fresh quota every sweep. At two windows sliding_window_check zeroes both
+# counts itself, so evicting there cannot change any decision.
 fn sliding_window_evict_stale(sw, max_idle_ns) {
     if (sw == 0) { return 0; }
-    var now = time_now_ns();
     var windows = load64(sw);
+    var window_ns = load64(sw + 16);
     var mtx = load64(sw + 24);
 
+    var threshold = window_ns * 2;
+    if (window_ns > 0x3FFFFFFFFFFFFFFF) { threshold = 0x7FFFFFFFFFFFFFFF; }
+    if (max_idle_ns > threshold) { threshold = max_idle_ns; }
+
     mutex_lock(mtx);
+    # Clock under the lock, as in ratelimit_check.
+    var now = time_now_ns();
 
     var entries = map_entries(windows);
     var cap = map_cap(windows);
     var evicted = 0;
+    var empties = 0;
     var i = 0;
     while (i < cap) {
         var ep = entries + i * 24;
-        if (load64(ep + 16) == 1) {
+        var st = load64(ep + 16);
+        if (st == 0) {
+            empties = empties + 1;
+        } elif (st == 1) {
             var wc_ptr = load64(ep + 8);
-            if (now - load64(wc_ptr + 16) >= max_idle_ns) {
+            if (now - load64(wc_ptr + 16) >= threshold) {
                 var k = load64(ep);
                 map_delete(windows, k);
                 # Free strictly AFTER the delete — same ordering rule as
@@ -346,6 +465,7 @@ fn sliding_window_evict_stale(sw, max_idle_ns) {
         }
         i = i + 1;
     }
+    _rl_map_compact(windows, empties);
 
     mutex_unlock(mtx);
     return evicted;
@@ -360,15 +480,18 @@ fn sliding_window_table_size(sw) {
     return n;
 }
 
+# Returns 1 (allowed) or 0 (rejected); a null `sw` or `key` is rejected.
 fn sliding_window_check(sw, key) {
-    if (sw == 0) { return 0; }
-    var now = time_now_ns();
+    if (sw == 0 || key == 0) { return 0; }
     var windows = load64(sw);
     var max_req = load64(sw + 8);
     var window_ns = load64(sw + 16);
     var mtx = load64(sw + 24);
 
     mutex_lock(mtx);
+    # Clock under the lock — see ratelimit_check. A stale `now` here made
+    # `elapsed` negative and skipped a due window advance.
+    var now = time_now_ns();
 
     var wc_ptr = map_get(windows, key);
     if (wc_ptr == 0) {
@@ -376,14 +499,13 @@ fn sliding_window_check(sw, key) {
         store64(wc_ptr, 0);
         store64(wc_ptr + 8, 0);
         store64(wc_ptr + 16, now);
-        # Owned for the same reason as `ratelimit_check`. ⚠ The sliding window
-        # has no eviction sweep, so its entries — key and counter both — live
-        # for the process. That predates this change (the counter already did);
-        # owning the key makes it correct rather than dangling.
+        # Owned for the same reason as `ratelimit_check`: the entry outlives the
+        # caller's key until sliding_window_evict_stale removes it.
         map_set(windows, _ratelimit_key_own(key), wc_ptr);
     }
 
     var elapsed = now - load64(wc_ptr + 16);
+    if (elapsed < 0) { elapsed = 0; }
 
     # Advance windows if needed
     if (elapsed >= window_ns * 2) {
@@ -401,6 +523,7 @@ fn sliding_window_check(sw, key) {
     # estimate = prev_count * weight + curr_count
     # Using x1000 scaling:
     var elapsed_in_current = now - load64(wc_ptr + 16);
+    if (elapsed_in_current < 0) { elapsed_in_current = 0; }
     var weight_x1000 = 1000 - elapsed_in_current * 1000 / window_ns;
     if (weight_x1000 < 0) { weight_x1000 = 0; }
     var prev = load64(wc_ptr);

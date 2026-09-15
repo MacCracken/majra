@@ -12,7 +12,8 @@ names the version it is aimed at and the condition that would move it.
 
 | Target | Theme |
 |---|---|
-| **2.8.1** | Committed to this cut. |
+| **2.9.0** | API and wire changes the 2.8.1 sweep deferred. |
+| **Next patch** | PATCH-safe leftovers from the 2.8.1 sweep. |
 | **2.8 line** | Larger capabilities, each taking the next MINOR as its trigger fires — or the next PATCH, where it adds no API. |
 | **Waiting on upstream** | Blocked outside this repo. Names the blocker. |
 | **Non-goals** | Deliberately out of scope, recorded so the question stops recurring. |
@@ -29,22 +30,45 @@ promotion is a decision rather than a mood.
 
 ---
 
-## 2.8.1
+## 2.9.0
 
-### P(-1) hardening sweep
+Fixes the 2.8.1 P(-1) sweep confirmed but could not take in a PATCH, because
+each needs a new public symbol, a signature change or a wire change. Details
+are in [`docs/audit/2026-09-15-audit.md`](../audit/2026-09-15-audit.md).
 
-The full pass from CLAUDE.md § Process — cleanliness, benchmark baseline,
-module-by-module review, external research (RFC drift and CVE classes for RESP,
-PostgreSQL wire, WebSocket, HTTP, AES-GCM, Ed25519), security audit filed under
-`docs/audit/`, the tests and benchmarks those findings earn, post-review
-benchmarks against the baseline, doc audit, and bundle regeneration.
+- **Encrypted IPC cross-connection replay.** The replay window is per handle,
+  so a frame captured on one connection replays into a later one under the same
+  PSK. The fix needs a handshake (per-connection key or session id), which is a
+  wire change.
+- **Signed envelopes: domain separation and anchored verify.** The signed bytes
+  carry no version or domain prefix, and `signed_envelope_verify(se, 0)` returns
+  "valid" for any re-signed envelope. Add the prefix, and make `expected_pk`
+  mandatory or give the unanchored mode a distinct return code.
+- **WebSocket Origin check.** `_ws_accept_upgrade` discards the request, so a
+  consumer cannot reject a cross-site handshake. Expose the Origin header (or
+  an allowlist) on the upgrade API.
+- **Release functions for returned results**:
+  - `pg_rows_free` / `redis_reply_free` for the result vecs that `pg_query`,
+    `pg_exec` and Redis array replies return.
+  - A way to free the heartbeat status-sweep transitions vec.
+- **Relay subscribers**: `relay_unsubscribe`, and ownership rules for a
+  `RelayMessage` delivered to several subscribers.
+- **A distinct error code** for an encrypted-IPC frame that carries the
+  receiver's own role (today it is `MAJRA_ERR_IPC`).
 
-**Scope constraint**: 2.8.1 is a PATCH, so a finding whose fix needs a signature
-change or a new public function is queued here for the next MINOR, not taken in
-the sweep. **Workflow budget**: at most 75 agents for the orchestrated part.
-**Aimed at**: 2.8.1 — deferred from a proposed 2.7.4 so that the 2.8.0 renames
-landed first.
-**Trigger**: already met.
+**Trigger**: already met. **Aimed at**: 2.9.0.
+
+## Next patch
+
+These can be fixed without an API change; the 2.8.1 sweep didn't reach them:
+
+- Heartbeat node-id key ownership (`hb_register` / `chb_register` keep a
+  borrowed key; `fleet.cyr` already owns its copy).
+- Relay dedup eviction leaves hashmap tombstones that are never cleared (the
+  ratelimit maps got compaction in 2.8.1).
+- Fuzz harnesses: no oracle, an unprinted time-based seed, and CI's iteration
+  argument is ignored. Also add `mq_lifecycle` / multi-producer bench rows and a
+  longer `soak_queue`.
 
 ---
 
@@ -156,6 +180,11 @@ then re-run the matrix.
 ---
 
 ## Upstream cleanup (not majra work)
+
+- cyrius `lib/thread.cyr` `chan_new` multiplies `cap * 8` unchecked and does not
+  check for a zero allocation (found by the 2.8.1 sweep). `lib/hashmap.cyr`
+  never reclaims tombstones, so delete-heavy maps probe ever longer; majra works
+  around it with compaction.
 
 - `cyrius/docs/development/issues/majra-cbarrier-arrive-and-wait-crash.md` was
   fixed in cyrius 5.4.10 but never moved to `issues/archived/` with a

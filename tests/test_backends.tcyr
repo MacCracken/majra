@@ -81,18 +81,68 @@ fn test_base64() {
     println("  base64: ok");
 }
 
+# 1 if the `n` bytes at `buf` equal the lower-case hex string `hex`.
+# Join two cstrs into a fresh buffer (keeps long HTTP fixtures under 120 cols).
+fn _tb_cat(a, b) {
+    var la = strlen(a);
+    var lb = strlen(b);
+    var p = alloc(la + lb + 1);
+    memcpy(p, a, la);
+    memcpy(p + la, b, lb);
+    store8(p + la + lb, 0);
+    return p;
+}
+
+fn _tb_hex_nib(c) {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    return -1;
+}
+
+fn _tb_hex_eq(buf, n, hex) {
+    if (buf == 0) { return 0; }
+    if (strlen(hex) != n * 2) { return 0; }
+    var i = 0;
+    while (i < n) {
+        var hi = _tb_hex_nib(load8(hex + i * 2));
+        var lo = _tb_hex_nib(load8(hex + i * 2 + 1));
+        if (hi < 0 || lo < 0) { return 0; }
+        if (load8(buf + i) != hi * 16 + lo) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# One FIPS 180 vector per call: each digest is compared in its own frame, so a
+# deep-call clobber (quirk #1) cannot bleed one vector's result into another.
+fn _tb_sha1_is(data, len, hex) {
+    var d = _majra_sha1(data, len);
+    var ok = _tb_hex_eq(d, 20, hex);
+    if (d != 0) { fl_free(d); }
+    return ok;
+}
+
+fn _tb_sha1_a_run(n, hex) {
+    var p = fl_alloc(n + 1);
+    memset(p, 97, n);
+    var ok = _tb_sha1_is(p, n, hex);
+    fl_free(p);
+    return ok;
+}
+
+# 2.8.1: these used to assert only that the digest pointer was non-zero, which
+# _majra_sha1 always returns — no digest error could fail them. Byte-exact FIPS
+# 180 vectors, including the 55/56/64-byte padding boundaries (55 is the last
+# length whose 0x80 + 64-bit length fits one block; 56 spills into a second).
 fn test_sha1() {
-    # Verify SHA-1 via WebSocket accept key (RFC 6455 test vector)
-    # This exercises the full SHA-1 + base64 pipeline.
-    # Direct byte assertions omitted — they corrupt the assert counter
-    # due to Cyrius compiler global clobbering in large functions.
-    var digest = _majra_sha1("", 0);
-    assert(digest != 0, "sha1 empty returns ptr");
-
-    var digest2 = _majra_sha1("abc", 3);
-    assert(digest2 != 0, "sha1 abc returns ptr");
-
-    # Functional correctness verified by test_ws_accept_key below
+    assert_eq(_tb_sha1_is("", 0, "da39a3ee5e6b4b0d3255bfef95601890afd80709"), 1, "sha1('') FIPS vector");
+    assert_eq(_tb_sha1_is("abc", 3, "a9993e364706816aba3e25717850c26c9cd0d89d"), 1, "sha1('abc') FIPS vector");
+    assert_eq(_tb_sha1_is("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", 56,
+        "84983e441c3bd26ebaae4aa1f95129e5e54670f1"), 1, "sha1 two-block FIPS vector");
+    assert_eq(_tb_sha1_a_run(55, "c1c8bbdc22796e28c0e15163d20899b65621d65a"), 1, "sha1 55 bytes (one-block boundary)");
+    assert_eq(_tb_sha1_a_run(56, "c2db330f6083854c99d4b5bfb6e8f29f201be699"), 1,
+      "sha1 56 bytes (spills to two blocks)");
+    assert_eq(_tb_sha1_a_run(64, "0098ba824b5c16427bd7a1122a5a442a25ec644d"), 1, "sha1 64 bytes (exact block)");
     println("  sha1: ok");
 }
 
@@ -161,6 +211,26 @@ fn test_base64_decode_validation() {
     assert(ok != 0, "b64 decode accepts valid input");
     assert_eq(load64(ok + 8), 5, "b64 decode length 5");
     assert_eq(memeq(load64(ok), "hello", 5), 1, "b64 decode roundtrip");
+
+    # 2.8.1: '=' is positional. It used to decode to 0 anywhere, so "AA==AAAA"
+    # returned 6 bytes of which 2 were never written (stale heap).
+    assert_eq(majra_base64_decode("AA==AAAA", 8), 0, "b64 rejects padding in an interior quantum");
+    assert_eq(majra_base64_decode("====", 4), 0, "b64 rejects ====");
+    assert_eq(majra_base64_decode("=AAA", 4), 0, "b64 rejects a leading =");
+    assert_eq(majra_base64_decode("AB=C", 4), 0, "b64 rejects = before a data char");
+    assert_eq(majra_base64_decode("A===", 4), 0, "b64 rejects three pad chars");
+    var r1 = majra_base64_decode("YQ==", 4);
+    assert(r1 != 0, "YQ== accepted");
+    assert_eq(load64(r1 + 8), 1, "YQ== decodes to 1 byte");
+    assert_eq(load8(load64(r1)), 97, "YQ== is 'a'");
+    var r2 = majra_base64_decode("YWI=", 4);
+    assert(r2 != 0, "YWI= accepted");
+    assert_eq(load64(r2 + 8), 2, "YWI= decodes to 2 bytes");
+    assert_eq(memeq(load64(r2), "ab", 2), 1, "YWI= is 'ab'");
+    var r6 = majra_base64_decode("YWJjZGVm", 8);
+    assert(r6 != 0, "unpadded 8-char input accepted");
+    assert_eq(load64(r6 + 8), 6, "YWJjZGVm decodes to 6 bytes");
+    assert_eq(memeq(load64(r6), "abcdef", 6), 1, "YWJjZGVm is 'abcdef'");
     println("  base64_decode_validation: ok");
 }
 
@@ -185,7 +255,9 @@ fn test_signed_envelope() {
     assert(signed_envelope_envelope(se) == e, "inner envelope preserved");
     assert(signed_envelope_signed_at(se) > 0, "signed_at populated");
 
-    # Verify with no expected_pk (transport integrity only)
+    # Verify with no expected_pk: SELF-CONSISTENCY only — it catches accidental
+    # corruption, not an attacker who re-signs with their own key (pinned by
+    # test_signed_envelope_unanchored).
     var rc = signed_envelope_verify(se, 0);
     assert_eq(rc, 0, "signed envelope verifies clean");
 
@@ -209,6 +281,185 @@ fn test_signed_envelope() {
     assert_eq(signed_envelope_verify(se, 0), 0, "restored sig verifies");
 
     println("  signed_envelope: ok");
+}
+
+# 2.8.1: signed_envelope_new trusted pk_ptr to match sk[32..64] (sigil signs
+# over sk's own pk half, so a mismatch yielded a handle that never verified)
+# and dereferenced null arguments.
+fn test_signed_envelope_args() {
+    ed25519_init();
+    var sk = fl_alloc(64);
+    var pk = fl_alloc(32);
+    assert_eq(ed25519_generate_keypair(sk, pk), 1, "keypair generated");
+    var e = envelope_new(str_from("node-a"), TARGET_TOPIC, str_from("t"), str_from("pay 10"));
+
+    var bad_pk = fl_alloc(32);
+    memcpy(bad_pk, pk, 32);
+    store8(bad_pk + 31, load8(bad_pk + 31) ^ 1);
+    assert_eq(signed_envelope_new(e, sk, bad_pk), 0, "a pk that is not sk[32..64] is refused");
+    assert_eq(signed_envelope_new(0, sk, pk), 0, "null envelope refused");
+    assert_eq(signed_envelope_new(e, 0, pk), 0, "null sk refused");
+    assert_eq(signed_envelope_new(e, sk, 0), 0, "null pk refused");
+
+    var se = signed_envelope_new(e, sk, pk);
+    assert(se != 0, "the matching pk still signs");
+    assert_eq(signed_envelope_verify(se, pk), 0, "and verifies anchored");
+    assert_eq(memeq(signed_envelope_signer_pk(se), pk, 32), 1, "signer pk is a copy of pk");
+    signed_envelope_free(se);
+    println("  signed_envelope_args: ok");
+}
+
+# 2.8.1: the canonical form carries u32 lengths with 0xFFFFFFFF meaning absent.
+# A field of 0xFFFFFFFF bytes aliased "absent" and memcpy'd 4 GiB; a negative or
+# garbage length (a non-Str field read as a Str) drove a wild memcpy.
+fn test_signed_envelope_lengths() {
+    ed25519_init();
+    var sk = fl_alloc(64);
+    var pk = fl_alloc(32);
+    ed25519_generate_keypair(sk, pk);
+    var e = envelope_new(str_from("node-a"), TARGET_TOPIC, str_from("t"), str_from("pay 10"));
+    var se = signed_envelope_new(e, sk, pk);
+    assert(se != 0, "in-range envelope signs");
+    # 32 fixed + three 4-byte prefixes + "node-a" + "t" + "pay 10".
+    assert_eq(signed_envelope_canon_len(se), 32 + 12 + 6 + 1 + 6, "in-range canonical length unchanged");
+
+    var small = fl_alloc(16);
+    var e2 = envelope_new(str_from("node-a"), TARGET_BROADCAST, 0, str_new(small, 4294967295));
+    assert_eq(signed_envelope_new(e2, sk, pk), 0, "payload length 0xFFFFFFFF (the absent tag) refused");
+    var e4 = envelope_new(str_new(small, -5), TARGET_BROADCAST, 0, 0);
+    assert_eq(signed_envelope_new(e4, sk, pk), 0, "negative from length refused");
+    var e5 = envelope_new(str_from("node-a"), TARGET_NODE, str_new(small, 8589934592), 0);
+    assert_eq(signed_envelope_new(e5, sk, pk), 0, "to_name length past u32 refused");
+
+    # Audit reproduction: a non-Str payload whose second word is huge.
+    var raw = fl_alloc(64);
+    store64(raw, raw);
+    store64(raw + 8, 0x4141414141414141);
+    var e3 = envelope_new(str_from("node-a"), TARGET_BROADCAST, 0, raw);
+    assert_eq(signed_envelope_new(e3, sk, pk), 0, "non-Str payload with a bogus length refused, no wild memcpy");
+
+    # The verify side refuses the same shapes, and a malformed handle is 1.
+    store64(se, e2);
+    assert_eq(signed_envelope_verify(se, 0), 3, "verify refuses an uncanonicalisable envelope");
+    store64(se, e);
+    assert_eq(signed_envelope_verify(se, 0), 0, "restored envelope verifies");
+    store64(se, 0);
+    assert_eq(signed_envelope_verify(se, 0), 1, "null inner envelope is a malformed handle");
+    store64(se, e);
+    var sig = load64(se + 8);
+    store64(se + 8, 0);
+    assert_eq(signed_envelope_verify(se, 0), 1, "null signature is a malformed handle");
+    store64(se + 8, sig);
+    assert_eq(signed_envelope_verify(se, 0), 0, "restored handle verifies");
+    signed_envelope_free(se);
+    println("  signed_envelope_lengths: ok");
+}
+
+# Pins the DOCUMENTED weakness of expected_pk == 0 so that any change to it is
+# deliberate: an attacker who can modify the message re-signs with their own
+# key and swaps signer_pk. Only an anchored verify catches it.
+fn test_signed_envelope_unanchored() {
+    ed25519_init();
+    var sk = fl_alloc(64);
+    var pk = fl_alloc(32);
+    ed25519_generate_keypair(sk, pk);
+    var ask = fl_alloc(64);
+    var apk = fl_alloc(32);
+    ed25519_generate_keypair(ask, apk);
+    var from = str_from("node-a");
+    var topic = str_from("payments");
+
+    var real = signed_envelope_new(envelope_new(from, TARGET_TOPIC, topic, str_from("pay 10")), sk, pk);
+    assert_eq(signed_envelope_verify(real, pk), 0, "the genuine envelope verifies anchored");
+
+    var forged_e = envelope_new(from, TARGET_TOPIC, topic, str_from("pay 1000000"));
+    var forged = signed_envelope_new(forged_e, ask, apk);
+    assert(forged != 0, "attacker re-signs the modified envelope");
+    assert_eq(signed_envelope_verify(forged, 0), 0, "UNANCHORED verify accepts the forgery (self-consistency only)");
+    assert_eq(signed_envelope_verify(forged, pk), 2, "anchored verify rejects the forgery");
+    # Claiming the victim's key without its signature fails on the signature.
+    memcpy(signed_envelope_signer_pk(forged), pk, 32);
+    assert_eq(signed_envelope_verify(forged, pk), 3, "victim pk + attacker signature is a bad signature");
+    println("  signed_envelope_unanchored: ok");
+}
+
+# Swap the 8-byte envelope field at `off` for `val`, verify, restore.
+fn _tb_se_swap_rc(se, off, val) {
+    var e = load64(se);
+    var old = load64(e + off);
+    store64(e + off, val);
+    var rc = signed_envelope_verify(se, 0);
+    store64(e + off, old);
+    return rc;
+}
+
+# Every envelope field must be inside the signature, and null must not sign
+# like empty. The only negative test used to flip a signature bit, so dropping
+# any field from _envelope_canonicalize would have stayed green.
+fn test_signed_envelope_coverage() {
+    ed25519_init();
+    var sk = fl_alloc(64);
+    var pk = fl_alloc(32);
+    ed25519_generate_keypair(sk, pk);
+    var payload = str_from("payload");
+    var e = envelope_new(str_from("node-a"), TARGET_TOPIC, str_from("topic-x"), payload);
+    var se = signed_envelope_new(e, sk, pk);
+    assert_eq(signed_envelope_verify(se, 0), 0, "coverage envelope verifies");
+
+    assert(_tb_se_swap_rc(se, 0, load64(e) ^ 1) != 0, "id_hi is signed");
+    assert(_tb_se_swap_rc(se, 8, load64(e + 8) ^ 1) != 0, "id_lo is signed");
+    assert(_tb_se_swap_rc(se, 16, str_from("node-b")) != 0, "from is signed");
+    assert(_tb_se_swap_rc(se, 24, TARGET_NODE) != 0, "to_kind is signed");
+    assert(_tb_se_swap_rc(se, 32, str_from("topic-y")) != 0, "to_name is signed");
+    assert(_tb_se_swap_rc(se, 40, str_from("payloaX")) != 0, "payload is signed");
+    assert(_tb_se_swap_rc(se, 48, load64(e + 48) + 1) != 0, "timestamp is signed");
+    var pd = str_data(payload);
+    store8(pd + 3, load8(pd + 3) ^ 1);
+    assert(signed_envelope_verify(se, 0) != 0, "a payload byte flipped in place is detected");
+    store8(pd + 3, load8(pd + 3) ^ 1);
+    assert_eq(signed_envelope_verify(se, 0), 0, "every field restored, verifies");
+
+    # Null vs empty: a broadcast (to_name 0, payload 0) must not verify as "".
+    var b = envelope_new(str_from("node-a"), TARGET_BROADCAST, 0, 0);
+    var sb = signed_envelope_new(b, sk, pk);
+    assert_eq(signed_envelope_verify(sb, 0), 0, "null-field envelope verifies");
+    assert(_tb_se_swap_rc(sb, 32, str_from("")) != 0, "to_name 0 and \"\" sign differently");
+    assert(_tb_se_swap_rc(sb, 40, str_from("")) != 0, "payload 0 and \"\" sign differently");
+    assert(_tb_se_swap_rc(sb, 16, 0) != 0, "from \"node-a\" and 0 sign differently");
+    println("  signed_envelope_coverage: ok");
+}
+
+# Golden canonical bytes. A silent change to the layout is a cross-version
+# signature break (2.6.9 shipped one); this pins it. Ids and timestamp are
+# written native-endian (store64), lengths big-endian u32, absent = FFFFFFFF.
+fn test_envelope_canonical_golden() {
+    var e = fl_alloc(56);
+    store64(e, 0x0102030405060708);
+    store64(e + 8, 0x1112131415161718);
+    store64(e + 16, str_from("ab"));
+    store64(e + 24, TARGET_TOPIC);
+    store64(e + 32, str_from("t"));
+    store64(e + 40, str_from("xyz"));
+    store64(e + 48, 0x2122232425262728);
+    var buf = _envelope_canonicalize(e);
+    var n = rethi();
+    assert_eq(n, 50, "golden canonical length");
+    assert_eq(_tb_hex_eq(buf, n,
+        "080706050403020118171615141312112827262524232221010000000000000000000002616200000001740000000378797a"),
+      1, "golden canonical bytes");
+    fl_free(buf);
+
+    store64(e + 24, TARGET_BROADCAST);
+    store64(e + 32, 0);
+    store64(e + 40, 0);
+    var buf2 = _envelope_canonicalize(e);
+    var n2 = rethi();
+    assert_eq(n2, 46, "golden absent-field length");
+    assert_eq(_tb_hex_eq(buf2, n2,
+        "0807060504030201181716151413121128272625242322210200000000000000000000026162ffffffffffffffff"),
+      1, "golden absent-field bytes");
+    fl_free(buf2);
+    println("  envelope_canonical_golden: ok");
 }
 
 fn test_aes_gcm_roundtrip() {
@@ -317,6 +568,141 @@ fn test_admin() {
     println("  admin: ok");
 }
 
+# 2.8.1: ratelimit_stats_for_key reported the STORED token count, as of the
+# key's last check — a key idle for an hour read as still drained. It now
+# projects the refill to now, without writing the bucket.
+fn test_ratelimit_stats_projection() {
+    var rl = ratelimit_new(1000000, 2);      # 1000 tokens/s, burst 2
+    ratelimit_check(rl, "p");
+    ratelimit_check(rl, "p");
+    ratelimit_check(rl, "p");
+    var bucket = map_get(load64(rl + 16), "p");
+    assert(bucket != 0, "bucket exists");
+    if (bucket == 0) { return 0; }
+    _majra_sleep_ns(3000000);                # >= 3 ms: at least 3 tokens earned
+    var stored = load64(bucket);
+    assert(stored < 2000, "the stored count is below burst after draining");
+    var s = ratelimit_stats_for_key(rl, "p");
+    assert(s != 0, "stats for p");
+    if (s == 0) { return 0; }
+    assert_eq(ratelimit_key_tokens(s), 2000, "a refilled key reports full burst credit");
+    assert_eq(load64(bucket), stored, "the projection did not write the bucket");
+    assert_eq(ratelimit_key_allowed(s), 2, "allowed count unchanged by the projection");
+    ratelimit_stats_free(s);
+    println("  ratelimit_stats_projection: ok");
+}
+
+# ---- admin HTTP handler over a socketpair ----
+var _fa_sv[8];          # global: 64 bytes
+var _fa_resp[512];      # global: 4096 bytes
+
+# Send `req` (len bytes) through majra_admin_handler; the response lands in
+# _fa_resp, NUL-terminated. Returns the response length.
+fn _fa_roundtrip_n(admin, req, n) {
+    syscall(SYS_SOCKETPAIR, 1, 1, 0, &_fa_sv);
+    var a = load32(&_fa_sv);
+    var b = load32(&_fa_sv + 4);
+    majra_admin_handler(admin, a, req, n);
+    syscall(SYS_CLOSE, a);
+    var got = 0;
+    var r = 1;
+    while (r > 0 && got < 4000) {
+        r = syscall(SYS_READ, b, &_fa_resp + got, 4000 - got);
+        if (r > 0) { got = got + r; }
+    }
+    store8(&_fa_resp + got, 0);
+    syscall(SYS_CLOSE, b);
+    return got;
+}
+
+fn _fa_roundtrip(admin, req) { return _fa_roundtrip_n(admin, req, strlen(req)); }
+
+fn _fa_has(needle) {
+    return str_contains_cstr(str_from(&_fa_resp), needle);
+}
+
+fn _fa_status_is(code) {
+    # "HTTP/1.1 " is 9 bytes; the status code follows.
+    return memeq(&_fa_resp + 9, code, 3);
+}
+
+# 2.8.1: routes were matched with str_eq on the cstr sandhi returns, so no
+# route ever matched (every request 404'd), and a path whose bytes 8..15
+# spelled a route length dereferenced the path text as an address.
+fn test_admin_handler() {
+    var cfg = heartbeat_config_default();
+    var cht = chb_tracker_new(cfg);
+    chb_register(cht, "node-a", 100);
+    var rl = ratelimit_new(1, 2);
+    ratelimit_check(rl, "k1");
+    var admin = majra_admin_new(cht, rl);
+
+    _fa_roundtrip(admin, "GET /health HTTP/1.1\r\nHost: 127.0.0.1:9090\r\n\r\n");
+    assert_eq(_fa_status_is("200"), 1, "/health is 200");
+    assert_eq(_fa_has("\r\n\r\nok"), 1, "/health body is ok");
+    _fa_roundtrip(admin, "GET /fleet HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq(_fa_status_is("200"), 1, "/fleet is 200");
+    assert_eq(_fa_has("\"total\":1"), 1, "/fleet reports the one registered node");
+    _fa_roundtrip(admin, "GET /ratelimit?key=k1 HTTP/1.1\r\n\r\n");
+    assert_eq(_fa_status_is("200"), 1, "/ratelimit?key=k1 is 200");
+    assert_eq(_fa_has("\"scope\":\"key\""), 1, "/ratelimit?key=k1 is key-scoped");
+    _fa_roundtrip(admin, "GET /ratelimit HTTP/1.1\r\nHost: [::1]:80\r\n\r\n");
+    assert_eq(_fa_has("\"scope\":\"global\""), 1, "/ratelimit without a key is global-scoped");
+    _fa_roundtrip(admin, "GET /nope HTTP/1.1\r\n\r\n");
+    assert_eq(_fa_status_is("404"), 1, "an unknown route is 404");
+
+    # The crafted path: "/AAAAAAA" + 0x07 + seven NULs. Bytes 8..15 read as a
+    # little-endian i64 are 7 == strlen("/health"), and bytes 0..7 as an address.
+    var pre = "GET /AAAAAAA\x07";
+    var post = " HTTP/1.1\r\n\r\n";
+    var plen = strlen(pre);
+    var qlen = strlen(post);
+    var crafted = fl_alloc(plen + 7 + qlen);
+    memcpy(crafted, pre, plen);
+    memset(crafted + plen, 0, 7);
+    memcpy(crafted + plen + 7, post, qlen);
+    assert(_fa_roundtrip_n(admin, crafted, plen + 7 + qlen) > 0, "crafted path gets a response, no crash");
+    assert_eq(_fa_status_is("404"), 1, "crafted path is 404");
+    fl_free(crafted);
+
+    assert_eq(majra_admin_serve(admin, "localhost", 0), -1, "serve refuses a non-literal bind address");
+    println("  admin_handler: ok");
+}
+
+# 2.8.1: DNS-rebinding gate. Only IP literals and "localhost" pass as Host.
+fn test_admin_host_gate() {
+    var cfg = heartbeat_config_default();
+    var cht = chb_tracker_new(cfg);
+    chb_register(cht, "node-a", 100);
+    var admin = majra_admin_new(cht, ratelimit_new(1, 2));
+
+    _fa_roundtrip(admin, "GET /fleet HTTP/1.1\r\nHost: evil.example:9090\r\n\r\n");
+    assert_eq(_fa_status_is("400"), 1, "a rebinding DNS name in Host is 400");
+    assert_eq(_fa_has("\"total\""), 0, "and the fleet body is not served");
+    _fa_roundtrip(admin, "GET /fleet HTTP/1.1\r\nHost: LocalHost:9090\r\n\r\n");
+    assert_eq(_fa_status_is("200"), 1, "LocalHost:9090 is accepted (case-insensitive)");
+    _fa_roundtrip(admin, "GET /fleet HTTP/1.1\r\nHost: localhost.evil.com\r\n\r\n");
+    assert_eq(_fa_status_is("400"), 1, "localhost.evil.com is 400");
+    _fa_roundtrip(admin, "GET /fleet HTTP/1.1\r\nHost: 127.0.0.1x\r\n\r\n");
+    assert_eq(_fa_status_is("400"), 1, "127.0.0.1x is 400");
+    _fa_roundtrip(admin, "GET /fleet HTTP/1.1\r\nHost: [::1\r\n\r\n");
+    assert_eq(_fa_status_is("400"), 1, "an unterminated IPv6 literal is 400");
+    _fa_roundtrip(admin, "GET /health HTTP/1.1\r\n\r\n");
+    assert_eq(_fa_status_is("200"), 1, "an absent Host is allowed");
+
+    assert_eq(_admin_host_ok("10.0.0.5"), 1, "host gate: IPv4 literal");
+    assert_eq(_admin_host_ok("10.0.0.5:8080"), 1, "host gate: IPv4 with port");
+    assert_eq(_admin_host_ok("[::1]"), 1, "host gate: IPv6 literal");
+    assert_eq(_admin_host_ok("localhost:"), 1, "host gate: empty port");
+    assert_eq(_admin_host_ok("[]"), 0, "host gate: empty IPv6");
+    assert_eq(_admin_host_ok(""), 0, "host gate: empty host");
+    assert_eq(_admin_host_ok("1.2.3.4:80a"), 0, "host gate: non-digit port");
+    assert_eq(_admin_host_ok("[::1]x"), 0, "host gate: junk after IPv6");
+    assert_eq(_admin_host_ok("localhostx"), 0, "host gate: localhost prefix of a name");
+    assert_eq(_admin_host_ok(0), 1, "host gate: absent Host allowed");
+    println("  admin_host_gate: ok");
+}
+
 fn test_ws_accept_key() {
     var client_key = "dGhlIHNhbXBsZSBub25jZQ==";
     var accept = _ws_accept_key(client_key);
@@ -352,6 +738,318 @@ fn test_ws_framing() {
     syscall(SYS_CLOSE, wb);
 
     println("  ws_framing: ok");
+}
+
+# Read `len` bytes off `fd` into a fresh block and compare the first `hlen`
+# against the hex header; returns the block (caller frees) or 0 on mismatch.
+fn _tb_ws_expect(fd, len, hex, hlen) {
+    var p = fl_alloc(len + 1);
+    if (_ws_read_full(fd, p, len) != len) { fl_free(p); return 0; }
+    if (_tb_hex_eq(p, hlen, hex) != 1) { fl_free(p); return 0; }
+    return p;
+}
+
+# The send path's return codes were all test_ws_framing checked; the bytes on
+# the wire never were, so a wrong FIN/opcode, 7-bit length or 126/127-form
+# header (the pass-1 headerless-payload bug) stayed green.
+fn test_ws_frame_bytes() {
+    var wa = _tb_pair();
+    var wb = rethi();
+
+    assert_eq(majra_ws_send_text(wa, "hi", 2), 0, "send 'hi'");
+    var f1 = _tb_ws_expect(wb, 4, "81026869", 4);
+    assert(f1 != 0, "'hi' -> 81 02 'h' 'i'");
+    if (f1 != 0) { fl_free(f1); }
+
+    var d = fl_alloc(70000);
+    memset(d, 113, 70000);
+    assert_eq(majra_ws_send_text(wa, d, 125), 0, "send 125 bytes");
+    var f2 = _tb_ws_expect(wb, 127, "817d", 2);
+    assert(f2 != 0, "125 bytes -> 7-bit length 7D");
+    if (f2 != 0) { fl_free(f2); }
+
+    assert_eq(majra_ws_send_text(wa, d, 126), 0, "send 126 bytes");
+    var f3 = _tb_ws_expect(wb, 130, "817e007e", 4);
+    assert(f3 != 0, "126 bytes -> 81 7E 00 7E");
+    if (f3 != 0) { fl_free(f3); }
+
+    assert_eq(majra_ws_send_text(wa, d, 300), 0, "send 300 bytes");
+    var f4 = _tb_ws_expect(wb, 304, "817e012c", 4);
+    assert(f4 != 0, "300 bytes -> 81 7E 01 2C");
+    if (f4 != 0) {
+        assert_eq(load8(f4 + 303), 113, "300-byte payload follows its header");
+        fl_free(f4);
+    }
+
+    assert_eq(majra_ws_send_text(wa, d, 65535), 0, "send 65535 bytes");
+    var f5 = _tb_ws_expect(wb, 65539, "817effff", 4);
+    assert(f5 != 0, "65535 bytes -> 81 7E FF FF");
+    if (f5 != 0) { fl_free(f5); }
+
+    assert_eq(majra_ws_send_text(wa, d, 70000), 0, "send 70000 bytes");
+    var f6 = _tb_ws_expect(wb, 70010, "817f0000000000011170", 10);
+    assert(f6 != 0, "70000 bytes -> 81 7F 00 00 00 00 00 01 11 70");
+    if (f6 != 0) {
+        assert_eq(load8(f6 + 70009), 113, "70000-byte payload follows its header");
+        fl_free(f6);
+    }
+    fl_free(d);
+
+    assert_eq(ws_send_pong(wa, "x", 1), 0, "send pong");
+    var f7 = _tb_ws_expect(wb, 3, "8a0178", 3);
+    assert(f7 != 0, "pong 'x' -> 8A 01 'x'");
+    if (f7 != 0) { fl_free(f7); }
+
+    assert_eq(ws_send_close(wa), 0, "send close");
+    var f8 = _tb_ws_expect(wb, 2, "8800", 2);
+    assert(f8 != 0, "close -> 88 00");
+    if (f8 != 0) { fl_free(f8); }
+
+    syscall(SYS_CLOSE, wa);
+    syscall(SYS_CLOSE, wb);
+    println("  ws_frame_bytes: ok");
+}
+
+# 2.8.1: _ws_write_full was a bare write(2), so one client doing
+# SO_LINGER{1,0}+close killed the server with SIGPIPE the moment it was
+# answered. This suite does not ignore SIGPIPE: a regression is exit 141.
+fn test_ws_sigpipe() {
+    var a = _tb_pair();
+    var b = rethi();
+    syscall(SYS_CLOSE, b);
+    assert_eq(ws_send_close(a), -1, "close frame to a reset peer returns -1 (no SIGPIPE)");
+    assert_eq(majra_ws_send_text(a, "hi", 2), -1, "text frame to a reset peer returns -1");
+    assert_eq(ws_send_pong(a, "x", 1), -1, "pong to a reset peer returns -1");
+    syscall(SYS_CLOSE, a);
+
+    # A non-socket fd gets ENOTSOCK and must fall back to write(2).
+    var fds[8];
+    memset(&fds, 0, 8);
+    sys_pipe(&fds);
+    assert_eq(_ws_write_full(load32(&fds + 4), "abc", 3), 3, "non-socket fd falls back to write(2)");
+    var got[8];
+    assert_eq(syscall(SYS_READ, load32(&fds), &got, 3), 3, "pipe read back");
+    assert_eq(memeq(&got, "abc", 3), 1, "pipe bytes");
+    syscall(SYS_CLOSE, load32(&fds));
+    syscall(SYS_CLOSE, load32(&fds + 4));
+    println("  ws_sigpipe: ok");
+}
+
+var _hs_resp[512];      # global: 4096 bytes
+var _hs_resp_len = 0;
+
+# Feed one upgrade request through _ws_accept_upgrade over a socketpair.
+# Returns its rc; whatever it wrote back lands in _hs_resp (_hs_resp_len <= 0:
+# nothing was written).
+fn _ws_hs(req, reqlen) {
+    var a = _tb_pair();
+    var b = rethi();
+    _ws_write_full(b, req, reqlen);
+    var rc = _ws_accept_upgrade(a);
+    _hs_resp_len = sys_recvfrom(b, &_hs_resp, 4000, 0x40, 0, 0);
+    if (_hs_resp_len > 0) { store8(&_hs_resp + _hs_resp_len, 0); }
+    syscall(SYS_CLOSE, a);
+    syscall(SYS_CLOSE, b);
+    return rc;
+}
+
+fn _ws_hsc(req) { return _ws_hs(req, strlen(req)); }
+
+fn _ws_resp_has(needle) {
+    if (_hs_resp_len <= 0) { return 0; }
+    var n = strlen(needle);
+    var i = 0;
+    while (i + n <= _hs_resp_len) {
+        if (memeq(&_hs_resp + i, needle, n) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# 2.8.1: the key was a case-sensitive substring search for
+# "Sec-WebSocket-Key: " anywhere in the block — refusing Go's and proxies'
+# casings, hashing trailing OWS into a wrong accept value, matching inside
+# another header's value, and never checking Upgrade/Connection/version.
+fn test_ws_handshake_parse() {
+    var ok = _tb_cat("GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n",
+      "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    assert_eq(_ws_hsc(ok), 1, "canonical RFC 6455 handshake");
+    assert_eq(_ws_resp_has("HTTP/1.1 101 Switching Protocols\r\n"), 1, "101 status line");
+    assert_eq(_ws_resp_has("Sec-WebSocket-Accept: mjqt7n322xkUQqCX5NPZbkSHHuk=\r\n\r\n"), 1, "canonical accept value");
+
+    var go = _tb_cat("GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n",
+      "Connection: Upgrade\r\nSec-Websocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-Websocket-Version: 13\r\n\r\n");
+    assert_eq(_ws_hsc(go), 1, "Go canonical header casing accepted");
+    assert_eq(_ws_resp_has("mjqt7n322xkUQqCX5NPZbkSHHuk="), 1, "Go casing: correct accept value");
+
+    var lc = _tb_cat("GET /chat HTTP/1.1\r\nhost: x\r\nupgrade: WebSocket\r\nconnection: keep-alive, Upgrade\r\n",
+      "sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n");
+    assert_eq(_ws_hsc(lc), 1, "lower-case names and a Connection token list accepted");
+
+    var ows = _tb_cat("GET /chat HTTP/1.1\r\nUpgrade:websocket\r\nConnection: Upgrade\r\n",
+      "Sec-WebSocket-Key:   dGhlIHNhbXBsZSBub25jZQ== \t\r\nSec-WebSocket-Version: 13 \r\n\r\n");
+    assert_eq(_ws_hsc(ows), 1, "OWS around values is trimmed");
+    assert_eq(_ws_resp_has("Sec-WebSocket-Accept: mjqt7n322xkUQqCX5NPZbkSHHuk=\r\n"), 1,
+      "OWS: accept value not polluted");
+
+    var smug = "GET / HTTP/1.1\r\nX-Note: Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    assert_eq(_ws_hsc(smug), 0, "a key inside another header's value is not a key");
+    assert(_hs_resp_len <= 0, "non-upgrade GET: nothing written");
+    var smug2 = _tb_cat("GET / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n",
+      "Sec-WebSocket-Version: 13\r\nX-Note: Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+    assert_eq(_ws_hsc(smug2), 0, "embedded key with real upgrade headers refused");
+    var noup = _tb_cat("GET /chat HTTP/1.1\r\n",
+      "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    assert_eq(_ws_hsc(noup), 0, "missing Upgrade refused");
+    var noconn = "GET /chat HTTP/1.1\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+    noconn = _tb_cat(noconn, "Sec-WebSocket-Version: 13\r\n\r\n");
+    assert_eq(_ws_hsc(noconn), 0, "missing Connection: upgrade refused");
+    var v8 = "GET /chat HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
+    v8 = _tb_cat(v8, "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 8\r\n\r\n");
+    assert_eq(_ws_hsc(v8), 0, "version 8 refused");
+    var dup = "GET /chat HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
+    dup = _tb_cat(dup, "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n");
+    dup = _tb_cat(dup, "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    assert_eq(_ws_hsc(dup), 0, "duplicate Sec-WebSocket-Key refused");
+    var shortk = "GET /chat HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
+    shortk = _tb_cat(shortk, "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    assert_eq(_ws_hsc(shortk), 0, "23-character key refused");
+    var post = "POST /chat HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
+    post = _tb_cat(post, "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    assert_eq(_ws_hsc(post), 0, "POST refused");
+    var fold = "GET /chat HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
+    fold = _tb_cat(fold, "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n x\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    assert_eq(_ws_hsc(fold), 0, "obs-fold refused");
+    assert(_hs_resp_len <= 0, "a refused handshake writes nothing");
+    println("  ws_handshake_parse: ok");
+}
+
+# 2.8.1: a header block that hit the 4 KB cap was answered 101 anyway, and its
+# unread tail then parsed as WebSocket frames.
+fn test_ws_handshake_oversize() {
+    var head = "GET /chat HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
+    head = _tb_cat(head, "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nCookie: ");
+    var hl = strlen(head);
+    var big = fl_alloc(hl + 5004);
+    memcpy(big, head, hl);
+    memset(big + hl, 97, 5000);
+    memcpy(big + hl + 5000, "\r\n\r\n", 4);
+    assert_eq(_ws_hs(big, hl + 5004), 0, "a 5 KB header block is refused");
+    assert(_hs_resp_len <= 0, "5 KB header block: no 101 written");
+    fl_free(big);
+    println("  ws_handshake_oversize: ok");
+}
+
+# 2.8.1: the accept key and the 101 response were built with str_builder on
+# the never-freeing bump allocator: 792 bytes per handshake from any peer that
+# just reconnects.
+fn test_ws_handshake_heap() {
+    var ok = "GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
+    ok = _tb_cat(ok, "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    assert_eq(_ws_hsc(ok), 1, "warm-up handshake");
+    var u0 = alloc_used();
+    var i = 0;
+    var bad = 0;
+    while (i < 200) {
+        if (_ws_hsc(ok) != 1) { bad = bad + 1; }
+        i = i + 1;
+    }
+    assert_eq(bad, 0, "200 handshakes all succeed");
+    assert_eq(alloc_used() - u0, 0, "200 handshakes do not grow the bump heap");
+    println("  ws_handshake_heap: ok");
+}
+
+# majra_ws_recv_frame over real sockets, one fresh pair per rejection so
+# leftover bytes cannot mask the next case.
+fn test_ws_recv_frame() {
+    var a = _tb_pair();
+    var b = rethi();
+    var f[16];
+    store8(&f, 0x81); store8(&f + 1, 0x85);
+    store8(&f + 2, 1); store8(&f + 3, 2); store8(&f + 4, 3); store8(&f + 5, 4);
+    store8(&f + 6, 104 ^ 1); store8(&f + 7, 101 ^ 2); store8(&f + 8, 108 ^ 3);
+    store8(&f + 9, 108 ^ 4); store8(&f + 10, 111 ^ 1);
+    _ws_write_full(b, &f, 11);
+    var fr = majra_ws_recv_frame(a);
+    assert(fr != 0, "masked text frame parses");
+    if (fr != 0) {
+        assert_eq(ws_frame_opcode(fr), 1, "opcode text");
+        assert_eq(ws_frame_len(fr), 5, "len 5");
+        assert_eq(ws_frame_fin(fr), 1, "fin");
+        assert_eq(memeq(ws_frame_payload(fr), "hello", 5), 1, "payload unmasked");
+        ws_frame_free(fr);
+    }
+    # Unmasked 1-byte frame plus 5 trailing bytes, so a parser that skipped the
+    # mask check would complete a frame here rather than time out.
+    store8(&f, 0x81); store8(&f + 1, 0x01); store8(&f + 2, 120);
+    memset(&f + 3, 0, 5);
+    _ws_write_full(b, &f, 8);
+    assert_eq(majra_ws_recv_frame(a), 0, "unmasked client frame refused");
+    syscall(SYS_CLOSE, a); syscall(SYS_CLOSE, b);
+
+    a = _tb_pair(); b = rethi();
+    store8(&f, 0xC1); store8(&f + 1, 0x80);
+    memset(&f + 2, 0, 4);
+    _ws_write_full(b, &f, 6);
+    assert_eq(majra_ws_recv_frame(a), 0, "RSV1 refused");
+    syscall(SYS_CLOSE, a); syscall(SYS_CLOSE, b);
+
+    a = _tb_pair(); b = rethi();
+    store8(&f, 0x83); store8(&f + 1, 0x80);
+    _ws_write_full(b, &f, 6);
+    assert_eq(majra_ws_recv_frame(a), 0, "reserved opcode 3 refused");
+    syscall(SYS_CLOSE, a); syscall(SYS_CLOSE, b);
+
+    a = _tb_pair(); b = rethi();
+    store8(&f, 0x89); store8(&f + 1, 0xFE); store8(&f + 2, 0); store8(&f + 3, 126);
+    _ws_write_full(b, &f, 4);
+    assert_eq(majra_ws_recv_frame(a), 0, "126-byte ping refused (control > 125)");
+    syscall(SYS_CLOSE, a); syscall(SYS_CLOSE, b);
+
+    a = _tb_pair(); b = rethi();
+    store8(&f, 0x09); store8(&f + 1, 0x80);
+    memset(&f + 2, 0, 4);
+    _ws_write_full(b, &f, 6);
+    assert_eq(majra_ws_recv_frame(a), 0, "FIN=0 ping refused (fragmented control)");
+    syscall(SYS_CLOSE, a); syscall(SYS_CLOSE, b);
+
+    a = _tb_pair(); b = rethi();
+    store8(&f, 0x82); store8(&f + 1, 0xFF);
+    store8(&f + 2, 0); store8(&f + 3, 0); store8(&f + 4, 0); store8(&f + 5, 1);
+    store8(&f + 6, 0); store8(&f + 7, 0); store8(&f + 8, 0); store8(&f + 9, 5);
+    _ws_write_full(b, &f, 10);
+    assert_eq(majra_ws_recv_frame(a), 0, "127-form with a top-32 bit set refused");
+    syscall(SYS_CLOSE, a); syscall(SYS_CLOSE, b);
+
+    a = _tb_pair(); b = rethi();
+    var m = fl_alloc(208);
+    memset(m, 122, 208);
+    store8(m, 0x82); store8(m + 1, 0xFE); store8(m + 2, 0); store8(m + 3, 200);
+    memset(m + 4, 0, 4);
+    _ws_write_full(b, m, 208);
+    fr = majra_ws_recv_frame(a);
+    assert(fr != 0, "126-form frame parses");
+    if (fr != 0) { assert_eq(ws_frame_len(fr), 200, "126-form len"); ws_frame_free(fr); }
+    fl_free(m);
+
+    # 70014 bytes fit an AF_UNIX socketpair buffer without a reader thread.
+    var big = fl_alloc(70014);
+    memset(big, 90, 70014);
+    store8(big, 0x82); store8(big + 1, 0xFF);
+    memset(big + 2, 0, 5);
+    store8(big + 7, 1); store8(big + 8, 0x11); store8(big + 9, 0x70);
+    memset(big + 10, 0, 4);
+    assert_eq(_ws_write_full(b, big, 70014), 70014, "70000-byte frame written");
+    fr = majra_ws_recv_frame(a);
+    assert(fr != 0, "127-form 70000-byte frame parses (not a literal-127 desync)");
+    if (fr != 0) {
+        assert_eq(ws_frame_len(fr), 70000, "127-form len");
+        assert_eq(load8(ws_frame_payload(fr) + 69999), 90, "127-form last byte");
+        ws_frame_free(fr);
+    }
+    fl_free(big);
+    syscall(SYS_CLOSE, a); syscall(SYS_CLOSE, b);
+    println("  ws_recv_frame: ok");
 }
 
 # 2.6.9: src/ipc.cyr ships in all four dist profiles and had NO test in any
@@ -433,13 +1131,620 @@ fn test_ipc() {
     println("  ipc: ok");
 }
 
+# A connected AF_UNIX stream pair, (a, b) via ret2.
+#
+# Both ends get a 10 s SO_RCVTIMEO, so a regression that leaves a test reading
+# a frame that was never sent fails that read (Err / 0) instead of hanging the
+# suite. Every read these tests expect to succeed has its bytes queued already.
+fn _tb_pair() {
+    var sv[8];
+    syscall(SYS_SOCKETPAIR, 1, 1, 0, &sv);
+    var a = load32(&sv);
+    var b = load32(&sv + 4);
+    #ifdef CYRIUS_TARGET_LINUX
+    var tv[16];
+    memset(&tv, 0, 16);
+    store64(&tv, 10);
+    sys_setsockopt(a, 1, 20, &tv, 16);      # SOL_SOCKET, SO_RCVTIMEO
+    sys_setsockopt(b, 1, 20, &tv, 16);
+    #endif
+    ret2(a, b);
+}
+
+# The same pair WITHOUT the receive timeout, for the parked-reader tests: there
+# the timeout would itself release a deadlocked reader and mask the regression.
+# Those tests are guarded by the watchdog instead.
+fn _tb_pair_raw() {
+    var sv[8];
+    syscall(SYS_SOCKETPAIR, 1, 1, 0, &sv);
+    ret2(load32(&sv), load32(&sv + 4));
+}
+
+# 2.8.1: _ipc_write_full was a bare write(2), so one client that connected and
+# left raised SIGPIPE and killed the whole ipc_accept daemon. This suite does
+# not ignore SIGPIPE, so a regression fails as a crash (exit 141).
+fn test_ipc_sigpipe() {
+    var a = _tb_pair();
+    var b = rethi();
+    syscall(SYS_CLOSE, b);
+    var t, v = ipc_send_frame(a, "hello", 5);
+    assert_eq(is_err_result(t), 1, "ipc send to a closed peer is Err, not SIGPIPE");
+    syscall(SYS_CLOSE, a);
+
+    # A non-socket fd (ENOTSOCK) must fall back to write(2).
+    var pf[8];
+    memset(&pf, 0, 8);
+    sys_pipe(&pf);
+    var pr = load32(&pf);
+    var pw = load32(&pf + 4);
+    var p_t, p_v = ipc_send_frame(pw, "pipe", 4);
+    assert_eq(is_err_result(p_t), 0, "ipc send on a pipe falls back to write(2)");
+    # Only read what was written: an empty pipe with its write end open blocks.
+    if (is_err_result(p_t) == 0) {
+        var g_t, g_v = ipc_recv_frame(pr);
+        assert_eq(is_err_result(g_t), 0, "ipc recv on the pipe");
+        if (is_err_result(g_t) == 0) {
+            assert_eq(load64(g_v), 4, "pipe frame length");
+            assert_eq(memeq(load64(g_v + 8), "pipe", 4), 1, "pipe frame payload");
+            ipc_frame_free(g_v);
+        }
+    }
+    syscall(SYS_CLOSE, pr);
+    syscall(SYS_CLOSE, pw);
+    println("  ipc_sigpipe: ok");
+}
+
+# 2.8.1: ipc_bind unlinked its path unconditionally — deleting a regular file
+# of that name, or silently hijacking a LIVE server's path. And no fd was
+# close-on-exec, so an exec'd child inherited the listener.
+fn test_ipc_bind_safety() {
+    var path = "/tmp/majra_tb_bind_safety.sock";
+    sys_unlink(path);
+    var fd = sys_open(path, 65, 420);
+    assert(fd >= 0, "regular file created at the socket path");
+    syscall(SYS_CLOSE, fd);
+    var f_t, f_v = ipc_bind(path);
+    assert_eq(is_err_result(f_t), 1, "ipc_bind refuses to replace a regular file");
+    if (is_err_result(f_t) == 0) { ipc_close(f_v); }
+    var st[144];
+    memset(&st, 0, 144);
+    assert_eq(sys_lstat(path, &st), 0, "the path still exists");
+    assert_eq(load32(&st + STAT_MODE) & 61440, 32768, "and is still the regular file (S_IFREG), not unlinked");
+    sys_unlink(path);
+
+    var b_t, b_v = ipc_bind(path);
+    assert_eq(is_err_result(b_t), 0, "ipc_bind on a clean path");
+    if (is_err_result(b_t) == 1) { return 0; }
+    assert_eq(syscall(SYS_FCNTL, b_v, 1, 0) & 1, 1, "listener is FD_CLOEXEC");
+    # Non-blocking listener, so a missing liveness probe fails an assertion
+    # below instead of parking this suite in accept(2).
+    syscall(SYS_FCNTL, b_v, 4, 2048);
+
+    var d_t, d_v = ipc_bind(path);
+    assert_eq(is_err_result(d_t), 1, "a second ipc_bind on a LIVE path is refused");
+    if (is_err_result(d_t) == 0) {
+        ipc_close(d_v);
+        ipc_close(b_v);
+        sys_unlink(path);
+        return 0;
+    }
+
+    var c_t, c_v = ipc_connect(path);
+    assert_eq(is_err_result(c_t), 0, "ipc_connect still reaches the first server");
+    if (is_err_result(c_t) == 1) { ipc_close(b_v); sys_unlink(path); return 0; }
+    assert_eq(syscall(SYS_FCNTL, c_v, 1, 0) & 1, 1, "connected client fd is FD_CLOEXEC");
+
+    # The refused bind's liveness probe is the first queued connection; it
+    # closes without sending a byte.
+    var z_t, z_v = ipc_accept(b_v);
+    assert_eq(is_err_result(z_t), 0, "the liveness probe is queued on the live server");
+    if (is_err_result(z_t) == 0) {
+        var zf_t, zf_v = ipc_recv_frame(z_v);
+        assert_eq(err_code_of(zf_t, zf_v), MAJRA_ERR_IPC_CONN_CLOSED, "probe connection reads as a clean close");
+        ipc_close(z_v);
+    }
+    var a_t, a_v = ipc_accept(b_v);
+    assert_eq(is_err_result(a_t), 0, "the real client is accepted next");
+    if (is_err_result(a_t) == 0) {
+        assert_eq(syscall(SYS_FCNTL, a_v, 1, 0) & 1, 1, "accepted fd is FD_CLOEXEC");
+        ipc_send_frame(c_v, "hi", 2);
+        var h_t, h_v = ipc_recv_frame(a_v);
+        assert_eq(is_err_result(h_t), 0, "frame from client to the first server");
+        if (is_err_result(h_t) == 0) {
+            assert_eq(memeq(load64(h_v + 8), "hi", 2), 1, "frame intact");
+            ipc_frame_free(h_v);
+        }
+        ipc_close(a_v);
+    }
+    ipc_close(c_v);
+    ipc_close(b_v);
+
+    # The closed listener leaves a STALE socket file: connect is refused, so
+    # it is safe to replace.
+    var st2[144];
+    memset(&st2, 0, 144);
+    assert_eq(sys_lstat(path, &st2), 0, "stale socket file is still on disk");
+    var s_t, s_v = ipc_bind(path);
+    assert_eq(is_err_result(s_t), 0, "ipc_bind replaces a stale socket");
+    if (is_err_result(s_t) == 0) { ipc_close(s_v); }
+    sys_unlink(path);
+    println("  ipc_bind_safety: ok");
+}
+
+# ipc_recv_frame's error codes: callers branch on them.
+fn test_ipc_recv_errors() {
+    var a = _tb_pair();
+    var b = rethi();
+    var hdr[4];
+    store8(&hdr, 0); store8(&hdr + 1, 32); store8(&hdr + 2, 0); store8(&hdr + 3, 0);
+    syscall(SYS_WRITE, a, &hdr, 4);
+    var t, v = ipc_recv_frame(b);
+    assert_eq(err_code_of(t, v), MAJRA_ERR_IPC_FRAME_TOO_LARGE, "2 MiB header is FRAME_TOO_LARGE");
+    syscall(SYS_CLOSE, a);
+    syscall(SYS_CLOSE, b);
+
+    var a2 = _tb_pair();
+    var b2 = rethi();
+    store8(&hdr, 0); store8(&hdr + 1, 0); store8(&hdr + 2, 0); store8(&hdr + 3, 10);
+    syscall(SYS_WRITE, a2, &hdr, 4);
+    syscall(SYS_WRITE, a2, "abc", 3);
+    syscall(SYS_CLOSE, a2);
+    var t2, v2 = ipc_recv_frame(b2);
+    assert_eq(is_err_result(t2), 1, "body truncated by EOF is Err");
+    assert_eq(err_code_of(t2, v2), MAJRA_ERR_IPC, "a truncated body is not reported as a clean close");
+    syscall(SYS_CLOSE, b2);
+
+    var a3 = _tb_pair();
+    var b3 = rethi();
+    syscall(SYS_CLOSE, a3);
+    var t3, v3 = ipc_recv_frame(b3);
+    assert_eq(err_code_of(t3, v3), MAJRA_ERR_IPC_CONN_CLOSED, "EOF before any byte is CONN_CLOSED");
+    syscall(SYS_CLOSE, b3);
+
+    sys_unlink("/tmp/majra_tb_nonexistent.sock");
+    assert_eq(is_err_result(ipc_connect("/tmp/majra_tb_nonexistent.sock")), 1, "ipc_connect to a missing path is Err");
+    println("  ipc_recv_errors: ok");
+}
+
+# ---- encrypted IPC over real sockets ----
+# Before 2.8.1 no test ran encrypted_ipc_send/recv/close over a socket, so the
+# replay window, role check, kill and close paths were unverified.
+
+# 2.8.1: every connection under one PSK restarted its nonces at (role, 0) —
+# (key, nonce) reuse across connections. A per-handle salt fills bytes 1-7.
+fn test_eipc_nonce_salt() {
+    var key[32];
+    memset(&key, 42, 32);
+    var a1 = _tb_pair();
+    var b1 = rethi();
+    var a2 = _tb_pair();
+    var b2 = rethi();
+    var h1 = encrypted_ipc_new(a1, &key, ENCRYPTED_IPC_INITIATOR);
+    var h2 = encrypted_ipc_new(a2, &key, ENCRYPTED_IPC_INITIATOR);
+    assert(h1 != 0 && h2 != 0, "two initiator handles under one PSK");
+    assert_eq(is_err_result(encrypted_ipc_send(h1, "same", 4)), 0, "h1 sends");
+    assert_eq(is_err_result(encrypted_ipc_send(h2, "same", 4)), 0, "h2 sends");
+    var f1_t, f1_v = ipc_recv_frame(b1);
+    var f2_t, f2_v = ipc_recv_frame(b2);
+    assert_eq(is_err_result(f1_t) + is_err_result(f2_t), 0, "both raw frames captured");
+    if (is_err_result(f1_t) + is_err_result(f2_t) != 0) { return 0; }
+    var n1 = load64(f1_v + 8);
+    var n2 = load64(f2_v + 8);
+    assert_eq(load64(f1_v), 12 + 4 + 16, "frame is nonce + ciphertext + tag");
+    assert(memeq(n1, n2, 12) != 1, "frame-0 nonces DIFFER between two handles under one PSK");
+    assert(memeq(n1 + 12, n2 + 12, 4) != 1, "so the ciphertexts differ (no keystream reuse)");
+    assert_eq(load8(n1), ENCRYPTED_IPC_INITIATOR, "nonce byte 0 is the role");
+    assert_eq(load8(n1 + 8) | load8(n1 + 9) | load8(n1 + 10) | load8(n1 + 11), 0, "bytes 8-11 carry counter 0");
+    assert_eq(load8(n1 + 4) & 128, 0, "h1 nonce byte 4 top bit clear");
+    assert_eq(load8(n2 + 4) & 128, 0, "h2 nonce byte 4 top bit clear");
+
+    # Second frame from h1: same salt, counter 1.
+    encrypted_ipc_send(h1, "next", 4);
+    var f3_t, f3_v = ipc_recv_frame(b1);
+    if (is_err_result(f3_t) == 0) {
+        var n3 = load64(f3_v + 8);
+        assert_eq(memeq(n1 + 1, n3 + 1, 7), 1, "salt bytes 1-7 are constant within a handle");
+        assert_eq(load8(n3 + 11), 1, "counter byte advances");
+        ipc_frame_free(f3_v);
+    }
+
+    # A peer still decrypts the salted frame (wire-compatible).
+    var r1 = encrypted_ipc_new(b1, &key, ENCRYPTED_IPC_RESPONDER);
+    ipc_send_frame(a1, n1, load64(f1_v));
+    var g_t, g_v = encrypted_ipc_recv(r1);
+    assert_eq(is_err_result(g_t), 0, "responder decrypts a salted frame");
+    if (is_err_result(g_t) == 0) {
+        assert_eq(load64(g_v), 4, "decrypted length");
+        assert_eq(memeq(load64(g_v + 8), "same", 4), 1, "decrypted bytes");
+        encrypted_ipc_payload_free(g_v);
+    }
+    ipc_frame_free(f1_v);
+    ipc_frame_free(f2_v);
+    encrypted_ipc_close(h1);
+    encrypted_ipc_close(h2);
+    encrypted_ipc_close(r1);
+    syscall(SYS_CLOSE, b2);
+    encrypted_ipc_free(h1);
+    encrypted_ipc_free(h2);
+    encrypted_ipc_free(r1);
+    println("  eipc_nonce_salt: ok");
+}
+
+fn _tb_eipc_salt(h) { return load64(load64(h + 8) + 32); }
+
+# 2.8.1: rekey redraws the salt, so A -> B -> A cannot replay nonces already
+# used under A.
+fn test_eipc_rekey_salt() {
+    var key[32];
+    memset(&key, 1, 32);
+    var key2[32];
+    memset(&key2, 2, 32);
+    var h = encrypted_ipc_new(-1, &key, ENCRYPTED_IPC_INITIATOR);
+    assert(h != 0, "handle on a dummy fd");
+    var s0 = _tb_eipc_salt(h);
+    var t1, v1 = encrypted_ipc_rekey(h, &key2);
+    assert_eq(is_err_result(t1), 0, "rekey A -> B");
+    var s1 = _tb_eipc_salt(h);
+    var t2, v2 = encrypted_ipc_rekey(h, &key);
+    assert_eq(is_err_result(t2), 0, "rekey back to A is Ok");
+    var s2 = _tb_eipc_salt(h);
+    assert(s0 != s1 && s1 != s2 && s0 != s2, "salt redrawn on each rekey");
+    assert_eq(s0 >> 56, 0, "salt top byte clear (byte 0 is the role)");
+    assert_eq((s2 >> 31) & 1, 0, "salt bit 31 clear (nonce byte 4 top bit)");
+    encrypted_ipc_close(h);
+    encrypted_ipc_free(h);
+    println("  eipc_rekey_salt: ok");
+}
+
+# Round trip both ways, tamper, replay, hard limit, close.
+fn test_eipc_roundtrip() {
+    var key[32];
+    memset(&key, 7, 32);
+    var key2[32];
+    memset(&key2, 8, 32);
+    var a = _tb_pair();
+    var b = rethi();
+    var ini = encrypted_ipc_new(a, &key, ENCRYPTED_IPC_INITIATOR);
+    var rsp = encrypted_ipc_new(b, &key, ENCRYPTED_IPC_RESPONDER);
+
+    assert_eq(is_err_result(encrypted_ipc_send(ini, "hello responder", 15)), 0, "initiator sends");
+    var t1, v1 = encrypted_ipc_recv(rsp);
+    assert_eq(is_err_result(t1), 0, "responder receives");
+    if (is_err_result(t1) == 0) {
+        assert_eq(load64(v1), 15, "i->r length");
+        assert_eq(memeq(load64(v1 + 8), "hello responder", 15), 1, "i->r plaintext");
+        encrypted_ipc_payload_free(v1);
+    }
+    assert_eq(is_err_result(encrypted_ipc_send(rsp, "hello initiator", 15)), 0, "responder sends");
+    var t2, v2 = encrypted_ipc_recv(ini);
+    assert_eq(is_err_result(t2), 0, "initiator receives");
+    if (is_err_result(t2) == 0) {
+        assert_eq(memeq(load64(v2 + 8), "hello initiator", 15), 1, "r->i plaintext");
+        encrypted_ipc_payload_free(v2);
+    }
+
+    # Capture a genuine frame off the wire, then feed variants of it back.
+    encrypted_ipc_send(ini, "second", 6);
+    var f_t, f_v = ipc_recv_frame(b);
+    assert_eq(is_err_result(f_t), 0, "raw frame captured");
+    if (is_err_result(f_t) == 1) { return 0; }
+    var raw = load64(f_v + 8);
+    var rlen = load64(f_v);
+    store8(raw + 13, load8(raw + 13) ^ 1);
+    ipc_send_frame(a, raw, rlen);
+    var x_t, x_v = encrypted_ipc_recv(rsp);
+    assert_eq(is_err_result(x_t), 1, "tampered ciphertext rejected");
+    assert_eq(load64(rsp + 56), 0, "a failed tag does not kill the handle");
+    store8(raw + 13, load8(raw + 13) ^ 1);
+    ipc_send_frame(a, raw, rlen);
+    var o_t, o_v = encrypted_ipc_recv(rsp);
+    assert_eq(is_err_result(o_t), 0, "the genuine frame still decrypts after a tamper (window not advanced)");
+    if (is_err_result(o_t) == 0) {
+        assert_eq(memeq(load64(o_v + 8), "second", 6), 1, "genuine frame plaintext");
+        encrypted_ipc_payload_free(o_v);
+    }
+    ipc_send_frame(a, raw, rlen);
+    var p_t, p_v = encrypted_ipc_recv(rsp);
+    assert_eq(is_err_result(p_t), 1, "a replayed frame is rejected");
+    assert_eq(load64(rsp + 56), 0, "a replay does not kill the handle");
+    ipc_frame_free(f_v);
+    encrypted_ipc_send(ini, "third", 5);
+    var q_t, q_v = encrypted_ipc_recv(rsp);
+    assert_eq(is_err_result(q_t), 0, "the channel keeps working after a rejected replay");
+    if (is_err_result(q_t) == 0) { encrypted_ipc_payload_free(q_v); }
+
+    # Frame-count limits.
+    store64(ini + 16, NONCE_HARD_LIMIT);
+    assert_eq(is_err_result(encrypted_ipc_send(ini, "x", 1)), 1, "send at NONCE_HARD_LIMIT is Err");
+    assert_eq(encrypted_ipc_messages_sent(ini), NONCE_HARD_LIMIT, "a refused send consumes no counter");
+    store64(ini + 16, NONCE_WARN_THRESHOLD);
+    assert_eq(is_err_result(encrypted_ipc_send(ini, "w", 1)), 0, "send at the warn threshold succeeds");
+    assert_eq(encrypted_ipc_needs_rekey(ini), 1, "and flags needs_rekey");
+    var w_t, w_v = encrypted_ipc_recv(rsp);
+    assert_eq(is_err_result(w_t), 0, "peer accepts the high-counter frame");
+    if (is_err_result(w_t) == 0) { encrypted_ipc_payload_free(w_v); }
+
+    # Close: everything after it is Err, the key is wiped and freed, fd -1.
+    encrypted_ipc_close(ini);
+    assert_eq(is_err_result(encrypted_ipc_send(ini, "x", 1)), 1, "send after close is Err");
+    assert_eq(is_err_result(encrypted_ipc_rekey(ini, &key2)), 1, "rekey after close is Err");
+    assert_eq(is_err_result(encrypted_ipc_recv(ini)), 1, "recv after close is Err");
+    assert_eq(load64(ini + 8), 0, "close wipes and frees the key block");
+    assert_eq(load64(ini), -1, "close releases the fd");
+    encrypted_ipc_close(ini);
+    # The surviving end sees EOF, and a send into the dead socket is Err, not SIGPIPE.
+    assert_eq(is_err_result(encrypted_ipc_recv(rsp)), 1, "peer recv after the other end closed is Err");
+    assert_eq(is_err_result(encrypted_ipc_send(rsp, "late", 4)), 1, "send to a closed peer is Err, not SIGPIPE");
+    encrypted_ipc_close(rsp);
+    encrypted_ipc_free(ini);
+    encrypted_ipc_free(rsp);
+    println("  eipc_roundtrip: ok");
+}
+
+# 2.8.1: per-key VOLUME limits (encrypted bytes), not just a frame count.
+fn test_eipc_volume_limit() {
+    var key[32];
+    memset(&key, 9, 32);
+    var key2[32];
+    memset(&key2, 10, 32);
+    var a = _tb_pair();
+    var b = rethi();
+    var h = encrypted_ipc_new(a, &key, ENCRYPTED_IPC_INITIATOR);
+    var vb = load64(h + 8);
+    # One 1-byte frame costs 1 + 16 (one tag block).
+    store64(vb + 40, _EIPC_VOLUME_HARD_BYTES - 16);
+    assert_eq(is_err_result(encrypted_ipc_send(h, "x", 1)), 1, "a frame crossing the volume hard limit is Err");
+    assert_eq(encrypted_ipc_messages_sent(h), 0, "the refused frame consumed no counter");
+    store64(vb + 40, _EIPC_VOLUME_HARD_BYTES - 17);
+    assert_eq(is_err_result(encrypted_ipc_send(h, "x", 1)), 0, "a frame landing exactly on the hard limit is Ok");
+    store64(vb + 40, _EIPC_VOLUME_WARN_BYTES - 20);
+    store64(h + 32, 0);
+    assert_eq(is_err_result(encrypted_ipc_send(h, "x", 1)), 0, "send below the warn mark");
+    assert_eq(encrypted_ipc_needs_rekey(h), 0, "below the warn mark: no rekey flag");
+    store64(vb + 40, _EIPC_VOLUME_WARN_BYTES - 5);
+    assert_eq(is_err_result(encrypted_ipc_send(h, "x", 1)), 0, "send crossing the warn mark");
+    assert_eq(encrypted_ipc_needs_rekey(h), 1, "volume warn sets needs_rekey");
+    assert_eq(load64(vb + 40), _EIPC_VOLUME_WARN_BYTES - 5 + 17, "volume counts payload plus a tag block");
+    var r_t, r_v = encrypted_ipc_rekey(h, &key2);
+    assert_eq(is_err_result(r_t), 0, "rekey");
+    assert_eq(load64(load64(h + 8) + 40), 0, "rekey resets the volume counter");
+    assert_eq(encrypted_ipc_needs_rekey(h), 0, "rekey clears needs_rekey");
+    encrypted_ipc_close(h);
+    encrypted_ipc_free(h);
+    syscall(SYS_CLOSE, b);
+    println("  eipc_volume_limit: ok");
+}
+
+# 2.8.1: an inbound frame carrying OUR role means both ends share a role (every
+# counter collides across directions) or a reflection — tear down, via
+# shutdown(2) so the fd number stays ours until close.
+fn test_eipc_same_role_kill() {
+    var key[32];
+    memset(&key, 21, 32);
+    var a = _tb_pair();
+    var b = rethi();
+    var sender = encrypted_ipc_new(a, &key, ENCRYPTED_IPC_INITIATOR);
+    var same = encrypted_ipc_new(b, &key, ENCRYPTED_IPC_INITIATOR);
+    assert_eq(is_err_result(encrypted_ipc_send(sender, "x", 1)), 0, "initiator frame sent");
+    var t, v = encrypted_ipc_recv(same);
+    assert_eq(is_err_result(t), 1, "same-role frame rejected");
+    assert_eq(load64(same + 56), 1, "same-role frame KILLS the handle");
+    assert_eq(load64(same), b, "kill keeps the fd number (shutdown, not close)");
+    assert(syscall(SYS_FCNTL, b, 1, 0) >= 0, "the descriptor is still open after the kill");
+    assert_eq(is_err_result(encrypted_ipc_send(same, "y", 1)), 1, "send after the kill is Err");
+    assert_eq(is_err_result(encrypted_ipc_recv(same)), 1, "recv after the kill is Err");
+    assert(load64(same + 8) != 0, "the kill leaves the key for close to wipe");
+
+    # 2.8.1: close used to return early on `closed`, leaving the PSK on the heap.
+    encrypted_ipc_close(same);
+    assert_eq(load64(same + 8), 0, "close after a kill wipes and frees the key");
+    assert_eq(load64(same), -1, "close after a kill closes the fd");
+    encrypted_ipc_close(same);
+    assert_eq(load64(same), -1, "a second close is harmless");
+    encrypted_ipc_close(sender);
+    encrypted_ipc_free(same);
+    encrypted_ipc_free(sender);
+    println("  eipc_same_role_kill: ok");
+}
+
+# 2.8.1: an oversized header killed the handle with close(2), freeing the fd
+# number while a concurrent send could still hold it. Now shutdown(2).
+fn test_eipc_oversize_kill() {
+    var key[32];
+    memset(&key, 33, 32);
+    var a = _tb_pair();
+    var b = rethi();
+    var ov = encrypted_ipc_new(b, &key, ENCRYPTED_IPC_RESPONDER);
+    var hdr[4];
+    memset(&hdr, 255, 4);
+    syscall(SYS_WRITE, a, &hdr, 4);
+    var t, v = encrypted_ipc_recv(ov);
+    assert_eq(is_err_result(t), 1, "oversized frame header is Err");
+    assert_eq(err_code_of(t, v), MAJRA_ERR_IPC_FRAME_TOO_LARGE, "reported as FRAME_TOO_LARGE");
+    assert_eq(load64(ov + 56), 1, "oversized header poisons the handle");
+    assert_eq(load64(ov), b, "fd number kept (shutdown, not close)");
+    assert(syscall(SYS_FCNTL, b, 1, 0) >= 0, "the descriptor is still open");
+    assert_eq(is_err_result(encrypted_ipc_send(ov, "x", 1)), 1, "send after the kill is Err");
+    assert_eq(syscall(SYS_READ, a, &hdr, 4), 0, "the peer observes the shutdown as EOF");
+
+    encrypted_ipc_close(ov);
+    assert_eq(load64(ov + 8), 0, "close after the oversize kill wipes and frees the key");
+    assert_eq(load64(ov), -1, "close after the oversize kill releases the fd");
+    encrypted_ipc_close(ov);
+    syscall(SYS_CLOSE, a);
+    encrypted_ipc_free(ov);
+    println("  eipc_oversize_kill: ok");
+}
+
+# Everything readable right now (MSG_DONTWAIT), or 0.
+fn _tb_drain(fd, buf, cap) {
+    var n = syscall(SYS_RECVFROM, fd, buf, cap, 0x40, 0, 0);
+    if (n < 0) { return 0; }
+    return n;
+}
+
+# 2.8.1 (RESP command encoding): this used to assert vec_len of a locally built
+# vec, which tests lib/vec.cyr and cannot fail for any redis_backend change.
+# Exact wire bytes, including the key prefix and numeric formatting. redis_eval
+# (the rate-limiter entry point) and redis_expire were called by no suite.
 fn test_redis_resp() {
-    var cmd = vec_new();
-    vec_push(cmd, "SET");
-    vec_push(cmd, "mykey");
-    vec_push(cmd, "myvalue");
-    assert_eq(vec_len(cmd), 3, "resp cmd 3 args");
+    var a = _tb_pair();
+    var b = rethi();
+    var rc = _mk_conn(b);
+    redis_set_prefix(rc, "pfx:");
+    var buf = fl_alloc(8192);
+
+    syscall(SYS_WRITE, a, "+OK\r\n", 5);
+    resp_reply_free(redis_setex(rc, "k", "v", 30));
+    var n = _tb_drain(a, buf, 8192);
+    var want = "*5\r\n$3\r\nSET\r\n$5\r\npfx:k\r\n$1\r\nv\r\n$2\r\nEX\r\n$2\r\n30\r\n";
+    assert_eq(n, strlen(want), "setex frame length");
+    assert_eq(memeq(buf, want, strlen(want)), 1, "setex frame bytes");
+
+    syscall(SYS_WRITE, a, ":0\r\n", 4);
+    assert_eq(redis_eval(rc, "return 0", 1, "rk", "a1", "a2", "a3"), 0, "eval integer reply");
+    n = _tb_drain(a, buf, 8192);
+    var want2 = "*7\r\n$4\r\nEVAL\r\n$8\r\nreturn 0\r\n$1\r\n1\r\n$6\r\npfx:rk\r\n$2\r\na1\r\n$2\r\na2\r\n$2\r\na3\r\n";
+    assert_eq(n, strlen(want2), "eval frame length");
+    assert_eq(memeq(buf, want2, strlen(want2)), 1, "eval frame bytes (prefix on the key only)");
+
+    syscall(SYS_WRITE, a, ":1\r\n", 4);
+    assert_eq(redis_expire(rc, "k", 60), 1, "expire integer reply");
+    n = _tb_drain(a, buf, 8192);
+    var want3 = "*3\r\n$6\r\nEXPIRE\r\n$5\r\npfx:k\r\n$2\r\n60\r\n";
+    assert_eq(n, strlen(want3), "expire frame length");
+    assert_eq(memeq(buf, want3, strlen(want3)), 1, "expire frame bytes");
+
+    syscall(SYS_WRITE, a, ":1\r\n", 4);
+    assert_eq(redis_zadd(rc, "z", "m", -7), 1, "zadd integer reply");
+    n = _tb_drain(a, buf, 8192);
+    var want4 = "*4\r\n$4\r\nZADD\r\n$5\r\npfx:z\r\n$2\r\n-7\r\n$1\r\nm\r\n";
+    assert_eq(n, strlen(want4), "zadd frame length");
+    assert_eq(memeq(buf, want4, strlen(want4)), 1, "zadd frame bytes (negative score)");
+
+    redis_set_prefix(rc, "");
+    syscall(SYS_WRITE, a, "+PONG\r\n", 7);
+    resp_reply_free(redis_ping(rc));
+    n = _tb_drain(a, buf, 8192);
+    assert_eq(n, 14, "ping frame length");
+    assert_eq(memeq(buf, "*1\r\n$4\r\nPING\r\n", 14), 1, "ping frame bytes");
+    assert_eq(redis_is_alive(rc), 1, "alive after the frame checks");
+    syscall(SYS_CLOSE, a);
+    syscall(SYS_CLOSE, b);
+    fl_free(buf);
     println("  redis_resp: ok");
+}
+
+# 2.8.1: resp_reply_free leaked. The +simple / -error Str pointed one byte into
+# its block, so fl_free read the size class off the type byte and the free
+# failed; the header came from the bump allocator. The freelist is LIFO, so the
+# next two same-class allocations must hand back exactly the freed blocks.
+fn test_resp_reply_free() {
+    var a = _tb_pair();
+    var b = rethi();
+    var rc = _mk_conn(b);
+    syscall(SYS_WRITE, a, "+OK\r\n", 5);
+    var r = _resp_read_reply(rc);
+    assert(r != 0, "+OK parsed");
+    if (r == 0) { return 0; }
+    assert_eq(str_len(r), 2, "+OK length 2");
+    assert_eq(streq(str_data(r), "OK"), 1, "+OK text is NUL-terminated at the block start");
+    var d = str_data(r);
+    resp_reply_free(r);
+    var x1 = fl_alloc(8);
+    var x2 = fl_alloc(8);
+    assert_eq(x1, r, "freed +OK header reused");
+    assert_eq(x2, d, "freed +OK data block reused");
+    fl_free(x2);
+    fl_free(x1);
+
+    syscall(SYS_WRITE, a, "-ERR bad\r\n", 10);
+    var e = _resp_read_reply(rc);
+    assert(e != 0, "-ERR parsed");
+    if (e == 0) { return 0; }
+    assert_eq(streq(str_data(e), "ERR bad"), 1, "-ERR text");
+    var ed = str_data(e);
+    resp_reply_free(e);
+    x1 = fl_alloc(8);
+    x2 = fl_alloc(8);
+    assert_eq(x1, e, "freed -ERR header reused");
+    assert_eq(x2, ed, "freed -ERR data block reused");
+    fl_free(x2);
+    fl_free(x1);
+    assert_eq(redis_is_alive(rc), 1, "alive after simple replies");
+
+    # A bulk reply is a C string too.
+    syscall(SYS_WRITE, a, "$5\r\nhello\r\n", 11);
+    var bs = _resp_read_reply(rc);
+    assert(bs != 0, "bulk parsed");
+    if (bs != 0) {
+        assert_eq(str_len(bs), 5, "bulk length");
+        assert_eq(strlen(str_data(bs)), 5, "bulk reply is NUL-terminated");
+        resp_reply_free(bs);
+    }
+    syscall(SYS_WRITE, a, ":-42\r\n", 6);
+    assert_eq(_resp_read_reply(rc), -42, "negative integer reply");
+
+    # A bulk body not followed by CRLF: the length lied, the stream is offset.
+    syscall(SYS_WRITE, a, "$2\r\nhiXY", 8);
+    assert_eq(_resp_read_reply(rc), 0, "bulk without its CRLF is refused");
+    assert_eq(redis_is_alive(rc), 0, "a lying bulk length poisons the connection");
+    syscall(SYS_CLOSE, a);
+
+    # An array truncated by EOF is a failure, not a zero-padded vec.
+    var a2 = _tb_pair();
+    var b2 = rethi();
+    var rc2 = _mk_conn(b2);
+    syscall(SYS_WRITE, a2, "*3\r\n:5\r\n", 8);
+    syscall(SYS_CLOSE, a2);
+    assert_eq(_resp_read_reply(rc2), 0, "truncated array returns 0, not [5,0,0]");
+    assert_eq(redis_is_alive(rc2), 0, "a truncated array poisons the connection");
+    println("  resp_reply_free: ok");
+}
+
+# 2.8.1: every command built its frame with str_builder / vec_new / str_from_int
+# on the bump allocator (never freed): ~2.6 KB per 6 commands, megabytes a
+# second under a rate limiter. Commands must now allocate nothing permanent.
+fn test_redis_no_bump_growth() {
+    var a = _tb_pair();
+    var b = rethi();
+    var rc = _mk_conn(b);
+    redis_set_prefix(rc, "pfx:");
+    var buf = fl_alloc(8192);
+    var i = 0;
+    while (i < 4) {
+        syscall(SYS_WRITE, a, "+OK\r\n", 5); resp_reply_free(redis_set(rc, "k", "v"));
+        syscall(SYS_WRITE, a, ":1\r\n", 4); redis_del(rc, "k");
+        syscall(SYS_WRITE, a, "$5\r\nhello\r\n", 11); resp_reply_free(redis_get(rc, "k"));
+        syscall(SYS_WRITE, a, ":1\r\n", 4); redis_zadd(rc, "z", "m", -7);
+        syscall(SYS_WRITE, a, "+PONG\r\n", 7); resp_reply_free(redis_ping(rc));
+        syscall(SYS_WRITE, a, "+OK\r\n", 5); resp_reply_free(redis_setex(rc, "k", "v", 9));
+        _tb_drain(a, buf, 8192);
+        i = i + 1;
+    }
+    var before = alloc_used();
+    i = 0;
+    while (i < 500) {
+        syscall(SYS_WRITE, a, "+OK\r\n", 5); resp_reply_free(redis_set(rc, "k", "v"));
+        syscall(SYS_WRITE, a, ":1\r\n", 4); redis_del(rc, "k");
+        syscall(SYS_WRITE, a, "$5\r\nhello\r\n", 11); resp_reply_free(redis_get(rc, "k"));
+        syscall(SYS_WRITE, a, ":1\r\n", 4); redis_zadd(rc, "z", "m", -7);
+        syscall(SYS_WRITE, a, "+PONG\r\n", 7); resp_reply_free(redis_ping(rc));
+        syscall(SYS_WRITE, a, "+OK\r\n", 5); resp_reply_free(redis_setex(rc, "k", "v", 9));
+        _tb_drain(a, buf, 8192);
+        i = i + 1;
+    }
+    assert_eq(alloc_used() - before, 0, "3000 redis commands grow the bump allocator by 0 bytes");
+    assert_eq(redis_is_alive(rc), 1, "alive after the loop");
+
+    # 2.8.1: a dead peer. The send used to be a bare write(2) (SIGPIPE kills the
+    # process) whose failure was ignored before a blocking read.
+    syscall(SYS_CLOSE, a);
+    assert_eq(redis_set(rc, "k", "v"), 0, "a command on a closed peer returns 0, no SIGPIPE");
+    assert_eq(redis_is_alive(rc), 0, "the failed send poisons the connection");
+    assert_eq(redis_get(rc, "k"), 0, "a dead handle fails fast");
+    fl_free(buf);
+    println("  redis_no_bump_growth: ok");
 }
 
 fn test_pg_wire() {
@@ -521,27 +1826,68 @@ fn test_tracker_type_tags() {
     println("  tracker_type_tags: ok");
 }
 
+# 1 if `lit` is tag + body + tag, where tag = lit[0 .. the second '$'] and the
+# first occurrence of the tag after the opening one is exactly the closing one:
+# the literal cannot end early, whatever the body holds.
+fn _tb_dq_ok(lit) {
+    var n = strlen(lit);
+    if (n < 6 || load8(lit) != 36) { return 0; }
+    var t = 1;
+    while (t < n && load8(lit + t) != 36) { t = t + 1; }
+    var tl = t + 1;
+    if (n < 2 * tl) { return 0; }
+    var i = tl;
+    while (i + tl <= n) {
+        if (memeq(lit + i, lit, tl) == 1) {
+            if (i == n - tl) { return 1; }
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _tb_lit(s) {
+    var sb = str_builder_new();
+    _pg_add_literal(sb, s);
+    return str_data(str_builder_build(sb));
+}
+
+fn _tb_qlit(s) {
+    var q = _pg_q_new();
+    _pg_q_lit(q, s);
+    return _pg_q_sql(q);
+}
+
+# 2.8.1: values are DOLLAR-QUOTED ($m_$...$m_$). The '' doubling this used was
+# safe only while standard_conforming_strings=on; with it off, `\'` closed the
+# literal. The tag grows one '_' past the longest '_' run in the value.
 fn test_pg_literal_escaping() {
     var sb = str_builder_new();
-    assert_eq(_pg_add_literal(sb, "plain"), 0, "escape plain returns ok");
-    assert_eq(streq(str_data(str_builder_build(sb)), "'plain'"), 1, "plain is quoted");
+    assert_eq(_pg_add_literal(sb, "plain"), 0, "literal returns ok");
+    assert_eq(streq(str_data(str_builder_build(sb)), "$m_$plain$m_$"), 1, "plain is dollar-quoted");
+    assert_eq(streq(_tb_lit(""), "$m_$$m_$"), 1, "empty string is an empty dollar literal");
+    assert_eq(streq(_tb_lit("a__b"), "$m___$a__b$m___$"), 1, "an underscore run lengthens the tag");
+    assert_eq(_pg_add_literal(str_builder_new(), 0), -1, "null is refused");
 
-    var sb2 = str_builder_new();
-    _pg_add_literal(sb2, "it's");
-    assert_eq(streq(str_data(str_builder_build(sb2)), "'it''s'"), 1, "single quote is doubled");
-
-    # The injection shape: closing the literal and appending SQL.
-    var sb3 = str_builder_new();
-    _pg_add_literal(sb3, "x'; DROP TABLE majra_workflow_definitions; --");
-    assert_eq(streq(str_data(str_builder_build(sb3)),
-        "'x''; DROP TABLE majra_workflow_definitions; --'"), 1,
-      "injection payload stays inside one literal");
-
-    var sb4 = str_builder_new();
-    _pg_add_literal(sb4, "");
-    assert_eq(streq(str_data(str_builder_build(sb4)), "''"), 1, "empty string is an empty literal");
-
-    assert_eq(_pg_add_literal(sb, 0), -1, "null is refused");
+    var cases = vec_new();
+    vec_push(cases, "it's");
+    vec_push(cases, "\\'; DROP TABLE majra_workflow_definitions; --");
+    vec_push(cases, "x'; DROP TABLE t; --");
+    vec_push(cases, "x$m");
+    vec_push(cases, "$m_");
+    vec_push(cases, "$m_$");
+    vec_push(cases, "a_$m__$b");
+    vec_push(cases, "$$m_$$");
+    vec_push(cases, "____");
+    vec_push(cases, "$");
+    var i = 0;
+    while (i < vec_len(cases)) {
+        var c = vec_get(cases, i);
+        assert_eq(_tb_dq_ok(_tb_lit(c)), 1, "adversarial literal closes only at its end");
+        assert_eq(streq(_tb_qlit(c), _tb_lit(c)), 1, "_pg_q_lit matches _pg_add_literal");
+        i = i + 1;
+    }
     println("  pg_literal_escaping: ok");
 }
 
@@ -632,16 +1978,465 @@ fn test_resp_parser() {
     println("  resp_parser: ok");
 }
 
+# `levels` nested "*1\r\n" headers around ":5\r\n", parsed as one reply.
+fn _tb_resp_nested(levels) {
+    var n = levels * 4 + 4;
+    var p = fl_alloc(n);
+    var i = 0;
+    while (i < levels) {
+        memcpy(p + i * 4, "*1\r\n", 4);
+        i = i + 1;
+    }
+    memcpy(p + levels * 4, ":5\r\n", 4);
+    var c = _resp_parse(p, n);
+    var reply = rethi();
+    fl_free(p);
+    ret2(c, reply);
+}
+
+# 2.8.1: this used to assert only that constants were positive and that i64
+# addition wraps — nothing that fails if the depth guard is removed. Drive the
+# recursion: server-controlled nesting is bounded at RESP_MAX_DEPTH.
 fn test_resp_limits() {
-    assert(RESP_MAX_BULK > 0, "resp bulk cap set");
-    assert(RESP_MAX_ARRAY > 0, "resp array cap set");
-    assert(RESP_MAX_DEPTH > 0, "resp depth cap set");
-    # The wraparound that motivated the cap: INT64_MAX + 2 goes negative, and
-    # _fl_class routes any negative size down the size<=16 path, so fl_alloc
-    # would hand back a 16-byte block labelled INT64_MAX long.
-    assert(9223372036854775807 + 2 < 0, "blen + 2 wraps negative at INT64_MAX");
-    assert(RESP_MAX_BULK < 9223372036854775807 - 2, "cap is below the wrap point");
+    assert(RESP_MAX_BULK < 9223372036854775807 - 2, "bulk cap is below the blen + 2 wrap point");
+
+    # The top-level array is depth 0, so RESP_MAX_DEPTH headers put the integer
+    # at exactly RESP_MAX_DEPTH: the deepest accepted.
+    var ok = _tb_resp_nested(RESP_MAX_DEPTH);
+    var r = rethi();
+    assert_eq(redis_is_alive(ok), 1, "nesting at exactly RESP_MAX_DEPTH is accepted");
+    var d = 1;
+    while (d < RESP_MAX_DEPTH && r != 0) {
+        r = vec_get(r, 0);
+        d = d + 1;
+    }
+    assert(r != 0, "the nested arrays are intact");
+    if (r != 0) { assert_eq(vec_get(r, 0), 5, "the innermost element survives"); }
+
+    var deep1 = _tb_resp_nested(RESP_MAX_DEPTH + 1);
+    assert_eq(rethi(), 0, "one level past RESP_MAX_DEPTH is refused");
+    assert_eq(redis_is_alive(deep1), 0, "and poisons the connection");
+    var deep2 = _tb_resp_nested(RESP_MAX_DEPTH + 2);
+    assert_eq(redis_is_alive(deep2), 0, "RESP_MAX_DEPTH + 2 poisons the connection");
     println("  resp_limits: ok");
+}
+
+# ---- PostgreSQL wire, offline over a socketpair ----
+
+fn _mk_pg(fd) {
+    var c = fl_alloc(16);
+    store64(c, fd);
+    store64(c + 8, 1);
+    return c;
+}
+
+# One backend message: type byte, be32(4 + len), body.
+fn _pgmsg(fd, t, body, blen) {
+    var m = fl_alloc(5 + blen);
+    store8(m, t);
+    _pg_write_be32(m, 1, 4 + blen);
+    if (blen > 0) { memcpy(m + 5, body, blen); }
+    syscall(SYS_WRITE, fd, m, 5 + blen);
+    fl_free(m);
+    return 0;
+}
+
+# DataRow with two columns: NULL, "hi".
+fn _pg_row_null_hi(fd) {
+    var d[16];
+    store8(&d, 0); store8(&d + 1, 2);
+    store8(&d + 2, 0xFF); store8(&d + 3, 0xFF); store8(&d + 4, 0xFF); store8(&d + 5, 0xFF);
+    _pg_write_be32(&d, 6, 2);
+    store8(&d + 10, 104); store8(&d + 11, 105);
+    _pgmsg(fd, 68, &d, 12);
+    return 0;
+}
+
+fn _pg_ok_tail(fd) {
+    _pgmsg(fd, 67, "SELECT 1", 9);
+    _pgmsg(fd, 90, "I", 1);
+    return 0;
+}
+
+fn _pg_error_z(fd) {
+    _pgmsg(fd, 69, "SERROR", 7);
+    _pgmsg(fd, 90, "I", 1);
+    return 0;
+}
+
+# 2.8.1: pg_query stopped reading on any failure and left the fd in the handle,
+# so the next query consumed the unread remainder of the previous result as its
+# own reply (or wrote into a reset socket: SIGPIPE).
+fn test_pg_query_offline() {
+    var buf = fl_alloc(65536);
+    var a = _tb_pair();
+    var b = rethi();
+    var conn = _mk_pg(b);
+
+    var two[2];
+    store8(&two, 0); store8(&two + 1, 2);
+    _pgmsg(a, 84, &two, 2);
+    _pg_row_null_hi(a);
+    _pg_ok_tail(a);
+    var rows = pg_query(conn, "SELECT x");
+    assert_eq(vec_len(rows), 1, "pg one row");
+    if (vec_len(rows) == 1) {
+        var row = vec_get(rows, 0);
+        assert_eq(vec_get(row, 0), 0, "NULL column is 0");
+        assert_eq(streq(vec_get(row, 1), "hi"), 1, "second column is 'hi'");
+    }
+    assert_eq(load64(conn), b, "a healthy query leaves the conn alive");
+    _tb_drain(a, buf, 65536);
+
+    # ErrorResponse drains to ReadyForQuery; the next query sees its own row.
+    _pg_error_z(a);
+    _pg_row_null_hi(a);
+    _pg_ok_tail(a);
+    rows = pg_query(conn, "SELECT bad");
+    assert_eq(vec_len(rows), 0, "an erroring query returns no rows");
+    assert_eq(load64(conn), b, "ErrorResponse keeps the conn alive");
+    rows = pg_query(conn, "SELECT x");
+    assert_eq(vec_len(rows), 1, "the next query sees its own row after the drain");
+    _tb_drain(a, buf, 65536);
+
+    # Server-side rejection is reported by the workflow calls (they returned 0).
+    _pg_error_z(a);
+    assert_eq(pg_save_workflow_def(conn, "wf-1", "n", "[]"), -1, "save returns -1 on ErrorResponse");
+    var n = _tb_drain(a, buf, 65536);
+    assert(n > 5, "save sent a Query message");
+    if (n > 5) { assert(memchr(buf + 5, 36, n - 5) >= 0, "the Query text carries a dollar quote"); }
+    _pgmsg(a, 67, "INSERT 0 1", 11);
+    _pgmsg(a, 90, "I", 1);
+    assert_eq(pg_save_workflow_def(conn, "wf-1", "n", "[]"), 0, "save returns 0 on CommandComplete");
+    _tb_drain(a, buf, 65536);
+    _pg_error_z(a);
+    assert_eq(pg_delete_workflow_def(conn, "wf-1"), -1, "delete returns -1 on ErrorResponse");
+    _tb_drain(a, buf, 65536);
+    _pg_error_z(a);
+    assert_eq(pg_get_workflow_def(conn, "wf-1"), 0, "get returns 0 on ErrorResponse");
+    _tb_drain(a, buf, 65536);
+    assert_eq(load64(conn), b, "conn alive after the drains");
+
+    # Malformed DataRow: col_len 100 with a 1-byte body. No row, poisoned.
+    var bad[8];
+    store8(&bad, 0); store8(&bad + 1, 1);
+    _pg_write_be32(&bad, 2, 100);
+    store8(&bad + 6, 120);
+    _pgmsg(a, 68, &bad, 7);
+    _pg_ok_tail(a);
+    rows = pg_query(conn, "SELECT x");
+    assert_eq(vec_len(rows), 0, "a malformed row yields no rows");
+    assert_eq(load64(conn), -1, "a malformed row poisons the conn");
+    rows = pg_query(conn, "SELECT x");
+    assert_eq(vec_len(rows), 0, "a poisoned conn fails fast");
+    pg_close(conn);
+    pg_close(conn);
+    syscall(SYS_CLOSE, a);
+
+    # A message over PG_MAX_MSG: framing is lost, so poisoned.
+    var a2 = _tb_pair();
+    var b2 = rethi();
+    var c2 = _mk_pg(b2);
+    var hdr[8];
+    store8(&hdr, 68);
+    _pg_write_be32(&hdr, 1, 0x10000000);
+    syscall(SYS_WRITE, a2, &hdr, 5);
+    rows = pg_query(c2, "SELECT big");
+    assert_eq(vec_len(rows), 0, "an oversized message yields no rows");
+    assert_eq(load64(c2), -1, "an oversized message poisons the conn");
+    syscall(SYS_CLOSE, a2);
+
+    # Peer gone: no SIGPIPE, poisoned, and every later call is safe.
+    var a3 = _tb_pair();
+    var b3 = rethi();
+    var c3 = _mk_pg(b3);
+    syscall(SYS_CLOSE, a3);
+    rows = pg_query(c3, "SELECT 1");
+    assert_eq(vec_len(rows), 0, "a dead peer yields no rows, no SIGPIPE");
+    assert_eq(load64(c3), -1, "a dead peer poisons the conn");
+    rows = pg_query(c3, "SELECT 2");
+    assert_eq(vec_len(rows), 0, "query on the dead conn returns at once");
+    pg_close(c3);
+    pg_close(c3);
+    assert_eq(pg_save_workflow_def(c3, "a", "b", "c"), -1, "save on a dead conn is -1");
+    fl_free(buf);
+    println("  pg_query_offline: ok");
+}
+
+# ---- threaded tests: keep these LAST (the allocator/LIFO checks above assume
+# no thread has run yet) ----
+
+# A deadlock regression must fail the suite, not hang CI: exit_group(3) if the
+# armed generation is still current after the budget.
+var _wd_gen = 0;
+
+fn _tb_watchdog(gen) {
+    var waited = 0;
+    while (waited < 15000 && _wd_gen == gen) {
+        sleep_ms(50);
+        waited = waited + 50;
+    }
+    if (_wd_gen == gen) {
+        println("  FAIL: watchdog - a blocking call never returned (deadlock regression)");
+        syscall(SYS_EXIT_GROUP, 3);
+    }
+    return 0;
+}
+
+fn _tb_wd_arm() {
+    _wd_gen = _wd_gen + 1;
+    thread_create_detached(&_tb_watchdog, _wd_gen);
+    return 0;
+}
+
+fn _tb_wd_disarm() {
+    _wd_gen = _wd_gen + 1;
+    return 0;
+}
+
+var _pr_e = 0;
+var _pr_t = 0;
+var _pr_v = 0;
+var _pr_done = 0;
+
+fn _pr_recv_worker(arg) {
+    var t, v = encrypted_ipc_recv(_pr_e);
+    _pr_t = t;
+    _pr_v = v;
+    _pr_done = 1;
+    return 0;
+}
+
+# 2.8.1: close took the recv mutex, which a reader parked on a silent peer holds
+# across read(2) — so closing the handle (the usual way to unblock that reader)
+# deadlocked. close now shuts the socket down first.
+fn test_eipc_parked_close() {
+    var key[32];
+    memset(&key, 11, 32);
+    var a = _tb_pair_raw();
+    var b = rethi();
+    var e = encrypted_ipc_new(b, &key, ENCRYPTED_IPC_RESPONDER);
+    _pr_e = e;
+    _pr_done = 0;
+    _tb_wd_arm();
+    var th = thread_create(&_pr_recv_worker, 0);
+    sleep_ms(200);
+    assert_eq(_pr_done, 0, "the reader is parked on the silent peer");
+    encrypted_ipc_close(e);
+    thread_join(th);
+    _tb_wd_disarm();
+    assert_eq(_pr_done, 1, "close released the parked reader");
+    assert_eq(is_err_result(_pr_t), 1, "the parked reader gets Err");
+    assert_eq(load64(e + 8), 0, "key wiped and freed");
+    assert_eq(load64(e), -1, "fd released");
+    syscall(SYS_CLOSE, a);
+    encrypted_ipc_free(e);
+    println("  eipc_parked_close: ok");
+}
+
+# 2.8.1: rekey took the recv mutex too, so a client parked waiting for a reply
+# could not rekey — or send the request the reply depends on.
+fn test_eipc_parked_rekey() {
+    var key[32];
+    memset(&key, 12, 32);
+    var key2[32];
+    memset(&key2, 13, 32);
+    var a = _tb_pair_raw();
+    var b = rethi();
+    var cli = encrypted_ipc_new(a, &key, ENCRYPTED_IPC_INITIATOR);
+    var srv = encrypted_ipc_new(b, &key, ENCRYPTED_IPC_RESPONDER);
+    _pr_e = cli;
+    _pr_done = 0;
+    _tb_wd_arm();
+    var th = thread_create(&_pr_recv_worker, 0);
+    sleep_ms(200);
+    var rk_t, rk_v = encrypted_ipc_rekey(cli, &key2);
+    assert_eq(is_err_result(rk_t), 0, "rekey with a parked reader returns Ok");
+    assert_eq(is_err_result(encrypted_ipc_send(cli, "req", 3)), 0, "send with a parked reader");
+    var sk_t, sk_v = encrypted_ipc_rekey(srv, &key2);
+    assert_eq(is_err_result(sk_t), 0, "server rekeys");
+    var q_t, q_v = encrypted_ipc_recv(srv);
+    assert_eq(is_err_result(q_t), 0, "server receives the request under the new key");
+    if (is_err_result(q_t) == 0) {
+        assert_eq(memeq(load64(q_v + 8), "req", 3), 1, "request intact");
+        encrypted_ipc_payload_free(q_v);
+    }
+    encrypted_ipc_send(srv, "rep", 3);
+    thread_join(th);
+    _tb_wd_disarm();
+    assert_eq(is_err_result(_pr_t), 0, "the parked reader receives the reply under the new key");
+    if (is_err_result(_pr_t) == 0) {
+        assert_eq(memeq(load64(_pr_v + 8), "rep", 3), 1, "reply intact");
+        encrypted_ipc_payload_free(_pr_v);
+    }
+    encrypted_ipc_close(cli);
+    encrypted_ipc_close(srv);
+    encrypted_ipc_free(cli);
+    encrypted_ipc_free(srv);
+    println("  eipc_parked_rekey: ok");
+}
+
+# 2.8.1: the RESP line buffer was ONE module global shared by every connection,
+# so two threads reading their own connections parsed each other's bytes.
+var _resp_thr_fail = 0;
+
+fn _resp_thr(arg) {
+    var a = _tb_pair();
+    var b = rethi();
+    var rc = _mk_conn(b);
+    var ok = 1;
+    var round = 0;
+    # 50 writes then 50 reads per round: pre-writing everything would block on
+    # AF_UNIX truesize accounting after ~1000 small writes.
+    while (round < 60) {
+        var i = 0;
+        while (i < 50) {
+            if (arg == 1) { syscall(SYS_WRITE, a, "+AAAAAAAAAAAA\r\n", 15); }
+            else { syscall(SYS_WRITE, a, ":123456789012\r\n", 15); }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < 50) {
+            var r = _resp_read_reply(rc);
+            if (arg == 1) {
+                if (redis_is_alive(rc) == 0 || r == 0) { ok = 0; i = 50; round = 60; }
+                elif (streq(str_data(r), "AAAAAAAAAAAA") == 0) { ok = 0; i = 50; round = 60; }
+                else { resp_reply_free(r); }
+            } else {
+                if (redis_is_alive(rc) == 0 || r != 123456789012) { ok = 0; i = 50; round = 60; }
+            }
+            i = i + 1;
+        }
+        round = round + 1;
+    }
+    if (ok == 0) { _resp_thr_fail = _resp_thr_fail + 1; }
+    syscall(SYS_CLOSE, a);
+    return 0;
+}
+
+fn test_resp_threads() {
+    _resp_thr_fail = 0;
+    _tb_wd_arm();
+    var t1 = thread_create(&_resp_thr, 1);
+    var t2 = thread_create(&_resp_thr, 2);
+    thread_join(t1);
+    thread_join(t2);
+    _tb_wd_disarm();
+    assert_eq(_resp_thr_fail, 0, "two threads parsing two connections do not corrupt each other");
+    println("  resp_threads: ok");
+}
+
+# ---- pg_connect against a loopback fake server ----
+var _srv_listen = 0;
+var _srv_ok = 0;
+var _bh_port = 0;
+
+# A listening loopback TCP socket on an ephemeral port: (fd, port) via ret2.
+fn _listen_any() {
+    var fd = syscall(_SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
+    syscall(_SYS_BIND, fd, sockaddr_in(INADDR_LOOPBACK(), 0), 16);
+    syscall(_SYS_LISTEN, fd, 8);
+    var sa[16];
+    var sl[8];
+    store64(&sl, 16);
+    syscall(SYS_GETSOCKNAME, fd, &sa, &sl);
+    var port = (load8(&sa + 2) << 8) | load8(&sa + 3);
+    ret2(fd, port);
+}
+
+# Accept one client, check its startup packet and cleartext password, then
+# authenticate it: AuthCleartextPassword, AuthOK, ReadyForQuery.
+fn _fake_pg_srv(arg) {
+    var c = syscall(_SYS_ACCEPT, _srv_listen, 0, 0);
+    var buf = fl_alloc(4096);
+    var ok = 1;
+    if (_pg_read_full(c, buf, 4) != 4) { ok = 0; }
+    var len = _pg_read_be32(buf, 0);
+    if (len < 8 || len > 4096) { len = 8; ok = 0; }
+    _pg_read_full(c, buf + 4, len - 4);
+    if (memeq(buf + 8, "user", 5) == 0) { ok = 0; }
+    if (memeq(buf + 13, "alice", 6) == 0) { ok = 0; }
+    if (memeq(buf + 19, "database", 9) == 0) { ok = 0; }
+    if (memeq(buf + 28, "db1", 4) == 0) { ok = 0; }
+    var r[16];
+    store8(&r, 82); _pg_write_be32(&r, 1, 8); _pg_write_be32(&r, 5, 3);
+    syscall(SYS_WRITE, c, &r, 9);
+    _pg_read_full(c, buf, 5);
+    var plen = _pg_read_be32(buf, 1);
+    if (plen < 4 || plen > 4000) { plen = 4; ok = 0; }
+    _pg_read_full(c, buf + 5, plen - 4);
+    if (load8(buf) != 112) { ok = 0; }
+    if (memeq(buf + 5, "s3cret", 7) == 0) { ok = 0; }
+    store8(&r, 82); _pg_write_be32(&r, 1, 8); _pg_write_be32(&r, 5, 0);
+    syscall(SYS_WRITE, c, &r, 9);
+    store8(&r, 90); _pg_write_be32(&r, 1, 5); store8(&r + 5, 73);
+    syscall(SYS_WRITE, c, &r, 6);
+    _srv_ok = ok;
+    fl_free(buf);
+    return 0;
+}
+
+# Connects to a listener that never accepts: the handshake stalls in read(2).
+fn _blackhole_client(arg) {
+    pg_connect("127.0.0.1", _bh_port, "bob", "db2", "x");
+    return 0;
+}
+
+# 2.8.1: one process-wide mutex was held across connect(2) and the whole
+# untimed handshake, so ONE stalled server blocked every pg_connect in the
+# process. Also verifies user/database/password reach the wire intact.
+fn test_pg_connect() {
+    var bh = _listen_any();
+    _bh_port = rethi();
+    thread_create_detached(&_blackhole_client, 0);
+    sleep_ms(200);
+
+    _tb_wd_arm();
+    var lf = _listen_any();
+    var port = rethi();
+    _srv_listen = lf;
+    _srv_ok = 0;
+    var st = thread_create(&_fake_pg_srv, 0);
+    var conn = pg_connect("127.0.0.1", port, "alice", "db1", "s3cret");
+    thread_join(st);
+    _tb_wd_disarm();
+    assert(conn != 0, "pg_connect succeeds while another connect is stalled");
+    assert_eq(_srv_ok, 1, "user, database and password arrived intact");
+    if (conn != 0) {
+        assert(load64(conn) >= 0, "connected handle carries an fd");
+        assert_eq(load64(conn + 8), 1, "connected handle is ready");
+        pg_close(conn);
+        assert_eq(load64(conn), -1, "pg_close marks the handle closed");
+    }
+    syscall(SYS_CLOSE, lf);
+    # Closing the black-hole listener resets its queued connection, so the
+    # stalled thread's read fails and it exits.
+    syscall(SYS_CLOSE, bh);
+    println("  pg_connect: ok");
+}
+
+# 2.8.1: a startup packet above the server's own 10000-byte cap is refused
+# BEFORE anything is sent (it used to be sent, then the read blocked forever).
+fn test_pg_connect_startup_cap() {
+    var u = fl_alloc(20001);
+    memset(u, 97, 20000);
+    store8(u + 20000, 0);
+    var bh = _listen_any();
+    var port = rethi();
+    _tb_wd_arm();
+    assert_eq(pg_connect("127.0.0.1", port, u, "db", "pw"), 0, "an oversized startup packet is refused");
+    _tb_wd_disarm();
+    var c = syscall(_SYS_ACCEPT, bh, 0, 0);
+    var buf = fl_alloc(64);
+    assert(c >= 0, "the refused client's connection was queued");
+    if (c >= 0) {
+        assert(syscall(SYS_RECVFROM, c, buf, 64, 0x40, 0, 0) <= 0, "and it sent nothing before closing");
+        syscall(SYS_CLOSE, c);
+    }
+    fl_free(buf);
+    fl_free(u);
+    syscall(SYS_CLOSE, bh);
+    println("  pg_connect_startup_cap: ok");
 }
 
 fn main() {
@@ -667,8 +2462,43 @@ fn main() {
     test_resp_parser();
     test_ws_framing();
 
+    # 2.8.1 hardening regressions (single-threaded).
+    test_signed_envelope_args();
+    test_signed_envelope_lengths();
+    test_signed_envelope_unanchored();
+    test_signed_envelope_coverage();
+    test_envelope_canonical_golden();
+    test_ratelimit_stats_projection();
+    test_ipc_sigpipe();
+    test_ipc_bind_safety();
+    test_ipc_recv_errors();
+    test_eipc_nonce_salt();
+    test_eipc_rekey_salt();
+    test_eipc_roundtrip();
+    test_eipc_volume_limit();
+    test_eipc_same_role_kill();
+    test_eipc_oversize_kill();
+    test_admin_handler();
+    test_admin_host_gate();
+    test_resp_reply_free();
+    test_redis_no_bump_growth();
+    test_pg_query_offline();
+    test_ws_frame_bytes();
+    test_ws_sigpipe();
+    test_ws_handshake_parse();
+    test_ws_handshake_oversize();
+    test_ws_handshake_heap();
+    test_ws_recv_frame();
+
+    # Threaded — last.
+    test_eipc_parked_close();
+    test_eipc_parked_rekey();
+    test_resp_threads();
+    test_pg_connect();
+    test_pg_connect_startup_cap();
+
     return assert_summary();
 }
 
 var r = main();
-syscall(SYS_EXIT, r);
+sys_exit_group(r);

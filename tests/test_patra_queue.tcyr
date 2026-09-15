@@ -130,14 +130,240 @@ fn test_patra_queue_hardening() {
     println("  patra_queue_hardening: ok");
 }
 
+fn _pq_unlink(p) {
+    sys_unlink(p);
+    var n = strlen(p);
+    var w = fl_alloc(n + 5);
+    memcpy(w, p, n);
+    memcpy(w + n, ".wal", 4);
+    store8(w + n + 4, 0);
+    sys_unlink(w);
+    fl_free(w);
+    return 0;
+}
+
+# 2.8.1 (F016): ids came from a per-handle counter seeded at open, so two
+# handles on one file minted the same ids, and the id-only claim in dequeue
+# then marked BOTH colliding rows running while delivering one.
+fn test_patra_queue_two_handles() {
+    patra_init();
+    var p = "/tmp/majra_patra_two_handles_test.patra";
+    _pq_unlink(p);
+    var a = patra_queue_new(p);
+    var b = patra_queue_new(p);
+    assert(a != 0, "two handles: a opened");
+    assert(b != 0, "two handles: b opened");
+
+    var ida1 = patra_queue_enqueue(a, PRIORITY_NORMAL, "a1");
+    var idb1 = patra_queue_enqueue(b, PRIORITY_NORMAL, "b1");
+    var ida2 = patra_queue_enqueue(a, PRIORITY_NORMAL, "a2");
+    var idb2 = patra_queue_enqueue(b, PRIORITY_NORMAL, "b2");
+    assert(ida1 != 0 && idb1 != 0 && ida2 != 0 && idb2 != 0, "two handles: all 4 enqueues return ids");
+    var distinct = 1;
+    if (ida1 == idb1 || ida1 == ida2 || ida1 == idb2) { distinct = 0; }
+    if (idb1 == ida2 || idb1 == idb2 || ida2 == idb2) { distinct = 0; }
+    assert_eq(distinct, 1, "two handles: all 4 ids distinct");
+    assert_eq(patra_queue_queued_count(a), 4, "two handles: 4 rows queued");
+
+    # Drain alternately through a and b; every job must be delivered once.
+    var got = 0;
+    var turn = 0;
+    var empties = 0;
+    while (empties < 2 && got < 10) {
+        var h = a;
+        if (turn == 1) { h = b; }
+        var j = patra_queue_dequeue(h);
+        if (j == 0) { empties = empties + 1; }
+        else {
+            empties = 0;
+            got = got + 1;
+            patra_queue_complete(h, patra_job_id(j));
+            patra_job_free(j);
+        }
+        turn = 1 - turn;
+    }
+    assert_eq(got, 4, "two handles: drain delivers all 4 jobs");
+    assert_eq(patra_queue_running_count(a), 0, "two handles: nothing stranded running");
+    assert_eq(patra_queue_completed_count(a), 4, "two handles: 4 completed");
+
+    patra_queue_close(a);
+    patra_queue_close(b);
+    var c = patra_queue_new(p);
+    assert(c != 0, "two handles: reopen");
+    assert_eq(patra_queue_enqueue(c, PRIORITY_LOW, "c"), 5, "two handles: reopen id continues at 5");
+    patra_queue_close(c);
+    _pq_unlink(p);
+    println("  patra_queue_two_handles: ok");
+}
+
+# 2.8.1 (F016 safety net): a file already holding duplicate ids (written by two
+# handles before the fix) must deliver each row, not claim all rows sharing the
+# id on the first dequeue.
+fn test_patra_queue_legacy_dup_ids() {
+    patra_init();
+    var p = "/tmp/majra_patra_dup_ids_test.patra";
+    _pq_unlink(p);
+    var db = patra_open(p);
+    assert(db != 0, "dup ids: raw open");
+    assert_eq(patra_exec(db,
+        "CREATE TABLE jobs (id INT, priority INT, payload STR, status INT, created_ns INT)"), PATRA_OK,
+      "dup ids: legacy table");
+    assert_eq(patra_exec(db, "INSERT INTO jobs VALUES (1, 2, 'legacy-a', 0, 100)"), PATRA_OK, "dup ids: row a");
+    assert_eq(patra_exec(db, "INSERT INTO jobs VALUES (1, 2, 'legacy-b', 0, 200)"), PATRA_OK, "dup ids: row b");
+    patra_close(db);
+
+    var q = patra_queue_new(p);
+    assert(q != 0, "dup ids: queue opened");
+    var seen_a = 0;
+    var seen_b = 0;
+    var j1 = patra_queue_dequeue(q);
+    assert(j1 != 0, "dup ids: first dequeue");
+    if (j1 != 0) {
+        if (streq(patra_job_payload(j1), "legacy-a") == 1) { seen_a = seen_a + 1; }
+        if (streq(patra_job_payload(j1), "legacy-b") == 1) { seen_b = seen_b + 1; }
+    }
+    assert_eq(patra_queue_queued_count(q), 1, "dup ids: first dequeue claims one row");
+    assert_eq(patra_queue_running_count(q), 1, "dup ids: exactly one row running");
+    # Completing the delivered job must not also complete its queued sibling.
+    if (j1 != 0) {
+        assert_eq(patra_queue_complete(q, patra_job_id(j1)), 1, "dup ids: complete marks the running row");
+        patra_job_free(j1);
+    }
+    assert_eq(patra_queue_queued_count(q), 1, "dup ids: complete leaves the sibling queued");
+    assert_eq(patra_queue_completed_count(q), 1, "dup ids: exactly one row completed");
+    var j2 = patra_queue_dequeue(q);
+    assert(j2 != 0, "dup ids: second dequeue delivers the other row");
+    if (j2 != 0) {
+        if (streq(patra_job_payload(j2), "legacy-a") == 1) { seen_a = seen_a + 1; }
+        if (streq(patra_job_payload(j2), "legacy-b") == 1) { seen_b = seen_b + 1; }
+        patra_job_free(j2);
+    }
+    assert_eq(seen_a, 1, "dup ids: legacy-a delivered once");
+    assert_eq(seen_b, 1, "dup ids: legacy-b delivered once");
+    assert_eq(patra_queue_dequeue(q), 0, "dup ids: queue empty after both");
+    patra_queue_close(q);
+    _pq_unlink(p);
+    println("  patra_queue_legacy_dup_ids: ok");
+}
+
+# Pass-2 HIGH data-loss fix: a pre-2.6.9 file (payload STR) must dequeue its
+# payload through the STR fallback, not as an empty string. Also pins id
+# continuity past the existing max and patra_queue_fail's 1/0 return.
+fn test_patra_queue_legacy_str_payload() {
+    patra_init();
+    var p = "/tmp/majra_patra_legacy_str_test.patra";
+    _pq_unlink(p);
+    var db = patra_open(p);
+    assert(db != 0, "legacy STR: raw open");
+    assert_eq(patra_exec(db,
+        "CREATE TABLE jobs (id INT, priority INT, payload STR, status INT, created_ns INT)"), PATRA_OK,
+      "legacy STR: table");
+    assert_eq(patra_exec(db, "INSERT INTO jobs VALUES (7, 2, 'old-payload', 0, 1)"), PATRA_OK, "legacy STR: row");
+    patra_close(db);
+
+    var q = patra_queue_new(p);
+    assert(q != 0, "legacy STR: queue opened on pre-2.6.9 file");
+    var j = patra_queue_dequeue(q);
+    assert(j != 0, "legacy STR: dequeue returned the job");
+    if (j != 0) {
+        assert_eq(patra_job_id(j), 7, "legacy STR: id round-trips");
+        assert_eq(streq(patra_job_payload(j), "old-payload"), 1, "legacy STR: payload not empty");
+        assert_eq(patra_queue_fail(q, patra_job_id(j)), 1, "legacy STR: fail on running id returns 1");
+        patra_job_free(j);
+    }
+    assert_eq(patra_queue_fail(q, 424242), 0, "legacy STR: fail on missing id returns 0");
+    assert_eq(patra_queue_running_count(q), 0, "legacy STR: failed job no longer running");
+    assert_eq(patra_queue_enqueue(q, PRIORITY_NORMAL, "n"), 8, "legacy STR: id continues at max+1");
+    patra_queue_close(q);
+    _pq_unlink(p);
+    println("  patra_queue_legacy_str_payload: ok");
+}
+
+# 2.8.1 (F013): patra_queue_new called patra_init on every open, replacing the
+# process-wide patra mutexes while other threads were parked on (or holding) the
+# old ones, so concurrent users on OTHER files hung forever. Run LAST: on a hang
+# the stuck workers may hold patra locks, so the runner reports and exits
+# without joining.
+var _pqs_q[3];
+var _pqs_done[3];
+fn _pqs_worker(k) {
+    var q = load64(&_pqs_q + k * 8);
+    var i = 0;
+    while (i < 300) {
+        patra_queue_enqueue(q, PRIORITY_NORMAL, "w");
+        store64(&_pqs_done + k * 8, i + 1);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn test_patra_queue_open_during_concurrent_use() {
+    patra_init();
+    var pa = "/tmp/majra_patra_stall_a.patra";
+    var pb = "/tmp/majra_patra_stall_b.patra";
+    var pc = "/tmp/majra_patra_stall_c.patra";
+    var pd = "/tmp/majra_patra_stall_d.patra";
+    _pq_unlink(pa); _pq_unlink(pb); _pq_unlink(pc); _pq_unlink(pd);
+    store64(&_pqs_q, patra_queue_new(pa));
+    store64(&_pqs_q + 8, patra_queue_new(pb));
+    store64(&_pqs_q + 16, patra_queue_new(pc));
+    assert(load64(&_pqs_q) != 0 && load64(&_pqs_q + 8) != 0 && load64(&_pqs_q + 16) != 0,
+      "stall: worker queues opened");
+    store64(&_pqs_done, 0); store64(&_pqs_done + 8, 0); store64(&_pqs_done + 16, 0);
+
+    var t0 = thread_create(&_pqs_worker, 0);
+    var t1 = thread_create(&_pqs_worker, 1);
+    var t2 = thread_create(&_pqs_worker, 2);
+    assert(t0 != 0 && t1 != 0 && t2 != 0, "stall: workers spawned");
+
+    var opens_ok = 0;
+    var n = 0;
+    while (n < 40) {
+        var d = patra_queue_new(pd);
+        if (d != 0) { opens_ok = opens_ok + 1; patra_queue_close(d); }
+        n = n + 1;
+    }
+    assert_eq(opens_ok, 40, "stall: 40 opens of queue D while workers run");
+
+    var deadline = clock_now_ns() + 20000000000;
+    var all = 0;
+    while (all == 0 && clock_now_ns() < deadline) {
+        if (load64(&_pqs_done) == 300 && load64(&_pqs_done + 8) == 300 && load64(&_pqs_done + 16) == 300) { all = 1; }
+        else { sleep_ms(10); }
+    }
+    assert_eq(load64(&_pqs_done), 300, "stall: worker A finished 300 enqueues within 20s");
+    assert_eq(load64(&_pqs_done + 8), 300, "stall: worker B finished 300 enqueues within 20s");
+    assert_eq(load64(&_pqs_done + 16), 300, "stall: worker C finished 300 enqueues within 20s");
+    if (all == 0) {
+        # Workers are hung; joining would hang the suite. Report and kill all threads.
+        println("  patra_queue_open_during_concurrent_use: HUNG (not joining)");
+        sys_exit_group(assert_summary() + 1);
+    }
+    thread_join(t0); thread_join(t1); thread_join(t2);
+    var total = patra_queue_queued_count(load64(&_pqs_q))
+    + patra_queue_queued_count(load64(&_pqs_q + 8))
+    + patra_queue_queued_count(load64(&_pqs_q + 16));
+    assert_eq(total, 900, "stall: 900 jobs durable across A..C");
+    patra_queue_close(load64(&_pqs_q));
+    patra_queue_close(load64(&_pqs_q + 8));
+    patra_queue_close(load64(&_pqs_q + 16));
+    _pq_unlink(pa); _pq_unlink(pb); _pq_unlink(pc); _pq_unlink(pd);
+    println("  patra_queue_open_during_concurrent_use: ok");
+}
+
 fn main() {
     alloc_init();
     fl_init();
     println("=== majra patra_queue tests ===");
     test_patra_queue();
     test_patra_queue_hardening();
+    test_patra_queue_two_handles();
+    test_patra_queue_legacy_dup_ids();
+    test_patra_queue_legacy_str_payload();
+    # Must stay last — see its comment.
+    test_patra_queue_open_during_concurrent_use();
     return assert_summary();
 }
 
 var r = main();
-syscall(SYS_EXIT, r);
+sys_exit_group(r);

@@ -81,7 +81,11 @@ fn circuit_state(cb) {
         mutex_unlock(mtx);
         return CIRCUIT_CLOSED;
     }
-    var elapsed = time_now_ns() - load64(cb + 8);
+    # ONE clock read for the whole decision. This path runs on every fail-fast
+    # request against an open breaker, inside the mutex; it used to read the
+    # clock up to three times, serialising callers behind ~1 us per read.
+    var now = time_now_ns();
+    var elapsed = now - load64(cb + 8);
     if (elapsed >= load64(cb + 24)) {
         # A probe is only allowed to hold the gate for one cooldown window.
         #
@@ -93,8 +97,8 @@ fn circuit_state(cb) {
         # recovered. The breaker latched open, which is the same availability
         # failure it exists to prevent, just inverted.
         var probe_at = load64(cb + 40);
-        if (probe_at == 0 || time_now_ns() - probe_at >= load64(cb + 24)) {
-            store64(cb + 40, time_now_ns());
+        if (probe_at == 0 || now - probe_at >= load64(cb + 24)) {
+            store64(cb + 40, now);
             mutex_unlock(mtx);
             return CIRCUIT_HALF_OPEN;
         }

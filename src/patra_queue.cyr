@@ -21,6 +21,9 @@
 # Status codes match the in-memory queue's JOB_* constants from queue.cyr:
 #   0=queued, 1=running, 2=completed, 3=failed
 #
+# ⚠ patra_init() belongs to the HOST: call it once, before spawning threads.
+# patra_queue_new only calls it when patra was never initialised (see there).
+#
 # API:
 #   var q = patra_queue_new("jobs.patra");
 #   var id = patra_queue_enqueue(q, PRIORITY_HIGH, "payload");
@@ -31,9 +34,10 @@
 
 # patra_queue struct (32 bytes):
 #   offset  0: db (i64)       — patra_open handle
-#   offset  8: next_id (i64)  — monotonic ID counter
+#   offset  8: next_id (i64)  — last id issued + 1 (informational; enqueue
+#                               allocates from MAX(id) under the file lock)
 #   offset 16: initialized (i64) — 1 once CREATE TABLE has run
-#   offset 24: mutex (i64)    — guards next_id and the dequeue claim
+#   offset 24: mutex (i64)    — serialises this handle's enqueue/dequeue
 
 fn _pq_create_sql() {
     var sb = str_builder_new();
@@ -57,25 +61,36 @@ fn _pq_ensure_table(pq) {
     return r;
 }
 
-# On open, find the max id in the existing jobs table so new IDs don't
-# collide with durable ones. `MAX(id)` returns a single-row aggregate
-# (`{count: 1, val: <max>}`) on a populated table, or `count: 0` on an
-# empty one — the count==0 branch initialises next_id to 1.
-fn _pq_load_next_id(pq) {
-    var db = load64(pq);
+# Largest id in the jobs table, or -1 if the query failed. `MAX(id)` returns a
+# single-row aggregate on a populated table, or `count: 0` on an empty one (0).
+fn _pq_max_id(db) {
     var rs = patra_query(db, "SELECT MAX(id) FROM jobs");
+    if (rs == 0) { return 0 - 1; }
     var max_id = 0;
-    if (rs != 0) {
-        if (patra_result_count(rs) > 0) {
-            max_id = patra_result_get_int(rs, 0, 0);
-        }
-        patra_result_free(rs);
+    if (patra_result_count(rs) > 0) {
+        max_id = patra_result_get_int(rs, 0, 0);
     }
+    patra_result_free(rs);
+    return max_id;
+}
+
+# Seeds next_id on open. Returns PATRA_OK, or PATRA_ERR_IO when MAX(id) could
+# not be read — that failure used to be swallowed, leaving next_id = 1 on a
+# populated file.
+fn _pq_load_next_id(pq) {
+    var max_id = _pq_max_id(load64(pq));
+    if (max_id < 0) { return PATRA_ERR_IO; }
     store64(pq + 8, max_id + 1);
+    return PATRA_OK;
 }
 
 fn patra_queue_new(path) {
-    patra_init();
+    # ⚠ Only when patra was never initialised. patra_init is not idempotent: it
+    # replaces the process-wide statement/allocator mutexes (a thread parked on
+    # the old one is never woken), installs a fresh zeroed TLS block on this
+    # thread, and turns off a host-enabled page cache. Calling it on every open
+    # hung concurrent patra users whenever another queue was opened.
+    if (_patra_mtx == 0) { patra_init(); }
     var db = patra_open(path);
     if (db == 0) { return 0; }
     var pq = fl_alloc(32);
@@ -84,12 +99,15 @@ fn patra_queue_new(path) {
     store64(pq + 8, 1);
     store64(pq + 16, 0);
     store64(pq + 24, mutex_new());
-    if (_pq_ensure_table(pq) != PATRA_OK) {
+    var ok = 0;
+    if (_pq_ensure_table(pq) == PATRA_OK) {
+        if (_pq_load_next_id(pq) == PATRA_OK) { ok = 1; }
+    }
+    if (ok == 0) {
         patra_close(db);
         fl_free(pq);
         return 0;
     }
-    _pq_load_next_id(pq);
     return pq;
 }
 
@@ -110,6 +128,12 @@ fn patra_queue_close(pq) {
 #
 # The return was also discarded, so a rejected INSERT was indistinguishable
 # from a committed one and the caller got an id for a job that does not exist.
+#
+# ⚠ The id is allocated as MAX(id) + 1 INSIDE a patra transaction, whose LOCK_EX
+# on the file spans the read and the INSERT. It used to come from a per-handle
+# counter seeded at open, so two handles on one file (two producer processes,
+# or two patra_queue_new calls) both minted the same ids, and the id-based
+# claim in dequeue then marked the colliding job running without delivering it.
 fn patra_queue_enqueue(pq, priority, payload) {
     if (pq == 0 || payload == 0) { return 0; }
     var db = load64(pq);
@@ -118,20 +142,34 @@ fn patra_queue_enqueue(pq, priority, payload) {
 
     var stmt = patra_prepare(db, "INSERT INTO jobs VALUES (?, ?, ?, 0, ?)");
     if (stmt == 0) { mutex_unlock(mtx); return 0; }
-
-    var id = load64(pq + 8);
-    patra_bind_int(stmt, 0, id);
-    patra_bind_int(stmt, 1, priority);
-    patra_bind_text(stmt, 2, payload, strlen(payload));
-    patra_bind_int(stmt, 3, time_now_ns());
-
-    var rc = patra_exec_prepared(db, stmt);
-    patra_finalize(stmt);
-    if (rc != PATRA_OK) {
+    if (patra_begin(db) != PATRA_OK) {
+        patra_finalize(stmt);
         mutex_unlock(mtx);
         return 0;
     }
-    # Only consume the id once the row is durable.
+
+    var max_id = _pq_max_id(db);
+    var rc = PATRA_ERR_IO;
+    var id = max_id + 1;
+    if (max_id >= 0) {
+        patra_bind_int(stmt, 0, id);
+        patra_bind_int(stmt, 1, priority);
+        patra_bind_text(stmt, 2, payload, strlen(payload));
+        patra_bind_int(stmt, 3, time_now_ns());
+        rc = patra_exec_prepared(db, stmt);
+    }
+    patra_finalize(stmt);
+    if (rc != PATRA_OK) {
+        patra_rollback(db);
+        mutex_unlock(mtx);
+        return 0;
+    }
+    # patra_commit reports a WAL overflow (its before-image list could not grow)
+    # as PATRA_ERR_FULL; the write is then not trustworthy, so report failure.
+    if (patra_commit(db) != PATRA_OK) {
+        mutex_unlock(mtx);
+        return 0;
+    }
     store64(pq + 8, id + 1);
     mutex_unlock(mtx);
     return id;
@@ -168,6 +206,7 @@ fn patra_queue_dequeue(pq) {
             # SELECT * order: id(0), priority(1), payload(2), status(3), created_ns(4)
             var best_id  = patra_result_get_int(rs, 0, 0);
             var best_pri = patra_result_get_int(rs, 0, 1);
+            var best_ns  = patra_result_get_int(rs, 0, 4);
 
             # Copy payload BEFORE freeing the result set (result rows are
             # owned by the rs buffer).
@@ -210,10 +249,16 @@ fn patra_queue_dequeue(pq) {
                 store8(pay_copy + pay_len, 0);
                 patra_result_free(rs);
 
-                var stmt = patra_prepare(db, "UPDATE jobs SET status = 1 WHERE id = ? AND status = 0");
+                # ⚠ created_ns is in the claim so a file that already holds
+                # duplicate ids (written by two handles before 2.8.1) claims one
+                # row, not every row sharing the id — the others used to be
+                # marked running without ever being delivered.
+                var stmt = patra_prepare(db,
+                  "UPDATE jobs SET status = 1 WHERE id = ? AND created_ns = ? AND status = 0");
                 if (stmt == 0) { fl_free(pay_copy); searching = 0; }
                 else {
                     patra_bind_int(stmt, 0, best_id);
+                    patra_bind_int(stmt, 1, best_ns);
                     var affected[8];
                     store64(&affected, 0);
                     var rc = patra_exec_returning(db, stmt, &affected);
@@ -254,10 +299,14 @@ fn patra_job_free(j) {
 # Returns 1 if a row moved, 0 otherwise. The patra_exec return used to be
 # discarded here too, so a failed status update looked exactly like a
 # successful one.
+#
+# ⚠ `AND status = 1`: only a RUNNING (dequeued) row completes or fails. A
+# pre-2.8.1 file can hold duplicate ids, and `WHERE id = ?` alone also marked
+# the undelivered sibling, which was then never dequeued.
 fn _pq_update_status(pq, id, new_status) {
     if (pq == 0) { return 0; }
     var db = load64(pq);
-    var stmt = patra_prepare(db, "UPDATE jobs SET status = ? WHERE id = ?");
+    var stmt = patra_prepare(db, "UPDATE jobs SET status = ? WHERE id = ? AND status = 1");
     if (stmt == 0) { return 0; }
     patra_bind_int(stmt, 0, new_status);
     patra_bind_int(stmt, 1, id);

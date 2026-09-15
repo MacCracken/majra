@@ -37,7 +37,8 @@ fn job_state_name(s) {
 #   offset  8: id_lo (i64)
 #   offset 16: priority (i64)
 #   offset 24: payload (i64) — pointer to user data
-#   offset 32: job_key (i64) — Str ptr for ManagedQueue lookup (or 0)
+#   offset 32: job_key (i64) — Str ptr for ManagedQueue lookup (or 0); a job
+#                              key block (see _next_job_key), freed with the item
 
 fn queue_item_new(priority, payload) {
     var item = fl_alloc(40);
@@ -51,10 +52,24 @@ fn queue_item_new(priority, payload) {
     return item;
 }
 
-# Release a QueueItem. Only for items the caller owns outright — an item
-# handed to mq_enqueue is owned by the queue until it terminates.
+# Release a QueueItem (and its job key, if mq_enqueue gave it one).
+#
+# ⚠ Ownership, one rule for every ManagedQueue path. An item returned by
+# mq_enqueue is released by exactly one party, once, after the queue has let
+# go of it:
+#   - a dequeued item: by the worker, after mq_complete / mq_fail on it;
+#   - an item handed back by mq_take_queued: by that caller;
+#   - a CANCELLED item: by nobody. mq_dequeue and mq_take_queued both drop it
+#     without freeing, because the enqueuer still holds the pointer and cannot
+#     observe when the drop happens. mq_take_queued used to free it, so an
+#     enqueuer that freed (or re-cancelled) its handle double-freed or cancelled
+#     whichever job the freelist had since given that block.
 fn queue_item_free(item) {
-    if (item != 0) { fl_free(item); }
+    if (item != 0) {
+        var key = load64(item + 32);
+        if (key != 0) { fl_free(key); }
+        fl_free(item);
+    }
     return 0;
 }
 
@@ -133,17 +148,21 @@ fn pq_enqueue(pq, item) {
 # moved at most once per doubling of the head — **amortised O(1) per pop**. The
 # fully-drained case is free: length and head both reset with nothing copied,
 # which is the common shape for a queue that empties between bursts.
+#
+# Survivors move with direct loads (vec: data ptr at 0, len at 8): the bounds
+# are already known here, so vec_get / vec_set's checks were pure overhead.
 fn _pq_compact(pq, i, tier, head) {
-    var len = vec_len(tier);
+    var len = load64(tier + 8);
     if (head >= len) {
         vec_truncate(tier, 0);
         store64(pq + 48 + i * 8, 0);
         return 0;
     }
+    var data = load64(tier);
     var w = 0;
     var r = head;
     while (r < len) {
-        vec_set(tier, w, vec_get(tier, r));
+        store64(data + w * 8, load64(data + r * 8));
         w = w + 1;
         r = r + 1;
     }
@@ -158,14 +177,15 @@ fn pq_dequeue(pq) {
     while (i < NUM_PRIORITIES) {
         var tier = load64(pq + i * 8);
         var head = load64(pq + 48 + i * 8);
-        if (vec_len(tier) > head) {
-            var item = vec_get(tier, head);
+        var len = load64(tier + 8);
+        if (len > head) {
+            var item = load64(load64(tier) + head * 8);
             head = head + 1;
             store64(pq + 48 + i * 8, head);
             store64(pq + 40, load64(pq + 40) - 1);
             # Amortised reclaim — see `_pq_compact`. Without it the backing vec
             # of a tier that never fully empties would grow without bound.
-            if (head * 2 >= vec_len(tier)) { _pq_compact(pq, i, tier, head); }
+            if (head * 2 >= len) { _pq_compact(pq, i, tier, head); }
             return item;
         }
         i = i + 1;
@@ -181,7 +201,10 @@ fn pq_is_empty(pq) { return load64(pq + 40) == 0; }
 # ConcurrentPQ struct (32 bytes):
 #   offset  0: pq (i64)
 #   offset  8: mutex (i64)
-#   offset 16: waiters_flag (i64) — address for futex wait/wake
+#   offset 16: waiters_flag (i64) — address for futex wait/wake. Low 32 bits:
+#              wake sequence (the value FUTEX_WAIT compares; futex reads only
+#              those 4 bytes on both little-endian targets). High 32 bits:
+#              number of cpq_dequeue_wait callers parked or about to park.
 #   offset 24: total_enqueued (i64) — counter ptr
 
 fn cpq_new() {
@@ -197,13 +220,20 @@ fn cpq_enqueue(cpq, item) {
     var mtx = load64(cpq + 8);
     mutex_lock(mtx);
     pq_enqueue(load64(cpq), item);
-    counter_inc(load64(cpq + 24));
-    # Wake one waiter
-    store64(cpq + 16, load64(cpq + 16) + 1);
+    # Bump the low-half sequence (wrapping inside its 32 bits, so it never
+    # carries into the waiter count) and read the waiter count, under the lock
+    # a waiter registers under.
+    var w = load64(cpq + 16);
+    var waiters = (w >> 32) & 4294967295;
+    store64(cpq + 16, (waiters << 32) | ((w + 1) & 4294967295));
     mutex_unlock(mtx);
+    counter_inc(load64(cpq + 24));
+    # ⚠ Wake only when someone registered. This used to issue FUTEX_WAKE on
+    # every enqueue, and nothing on the ManagedQueue path ever waits here, so
+    # every mq_enqueue paid a syscall that woke nobody.
     # agnos: no futex — the cooperative dequeue-waiter spin-yields, so wake is a no-op.
     #ifndef CYRIUS_TARGET_AGNOS
-    syscall(SYS_FUTEX, cpq + 16, FUTEX_WAKE, 1, 0, 0, 0);
+    if (waiters != 0) { syscall(SYS_FUTEX, cpq + 16, FUTEX_WAKE, 1, 0, 0, 0); }
     #endif
 }
 
@@ -216,16 +246,29 @@ fn cpq_dequeue(cpq) {
 }
 
 # Blocking dequeue — waits until an item is available.
+#
+# Registers in the high half of cpq+16 under the mutex before parking, and
+# deregisters under it after waking, so cpq_enqueue (which reads the count
+# under the same mutex) can never skip the wake for a waiter that saw the
+# queue empty. A wake racing the park is caught by FUTEX_WAIT's compare of the
+# low-half sequence, which that enqueue already advanced.
 fn cpq_dequeue_wait(cpq) {
+    var mtx = load64(cpq + 8);
+    var parked = 0;
     while (1) {
-        var mtx = load64(cpq + 8);
         mutex_lock(mtx);
+        if (parked == 1) {
+            store64(cpq + 16, load64(cpq + 16) - 4294967296);
+            parked = 0;
+        }
         var item = pq_dequeue(load64(cpq));
         if (item != 0) {
             mutex_unlock(mtx);
             return item;
         }
-        var val = load64(cpq + 16);
+        var w = load64(cpq + 16);
+        store64(cpq + 16, w + 4294967296);
+        parked = 1;
         mutex_unlock(mtx);
         # Wait for enqueue notification. agnos: no futex_wait — yield to the
         # cooperative scheduler and re-check (spin-yield replaces the park).
@@ -233,7 +276,7 @@ fn cpq_dequeue_wait(cpq) {
         sys_sched_yield();
         #endif
         #ifndef CYRIUS_TARGET_AGNOS
-        syscall(SYS_FUTEX, cpq + 16, FUTEX_WAIT, val, 0, 0, 0);
+        syscall(SYS_FUTEX, cpq + 16, FUTEX_WAIT, w & 4294967295, 0, 0, 0);
         #endif
     }
 }
@@ -251,14 +294,19 @@ fn cpq_len(cpq) {
 #   offset 16: priority
 #   offset 24: payload
 #   offset 32: state (JobState)
-#   offset 40: enqueued_at_ns
-#   offset 48: started_at_ns
-#   offset 56: finished_at_ns
+#   offset 40: enqueued_at_ns — always 0 since 2.8.1 (see below)
+#   offset 48: started_at_ns  — always 0 since 2.8.1
+#   offset 56: finished_at_ns — always 0 since 2.8.1
 #   offset 64: max_concurrent (i64) — 0 = unlimited
+#
+# ⚠ The three timestamps are no longer written. A ManagedItem never leaves this
+# module and nothing read them, yet each was a clock_gettime syscall taken
+# while holding the queue mutex — up to three per job on a worker pool's
+# hottest lock. The slots stay so the layout does not move.
 
 # ManagedQueue struct (64 bytes):
 #   offset  0: cpq (i64) — ConcurrentPriorityQueue ptr
-#   offset  8: jobs (i64) — hashmap: id_str -> ManagedItem ptr
+#   offset  8: jobs (i64) — hashmap: job key Str -> ManagedItem ptr
 #   offset 16: mutex (i64)
 #   offset 24: name (i64) — Str ptr
 #   offset 32: running_count (i64)
@@ -269,7 +317,7 @@ fn cpq_len(cpq) {
 fn mq_new(name, max_concurrent) {
     var mq = fl_alloc(64);
     store64(mq, cpq_new());
-    # map_new_str: keys are Str structs (_next_job_key returns str_from_int).
+    # map_new_str: keys are job-key Strs (_next_job_key), hashed by content.
     # Cyrius 5.4.14+ fixed the collision bug where the legacy map_new()
     # cstr hash walked Str struct bytes as chars. See docs/development
     # /roadmap.md and cyrius/.../stdlib-hashmap-str-key-collision.md.
@@ -287,29 +335,48 @@ fn mq_with_metrics(mq, metrics_vt) {
     store64(mq + 48, metrics_vt);
 }
 
-# Sequential job ID counter for stable map keys.
+# Sequential job ID counter, shared by EVERY ManagedQueue in the process.
 var _mq_next_job_id = 1;
 
+# Allocate the next job id and its key. Job key block (40 bytes, one fl_alloc,
+# released by queue_item_free):
+#   offset  0: data ptr (= block + 16) ┐ a Str header, so queue_item_key and
+#   offset  8: len                     ┘ the Str-keyed jobs map see a plain Str
+#   offset 16: decimal digits + NUL (fmt_int_buf needs 24 bytes)
+#
+# ⚠ The id comes from atomic_fetch_add, not a locked read-modify-write. The
+# counter is process-wide but each queue only held ITS OWN mutex around it, so
+# enqueues on two different queues could rewind it and hand one queue a key
+# that was still live — the second map_set overwrote the first job, losing it
+# and leaking a concurrency slot.
+#
+# ⚠ The key used to be str_from_int on the bump allocator, which never frees:
+# ~33 bytes leaked per job for the life of the process. Freeing it with the item
+# is safe because every path deletes the map entry before the item can be
+# freed, and the hashmap never key-compares a tombstone or rehashes one on grow.
 fn _next_job_key() {
-    var id = _mq_next_job_id;
-    _mq_next_job_id = _mq_next_job_id + 1;
-    return str_from_int(id);
+    var id = atomic_fetch_add(&_mq_next_job_id, 1);
+    var key = fl_alloc(40);
+    var len = fmt_int_buf(id, key + 16);
+    store64(key, key + 16);
+    store64(key + 8, len);
+    return key;
 }
 
-# The queue mutex covers key generation and BOTH allocations, not just the
-# map_set. Two concurrent enqueues previously raced twice over:
-#   1. `_next_job_key()` increments the `_mq_next_job_id` global with a plain
-#      read-modify-write, so both callers could take the same key and the
-#      second map_set silently overwrote the first job.
-#   2. `queue_item_new` / `fl_alloc(72)` pop lib/freelist.cyr's free list with
-#      no lock (unlike `alloc`, which has a CAS spinlock), so both callers
-#      could be handed the same block.
-# Either way jobs vanished with no error: measured 788-796 of 800 surviving
-# across concurrent enqueues before the fix. See CHANGELOG 2.5.3.
-fn mq_enqueue(mq, priority, payload) {
-    var mtx = load64(mq + 16);
-    mutex_lock(mtx);
+# The ManagedItem tracking `item` on this queue, or 0. An item with no job key
+# (a bare queue_item_new) is never tracked; hashing its 0 key would fault.
+fn _mq_lookup(jobs, item) {
+    var key = load64(item + 32);
+    if (key == 0) { return 0; }
+    return map_get(jobs, key);
+}
 
+# Only the map insert is under the queue mutex. The item, its key and the
+# ManagedItem are built first: the id is atomic (above) and fl_alloc has been
+# thread-safe since cyrius 6.5.19 (cyrius-quirks.md archive #8). Through 6.5.18
+# the lock had to cover the allocations too, or two enqueues could be handed
+# the same block — measured 788-796 of 800 jobs surviving (CHANGELOG 2.5.3).
+fn mq_enqueue(mq, priority, payload) {
     var item = queue_item_new(priority, payload);
     var key = _next_job_key();
     store64(item + 32, key);
@@ -321,11 +388,13 @@ fn mq_enqueue(mq, priority, payload) {
     store64(mi + 16, priority);
     store64(mi + 24, payload);
     store64(mi + 32, JOB_QUEUED);
-    store64(mi + 40, time_now_ns());
+    store64(mi + 40, 0);
     store64(mi + 48, 0);
     store64(mi + 56, 0);
     store64(mi + 64, 0);
 
+    var mtx = load64(mq + 16);
+    mutex_lock(mtx);
     map_set(load64(mq + 8), key, mi);
     mutex_unlock(mtx);
 
@@ -372,12 +441,12 @@ fn mq_dequeue(mq) {
                 mutex_unlock(mtx);
                 searching = 0;
             } else {
-                var key = load64(item + 32);
-                var mi = map_get(jobs, key);
+                var mi = _mq_lookup(jobs, item);
                 if (mi != 0 && load64(mi + 32) == JOB_CANCELLED) {
                     # Cancelled while queued: drop it and keep looking. The
                     # slot is released here since no worker will complete it.
-                    map_delete(jobs, key);
+                    # The QueueItem is NOT freed — see queue_item_free.
+                    map_delete(jobs, load64(item + 32));
                     fl_free(mi);
                     mutex_unlock(mtx);
                 } else {
@@ -391,7 +460,6 @@ fn mq_dequeue(mq) {
                     # has no tracking entry, so it can never be completed.
                     if (mi != 0) {
                         store64(mi + 32, JOB_RUNNING);
-                        store64(mi + 48, time_now_ns());
                         store64(mq + 32, load64(mq + 32) + 1);
                         mutex_unlock(mtx);
                         out = item;
@@ -417,7 +485,8 @@ fn mq_dequeue(mq) {
 # Remove the next QUEUED job without treating it as an execution.
 #
 # Returns the QueueItem, or 0 if nothing is queued. The caller owns the item
-# and should release it with queue_item_free once it has copied what it needs.
+# and should release it with queue_item_free once it has copied what it needs
+# (any handle the enqueuer kept to it is then dangling).
 #
 # This exists because a steal or a drain is NOT a dequeue. `mq_dequeue` marks
 # the job RUNNING, increments running_count, and — critically — REFUSES once
@@ -427,7 +496,10 @@ fn mq_dequeue(mq) {
 # or a deregister needs to act on. fleet.cyr used mq_dequeue + a compensating
 # mq_fail for both; this is the primitive it actually wanted.
 #
-# Cancelled jobs are dropped rather than handed back, matching mq_dequeue.
+# Cancelled jobs are dropped rather than handed back, matching mq_dequeue —
+# and, like mq_dequeue, WITHOUT freeing the item (see queue_item_free). This
+# path used to free it, so the enqueuer's handle to a cancelled job was valid
+# or dangling depending on which path happened to reach it first.
 fn mq_take_queued(mq) {
     var mtx = load64(mq + 16);
     var jobs = load64(mq + 8);
@@ -441,18 +513,15 @@ fn mq_take_queued(mq) {
             mutex_unlock(mtx);
             searching = 0;
         } else {
-            var key = load64(item + 32);
-            var mi = map_get(jobs, key);
+            var mi = _mq_lookup(jobs, item);
             var cancelled = 0;
             if (mi != 0 && load64(mi + 32) == JOB_CANCELLED) { cancelled = 1; }
             if (mi != 0) {
-                map_delete(jobs, key);
+                map_delete(jobs, load64(item + 32));
                 fl_free(mi);
             }
             mutex_unlock(mtx);
-            if (cancelled == 1) {
-                queue_item_free(item);
-            } else {
+            if (cancelled == 0) {
                 out = item;
                 searching = 0;
             }
@@ -471,13 +540,18 @@ fn mq_take_queued(mq) {
 # The map entry is also released here. mq_enqueue inserted a ManagedItem per
 # job and nothing ever removed one, so a long-lived queue grew until the
 # process died. Terminal states are where a job stops being interesting.
+#
+# A 0 item (or queue) is a no-op, like an unknown one: mq_dequeue returns 0 both
+# when empty and at the concurrency cap, and `mq_complete(mq, mq_dequeue(mq))`
+# used to read address 0x20 and SIGSEGV the worker. Same guard in mq_fail and
+# mq_cancel.
 fn mq_complete(mq, item) {
-    var key = load64(item + 32);
+    if (mq == 0 || item == 0) { return 0; }
     var mtx = load64(mq + 16);
     var jobs = load64(mq + 8);
 
     mutex_lock(mtx);
-    var mi = map_get(jobs, key);
+    var mi = _mq_lookup(jobs, item);
     # Only a job that actually reached RUNNING is terminated here. 2.6.9
     # deleted and freed the ManagedItem for ANY resolvable key, including one
     # still JOB_QUEUED — leaving its QueueItem sitting in the priority queue
@@ -486,46 +560,46 @@ fn mq_complete(mq, item) {
     if (mi != 0 && load64(mi + 32) == JOB_RUNNING) {
         store64(mq + 32, load64(mq + 32) - 1);
         store64(mi + 32, JOB_COMPLETED);
-        store64(mi + 56, time_now_ns());
         counter_inc(load64(mq + 56));
-        map_delete(jobs, key);
+        map_delete(jobs, load64(item + 32));
         fl_free(mi);
     }
     mutex_unlock(mtx);
+    return 0;
 }
 
 # Mark a job as failed.
 fn mq_fail(mq, item) {
-    var key = load64(item + 32);
+    if (mq == 0 || item == 0) { return 0; }
     var mtx = load64(mq + 16);
     var jobs = load64(mq + 8);
 
     mutex_lock(mtx);
-    var mi = map_get(jobs, key);
+    var mi = _mq_lookup(jobs, item);
     if (mi != 0 && load64(mi + 32) == JOB_RUNNING) {
         store64(mq + 32, load64(mq + 32) - 1);
         store64(mi + 32, JOB_FAILED);
-        store64(mi + 56, time_now_ns());
-        map_delete(jobs, key);
+        map_delete(jobs, load64(item + 32));
         fl_free(mi);
     }
     mutex_unlock(mtx);
+    return 0;
 }
 
 # Cancel a queued job (only from QUEUED state).
 fn mq_cancel(mq, item) {
-    var key = load64(item + 32);
+    if (mq == 0 || item == 0) { return 0; }
     var mtx = load64(mq + 16);
 
     mutex_lock(mtx);
-    var mi = map_get(load64(mq + 8), key);
+    var mi = _mq_lookup(load64(mq + 8), item);
     if (mi != 0) {
         if (load64(mi + 32) == JOB_QUEUED) {
             store64(mi + 32, JOB_CANCELLED);
-            store64(mi + 56, time_now_ns());
         }
     }
     mutex_unlock(mtx);
+    return 0;
 }
 
 fn mq_queued_count(mq) { return cpq_len(load64(mq)); }

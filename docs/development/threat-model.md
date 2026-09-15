@@ -52,7 +52,10 @@ covered by `cyrius.lock`'s 110 hashes and CI's `cyrius deps --verify`. See
 > requires a role. Replay defence is a strictly-increasing peer counter: a stale
 > or reflected nonce is rejected before decryption, and the window is advanced
 > only *after* the tag authenticates, so a forged nonce cannot burn counters
-> and lock out the real peer.
+> and lock out the real peer. ⚠ That window is **per handle** (see the Replay
+> row below): it does not stop a frame captured on one connection from
+> replaying into a new connection under the same PSK. Since 2.8.1 a frame
+> carrying the receiver's own role kills the handle instead of just erroring.
 
 > **Ed25519 verification strictness is sigil's property, not majra's.**
 > `signed_envelope_verify` delegates to `ed25519_verify`. RFC 8032 5.1.7's
@@ -72,18 +75,20 @@ covered by `cyrius.lock`'s 110 hashes and CI's `cyrius deps --verify`. See
 | relay | Sequence dedup map | Unbounded sender tracking | `relay_set_max_dedup()` + `relay_evict_stale_dedup()` |
 | heartbeat | Node registration | Unbounded node tracking | Eviction policy auto-removes stale nodes |
 | ipc | Frame parsing | Oversized frames | 1 MB max frame size check |
-| ipc_encrypted | Nonce exhaustion | Key reuse | Counter tracking + `encrypted_ipc_needs_rekey()` warning at 2^31 |
+| ipc_encrypted | Nonce reuse / exhaustion | Key+nonce reuse | Role byte separates the two directions; since **2.8.1** a per-handle CSPRNG salt (nonce bytes 1-7) separates connections that share a PSK (before, every connection restarted at nonce 0). Wire-compatible with 2.8.0 peers. `encrypted_ipc_needs_rekey()` warns at 2^31 frames, hard-fail at 2^32 |
+| ipc_encrypted | Captured frames | Replay | The replay window is **per handle**: frames recorded from one connection can replay into a later connection under the same PSK. Open. The fix needs a handshake, which is a wire change, so it is queued for 2.9.0. Until then, rekey per connection |
 | redis_backend | RESP protocol | Injection | Commands built via structured builder, not string concat |
 | postgres_backend | Built-in workflow API (`pg_save`/`get`/`delete_workflow_def`) | Injection | Values quoted and escaped by `_pg_add_literal` since **2.6.10** (single quotes doubled). Simple query protocol only — no prepared statements, so escaping is the sole defence; relies on `standard_conforming_strings=on`, PostgreSQL's default since 9.1 |
 | postgres_backend | Raw `pg_query` / `pg_exec` | Injection | Caller-composed SQL — **the caller must escape.** `_pg_add_literal` is available for that |
 | postgres_backend | Wire transport + auth | Credential and data disclosure | **Plaintext protocol, cleartext password.** No SSLRequest, no TLS; the only auth implemented is `AuthenticationCleartextPassword` (type 3), so the password crosses the wire unencrypted alongside every query and result row. SCRAM (type 10) is **failed closed**, never downgraded. Deploy only over loopback or an already-confidential channel |
 | ws | HTTP upgrade | Malformed headers | Fixed header parsing with length limits (4 KB) |
 | ws | SHA-1 | Collision attacks | SHA-1 used only for WebSocket handshake (RFC 6455 requirement, not security-critical) |
-| signed_envelope | Ed25519 verify on untrusted input | Forgery | sigil's `ed25519_verify` rejects non-canonical S; canonical encoding is deterministic — tamper causes verify to fail |
+| signed_envelope | Ed25519 verify on untrusted input | Forgery | sigil's `ed25519_verify` rejects non-canonical S; canonical encoding is deterministic, so tampering fails verification. ⚠ `signed_envelope_verify(se, 0)` (no `expected_pk`) proves only self-consistency. An attacker can re-sign and swap `signer_pk`. Pass `expected_pk`, or check `signed_envelope_signer_pk` against a trust store, whenever the result gates an action |
 | signed_envelope | Key storage | Key leakage | `expected_pk` comparison via `ct_eq_bytes_lens` (stdlib `lib/ct.cyr`, constant-time); caller owns key lifetime |
 | admin | HTTP endpoint | Unauthorized access | **No auth of any kind, and no default bind.** `majra_admin_serve` takes a caller-supplied dotted-quad string and returns `-1` if it will not parse, so it fails rather than binding somewhere unintended — but nothing enforces loopback. Pass `"127.0.0.1"` unless fronted by a proxy that authenticates. ⚠ Before **2.6.9** `addr` was forwarded raw to `sockaddr_in`, which wants a packed integer, so the documented `"127.0.0.1"` call bound to the low 32 bits of a `char*` |
+| admin | HTTP endpoint | DNS rebinding | A loopback bind does not stop a browser page from reaching the port through a rebound name. Since **2.8.1** the handler answers 400 unless `Host` is absent, an IP literal, or `localhost` (optional port), so a reverse proxy must forward an IP-literal or `localhost` Host |
 | admin | HTTP endpoint | Mutation | Read-only — no PUT/POST/DELETE routes exist |
-| pubsub | Slow or stalled subscriber | Publisher stall / fan-out DoS | **`PUBSUB_LAG_BLOCK` is the default** — a subscriber that stops draining parks `pubsub_publish` for its topic. Since **2.7.0** a subscription can opt into `PUBSUB_LAG_DROP_NEWEST` / `_DROP_OLDEST` / `_UNSUBSCRIBE`, and `pubsub_dropped_count` reports what was lost. `pubsub_unsubscribe` breaks a wedge |
+| pubsub | Slow or stalled subscriber | Publisher stall / fan-out DoS | **`PUBSUB_LAG_BLOCK` is the default** — a subscriber that stops draining parks `pubsub_publish` for its topic. Since **2.7.0** a subscription can opt into `PUBSUB_LAG_DROP_NEWEST` / `_DROP_OLDEST` / `_UNSUBSCRIBE`, and `pubsub_dropped_count` reports what was lost. `pubsub_unsubscribe` stops future publishes from parking; a publisher already parked is released only by draining the channel or `chan_close` |
 | patra_queue | SQL injection via payload | Injection (closed) | Prepared statement with a bound parameter since **2.6.9** — `patra_prepare("INSERT INTO jobs VALUES (?, ?, ?, 0, ?)")` + `patra_bind_text`. The payload never enters the SQL text; no consumer sanitization required |
 | patra_queue | Unbounded disk growth | Disk exhaustion | Consumer responsibility — periodically sweep `completed`/`failed` rows |
 

@@ -25,71 +25,172 @@ var RESP_MAX_DEPTH = 8;
 
 # --- RESP Protocol ---
 
-# Append CRLF to a string builder.
-fn _sb_crlf(sb) {
-    str_builder_add_cstr(sb, "\r\n");
+# sendto(2)'s number, or 0 where there is no MSG_NOSIGNAL send path.
+# ⚠ Spelled per arch: sendto has no ESYSXLAT row (quirk #9), so the x86_64 44
+# would run as fstatfs on aarch64. The peers declare no SYS_SENDTO. macOS has
+# no MSG_NOSIGNAL; agnos and Windows have no BSD sockets.
+fn _resp_sendto_nr() {
+    #ifdef CYRIUS_TARGET_LINUX
+    #ifdef CYRIUS_ARCH_X86
+    return 44;
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    return 206;
+    #endif
+    #endif
+    return 0;
 }
 
-# Send a RESP command array over a TCP socket.
-# cmd is a vec of C strings (command + arguments).
-# Returns 0 on success, -1 on failure.
-fn _resp_send_cmd(fd, cmd) {
-    if (fd < 0) { return -1; }
-    var sb = str_builder_new();
-    # Array header
-    str_builder_add_cstr(sb, "*");
-    str_builder_add_int(sb, vec_len(cmd));
-    _sb_crlf(sb);
-    # Each element as bulk string
-    var i = 0;
-    var len = vec_len(cmd);
-    while (i < len) {
-        var arg = vec_get(cmd, i);
-        var alen = strlen(arg);
-        str_builder_add_cstr(sb, "$");
-        str_builder_add_int(sb, alen);
-        _sb_crlf(sb);
-        str_builder_add_cstr(sb, arg);
-        _sb_crlf(sb);
-        i = i + 1;
-    }
-    var msg = str_builder_build(sb);
-    # A short write used to count as success, which desynchronises the command
-    # stream: the server parses a truncated command and every later reply is
-    # misattributed.
-    var data = str_data(msg);
-    var mlen = str_len(msg);
+# Write exactly `len` bytes. Returns 0, or -1 if any write failed — a short
+# write used to count as success, which desynchronises the command stream: the
+# server parses a truncated command and every later reply is misattributed.
+#
+# ⚠ Sent with MSG_NOSIGNAL (0x4000). A bare write(2) to a connection the peer
+# (or an idle-timeout load balancer) has reset raises SIGPIPE, whose default
+# action kills the whole consumer process. A non-socket fd gets ENOTSOCK (-88)
+# and falls back to write(2). EINTR (-4) retries.
+fn _resp_write_full(fd, buf, len) {
     var total = 0;
-    while (total < mlen) {
-        var w = syscall(SYS_WRITE, fd, data + total, mlen - total);
-        if (w <= 0) { return -1; }
+    var nr = _resp_sendto_nr();
+    while (total < len) {
+        var w = 0;
+        if (nr != 0) {
+            w = syscall(nr, fd, buf + total, len - total, 0x4000, 0, 0);
+            if (w == -88) {
+                nr = 0;
+                w = syscall(SYS_WRITE, fd, buf + total, len - total);
+            }
+        } else {
+            w = syscall(SYS_WRITE, fd, buf + total, len - total);
+        }
+        if (w == -4) { w = 0; }
+        elif (w <= 0) { return -1; }
         total = total + w;
     }
     return 0;
 }
 
-# Read a line from the socket (up to \r\n). Returns Str or 0.
-var _resp_buf[512];
+# Send a RESP command array: `argc` C strings at av[0..argc). Returns 0 on
+# success, -1 if the write failed (the stream is then in an unknown state), or
+# -2 if nothing was sent (bad argument or allocation failure).
+#
+# ⚠ Sized first and assembled in ONE fl_alloc block that is freed on every
+# path. The str_builder / str_builder_build / vec_new version took ~300 bytes
+# per command from the bump allocator, which never frees — a rate limiter at
+# 10k ops/s grew the process by megabytes a second.
+fn _resp_send_argv(fd, av, argc) {
+    if (fd < 0) { return -1; }
+    var nb[24];
+    var total = 1 + fmt_int_buf(argc, &nb) + 2;
+    var i = 0;
+    while (i < argc) {
+        var arg = load64(av + i * 8);
+        if (arg == 0) { return -2; }
+        var alen = strlen(arg);
+        total = total + 1 + fmt_int_buf(alen, &nb) + 2 + alen + 2;
+        i = i + 1;
+    }
+    var frame = fl_alloc(total);
+    if (frame == 0) { return -2; }
+    store8(frame, 42);
+    var p = 1;
+    var dl = fmt_int_buf(argc, &nb);
+    memcpy(frame + p, &nb, dl);
+    p = p + dl;
+    memcpy(frame + p, "\r\n", 2);
+    p = p + 2;
+    i = 0;
+    while (i < argc) {
+        var a2 = load64(av + i * 8);
+        var alen2 = strlen(a2);
+        store8(frame + p, 36);
+        p = p + 1;
+        dl = fmt_int_buf(alen2, &nb);
+        memcpy(frame + p, &nb, dl);
+        p = p + dl;
+        memcpy(frame + p, "\r\n", 2);
+        p = p + 2;
+        memcpy(frame + p, a2, alen2);
+        p = p + alen2;
+        memcpy(frame + p, "\r\n", 2);
+        p = p + 2;
+        i = i + 1;
+    }
+    var rc = _resp_write_full(fd, frame, total);
+    fl_free(frame);
+    return rc;
+}
+
+# Send a RESP command array over a TCP socket.
+# cmd is a vec of C strings (command + arguments).
+# Returns 0 on success, negative on failure (see _resp_send_argv).
+fn _resp_send_cmd(fd, cmd) {
+    if (fd < 0) { return -1; }
+    var len = vec_len(cmd);
+    var av = fl_alloc(len * 8 + 8);
+    if (av == 0) { return -2; }
+    var i = 0;
+    while (i < len) {
+        store64(av + i * 8, vec_get(cmd, i));
+        i = i + 1;
+    }
+    var rc = _resp_send_argv(fd, av, len);
+    fl_free(av);
+    return rc;
+}
+
+# Read a line from the socket (up to \r\n). Returns an OWNED, NUL-terminated
+# fl_alloc copy of the line without its CRLF, with the length via ret2; or 0.
+#
+# ⚠ The scratch buffer is a function LOCAL (N bytes, on the calling thread's
+# stack — quirk #4), not a module global. The global `_resp_buf` was shared by
+# every connection in the process, so two threads each reading their own
+# RedisConn interleaved bytes into one buffer and parsed each other's replies.
 fn _resp_read_line(fd) {
+    var lbuf[4096];
     var pos = 0;
     while (pos < 4088) {
-        var n = syscall(SYS_READ, fd, &_resp_buf + pos, 1);
-        if (n <= 0) { return 0; }
-        if (pos > 0 && load8(&_resp_buf + pos - 1) == 13 && load8(&_resp_buf + pos) == 10) {
-            # Return an OWNED copy. _resp_buf is a module global, so handing
-            # back a Str aliasing it meant every previously-returned simple
-            # string, error and integer line was rewritten by the next read —
-            # nested array replies clobbered their own earlier elements.
+        var n = syscall(SYS_READ, fd, &lbuf + pos, 1);
+        if (n == -4) { continue; }
+        if (n <= 0) { ret2(0, 0); }
+        if (pos > 0 && load8(&lbuf + pos - 1) == 13 && load8(&lbuf + pos) == 10) {
             var line_len = pos - 1;
             var copy = fl_alloc(line_len + 1);
-            if (copy == 0) { return 0; }
-            memcpy(copy, &_resp_buf, line_len);
+            if (copy == 0) { ret2(0, 0); }
+            memcpy(copy, &lbuf, line_len);
             store8(copy + line_len, 0);
-            return str_new(copy, line_len);
+            ret2(copy, line_len);
         }
         pos = pos + 1;
     }
-    return 0;
+    ret2(0, 0);
+}
+
+# Parse a RESP integer field in place — same rules as str_to_int (an optional
+# leading '-', non-digits skipped) without allocating a Str header for it.
+fn _resp_int(p, n) {
+    var result = 0;
+    var neg = 0;
+    var i = 0;
+    if (n > 0 && load8(p) == 45) { neg = 1; i = 1; }
+    while (i < n) {
+        var c = load8(p + i);
+        if (c >= 48 && c <= 57) { result = result * 10 + c - 48; }
+        i = i + 1;
+    }
+    if (neg == 1) { result = 0 - result; }
+    return result;
+}
+
+# A Str header over an fl_alloc'd reply buffer. The header itself is fl_alloc'd
+# too, so resp_reply_free can release both — a str_new header came from the
+# bump allocator and leaked 16 bytes per reply even when the caller freed it.
+fn _resp_str(data, len) {
+    var s = fl_alloc(16);
+    if (s == 0) { return 0; }
+    store64(s, data);
+    store64(s + 8, len);
+    return s;
 }
 
 # Read a RESP reply. Returns:
@@ -135,54 +236,77 @@ fn _resp_read_reply_d(rc, depth) {
     if (fd < 0) { return 0; }
     if (depth > RESP_MAX_DEPTH) { _resp_poison(rc); return 0; }
     var line = _resp_read_line(fd);
+    var llen = rethi();
     if (line == 0) { _resp_poison(rc); return 0; }
-    var data = str_data(line);
-    var type_byte = load8(data);
+    var type_byte = load8(line);
 
-    # NOTE ON OWNERSHIP: `line` borrows an fl_alloc'd copy made by
-    # _resp_read_line. The simple-string and error cases hand a Str over it
-    # back to the caller, so those must NOT free it — the caller owns it and
-    # releases it with resp_reply_free. The integer and length-header cases
-    # consume it here and free it.
-    if (type_byte == 43) {
-        # +simple string — caller owns the buffer
-        return str_new(data + 1, str_len(line) - 1);
-    }
-    if (type_byte == 45) {
-        # -error — caller owns the buffer
-        return str_new(data + 1, str_len(line) - 1);
+    # NOTE ON OWNERSHIP: `line` is an fl_alloc'd copy made by _resp_read_line.
+    # The simple-string and error cases hand a Str over it back to the caller,
+    # so those must NOT free it — the caller owns it and releases it with
+    # resp_reply_free. The integer and length-header cases consume it here and
+    # free it.
+    if (type_byte == 43 || type_byte == 45) {
+        # +simple string / -error — caller owns the buffer.
+        # ⚠ Shift the text to the START of the block rather than returning a Str
+        # at line + 1: resp_reply_free hands str_data to fl_free, which reads
+        # the size class 16 bytes before the pointer it is given, and one byte
+        # in that lands on the type byte — every '+OK' was "freed" by a failing
+        # munmap and leaked.
+        var k = 0;
+        while (k < llen - 1) {
+            store8(line + k, load8(line + k + 1));
+            k = k + 1;
+        }
+        store8(line + llen - 1, 0);
+        var s = _resp_str(line, llen - 1);
+        if (s == 0) { fl_free(line); }
+        return s;
     }
     if (type_byte == 58) {
         # :integer — the line is fully consumed here
-        var iv = str_to_int(str_new(data + 1, str_len(line) - 1));
-        fl_free(data);
+        var iv = _resp_int(line + 1, llen - 1);
+        fl_free(line);
         return iv;
     }
     if (type_byte == 36) {
         # $bulk string
-        var blen = str_to_int(str_new(data + 1, str_len(line) - 1));
-        if (blen < 0) { fl_free(data); return 0; }
+        var blen = _resp_int(line + 1, llen - 1);
+        fl_free(line);
+        if (blen < 0) { return 0; }
         # Without this cap, `$9223372036854775807` makes `blen + 2` WRAP
         # NEGATIVE; _fl_class sends any negative size down the size<=16 path,
         # so fl_alloc hands back a 16-byte block which str_new then labels
         # with a length of INT64_MAX. The first str_eq on that reply walks the
         # entire address space.
-        fl_free(data);
         if (blen > RESP_MAX_BULK) { _resp_poison(rc); return 0; }
         var buf = fl_alloc(blen + 2);
-        if (buf == 0) { return 0; }
+        # The body is still queued on the socket, so failing here loses framing.
+        if (buf == 0) { _resp_poison(rc); return 0; }
         var total = 0;
         while (total < blen + 2) {
             var n = syscall(SYS_READ, fd, buf + total, blen + 2 - total);
-            if (n <= 0) { fl_free(buf); _resp_poison(rc); return 0; }
+            if (n == -4) { n = 0; }
+            elif (n <= 0) { fl_free(buf); _resp_poison(rc); return 0; }
             total = total + n;
         }
-        return str_new(buf, blen);
+        # A bulk body must be followed by CRLF; anything else means the length
+        # lied and the stream is offset. Overwriting the CR with a NUL then makes
+        # a bulk reply a valid C string like every other Str reply — without it
+        # str_data(redis_get(...)) ran on into stale freelist bytes.
+        if (load8(buf + blen) != 13 || load8(buf + blen + 1) != 10) {
+            fl_free(buf);
+            _resp_poison(rc);
+            return 0;
+        }
+        store8(buf + blen, 0);
+        var bs = _resp_str(buf, blen);
+        if (bs == 0) { fl_free(buf); }
+        return bs;
     }
     if (type_byte == 42) {
         # *array
-        var count = str_to_int(str_new(data + 1, str_len(line) - 1));
-        fl_free(data);
+        var count = _resp_int(line + 1, llen - 1);
+        fl_free(line);
         if (count < 0) { return 0; }
         # An oversized count spins this loop growing `arr` long after the
         # socket has stopped producing, and unbounded nesting turns
@@ -202,27 +326,46 @@ fn _resp_read_reply_d(rc, depth) {
             # truncated to an empty array, and the elements it did not consume
             # stayed queued on the socket. The next command on that connection
             # then read the leftovers as its own reply and the stream was
-            # permanently offset by one. Push every element; a genuine socket
-            # failure is caught by the read loop above, which cannot produce
-            # more elements anyway.
+            # permanently offset by one. Push every element, and tell a genuine
+            # failure apart by the connection state instead: an element that
+            # poisoned the handle aborts the array like every other failure,
+            # rather than padding it out to `count` with zeros.
             vec_push(arr, _resp_read_reply_d(rc, depth + 1));
+            if (load64(rc) < 0) { return 0; }
             j = j + 1;
         }
         return arr;
     }
     # Unrecognised type byte — nothing else will consume the line, and we no
     # longer know where the next reply starts.
-    fl_free(data);
+    fl_free(line);
     _resp_poison(rc);
     return 0;
 }
 
 # Release a Str reply returned by _resp_read_reply for a simple string, an
-# error, or a bulk string. Integers are values, arrays are vecs from the bump
-# allocator; neither needs this.
+# error, or a bulk string — its buffer and its header. Integers are values,
+# arrays are vecs from the bump allocator; neither needs this.
 fn resp_reply_free(reply) {
-    if (reply != 0) { fl_free(str_data(reply)); }
+    if (reply != 0) {
+        fl_free(str_data(reply));
+        fl_free(reply);
+    }
     return 0;
+}
+
+# Send one command and read its reply.
+#
+# The wrappers used to ignore a failed send and go straight to the read — which
+# then blocked, untimed, for a reply to a command the server never received
+# (or is still waiting for the rest of). A failed write leaves the stream in an
+# unknown state, so poison it like a failed read.
+fn _resp_roundtrip(rc, av, argc) {
+    if (rc == 0) { return 0; }
+    var sr = _resp_send_argv(load64(rc), av, argc);
+    if (sr == -1) { _resp_poison(rc); return 0; }
+    if (sr < 0) { return 0; }
+    return _resp_read_reply(rc);
 }
 
 # --- Redis Connection ---
@@ -283,164 +426,195 @@ fn redis_close(rc) {
     return 0;
 }
 
-# Build prefixed key
+# Build prefixed key. Returns `key` itself when there is no prefix, otherwise
+# an fl_alloc'd copy the caller releases with _redis_pkey_free once the command
+# is sent (0 on allocation failure).
 fn _redis_pkey(rc, key) {
     var prefix = load64(rc + 8);
-    if (strlen(prefix) == 0) { return key; }
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, prefix);
-    str_builder_add_cstr(sb, key);
-    return str_data(str_builder_build(sb));
+    if (prefix == 0 || key == 0) { return key; }
+    var plen = strlen(prefix);
+    if (plen == 0) { return key; }
+    var klen = strlen(key);
+    var out = fl_alloc(plen + klen + 1);
+    if (out == 0) { return 0; }
+    memcpy(out, prefix, plen);
+    memcpy(out + plen, key, klen);
+    store8(out + plen + klen, 0);
+    return out;
+}
+
+fn _redis_pkey_free(key, pk) {
+    if (pk != 0 && pk != key) { fl_free(pk); }
+    return 0;
 }
 
 # --- Basic Commands ---
+#
+# Arguments go through a stack-local pointer array (`var av[64]` is 64 BYTES —
+# eight slots — as a local, quirk #4) and numbers through a local digit buffer,
+# so a command allocates nothing that outlives it.
+
+# One command whose second argument is a prefixed key.
+fn _redis_key_cmd(rc, name, key) {
+    var av[64];
+    var pk = _redis_pkey(rc, key);
+    store64(&av, name);
+    store64(&av + 8, pk);
+    var r = _resp_roundtrip(rc, &av, 2);
+    _redis_pkey_free(key, pk);
+    return r;
+}
 
 fn redis_set(rc, key, value) {
-    var cmd = vec_new();
-    vec_push(cmd, "SET");
-    vec_push(cmd, _redis_pkey(rc, key));
-    vec_push(cmd, value);
-    _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(rc);
+    var av[64];
+    var pk = _redis_pkey(rc, key);
+    store64(&av, "SET");
+    store64(&av + 8, pk);
+    store64(&av + 16, value);
+    var r = _resp_roundtrip(rc, &av, 3);
+    _redis_pkey_free(key, pk);
+    return r;
 }
 
 fn redis_get(rc, key) {
-    var cmd = vec_new();
-    vec_push(cmd, "GET");
-    vec_push(cmd, _redis_pkey(rc, key));
-    _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(rc);
+    return _redis_key_cmd(rc, "GET", key);
 }
 
 fn redis_del(rc, key) {
-    var cmd = vec_new();
-    vec_push(cmd, "DEL");
-    vec_push(cmd, _redis_pkey(rc, key));
-    _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(rc);
+    return _redis_key_cmd(rc, "DEL", key);
 }
 
 fn redis_exists(rc, key) {
-    var cmd = vec_new();
-    vec_push(cmd, "EXISTS");
-    vec_push(cmd, _redis_pkey(rc, key));
-    _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(rc);
+    return _redis_key_cmd(rc, "EXISTS", key);
 }
 
 # SET with EX (expire in seconds)
 fn redis_setex(rc, key, value, ttl_secs) {
-    var cmd = vec_new();
-    vec_push(cmd, "SET");
-    vec_push(cmd, _redis_pkey(rc, key));
-    vec_push(cmd, value);
-    vec_push(cmd, "EX");
-    var ttl_str = str_data(str_from_int(ttl_secs));
-    vec_push(cmd, ttl_str);
-    _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(rc);
+    var av[64];
+    var nb[24];
+    fmt_int_buf(ttl_secs, &nb);
+    var pk = _redis_pkey(rc, key);
+    store64(&av, "SET");
+    store64(&av + 8, pk);
+    store64(&av + 16, value);
+    store64(&av + 24, "EX");
+    store64(&av + 32, &nb);
+    var r = _resp_roundtrip(rc, &av, 5);
+    _redis_pkey_free(key, pk);
+    return r;
 }
 
 # --- Sorted Set (Queue) ---
 
 fn redis_zadd(rc, key, member, score) {
-    var cmd = vec_new();
-    vec_push(cmd, "ZADD");
-    vec_push(cmd, _redis_pkey(rc, key));
-    vec_push(cmd, str_data(str_from_int(score)));
-    vec_push(cmd, member);
-    _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(rc);
+    var av[64];
+    var nb[24];
+    fmt_int_buf(score, &nb);
+    var pk = _redis_pkey(rc, key);
+    store64(&av, "ZADD");
+    store64(&av + 8, pk);
+    store64(&av + 16, &nb);
+    store64(&av + 24, member);
+    var r = _resp_roundtrip(rc, &av, 4);
+    _redis_pkey_free(key, pk);
+    return r;
 }
 
 fn redis_zpopmin(rc, key) {
-    var cmd = vec_new();
-    vec_push(cmd, "ZPOPMIN");
-    vec_push(cmd, _redis_pkey(rc, key));
-    vec_push(cmd, "1");
-    _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(rc);
+    var av[64];
+    var pk = _redis_pkey(rc, key);
+    store64(&av, "ZPOPMIN");
+    store64(&av + 8, pk);
+    store64(&av + 16, "1");
+    var r = _resp_roundtrip(rc, &av, 3);
+    _redis_pkey_free(key, pk);
+    return r;
 }
 
 fn redis_zcard(rc, key) {
-    var cmd = vec_new();
-    vec_push(cmd, "ZCARD");
-    vec_push(cmd, _redis_pkey(rc, key));
-    _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(rc);
+    return _redis_key_cmd(rc, "ZCARD", key);
 }
 
 # --- Pub/Sub (publish only — subscribe requires dedicated connection) ---
 
 fn redis_publish(rc, channel, message) {
-    var cmd = vec_new();
-    vec_push(cmd, "PUBLISH");
-    vec_push(cmd, _redis_pkey(rc, channel));
-    vec_push(cmd, message);
-    _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(rc);
+    var av[64];
+    var pk = _redis_pkey(rc, channel);
+    store64(&av, "PUBLISH");
+    store64(&av + 8, pk);
+    store64(&av + 16, message);
+    var r = _resp_roundtrip(rc, &av, 3);
+    _redis_pkey_free(channel, pk);
+    return r;
 }
 
 # --- Hash (for rate limiter) ---
 
 fn redis_hset(rc, key, field, value) {
-    var cmd = vec_new();
-    vec_push(cmd, "HSET");
-    vec_push(cmd, _redis_pkey(rc, key));
-    vec_push(cmd, field);
-    vec_push(cmd, value);
-    _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(rc);
+    var av[64];
+    var pk = _redis_pkey(rc, key);
+    store64(&av, "HSET");
+    store64(&av + 8, pk);
+    store64(&av + 16, field);
+    store64(&av + 24, value);
+    var r = _resp_roundtrip(rc, &av, 4);
+    _redis_pkey_free(key, pk);
+    return r;
 }
 
 fn redis_hget(rc, key, field) {
-    var cmd = vec_new();
-    vec_push(cmd, "HGET");
-    vec_push(cmd, _redis_pkey(rc, key));
-    vec_push(cmd, field);
-    _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(rc);
+    var av[64];
+    var pk = _redis_pkey(rc, key);
+    store64(&av, "HGET");
+    store64(&av + 8, pk);
+    store64(&av + 16, field);
+    var r = _resp_roundtrip(rc, &av, 3);
+    _redis_pkey_free(key, pk);
+    return r;
 }
 
 fn redis_expire(rc, key, seconds) {
-    var cmd = vec_new();
-    vec_push(cmd, "EXPIRE");
-    vec_push(cmd, _redis_pkey(rc, key));
-    vec_push(cmd, str_data(str_from_int(seconds)));
-    _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(rc);
+    var av[64];
+    var nb[24];
+    fmt_int_buf(seconds, &nb);
+    var pk = _redis_pkey(rc, key);
+    store64(&av, "EXPIRE");
+    store64(&av + 8, pk);
+    store64(&av + 16, &nb);
+    var r = _resp_roundtrip(rc, &av, 3);
+    _redis_pkey_free(key, pk);
+    return r;
 }
 
 # --- KEYS (for heartbeat list_online) ---
 
 fn redis_keys(rc, pattern) {
-    var cmd = vec_new();
-    vec_push(cmd, "KEYS");
-    vec_push(cmd, _redis_pkey(rc, pattern));
-    _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(rc);
+    return _redis_key_cmd(rc, "KEYS", pattern);
 }
 
 # --- EVAL (for rate limiter Lua script) ---
 
 fn redis_eval(rc, script, num_keys, key, arg1, arg2, arg3) {
-    var cmd = vec_new();
-    vec_push(cmd, "EVAL");
-    vec_push(cmd, script);
-    vec_push(cmd, str_data(str_from_int(num_keys)));
-    vec_push(cmd, _redis_pkey(rc, key));
-    vec_push(cmd, arg1);
-    vec_push(cmd, arg2);
-    vec_push(cmd, arg3);
-    _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(rc);
+    var av[64];
+    var nb[24];
+    fmt_int_buf(num_keys, &nb);
+    var pk = _redis_pkey(rc, key);
+    store64(&av, "EVAL");
+    store64(&av + 8, script);
+    store64(&av + 16, &nb);
+    store64(&av + 24, pk);
+    store64(&av + 32, arg1);
+    store64(&av + 40, arg2);
+    store64(&av + 48, arg3);
+    var r = _resp_roundtrip(rc, &av, 7);
+    _redis_pkey_free(key, pk);
+    return r;
 }
 
 # --- PING (connection test) ---
 
 fn redis_ping(rc) {
-    var cmd = vec_new();
-    vec_push(cmd, "PING");
-    _resp_send_cmd(load64(rc), cmd);
-    return _resp_read_reply(rc);
+    var av[64];
+    store64(&av, "PING");
+    return _resp_roundtrip(rc, &av, 1);
 }

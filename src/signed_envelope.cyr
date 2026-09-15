@@ -17,6 +17,12 @@
 #   offset 24: signed_at (i64) — nanoseconds since CLOCK_MONOTONIC
 #   offset 32: canon_len (i64) — length of the canonical buffer (cached
 #                                for debug/observability; verifier recomputes)
+#
+# ⚠ The inner envelope's `from`, `to_name` and `payload` MUST each be a Str or
+# 0. The 56-byte envelope carries no payload length, so canonicalisation reads
+# the length from the Str header: a cstr, an integer, or a raw/json object in
+# any of those fields makes it copy (and sign) an arbitrary span of memory, or
+# fault. A field of 0xFFFFFFFF bytes or more is refused (see below).
 
 var SIGNED_ENV_SIG_LEN = 64;
 var SIGNED_ENV_PK_LEN = 32;
@@ -31,7 +37,8 @@ var SIGNED_ENV_PK_LEN = 32;
 #   [4] to_name_len    [to_name bytes (0 bytes if to_name == 0)]
 #   [4] payload_len    [payload bytes (payload is treated as a Str)]
 #
-# Returns a buffer pointer; length returned via ret2/rethi.
+# Returns a buffer pointer; length returned via ret2/rethi. Returns 0 (length
+# 0) when a field's length cannot be encoded — see the length guard below.
 # Canonical = deterministic: same envelope → same bytes.
 fn _envelope_canonicalize(e) {
     var from = envelope_from(e);
@@ -52,6 +59,16 @@ fn _envelope_canonicalize(e) {
     var pay_len = 0;
     var pay_tag = 4294967295;
     if (payload != 0) { pay_len = str_len(payload); pay_tag = pay_len; }
+
+    # ⚠ Length prefixes are u32 and 0xFFFFFFFF is the absent sentinel, so a
+    # length >= 0xFFFFFFFF would either truncate or alias "absent" — two
+    # different envelopes, one signing input. Refuse instead. This also bounds
+    # `total` (no overflow) and turns the common non-Str-field mistake — a
+    # garbage word read as str_len — into a refusal rather than a wild memcpy.
+    # In-range envelopes canonicalise to exactly the bytes they always did.
+    if (from_len < 0 || from_len >= 4294967295) { ret2(0, 0); }
+    if (to_len < 0 || to_len >= 4294967295) { ret2(0, 0); }
+    if (pay_len < 0 || pay_len >= 4294967295) { ret2(0, 0); }
 
     var hdr = 8 + 8 + 8 + 8 + 4 + 4 + 4;
     var total = hdr + from_len + to_len + pay_len;
@@ -97,12 +114,30 @@ fn _envelope_canonicalize(e) {
 #           comment previously said "raw 32-byte Ed25519 secret key", which is
 #           what made that an easy mistake. Caller owns it; zeroize after the
 #           signing session ends.
+#           It must come from ed25519_keypair / ed25519_generate_keypair —
+#           never be assembled by hand as seed || some externally sourced pk.
 #   pk_ptr: raw 32-byte Ed25519 public key that corresponds to sk
+#
+# Returns 0 (no envelope) when e, sk_ptr or pk_ptr is 0, when pk_ptr differs
+# from sk[32..64], or when a field length cannot be canonicalised.
+#
+# ⚠ The pk check exists because sigil hashes sk[32..64], not pk_ptr, into the
+# signature: a mismatched pk used to yield a non-zero handle that never
+# verifies. It does NOT validate sk[32..64] itself. Signing one seed under two
+# different pk halves reuses R and leaks the private scalar (the
+# "double public key" signing-oracle class, ed25519-dalek RUSTSEC-2022-0093);
+# a caller that cannot vouch for where sk's pk half came from must re-derive
+# it with ed25519_keypair(seed, …) first.
 fn signed_envelope_new(e, sk_ptr, pk_ptr) {
+    if (e == 0 || sk_ptr == 0 || pk_ptr == 0) { return 0; }
+    if (ct_eq_bytes_lens(sk_ptr + 32, SIGNED_ENV_PK_LEN, pk_ptr, SIGNED_ENV_PK_LEN) == 0) {
+        return 0;
+    }
     ed25519_init();
 
     var canon = _envelope_canonicalize(e);
     var canon_len = rethi();
+    if (canon == 0) { return 0; }
 
     var sig = fl_alloc(SIGNED_ENV_SIG_LEN);
     ed25519_sign(sk_ptr, canon, canon_len, sig);
@@ -123,18 +158,26 @@ fn signed_envelope_new(e, sk_ptr, pk_ptr) {
 
 # Verify a SignedEnvelope. Returns 0 if the signature is valid over the
 # canonical encoding of the inner envelope and the stored public key.
-# Returns non-zero on any failure (bad signature, mismatched content,
-# pk mismatch if expected_pk != 0).
+# Returns non-zero on any failure: 1 malformed handle, 2 pk mismatch
+# (expected_pk != 0), 3 bad signature / mismatched content / a field length
+# that cannot be canonicalised.
 #
 # expected_pk: if non-zero, verify that the signer_pk matches this
-#              specific key (trust anchoring). If 0, verify only that
-#              the signature is valid for the embedded pk (transport
-#              integrity without identity binding).
+#              specific key (trust anchoring). PASS IT whenever the result
+#              gates an action.
+#
+# ⚠ With expected_pk == 0 a 0 return proves only that the envelope is
+# self-consistent (it detects accidental corruption). It is NOT authenticity
+# and NOT integrity against an active attacker: anyone who can modify the
+# message can change the payload, re-sign with their own key and swap
+# signer_pk, and it still returns 0. A caller using this mode MUST check
+# signed_envelope_signer_pk(se) against its own trust store before acting.
 fn signed_envelope_verify(se, expected_pk) {
     if (se == 0) { return 1; }
     var e = load64(se);
     var sig = load64(se + 8);
     var signer_pk = load64(se + 16);
+    if (e == 0 || sig == 0 || signer_pk == 0) { return 1; }
 
     if (expected_pk != 0) {
         # Constant-time compare of 32 public-key bytes
@@ -145,6 +188,7 @@ fn signed_envelope_verify(se, expected_pk) {
 
     var canon = _envelope_canonicalize(e);
     var canon_len = rethi();
+    if (canon == 0) { return 3; }
     var ok = ed25519_verify(signer_pk, canon, canon_len, sig);
     # This is the UNTRUSTED path — a peer that feeds verify failures could
     # otherwise leak a payload-sized buffer per attempt.

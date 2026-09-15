@@ -206,7 +206,22 @@ fn test_managed_queue_cancel() {
     mq_cancel(mq, j1);
     # Dequeue should skip cancelled item (it's still in the cpq though)
     var d = mq_dequeue(mq);
-    # The item is dequeued from cpq but its managed state is CANCELLED
+    # 2.8.1: this test used to assert nothing and could fail only by crashing.
+    assert_eq(d, 0, "a sole cancelled job is not delivered");
+    assert_eq(mq_job_count(mq), 0, "and its tracking entry is released by the skip");
+    assert_eq(mq_queued_count(mq), 0, "and nothing is left queued");
+
+    # Cancel only acts on QUEUED: cancelling a RUNNING job is a no-op, and the
+    # job still completes normally, giving its slot back.
+    var j2 = mq_enqueue(mq, PRIORITY_NORMAL, 1000);
+    var run = mq_dequeue(mq);
+    assert(run == j2, "the fresh job is delivered");
+    mq_cancel(mq, run);
+    assert_eq(mq_running_count(mq), 1, "cancel on a RUNNING job leaves it running");
+    assert_eq(mq_job_count(mq), 1, "and still tracked");
+    mq_complete(mq, run);
+    assert_eq(mq_running_count(mq), 0, "mq_complete still decrements after the no-op cancel");
+    assert_eq(mq_total_completed(mq), 1, "and counts it as completed");
     println("  managed_queue_cancel: ok");
 }
 
@@ -422,9 +437,12 @@ fn test_pubsub_wildcard_patterns() {
     assert_eq(chan_recv(ch_hash), 22, "ps # got msg");
     assert_eq(chan_recv(ch_plus), 22, "ps + got msg");
 
-    pubsub_publish(ps, "sensors/room2/humidity", 65);
+    assert_eq(pubsub_publish(ps, "sensors/room2/humidity", 65), 1,
+      "humidity reaches exactly one subscriber");
     assert_eq(chan_recv(ch_hash), 65, "ps # got humidity");
-    # ch_plus should NOT get humidity (doesn't match +/temp)
+    # ch_plus must NOT get humidity (doesn't match +/temp). The ring's count
+    # word (lib/thread.cyr channel layout, offset 32) makes that assertable.
+    assert_eq(load64(ch_plus + 32), 0, "ps + did not receive humidity");
 
     println("  pubsub_wildcard_patterns: ok");
 }
@@ -844,6 +862,15 @@ fn test_relay_capacity_is_applied() {
     var zero = relay_with_capacity("n3", 0);
     assert_eq(relay_capacity(zero), 256,
       "and a non-positive capacity falls back rather than building a dead channel");
+    # 2.8.1: a capacity whose `cap * 8` wraps (or is absurd) falls back too.
+    # chan_new allocates `cap * 8` unchecked, so 2^61 + 2 built a 16-byte ring
+    # that recorded a 2^61 capacity and sends wrote past it.
+    assert_eq(relay_capacity(relay_with_capacity("x", 0x2000000000000002)), 256,
+      "a capacity that wraps cap*8 falls back to the default");
+    assert_eq(relay_capacity(relay_with_capacity("y", 16777217)), 256,
+      "just over 2^24 falls back");
+    assert_eq(relay_capacity(relay_with_capacity("z", 16777216)), 16777216,
+      "2^24 itself is honoured");
     # ⚠ **A full subscriber ring must NOT wedge the sender.** Rust's
     # `broadcast::send` never blocks — a lagging receiver gets `Lagged`, the
     # sender proceeds. `chan_send` futex-waits for space, so honouring the
@@ -982,6 +1009,11 @@ fn test_ratelimit_evict_reclaims() {
     assert(owned_key != 0, "evict: owned key present");
     assert(owned_bucket != 0, "evict: owned bucket present");
 
+    # 2.8.1: only a bucket that has refilled to burst is evicted (a partly
+    # drained one would hand the client a fresh burst). The check above spent
+    # one token at 1000/s, so wait out >= 1 ms. The sleep allocates nothing, so
+    # the freelist address checks below still hold.
+    _majra_sleep_ns(3000000);
     assert_eq(ratelimit_evict_stale(rl, 0), 1, "evict removes the idle key");
     assert_eq(ratelimit_key_count(rl), 0, "evict leaves 0 keys");
 
@@ -1191,7 +1223,10 @@ fn test_sliding_window_evict() {
     sliding_window_check(sw, "a");
     sliding_window_check(sw, "b");
     assert_eq(sliding_window_table_size(sw), 2, "2 keys tracked");
-    # max_idle 0 evicts everything idle for >= 0ns, i.e. all of it.
+    # max_idle 0 evicts everything whose window started >= 2 windows ago (the
+    # 2.8.1 floor — see test_sliding_window_evict_spares_active). The window is
+    # 1 ms, so wait out 2 of them.
+    _majra_sleep_ns(3000000);
     assert_eq(sliding_window_evict_stale(sw, 0), 2, "both keys evicted");
     assert_eq(sliding_window_table_size(sw), 0, "table drained");
     println("  sliding_window_evict: ok");
@@ -1208,17 +1243,50 @@ fn test_sliding_window_rejects_zero_window() {
 # ratelimit_check advanced last_access_ns to `now` even when the truncated
 # refill was 0, discarding the fractional credit — so a limiter polled faster
 # than one token-period refilled at zero forever.
+#
+# ⚠ 2.8.1: the previous body could not fail. At ratelimit_new(1, 1) (0.001
+# tokens/s) both the buggy and the fixed limiter refuse after 50 polls, so the
+# assertion was a tautology. This drives the bucket directly (tokens at +0,
+# credited-until clock at +8) so both outcomes are deterministic.
 fn test_ratelimit_subinterval_polling_accrues() {
-    # 1 token/sec, burst 1: spend the single token, then poll rapidly.
+    # rate_x1000 = 1: one milli-token per SECOND, so any poll less than 1 s
+    # after the clock truncates to a refill of 0 — the starvation shape.
     var rl = ratelimit_new(1, 1);
     assert_eq(ratelimit_check(rl, "k"), 1, "first request allowed from burst");
+    var b = map_get(load64(rl + 16), "k");
+    assert(b != 0, "bucket reachable");
+    # 999 milli-tokens: one milli-token short. Credited until 900 ms ago.
+    store64(b, 999);
+    store64(b + 8, time_now_ns() - 900000000);
     var i = 0;
-    while (i < 50) { ratelimit_check(rl, "k"); i = i + 1; }
-    # The rapid polls must not have reset the refill clock; after the busy
-    # loop the bucket has still accrued whatever wall time actually passed.
-    # (Assert the invariant that matters: the limiter is still refusing, not
-    # that it wrongly refilled.)
-    assert_eq(ratelimit_check(rl, "k"), 0, "still limited after rapid polling");
+    while (i < 20) {
+        assert_eq(ratelimit_check(rl, "k"), 0, "sub-interval poll refused");
+        i = i + 1;
+    }
+    # 200 ms more of credit: >= 1.1 s since the ORIGINAL clock. A limiter whose
+    # zero-refill polls reset the clock to `now` sees only ~200 ms here and
+    # still refuses.
+    store64(b + 8, load64(b + 8) - 200000000);
+    assert_eq(ratelimit_check(rl, "k"), 1,
+      "rapid polls did not discard the fractional credit — the token accrued");
+
+    # Fail-open guard (2.6.10 CRITICAL). 1000 tokens/s, burst 1, drained, then
+    # idle 3 hours. The refill must clamp to burst and the clock must move to
+    # `now` — never backwards — so the limiter closes again at once.
+    var rl2 = ratelimit_new(1000000, 1);
+    assert_eq(ratelimit_check(rl2, "f"), 1, "fail-open: first check from burst");
+    var b2 = map_get(load64(rl2 + 16), "f");
+    store64(b2, 0);
+    store64(b2 + 8, time_now_ns() - 10800000000000);
+    assert_eq(ratelimit_check(rl2, "f"), 1, "fail-open: a long-idle bucket refills and allows");
+    var t1 = load64(b2 + 8);
+    ratelimit_check(rl2, "f");
+    var t2 = load64(b2 + 8);
+    var now = time_now_ns();
+    assert(t1 <= now, "fail-open: clock not in the future");
+    assert(t2 >= t1, "fail-open: clock never moves backwards");
+    assert(now - t1 < 60000000000, "fail-open: clock moved up to now, not left hours back");
+    assert_eq(ratelimit_check(rl2, "f"), 0, "fail-open: the limiter closes again immediately");
     println("  ratelimit_subinterval_polling_accrues: ok");
 }
 
@@ -1240,6 +1308,23 @@ fn test_namespace_prefix_validation() {
     # The concrete bypass: without validation, "a/#" produced the wildcard
     # "a/#/#", whose embedded '#' matches every other tenant under "a".
     assert_eq(namespace_valid_prefix("a/#"), 0, "the a/# bypass prefix is refused");
+
+    # A rejected namespace is 0, and the module's own recipes feed that result
+    # straight into the accessors. Every one must answer 0, not dereference it.
+    var bad = namespace_new("a/b");
+    assert_eq(bad, 0, "invalid prefix rejected");
+    assert_eq(namespace_topic(bad, "x"), 0, "topic on a null namespace");
+    assert_eq(namespace_key(bad, "x"), 0, "key on a null namespace");
+    assert_eq(namespace_node_id(bad, "x"), 0, "node_id on a null namespace");
+    assert_eq(namespace_pattern(bad, "x/#"), 0, "pattern on a null namespace");
+    assert_eq(namespace_wildcard(bad), 0, "wildcard on a null namespace");
+    assert_eq(namespace_strip_topic(bad, str_from("a/x")), 0, "strip_topic on a null namespace");
+    assert_eq(namespace_strip_key(bad, str_from("a:x")), 0, "strip_key on a null namespace");
+    var good = namespace_new("acme");
+    assert_eq(namespace_topic(good, 0), 0, "null topic cstr on a valid namespace");
+    assert_eq(namespace_key(good, 0), 0, "null key cstr on a valid namespace");
+    assert_eq(namespace_strip_topic(good, 0), 0, "null topic Str on a valid namespace");
+    assert_eq(namespace_strip_key(good, 0), 0, "null key Str on a valid namespace");
     println("  namespace_prefix_validation: ok");
 }
 
@@ -1249,16 +1334,32 @@ fn test_fleet_routing() {
     fleet_register_node(fq, "n1");
     fleet_register_node(fq, "n2");
 
-    # Submit 3 jobs — should distribute across nodes
+    # Submit 4 jobs — least-loaded routing splits them evenly.
     fleet_submit(fq, PRIORITY_NORMAL, 1);
     fleet_submit(fq, PRIORITY_NORMAL, 2);
     fleet_submit(fq, PRIORITY_NORMAL, 3);
+    fleet_submit(fq, PRIORITY_NORMAL, 4);
 
-    # Both nodes should have jobs
     var q1 = fleet_node_queue(fq, "n1");
     var q2 = fleet_node_queue(fq, "n2");
     assert(q1 != 0, "fleet n1 has queue");
     assert(q2 != 0, "fleet n2 has queue");
+    # 2.8.1: the != 0 checks above hold right after registration whatever
+    # fleet_submit does. The depths are what least-loaded routing decides.
+    assert_eq(mq_queued_count(q1), 2, "fleet n1 received half the jobs");
+    assert_eq(mq_queued_count(q2), 2, "fleet n2 received half the jobs");
+
+    # A pre-loaded node is skipped: the next submit lands on the lighter one.
+    var fq2 = fleet_new(fleet_config_new(10, 5, 0));
+    fleet_register_node(fq2, "heavy");
+    fleet_register_node(fq2, "light");
+    var qh = fleet_node_queue(fq2, "heavy");
+    var ql = fleet_node_queue(fq2, "light");
+    mq_enqueue(qh, PRIORITY_NORMAL, 10);
+    mq_enqueue(qh, PRIORITY_NORMAL, 11);
+    assert(fleet_submit(fq2, PRIORITY_NORMAL, 12) != 0, "submit succeeds");
+    assert_eq(mq_queued_count(ql), 1, "the submit went to the least-loaded node");
+    assert_eq(mq_queued_count(qh), 2, "and not to the loaded one");
 
     println("  fleet_routing: ok");
 }
@@ -1648,6 +1749,20 @@ fn test_circuit_breaker_lifecycle() {
 
     circuit_record_success(cb);
     assert_eq(circuit_state(cb), CIRCUIT_CLOSED, "cb closed after success");
+
+    # One probe per cooldown window, and an abandoned probe is re-admitted after
+    # the next window (the 2.6.10 latch). Also the 2.8.1 single-clock-read
+    # path. Whole-cooldown floor sleeps (cyrius-quirks #11): 300 ms windows.
+    var cb2 = circuit_breaker_new(1, 300000000);
+    circuit_record_failure(cb2);
+    assert_eq(circuit_state(cb2), CIRCUIT_OPEN, "cb2 open after its one failure");
+    _majra_sleep_ns(400000000);
+    assert_eq(circuit_state(cb2), CIRCUIT_HALF_OPEN, "cb2 half-open after the cooldown");
+    assert_eq(circuit_state(cb2), CIRCUIT_OPEN, "a second caller in the same window stays OPEN");
+    _majra_sleep_ns(400000000);
+    assert_eq(circuit_state(cb2), CIRCUIT_HALF_OPEN, "an abandoned probe is re-admitted next window");
+    circuit_reset(cb2);
+    assert_eq(circuit_state(cb2), CIRCUIT_CLOSED, "reset closes");
     println("  circuit_breaker_lifecycle: ok");
 }
 
@@ -1663,6 +1778,23 @@ fn test_connection_pool() {
 
     conn_pool_reset_circuit(pool, "ep1");
     assert_eq(conn_pool_circuit_state(pool, "ep1"), CIRCUIT_CLOSED, "ep1 reset");
+
+    # 2.8.1: every assertion above is also satisfied by a pool that never
+    # stores its breakers (an unknown endpoint reads CLOSED). Prove storage.
+    assert_eq(conn_pool_endpoint_count(pool), 2, "both breakers are registered");
+    # Threshold 0: `failures < threshold` is false at once, so the breaker is
+    # on its degraded path from birth — the first caller takes the probe.
+    conn_pool_with_circuit_breaker(pool, "ep0", 0, 3600000000000);
+    assert_eq(conn_pool_endpoint_count(pool), 3, "a third breaker is registered");
+    assert_eq(conn_pool_circuit_state(pool, "ep0"), CIRCUIT_HALF_OPEN,
+      "the stored threshold-0 breaker is consulted, not defaulted to CLOSED");
+    assert_eq(conn_pool_circuit_state(pool, "ep0"), CIRCUIT_OPEN,
+      "and it is the SAME breaker: its probe is already out");
+    assert_eq(conn_pool_circuit_state(pool, "ep-unknown"), CIRCUIT_CLOSED,
+      "an unregistered endpoint still reads CLOSED");
+    conn_pool_reset_circuit(pool, "ep0");
+    assert_eq(conn_pool_circuit_state(pool, "ep0"), CIRCUIT_HALF_OPEN,
+      "reset reached the stored breaker and re-armed its probe");
     println("  connection_pool: ok");
 }
 
@@ -1721,14 +1853,1632 @@ fn test_integration_namespaced_pubsub() {
 
     # Publish to tenant-a
     var topic_a = str_data(namespace_topic(ns_a, "events/created"));
-    pubsub_publish(ps, topic_a, 42);
+    assert_eq(pubsub_publish(ps, topic_a, 42), 1, "tenant-a's publish reaches exactly one subscriber");
 
     # tenant-a should get it
     assert_eq(chan_recv(ch_a), 42, "ns-a got msg");
 
-    # tenant-b should NOT (different namespace)
-    # Note: can't do non-blocking recv in Cyrius, so we just verify delivery count
+    # tenant-b must NOT (different namespace). The ring's count word (offset 32)
+    # makes isolation assertable without a blocking recv.
+    assert_eq(load64(ch_b + 32), 0, "tenant-b received nothing");
+    assert_eq(chan_try_recv(ch_b), 0, "and has nothing to receive");
     println("  integration_namespaced_pubsub: ok");
+}
+
+# =============================================================================
+# 2.8.1 P(-1) hardening regressions
+# =============================================================================
+#
+# Each test names the finding it guards. Shared helpers first. Every helper and
+# global here is `_t8_`-prefixed: cyrius has one flat namespace.
+
+# Copy a literal into a caller-owned buffer (NUL-terminated) and return it —
+# the "sender decodes each frame into a reused buffer" shape.
+fn _t8_cpy(d, lit) {
+    var n = strlen(lit);
+    memcpy(d, lit, n);
+    store8(d + n, 0);
+    return d;
+}
+
+# A heap copy of `s` at a fresh address (same bytes, different pointer).
+fn _t8_heap_cstr(s) {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, s);
+    return str_cstr(str_builder_build(sb));
+}
+
+fn _t8_intkey(n) { return str_cstr(str_from_int(n)); }
+
+# Empty (state 0) slots of a lib/hashmap.cyr map.
+fn _t8_empty_slots(m) {
+    var e = map_entries(m);
+    var cap = map_cap(m);
+    var n = 0;
+    var i = 0;
+    while (i < cap) {
+        if (load64(e + i * 24 + 16) == 0) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+# --- F105: counter_inc / counter_add are atomic ---------------------------
+
+var _t8_ctr = 0;
+
+fn _t8_ctr_worker(arg) {
+    var i = 0;
+    while (i < 100000) {
+        counter_inc(_t8_ctr);
+        counter_add(_t8_ctr, 2);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn test_counter_concurrent_no_lost_updates() {
+    _t8_ctr = counter_new();
+    var t1 = thread_create(&_t8_ctr_worker, 0);
+    var t2 = thread_create(&_t8_ctr_worker, 0);
+    var t3 = thread_create(&_t8_ctr_worker, 0);
+    var t4 = thread_create(&_t8_ctr_worker, 0);
+    thread_join(t1); thread_join(t2); thread_join(t3); thread_join(t4);
+    assert_eq(counter_get(_t8_ctr), 1200000, "4 threads x 100k x (inc + add 2): no lost counter updates");
+    println("  counter_concurrent_no_lost_updates: ok");
+}
+
+# --- F100: map_evict on a grown map -----------------------------------------
+
+fn _t8_even_pred(k, v) {
+    if (v % 2 == 0) { return 1; }
+    return 0;
+}
+
+fn _t8_mk_key(buf, i) {
+    memset(buf, 0, 16);
+    store8(buf, 65 + (i / 676) % 26);
+    store8(buf + 1, 65 + (i / 26) % 26);
+    store8(buf + 2, 65 + i % 26);
+    return buf;
+}
+
+fn test_map_evict_grown() {
+    var m = map_new();
+    var i = 0;
+    while (i < 200) {
+        map_set(m, _t8_mk_key(fl_alloc(16), i), i);
+        i = i + 1;
+    }
+    assert_eq(map_size(m), 200, "map_evict: 200 keys before");
+    assert(map_cap(m) > 16, "map_evict precondition: the map has grown");
+    assert_eq(map_evict(m, &_t8_even_pred), 100, "map_evict removes the 100 even values");
+    assert_eq(map_size(m), 100, "map_evict: 100 left");
+    var kq = fl_alloc(16);
+    var kept_ok = 1;
+    var gone_ok = 1;
+    i = 0;
+    while (i < 200) {
+        _t8_mk_key(kq, i);
+        if (i % 2 == 1) {
+            if (map_get(m, kq) != i) { kept_ok = 0; }
+        } else {
+            if (map_has(m, kq) != 0) { gone_ok = 0; }
+        }
+        i = i + 1;
+    }
+    assert_eq(kept_ok, 1, "map_evict: every odd key survives with its value");
+    assert_eq(gone_ok, 1, "map_evict: every even key is gone");
+    assert_eq(map_evict(m, &_t8_even_pred), 0, "map_evict: a second pass evicts nothing");
+    println("  map_evict_grown: ok");
+}
+
+# --- F002: ratelimit under contention on one key ----------------------------
+
+var _t8_rc_rl = 0;
+var _t8_rc_deadline = 0;
+var _t8_rc_allowed = 0;
+var _t8_rc_mtx = 0;
+
+fn _t8_rc_worker(arg) {
+    var n = 0;
+    while (time_now_ns() < _t8_rc_deadline) {
+        if (ratelimit_check(_t8_rc_rl, "shared") == 1) { n = n + 1; }
+    }
+    mutex_lock(_t8_rc_mtx);
+    _t8_rc_allowed = _t8_rc_allowed + n;
+    mutex_unlock(_t8_rc_mtx);
+    return 0;
+}
+
+# 2.8.0 read the clock before the limiter lock: a caller that lost the race
+# carried a stale `now`, the refill went negative and the stored deficit locked
+# every caller out — 10 allowed in a second at 1000/s, and still refusing after
+# the contention stopped. Whole-second window, floor bound (cyrius-quirks #11).
+fn test_ratelimit_contention() {
+    _t8_rc_rl = ratelimit_new(1000000, 10);
+    _t8_rc_mtx = mutex_new();
+    _t8_rc_allowed = 0;
+    _t8_rc_deadline = time_now_ns() + 1000000000;
+    var ts = vec_new();
+    var i = 0;
+    while (i < 8) { vec_push(ts, thread_create(&_t8_rc_worker, 0)); i = i + 1; }
+    i = 0;
+    while (i < 8) { thread_join(vec_get(ts, i)); i = i + 1; }
+    assert(_t8_rc_allowed >= 500, "contention: allowed >= rate*secs/2");
+    assert(_t8_rc_allowed <= 1100, "contention: allowed <= rate*secs + burst (+ margin)");
+    var s = ratelimit_stats_for_key(_t8_rc_rl, "shared");
+    assert(s != 0, "contention: key stats present");
+    assert(ratelimit_key_tokens(s) >= 0, "contention: no stored token deficit");
+    ratelimit_stats_free(s);
+    _majra_sleep_ns(20000000);
+    assert_eq(ratelimit_check(_t8_rc_rl, "shared"), 1, "contention: a check after 20 ms idle is allowed");
+    println("  ratelimit_contention: ok");
+}
+
+# --- F004: only a refilled bucket is evicted --------------------------------
+
+fn test_ratelimit_evict_requires_full_bucket() {
+    # 1 token/s, burst 5, drained.
+    var rl = ratelimit_new(1000, 5);
+    var i = 0;
+    while (i < 5) { ratelimit_check(rl, "c"); i = i + 1; }
+    assert_eq(ratelimit_check(rl, "c"), 0, "full-bucket evict: drained");
+    _majra_sleep_ns(5000000);
+    assert_eq(ratelimit_evict_stale(rl, 1000000), 0,
+      "a drained bucket idle past max_idle survives the sweep");
+    assert_eq(ratelimit_key_count(rl), 1, "full-bucket evict: key kept");
+    assert_eq(ratelimit_check(rl, "c"), 0,
+      "and the client does NOT get a fresh burst from the sweep");
+
+    # A rate-0 limiter never refills, so a spent bucket is never evicted.
+    var rl0 = ratelimit_new(0, 2);
+    ratelimit_check(rl0, "spent");
+    assert_eq(ratelimit_evict_stale(rl0, 0), 0, "a rate-0 spent bucket is kept");
+    assert_eq(ratelimit_key_count(rl0), 1, "rate-0: key kept");
+
+    # A refilled bucket is lossless to evict.
+    var rl2 = ratelimit_new(1000000000, 2);
+    ratelimit_check(rl2, "full");
+    _majra_sleep_ns(2000000);
+    assert_eq(ratelimit_evict_stale(rl2, 0), 1, "a refilled bucket is evicted");
+    println("  ratelimit_evict_requires_full_bucket: ok");
+}
+
+# --- F003: an actively rejected sliding window is not "idle" ----------------
+
+fn test_sliding_window_evict_spares_active() {
+    var sw = sliding_window_new(3, 10000000000);
+    sliding_window_check(sw, "k");
+    sliding_window_check(sw, "k");
+    sliding_window_check(sw, "k");
+    assert_eq(sliding_window_check(sw, "k"), 0, "sw active: rejected at quota");
+    _majra_sleep_ns(5000000);
+    assert_eq(sliding_window_evict_stale(sw, 1000000), 0,
+      "a window younger than 2 windows is not evicted by a short max_idle");
+    assert_eq(sliding_window_check(sw, "k"), 0, "and the key is still rejected after the sweep");
+
+    var sw2 = sliding_window_new(3, 1000000);
+    sliding_window_check(sw2, "a");
+    _majra_sleep_ns(3000000);
+    assert_eq(sliding_window_evict_stale(sw2, 0), 1, "a window >= 2 windows old is evicted");
+    println("  sliding_window_evict_spares_active: ok");
+}
+
+# --- F005: sweeps reclaim tombstones ----------------------------------------
+
+# lib/hashmap.cyr never rehashes tombstones out and grows on live count only,
+# so key churn drove the empties to zero and every miss probed all `cap` slots
+# under the limiter lock. The sweeps now rebuild below cap/4 empties.
+fn test_ratelimit_churn_reclaims_tombstones() {
+    # 1M tokens/s, burst 1: refilled to full within 1 µs, so every sweep after
+    # a 1 ms sleep evicts every key.
+    var rl = ratelimit_new(1000000000, 1);
+    var buckets = load64(rl + 16);
+    var round = 0;
+    var clean = 1;
+    while (round < 100) {
+        var j = 0;
+        while (j < 8) { ratelimit_check(rl, _t8_intkey(round * 100 + j)); j = j + 1; }
+        _majra_sleep_ns(1000000);
+        ratelimit_evict_stale(rl, 0);
+        if (_t8_empty_slots(buckets) * 4 < map_cap(buckets)) { clean = 0; }
+        round = round + 1;
+    }
+    assert_eq(clean, 1, "churn: every sweep leaves >= cap/4 empty slots");
+
+    # Rebuild with LIVE keys: churn (without letting a sweep see the low state)
+    # until 8 fresh keys sit in a map with < cap/4 empties, then sweep with an
+    # idle threshold nothing meets. The sweep must rebuild and lose nothing.
+    var g = 0;
+    var reached = 0;
+    while (g < 2000 && reached == 0) {
+        var j2 = 0;
+        while (j2 < 8) { ratelimit_check(rl, _t8_intkey(500000 + g * 100 + j2)); j2 = j2 + 1; }
+        if (_t8_empty_slots(buckets) * 4 < map_cap(buckets)) {
+            reached = 1;
+        } else {
+            _majra_sleep_ns(1000000);
+            ratelimit_evict_stale(rl, 0);
+            g = g + 1;
+        }
+    }
+    assert_eq(reached, 1, "churn precondition: tombstones ate the empties with 8 live keys");
+    ratelimit_check(rl, "live1");
+    ratelimit_check(rl, "live1");
+    var live = ratelimit_key_count(rl);
+    assert_eq(live, 9, "churn: 9 live keys before the rebuild sweep");
+    assert_eq(ratelimit_evict_stale(rl, 3600000000000), 0, "churn: nothing is an hour idle");
+    assert_eq(ratelimit_key_count(rl), 9, "churn: live keys kept across the rebuild");
+    assert(_t8_empty_slots(buckets) * 4 >= map_cap(buckets), "churn: the sweep rebuilt the map");
+    var s = ratelimit_stats_for_key(rl, "live1");
+    assert(s != 0, "churn: live1 still resolves after the rebuild");
+    assert_eq(ratelimit_key_allowed(s) + ratelimit_key_rejected(s), 2, "churn: its per-key counters survived");
+    ratelimit_stats_free(s);
+    var found = 0;
+    var j3 = 0;
+    while (j3 < 8) {
+        var sk = ratelimit_stats_for_key(rl, _t8_intkey(500000 + g * 100 + j3));
+        if (sk != 0) { found = found + 1; ratelimit_stats_free(sk); }
+        j3 = j3 + 1;
+    }
+    assert_eq(found, 8, "churn: all 8 generation keys still resolve after the rebuild");
+
+    # Heartbeat twin: register/deregister churn with a sweep every 10 cycles.
+    var cht = chb_tracker_new(heartbeat_config_new(30000000000, 90000000000, 0));
+    var nodes = load64(cht + 8);
+    var r = 0;
+    while (r < 400) {
+        var id = _t8_intkey(700000 + r);
+        chb_register(cht, id, 0);
+        chb_deregister(cht, id);
+        if (r % 10 == 0) { chb_update_statuses(cht); }
+        r = r + 1;
+    }
+    chb_register(cht, "keep", 7);
+    chb_update_statuses(cht);
+    assert(_t8_empty_slots(nodes) * 4 >= map_cap(nodes), "heartbeat churn: the sweep reclaims tombstones");
+    assert_eq(chb_len(cht), 1, "heartbeat churn: one live node");
+    var cp = chb_get(cht, "keep");
+    assert(cp != 0, "heartbeat churn: the live node survives the rebuild");
+    if (cp != 0) {
+        assert_eq(load64(cp + 16), 7, "heartbeat churn: with its metadata");
+        chb_node_free(cp);
+    }
+    println("  ratelimit_churn_reclaims_tombstones: ok");
+}
+
+# --- F006: fleet_stats and list_by_status leak nothing ----------------------
+
+fn test_heartbeat_stats_allocate_nothing() {
+    var cht = chb_tracker_new(heartbeat_config_default());
+    var ht = hb_tracker_new(heartbeat_config_default());
+    var i = 0;
+    while (i < 100) {
+        var id = _t8_intkey(i);
+        chb_register(cht, id, 0);
+        hb_register(ht, id, 0);
+        i = i + 1;
+    }
+    fl_free(chb_fleet_stats(cht));
+    var u0 = alloc_used();
+    i = 0;
+    while (i < 10) { fl_free(chb_fleet_stats(cht)); i = i + 1; }
+    assert_eq(alloc_used() - u0, 0, "chb_fleet_stats allocates nothing on the bump heap");
+    assert_eq(vec_len(chb_list_by_status(cht, STATUS_ONLINE)), 100, "chb_list_by_status lists all 100");
+    assert_eq(vec_len(hb_list_by_status(ht, STATUS_ONLINE)), 100, "hb_list_by_status lists all 100");
+    assert_eq(vec_len(chb_list_by_status(cht, STATUS_OFFLINE)), 0, "and none offline");
+    println("  heartbeat_stats_allocate_nothing: ok");
+}
+
+# --- F008: high-rate and long-idle refill arithmetic ------------------------
+
+fn test_ratelimit_high_rate_refill() {
+    # 10M tokens/s, burst 10. 2.8.0 lost every sub-second refill above rate
+    # 9.2M/s and admitted only the burst.
+    var rl = ratelimit_new(10000000000, 10);
+    var t0 = time_now_ns();
+    var n = 0;
+    while (time_now_ns() - t0 < 100000000) {
+        if (ratelimit_check(rl, "h") == 1) { n = n + 1; }
+    }
+    assert(n > 1000, "a 10M/s limiter refills within the second");
+
+    # 1B tokens/s, burst 5, idle 200 days: `elapsed_sec * rate_x1000` wraps.
+    var rl2 = ratelimit_new(1000000000000, 5);
+    ratelimit_check(rl2, "x");
+    var b = map_get(load64(rl2 + 16), "x");
+    store64(b + 8, load64(b + 8) - 200 * 86400 * 1000000000);
+    store64(b, 0);
+    assert_eq(ratelimit_check(rl2, "x"), 1, "a long-idle high-rate bucket allows");
+    assert_eq(load64(b), 4000, "refilled to burst then spent one — never a negative count");
+    println("  ratelimit_high_rate_refill: ok");
+}
+
+# --- F080 / F081 / F102: ConcurrentHeartbeatTracker -------------------------
+
+fn test_chb_status_transitions() {
+    # Suspect 50 ms, offline 2 s — windows wide enough for qemu (quirk #11).
+    var cht = chb_tracker_new(heartbeat_config_new(50000000, 2000000000, 0));
+    chb_register(cht, "a", 0);
+    chb_register(cht, "b", 0);
+    _majra_sleep_ns(100000000);
+    chb_heartbeat(cht, "b");
+    var tr = chb_update_statuses(cht);
+    assert_eq(vec_len(tr), 1, "chb: exactly one transition");
+    if (vec_len(tr) == 1) {
+        assert(streq(load64(vec_get(tr, 0)), "a") == 1, "chb: the transition is node a");
+        assert_eq(load64(vec_get(tr, 0) + 8), STATUS_SUSPECT, "chb: to SUSPECT");
+    }
+    var fs = chb_fleet_stats(cht);
+    assert_eq(load64(fs), 2, "chb stats: total 2");
+    assert_eq(load64(fs + 8), 1, "chb stats: online 1");
+    assert_eq(load64(fs + 16), 1, "chb stats: suspect 1");
+    assert_eq(load64(fs + 24), 0, "chb stats: offline 0");
+    fl_free(fs);
+    var ls = chb_list_by_status(cht, STATUS_SUSPECT);
+    assert_eq(vec_len(ls), 1, "chb list: one suspect");
+    if (vec_len(ls) == 1) { assert(streq(vec_get(ls, 0), "a") == 1, "chb list: it is a"); }
+
+    assert_eq(chb_heartbeat(cht, "a"), 1, "chb: heartbeat on a known node");
+    var g = chb_get(cht, "a");
+    assert_eq(load64(g), STATUS_ONLINE, "chb: the heartbeat itself sets ONLINE");
+    chb_node_free(g);
+    assert_eq(vec_len(chb_update_statuses(cht)), 0, "chb: no transition after the heartbeat");
+
+    # Eviction on the concurrent tracker: offline after 2 µs, evicted after 1 cycle.
+    var c2 = chb_tracker_new(heartbeat_config_new(1000, 2000, 1));
+    chb_register(c2, "e1", 0);
+    _majra_sleep_ns(2000000);
+    chb_update_statuses(c2);
+    assert_eq(chb_len(c2), 0, "chb: an offline node is evicted after eviction_cycles sweeps");
+    assert_eq(chb_get(c2, "e1"), 0, "chb: and is gone");
+    println("  chb_status_transitions: ok");
+}
+
+fn test_chb_get_returns_owned_copy() {
+    var cht = chb_tracker_new(heartbeat_config_default());
+    chb_register(cht, "n1", 9);
+    var cp = chb_get(cht, "n1");
+    assert(cp != 0, "chb_get: known id");
+    assert(cp != map_get(load64(cht + 8), "n1"), "chb_get returns a copy, not the tracker's block");
+    chb_deregister(cht, "n1");
+    chb_register(cht, "n2", 1234);
+    assert_eq(load64(cp + 16), 9, "the copy survives the node's block being freed and reused");
+    chb_node_free(cp);
+    assert_eq(chb_get(cht, "nope"), 0, "chb_get: unknown id -> 0");
+    println("  chb_get_returns_owned_copy: ok");
+}
+
+fn test_chb_heartbeat_stamp_never_regresses() {
+    var cht = chb_tracker_new(heartbeat_config_default());
+    chb_register(cht, "n2", 0);
+    var ns = map_get(load64(cht + 8), "n2");
+    store64(ns, STATUS_SUSPECT);
+    var future = time_now_ns() + 1000000000000;
+    store64(ns + 8, future);
+    assert_eq(chb_heartbeat(cht, "n2"), 1, "heartbeat ok");
+    assert_eq(load64(ns + 8), future, "a clock read before the lock never moves last_seen backwards");
+    assert_eq(load64(ns), STATUS_ONLINE, "and the heartbeat still marks the node ONLINE");
+    assert_eq(chb_heartbeat_with_metadata(cht, "n2", 55), 1, "heartbeat_with_metadata ok");
+    assert_eq(load64(ns + 8), future, "with_metadata keeps the newer stamp too");
+    assert_eq(load64(ns + 16), 55, "and stores the metadata");
+    println("  chb_heartbeat_stamp_never_regresses: ok");
+}
+
+# --- F014: enqueues on several queues at once lose no job -------------------
+
+var _t8_mqs = 0;
+var _t8_mq_per = 2000;
+var _t8_mq_go = 0;
+
+fn _t8_mq4_worker(k) {
+    var q = vec_get(_t8_mqs, k);
+    while (atomic_load(&_t8_mq_go) == 0) { }
+    var i = 0;
+    while (i < _t8_mq_per) {
+        mq_enqueue(q, PRIORITY_NORMAL, i + 1);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# _mq_next_job_id is process-wide but each queue locked only its own mutex
+# around it, so enqueues on different queues could rewind it and hand a queue a
+# key still live in its own map — the second map_set overwrote the first job.
+# ⚠ Timing-dependent: the rewind needs a thread preempted inside the id's
+# load/store while another queue's thread runs ahead, so a single run of the
+# 2.8.0 shape often passes. Oversubscribed (32 threads on the go flag) and
+# repeated to raise the odds — it caught the 2.8.0 shape in 7 of 10 native
+# runs; loop the suite (testing.md) before trusting a green run.
+fn test_mq_multi_queue_concurrent_enqueue() {
+    var nq = 32;
+    var rep = 0;
+    var ok = 1;
+    var drained_ok = 1;
+    while (rep < 2) {
+        _t8_mqs = vec_new();
+        _t8_mq_go = 0;
+        var k = 0;
+        while (k < nq) { vec_push(_t8_mqs, mq_new("mq", 0)); k = k + 1; }
+        var ts = vec_new();
+        k = 0;
+        while (k < nq) { vec_push(ts, thread_create(&_t8_mq4_worker, k)); k = k + 1; }
+        atomic_store(&_t8_mq_go, 1);
+        k = 0;
+        while (k < nq) { thread_join(vec_get(ts, k)); k = k + 1; }
+        k = 0;
+        while (k < nq) {
+            var q = vec_get(_t8_mqs, k);
+            if (mq_job_count(q) != _t8_mq_per) { ok = 0; }
+            if (mq_queued_count(q) != _t8_mq_per) { ok = 0; }
+            # Drain, which also returns every block to the freelist for the next rep.
+            var n = 0;
+            var it = mq_dequeue(q);
+            while (it != 0) {
+                mq_complete(q, it);
+                queue_item_free(it);
+                n = n + 1;
+                it = mq_dequeue(q);
+            }
+            if (n != mq_total_completed(q)) { drained_ok = 0; }
+            if (mq_running_count(q) != 0) { drained_ok = 0; }
+            if (mq_job_count(q) != 0) { drained_ok = 0; }
+            k = k + 1;
+        }
+        rep = rep + 1;
+    }
+    assert_eq(ok, 1, "32 queues x 2000 concurrent enqueues: every job tracked on its own queue");
+    assert_eq(drained_ok, 1, "every tracked job is delivered, completed and released");
+    println("  mq_multi_queue_concurrent_enqueue: ok");
+}
+
+# --- F015 / F018: cancelled-item and job-key ownership ----------------------
+
+fn test_mq_take_queued_keeps_cancelled_handle() {
+    var mq = mq_new("tc", 0);
+    var p = mq_enqueue(mq, PRIORITY_NORMAL, 7);
+    var keep = mq_enqueue(mq, PRIORITY_NORMAL, 8);
+    mq_cancel(mq, p);
+    assert(mq_take_queued(mq) == keep, "take_queued skips the cancelled job");
+    assert_eq(queue_item_payload(p), 7, "the cancelled handle's payload is still readable");
+    assert(queue_item_key(p) != 0, "and so is its key");
+    mq_cancel(mq, p);
+    var fresh = mq_enqueue(mq, PRIORITY_NORMAL, 9);
+    assert(fresh != p, "the cancelled item's block was not freed and reused");
+    var d = mq_dequeue(mq);
+    assert(d == fresh, "re-cancelling the stale handle did not cancel the fresh job");
+    assert_eq(queue_item_payload(d), 9, "the fresh job is delivered intact");
+    mq_complete(mq, d);
+    queue_item_free(d);
+    queue_item_free(keep);
+    println("  mq_take_queued_keeps_cancelled_handle: ok");
+}
+
+fn test_mq_job_key_returns_to_freelist() {
+    var mq = mq_new("kr", 0);
+    var it = mq_enqueue(mq, PRIORITY_NORMAL, 1);
+    var k1 = queue_item_key(it);
+    var d = mq_dequeue(mq);
+    mq_complete(mq, d);
+    queue_item_free(d);
+    var it2 = mq_enqueue(mq, PRIORITY_NORMAL, 2);
+    assert(queue_item_key(it2) == k1, "the job key block is freed with its item and reused");
+    assert(str_len(queue_item_key(it2)) >= 1, "and the reused key is a valid Str");
+    var d2 = mq_dequeue(mq);
+    assert(d2 == it2, "the job keyed on the reused block is tracked and delivered");
+    mq_complete(mq, d2);
+    assert_eq(mq_job_count(mq), 0, "and releases its tracking entry");
+    queue_item_free(d2);
+    println("  mq_job_key_returns_to_freelist: ok");
+}
+
+# --- F094: ManagedQueue metrics dispatch ------------------------------------
+
+var _t8_m_enq = 0;
+var _t8_m_deq = 0;
+var _t8_m_pri = 0;
+var _t8_m_name = 0;
+
+fn _t8_m_on_enq(name, pri) {
+    _t8_m_enq = _t8_m_enq + 1;
+    _t8_m_name = name;
+    return 0;
+}
+
+fn _t8_m_on_deq(name, pri) {
+    _t8_m_deq = _t8_m_deq + 1;
+    _t8_m_pri = pri;
+    return 0;
+}
+
+fn test_mq_metrics_dispatch() {
+    _t8_m_enq = 0;
+    _t8_m_deq = 0;
+    _t8_m_pri = 0 - 1;
+    _t8_m_name = 0;
+    var vt = noop_metrics();
+    store64(vt, &_t8_m_on_enq);
+    store64(vt + 8, &_t8_m_on_deq);
+    var nm = "metrics-q";
+    var mq = mq_new(nm, 0);
+    mq_with_metrics(mq, vt);
+    mq_enqueue(mq, PRIORITY_HIGH, 1);
+    var d = mq_dequeue(mq);
+    assert(d != 0, "metrics: job delivered");
+    assert_eq(_t8_m_enq, 1, "metrics: enqueue hook fired once");
+    assert_eq(_t8_m_deq, 1, "metrics: dequeue hook fired once");
+    assert_eq(_t8_m_pri, PRIORITY_HIGH, "metrics: dequeue hook saw the job's priority");
+    assert(_t8_m_name == nm, "metrics: hooks get the queue's name pointer");
+    assert_eq(mq_dequeue(mq), 0, "metrics: empty queue");
+    assert_eq(_t8_m_deq, 1, "metrics: an empty dequeue does not fire the hook");
+    println("  mq_metrics_dispatch: ok");
+}
+
+# --- F095: cpq_dequeue_wait parks and wakes ---------------------------------
+
+var _t8_w_cpq = 0;
+var _t8_w_got = 0;
+var _t8_w_done = 0;
+
+fn _t8_waiter(a) {
+    _t8_w_got = queue_item_payload(cpq_dequeue_wait(_t8_w_cpq));
+    _t8_w_done = 1;
+    return 0;
+}
+
+fn test_cpq_dequeue_wait_park_and_wake() {
+    _t8_w_cpq = cpq_new();
+    _t8_w_got = 0;
+    _t8_w_done = 0;
+    var th = thread_create(&_t8_waiter, 0);
+    assert(th != 0, "cpq waiter spawned");
+    _majra_sleep_ns(100000000);
+    assert_eq(_t8_w_done, 0, "cpq waiter is still parked on an empty queue");
+    assert_eq(load64(_t8_w_cpq + 16) >> 32, 1, "and registered itself as a waiter");
+    cpq_enqueue(_t8_w_cpq, queue_item_new(PRIORITY_NORMAL, 4242));
+    # Bounded: a skipped wake leaves the waiter parked for good.
+    var w = 0;
+    while (_t8_w_done == 0 && w < 200) { _majra_sleep_ns(10000000); w = w + 1; }
+    assert_eq(_t8_w_done, 1, "the enqueue woke the parked waiter");
+    if (_t8_w_done == 1) {
+        thread_join(th);
+        assert_eq(_t8_w_got, 4242, "and it received the payload");
+        assert_eq(load64(_t8_w_cpq + 16) >> 32, 0, "the waiter deregistered");
+    }
+    cpq_enqueue(_t8_w_cpq, queue_item_new(PRIORITY_NORMAL, 77));
+    assert_eq(queue_item_payload(cpq_dequeue_wait(_t8_w_cpq)), 77, "a wait with an item queued returns at once");
+    println("  cpq_dequeue_wait_park_and_wake: ok");
+}
+
+# --- F106: interleaved pq equivalence against a model -----------------------
+
+fn test_pq_interleaved_model() {
+    var pq = pq_new();
+    var mvs = vec_new();
+    var mh = vec_new();
+    var t = 0;
+    while (t < 5) { vec_push(mvs, vec_new()); vec_push(mh, 0); t = t + 1; }
+    var x = 12345;
+    var seq = 1;
+    var ok = 1;
+    var ops = 0;
+    while (ops < 20000) {
+        x = (x * 1103515245 + 12345) % 2147483648;
+        var r = x >> 8;
+        # Alternate 1000-op phases: enqueue-heavy (2/3) then dequeue-heavy
+        # (2/3), so the queue repeatedly drains and every tier's head crosses
+        # its compaction point — not just CRITICAL's.
+        var enq = 0;
+        if ((ops / 1000) % 2 == 0) { if (r % 3 != 0) { enq = 1; } }
+        else { if (r % 3 == 0) { enq = 1; } }
+        if (enq == 1) {
+            var pr = r % 5;
+            pq_enqueue(pq, queue_item_new(pr, seq));
+            vec_push(vec_get(mvs, pr), seq);
+            seq = seq + 1;
+        } else {
+            var it = pq_dequeue(pq);
+            var expect = 0 - 1;
+            t = 0;
+            while (t < 5 && expect < 0) {
+                var tv = vec_get(mvs, t);
+                var h = vec_get(mh, t);
+                if (vec_len(tv) > h) {
+                    expect = vec_get(tv, h);
+                    vec_set(mh, t, h + 1);
+                }
+                t = t + 1;
+            }
+            if (expect < 0) {
+                if (it != 0) { ok = 0; }
+            } else {
+                if (it == 0) { ok = 0; }
+                elif (queue_item_payload(it) != expect) { ok = 0; }
+            }
+            if (it != 0) { queue_item_free(it); }
+        }
+        ops = ops + 1;
+    }
+    var model_len = 0;
+    t = 0;
+    while (t < 5) { model_len = model_len + vec_len(vec_get(mvs, t)) - vec_get(mh, t); t = t + 1; }
+    assert_eq(ok, 1, "20k interleaved pq ops match the per-tier FIFO model");
+    assert_eq(pq_len(pq), model_len, "pq_len matches the model depth");
+    println("  pq_interleaved_model: ok");
+}
+
+# --- F020 / F021 / F023 / F024 / F029 / F086 / F103: relay ------------------
+
+fn test_relay_dedup_key_is_owned() {
+    var r = relay_new("recv");
+    var buf = fl_alloc(32);
+    var i = 1;
+    while (i <= 5) {
+        _t8_cpy(buf, "node-b");
+        relay_receive(r, relay_msg_new(i, buf, 0, "t", i));
+        i = i + 1;
+    }
+    _t8_cpy(buf, "node-c");
+    assert(relay_receive(r, relay_msg_new(1, buf, 0, "t", 1)) != 0,
+      "relay owned: node-c accepted from the reused buffer");
+    _t8_cpy(buf, "node-b");
+    assert_eq(relay_receive(r, relay_msg_new(3, buf, 0, "t", 3)), 0, "relay owned: a node-b replay is dropped");
+    assert_eq(relay_dedup_table_size(r), 2, "relay owned: 2 senders");
+    assert_eq(load64(relay_stats(r) + 16), 1, "relay owned: one duplicate counted");
+    assert_eq(relay_last_seq(r, "node-b"), 5, "relay owned: node-b last seq");
+    assert_eq(relay_last_seq(r, "node-c"), 1, "relay owned: node-c last seq");
+
+    # Freed sender buffers.
+    var r2 = relay_new("recv");
+    var j = 1;
+    while (j <= 3) {
+        var b = fl_alloc(32);
+        _t8_cpy(b, "node-x");
+        relay_receive(r2, relay_msg_new(j, b, 0, "t", j));
+        _t8_cpy(b, "garbage!");
+        fl_free(b);
+        j = j + 1;
+    }
+    assert_eq(relay_receive(r2, relay_msg_new(2, "node-x", 0, "t", 2)), 0,
+      "relay owned: a replay is dropped after the sender's buffers were freed");
+    assert_eq(relay_dedup_table_size(r2), 1, "relay owned: still one sender");
+    assert_eq(relay_last_seq(r2, "node-x"), 3, "relay owned: last seq survived the frees");
+    println("  relay_dedup_key_is_owned: ok");
+}
+
+fn test_relay_bounded_dedup_no_uaf() {
+    var r = relay_new("recv");
+    relay_set_max_dedup(r, 2);
+    var buf = fl_alloc(32);
+    var distinct = 1;
+    var i = 1;
+    while (i < 2000) {
+        _t8_cpy(buf, "node-a");
+        var inc = relay_receive_ex(r, relay_msg_new(i, buf, 0, "t", i));
+        relay_receive_ex(r, relay_msg_new(i, "node-b", 0, "t", i));
+        _t8_cpy(buf, "node-c");
+        var inc2 = relay_receive_ex(r, relay_msg_new(i, buf, 0, "t", i));
+        if (inc != 0 && inc2 != 0 && inc == inc2) { distinct = 0; }
+        incoming_msg_free(inc);
+        incoming_msg_free(inc2);
+        i = i + 1;
+    }
+    assert_eq(distinct, 1, "bounded dedup: eviction never frees a live block (no aliased IncomingMessage)");
+    assert(relay_dedup_table_size(r) <= 2, "bounded dedup: table stays at max_dedup");
+    println("  relay_bounded_dedup_no_uaf: ok");
+}
+
+fn test_relay_send_frees_undelivered() {
+    var r = relay_new("n1");
+    var a = fl_alloc(64);
+    fl_free(a);
+    relay_send(r, "n2", "t", 1);
+    var b = fl_alloc(64);
+    assert(b == a, "an undelivered relay message goes back to the freelist");
+    fl_free(b);
+
+    var ch = relay_subscribe(r);
+    var c = fl_alloc(64);
+    fl_free(c);
+    relay_send(r, "n2", "t", 2);
+    var got = chan_try_recv(ch);
+    assert(got == c, "the delivered message is that block");
+    var probe = fl_alloc(64);
+    assert(probe != c, "a delivered message is not freed");
+    assert_eq(load64(got + 32), 2, "and its payload is intact");
+    fl_free(probe);
+    println("  relay_send_frees_undelivered: ok");
+}
+
+fn test_relay_null_sender_and_node_id() {
+    var r = relay_new("n1");
+    assert_eq(relay_receive(r, relay_msg_new(1, 0, 0, "t", 1)), 0, "a null sender is refused");
+    assert_eq(relay_receive(r, relay_msg_new(2, 0, 0, "t", 1)), 0, "and a second one does not crash");
+    assert(relay_receive(r, relay_msg_new(1, "n2", 0, "t", 1)) != 0, "a real sender is still accepted");
+    assert_eq(relay_dedup_table_size(r), 1, "null senders never entered the table");
+    assert_eq(relay_last_seq(r, 0), 0 - 1, "relay_last_seq(0) is -1");
+    var z = relay_new(0);
+    assert_eq(relay_receive(z, relay_msg_new(1, "n2", "n9", "t", 1)), 0,
+      "a relay with no node id skips targeted messages");
+    assert(relay_receive(z, relay_msg_new(2, "n2", 0, "t", 1)) != 0, "and still accepts broadcasts");
+    println("  relay_null_sender_and_node_id: ok");
+}
+
+fn test_relay_prunes_closed_subscribers() {
+    var r = relay_new("n1");
+    var c1 = relay_subscribe(r);
+    var c2 = relay_subscribe(r);
+    chan_close(c1);
+    relay_send(r, "n2", "t", 5);
+    assert_eq(vec_len(load64(r + 24)), 1, "relay_send prunes a closed subscriber");
+    assert(chan_try_recv(c2) != 0, "and the live one is still delivered to");
+    var c3 = relay_subscribe(r);
+    chan_close(c2);
+    chan_close(c3);
+    relay_receive(r, relay_msg_new(1, "n3", 0, "t", 1));
+    assert_eq(vec_len(load64(r + 24)), 0, "relay_receive prunes closed subscribers");
+    println("  relay_prunes_closed_subscribers: ok");
+}
+
+fn test_relay_evict_stale_dedup() {
+    var r = relay_new("n1");
+    relay_receive(r, relay_msg_new(1, "n2", 0, "t", 1));
+    assert_eq(relay_evict_stale_dedup(r, 3600000000000), 0, "evict_stale_dedup: nothing idle an hour");
+    assert_eq(relay_dedup_table_size(r), 1, "evict_stale_dedup: size 1");
+    # The table's own key and entry, found by slot walk (map_keys would allocate).
+    var seen = load64(r + 16);
+    var ents = map_entries(seen);
+    var owned_key = 0;
+    var owned_entry = 0;
+    var i = 0;
+    while (i < map_cap(seen)) {
+        if (load64(ents + i * 24 + 16) == 1) {
+            owned_key = load64(ents + i * 24);
+            owned_entry = load64(ents + i * 24 + 8);
+        }
+        i = i + 1;
+    }
+    assert(owned_key != 0, "evict_stale_dedup: owned key found");
+    _majra_sleep_ns(5000000);
+    assert_eq(relay_evict_stale_dedup(r, 1000000), 1, "evict_stale_dedup: the idle sender is evicted");
+    # Both blocks are class 0 (<= 16 B); the entry is freed first, then the key,
+    # so LIFO hands back the key first. No allocation between.
+    var p1 = fl_alloc(3);
+    var p2 = fl_alloc(16);
+    assert(p1 == owned_key, "evict_stale_dedup: the owned key copy is freed");
+    assert(p2 == owned_entry, "evict_stale_dedup: the DedupEntry is freed");
+    fl_free(p2);
+    fl_free(p1);
+    assert_eq(relay_dedup_table_size(r), 0, "evict_stale_dedup: size 0");
+    assert_eq(load64(relay_stats(r) + 24), 1, "evict_stale_dedup: dedup_evicted counted");
+    assert(relay_receive(r, relay_msg_new(1, "n2", 0, "t", 1)) != 0, "evict_stale_dedup: seq 1 accepted again");
+    println("  relay_evict_stale_dedup: ok");
+}
+
+var _t8_rs_r = 0;
+var _t8_rs_names = 0;
+var _t8_rs_go = 0;
+
+fn _t8_rs_worker(arg) {
+    while (atomic_load(&_t8_rs_go) == 0) { }
+    var i = 0;
+    while (i < 5000) {
+        var b = fl_alloc(32);
+        var nm = vec_get(_t8_rs_names, (i + arg * 7) % 64);
+        memcpy(b, nm, strlen(nm) + 1);
+        var inc = relay_receive_ex(_t8_rs_r, relay_msg_new(i + 1, b, 0, "t", i));
+        if (inc != 0) { incoming_msg_free(inc); }
+        store8(b, 88);
+        fl_free(b);
+        relay_send(_t8_rs_r, "x", "t", i);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn test_relay_threaded_stress() {
+    _t8_rs_r = relay_new("me");
+    relay_set_max_dedup(_t8_rs_r, 16);
+    relay_subscribe(_t8_rs_r);
+    _t8_rs_names = vec_new();
+    var i = 0;
+    while (i < 64) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "sender-");
+        str_builder_add_int(sb, i);
+        vec_push(_t8_rs_names, str_cstr(str_builder_build(sb)));
+        i = i + 1;
+    }
+    _t8_rs_go = 0;
+    var t1 = thread_create(&_t8_rs_worker, 0);
+    var t2 = thread_create(&_t8_rs_worker, 1);
+    var t3 = thread_create(&_t8_rs_worker, 2);
+    var t4 = thread_create(&_t8_rs_worker, 3);
+    atomic_store(&_t8_rs_go, 1);
+    thread_join(t1); thread_join(t2); thread_join(t3); thread_join(t4);
+    assert(relay_dedup_table_size(_t8_rs_r) <= 16, "threaded relay: dedup table stays bounded");
+    assert_eq(load64(relay_stats(_t8_rs_r)), 20000, "threaded relay: every send claimed a sequence");
+    println("  relay_threaded_stress: ok");
+}
+
+# --- F022 / F025 / F026 / F030 / F031 / F090 / F107 / F108: pubsub ----------
+
+fn test_pubsub_keys_are_owned() {
+    var ps = pubsub_new();
+    var keep = pubsub_subscribe(ps, "chat/room1");
+    var chs = vec_new();
+    var i = 0;
+    while (i < 12) { vec_push(chs, pubsub_subscribe(ps, "chat/room1")); i = i + 1; }
+    var tmp = fl_alloc(32);
+    i = 0;
+    while (i < 12) {
+        _t8_cpy(tmp, "chat/room1");
+        pubsub_unsubscribe(ps, tmp, vec_get(chs, i));
+        i = i + 1;
+    }
+    _t8_cpy(tmp, "zzzz/xxxxx");
+    assert_eq(pubsub_publish(ps, "chat/room1", 7), 1,
+      "pubsub owned: topic delivers after compaction through a temp buffer");
+    assert_eq(pubsub_subscriber_count(ps, "chat/room1"), 1, "pubsub owned: subscriber count after compaction");
+    assert_eq(chan_try_recv(keep), 7, "pubsub owned: the survivor received it");
+
+    _t8_cpy(tmp, "a/b");
+    var eb = pubsub_subscribe(ps, tmp);
+    _t8_cpy(tmp, "q/q");
+    assert_eq(pubsub_publish(ps, "a/b", 9), 1, "pubsub owned: exact key copied");
+    assert_eq(chan_try_recv(eb), 9, "pubsub owned: exact subscriber received");
+
+    _t8_cpy(tmp, "ev/#");
+    var pb = pubsub_subscribe_pattern(ps, tmp);
+    _t8_cpy(tmp, "zz/z");
+    assert_eq(pubsub_publish(ps, "ev/x", 9), 1, "pubsub owned: pattern key copied");
+    assert_eq(chan_try_recv(pb), 9, "pubsub owned: pattern subscriber received");
+
+    var hc = hashed_channel_new();
+    _t8_cpy(tmp, "h/1");
+    var hch = hashed_channel_subscribe(hc, tmp);
+    _t8_cpy(tmp, "h/2");
+    hashed_channel_send(hc, "h/1", 33);
+    assert_eq(chan_try_recv(hch), 33, "pubsub owned: hashed channel key copied");
+
+    # Pattern-map compaction through a temp buffer.
+    var pkeep = pubsub_subscribe_pattern(ps, "pp/#");
+    var pchs = vec_new();
+    i = 0;
+    while (i < 12) { vec_push(pchs, pubsub_subscribe_pattern(ps, "pp/#")); i = i + 1; }
+    i = 0;
+    while (i < 12) {
+        _t8_cpy(tmp, "pp/#");
+        pubsub_unsubscribe_pattern(ps, tmp, vec_get(pchs, i));
+        i = i + 1;
+    }
+    _t8_cpy(tmp, "qq/#");
+    assert_eq(pubsub_publish(ps, "pp/q", 5), 1,
+      "pubsub owned: pattern delivers after compaction through a temp buffer");
+    assert_eq(chan_try_recv(pkeep), 5, "pubsub owned: pattern survivor received");
+    println("  pubsub_keys_are_owned: ok");
+}
+
+var _t8_pp_ps = 0;
+var _t8_pp_ret = 0 - 1;
+var _t8_pp_done = 0;
+
+fn _t8_pp_publisher(arg) {
+    _t8_pp_ret = pubsub_publish(_t8_pp_ps, "sensors/t", 99);
+    _t8_pp_done = 1;
+    return 0;
+}
+
+fn test_pubsub_pattern_policy_and_drops() {
+    _t8_pp_ps = pubsub_new();
+    _t8_pp_ret = 0 - 1;
+    _t8_pp_done = 0;
+    var ch = pubsub_subscribe_pattern(_t8_pp_ps, "sensors/#");
+    assert_eq(pubsub_set_policy(_t8_pp_ps, "sensors/#", ch, PUBSUB_LAG_DROP_NEWEST), 1,
+      "set_policy finds a pattern subscription");
+    var i = 0;
+    while (i < 64) { pubsub_publish(_t8_pp_ps, "sensors/t", i + 1); i = i + 1; }
+    # Under 2.8.0 set_policy returned 0 and this publish parked forever — so it
+    # runs on a thread with a bounded wait, and a parked publisher is released
+    # by draining the ring rather than hanging the suite.
+    var th = thread_create(&_t8_pp_publisher, 0);
+    var w = 0;
+    while (_t8_pp_done == 0 && w < 200) { _majra_sleep_ns(10000000); w = w + 1; }
+    assert_eq(_t8_pp_done, 1, "the 65th publish to a full DROP_NEWEST pattern ring returns");
+    if (_t8_pp_done == 0) { while (_t8_pp_done == 0) { chan_try_recv(ch); } }
+    thread_join(th);
+    assert_eq(_t8_pp_ret, 0, "and delivers to nobody");
+    assert_eq(pubsub_dropped_count(_t8_pp_ps, "sensors/#", ch), 1, "and the pattern drop is counted");
+    println("  pubsub_pattern_policy_and_drops: ok");
+}
+
+fn test_pubsub_unsubscribe_policy_closed_channel() {
+    var ps = pubsub_new();
+    var cc = pubsub_subscribe_with_policy(ps, "c/x", PUBSUB_LAG_UNSUBSCRIBE);
+    chan_close(cc);
+    assert_eq(pubsub_publish(ps, "c/x", 1), 0, "a closed channel receives nothing");
+    assert_eq(pubsub_subscriber_count(ps, "c/x"), 0,
+      "an UNSUBSCRIBE subscriber whose channel closed deactivates itself");
+
+    var ps3 = pubsub_new();
+    var i = 0;
+    while (i < 16) {
+        chan_close(pubsub_subscribe_with_policy(ps3, "g/t", PUBSUB_LAG_UNSUBSCRIBE));
+        i = i + 1;
+    }
+    pubsub_publish(ps3, "g/t", 1);
+    assert_eq(pubsub_subscriber_count(ps3, "g/t"), 0, "all 16 self-deactivated");
+    var live = pubsub_subscribe(ps3, "g/t");
+    assert_eq(vec_len(map_get(load64(ps3), "g/t")), 1,
+      "self-deactivated tombstones are compacted at the subscribe growth point");
+    assert_eq(pubsub_publish(ps3, "g/t", 2), 1, "the new subscriber is live");
+    assert_eq(chan_try_recv(live), 2, "and receives");
+    println("  pubsub_unsubscribe_policy_closed_channel: ok");
+}
+
+var _t8_dn_go = 0;
+var _t8_dn_ps = 0;
+var _t8_dn_n = 20000;
+
+fn _t8_dn_worker(arg) {
+    while (atomic_load(&_t8_dn_go) == 0) { }
+    var i = 0;
+    while (i < _t8_dn_n) {
+        pubsub_publish(_t8_dn_ps, "d/n", 5);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn test_pubsub_concurrent_drops_counted() {
+    _t8_dn_ps = pubsub_new();
+    _t8_dn_go = 0;
+    var ch = pubsub_subscribe_with_policy(_t8_dn_ps, "d/n", PUBSUB_LAG_DROP_NEWEST);
+    var i = 0;
+    while (i < 64) { pubsub_publish(_t8_dn_ps, "d/n", 5); i = i + 1; }
+    var t1 = thread_create(&_t8_dn_worker, 0);
+    var t2 = thread_create(&_t8_dn_worker, 0);
+    var t3 = thread_create(&_t8_dn_worker, 0);
+    var t4 = thread_create(&_t8_dn_worker, 0);
+    atomic_store(&_t8_dn_go, 1);
+    thread_join(t1); thread_join(t2); thread_join(t3); thread_join(t4);
+    assert_eq(pubsub_dropped_count(_t8_dn_ps, "d/n", ch), 4 * _t8_dn_n, "concurrent DROP_NEWEST drops are all counted");
+    println("  pubsub_concurrent_drops_counted: ok");
+}
+
+fn test_pubsub_subscribe_invalid_policy() {
+    var ps = pubsub_new();
+    assert_eq(pubsub_subscribe_with_policy(ps, "bad", 4), 0, "an out-of-range policy is refused");
+    assert_eq(pubsub_subscribe_with_policy(ps, "bad", 0 - 1), 0, "a negative policy is refused");
+    assert_eq(pubsub_subscriber_count(ps, "bad"), 0, "and nothing was subscribed");
+    assert_eq(pubsub_publish(ps, "bad", 1), 0, "so a publish reaches nobody");
+    println("  pubsub_subscribe_invalid_policy: ok");
+}
+
+fn test_pubsub_unsubscribe_pattern() {
+    var ps = pubsub_new();
+    var pch = pubsub_subscribe_pattern(ps, "ev/#");
+    assert_eq(pubsub_publish(ps, "ev/x", 1), 1, "pattern delivery");
+    chan_recv(pch);
+    assert_eq(pubsub_unsubscribe(ps, "ev/#", pch), 0, "an exact-map unsubscribe does not detach a pattern subscriber");
+    assert_eq(pubsub_publish(ps, "ev/x", 2), 1, "so it still delivers");
+    chan_recv(pch);
+    assert_eq(pubsub_unsubscribe_pattern(ps, "ev/#", pch), 1, "unsubscribe_pattern reports a match");
+    assert_eq(pubsub_publish(ps, "ev/x", 3), 0, "no delivery after unsubscribe_pattern");
+    assert_eq(pubsub_unsubscribe_pattern(ps, "ev/#", pch), 0, "a second unsubscribe_pattern is a no-op");
+    assert_eq(pubsub_unsubscribe_pattern(ps, "ev/#", 0), 0, "a null channel is refused");
+    println("  pubsub_unsubscribe_pattern: ok");
+}
+
+fn test_pubsub_pattern_added_after_publishes() {
+    var ps = pubsub_new();
+    var e = pubsub_subscribe(ps, "x/y");
+    assert_eq(pubsub_publish(ps, "x/y", 1), 1, "exact only, no patterns yet");
+    chan_recv(e);
+    var p = pubsub_subscribe_pattern(ps, "x/#");
+    assert_eq(pubsub_publish(ps, "x/y", 2), 2, "a pattern added later is walked");
+    assert_eq(chan_try_recv(e), 2, "exact delivery unaffected");
+    assert_eq(chan_try_recv(p), 2, "pattern delivery");
+    println("  pubsub_pattern_added_after_publishes: ok");
+}
+
+# Frozen copy of the 2.8.0 strlen-bounded matches_pattern — the oracle for the
+# single-pass rewrite. Do not "fix" it: equivalence is the property.
+fn _t8_mp_ref(topic, pattern) {
+    var td = topic;
+    var tlen = strlen(topic);
+    var pd = pattern;
+    var plen = strlen(pattern);
+    var ti = 0;
+    var pi = 0;
+    while (pi < plen) {
+        var pc = load8(pd + pi);
+        if (pc == 35) {
+            var hash_aligned = 0;
+            if (pi == 0) { hash_aligned = 1; }
+            if (pi > 0 && load8(pd + pi - 1) == 47) { hash_aligned = 1; }
+            if (hash_aligned == 1 && pi + 1 == plen) { return 1; }
+        }
+        if (pc == 43) {
+            var plus_aligned = 0;
+            if (pi == 0) { plus_aligned = 1; }
+            if (pi > 0 && load8(pd + pi - 1) == 47) { plus_aligned = 1; }
+            var plus_ok = 0;
+            if (plus_aligned == 1) {
+                if (pi + 1 == plen) { plus_ok = 1; }
+                if (pi + 1 < plen && load8(pd + pi + 1) == 47) { plus_ok = 1; }
+            }
+            if (plus_ok == 1) {
+                while (ti < tlen) {
+                    if (load8(td + ti) == 47) { break; }
+                    ti = ti + 1;
+                }
+                pi = pi + 1;
+                if (pi < plen && ti < tlen) {
+                    if (load8(pd + pi) == 47 && load8(td + ti) == 47) {
+                        pi = pi + 1;
+                        ti = ti + 1;
+                    }
+                }
+                continue;
+            }
+        }
+        if (ti >= tlen) {
+            if (pc == 47 && pi + 2 == plen && load8(pd + pi + 1) == 35) { return 1; }
+            return 0;
+        }
+        if (pc != load8(td + ti)) { return 0; }
+        pi = pi + 1;
+        ti = ti + 1;
+    }
+    return ti >= tlen;
+}
+
+fn test_matches_pattern_equivalence() {
+    var alphabet = "a/+#";
+    var strs = vec_new();
+    var len = 0;
+    var span = 1;
+    while (len <= 5) {
+        var idx = 0;
+        while (idx < span) {
+            var s = alloc(len + 1);
+            var v = idx;
+            var k = 0;
+            while (k < len) {
+                store8(s + k, load8(alphabet + v % 4));
+                v = v / 4;
+                k = k + 1;
+            }
+            store8(s + len, 0);
+            vec_push(strs, s);
+            idx = idx + 1;
+        }
+        len = len + 1;
+        span = span * 4;
+    }
+    var n = vec_len(strs);
+    assert_eq(n, 1365, "all strings of length 0..5 over {a,/,+,#}");
+    var bad = 0;
+    var ones = 0;
+    var ti = 0;
+    while (ti < n) {
+        var t = vec_get(strs, ti);
+        var pj = 0;
+        while (pj < n) {
+            var p = vec_get(strs, pj);
+            var want = _t8_mp_ref(t, p);
+            if (want != matches_pattern(t, p)) { bad = bad + 1; }
+            ones = ones + want;
+            pj = pj + 1;
+        }
+        ti = ti + 1;
+    }
+    assert_eq(bad, 0, "matches_pattern equals the 2.8.0 reference on every pair");
+    assert(ones > 1365, "the corpus exercises matches, not only mismatches");
+    assert(matches_pattern("a/", "a/+") == 1, "+ matches an empty last level");
+    assert(matches_pattern("a", "a/#") == 1, "# matches the bare parent");
+    assert(matches_pattern("a/b", "a/+/#") == 1, "+ then parent #");
+    assert(matches_pattern("a/b/c", "a/+") == 0, "+ does not span levels");
+    assert(matches_pattern("", "#") == 1, "# matches the empty topic");
+    println("  matches_pattern_equivalence: ok");
+}
+
+# --- F033 / F037 / F039 / F075 / F036: dag ----------------------------------
+
+var _t8_ff_calls = 0;
+var _t8_ff_mtx = 0;
+var _t8_ff_log = 0;
+var _t8_reader_out = 0;
+
+fn _t8_ff_reset() {
+    if (_t8_ff_mtx == 0) { _t8_ff_mtx = mutex_new(); }
+    _t8_ff_calls = 0;
+    _t8_ff_log = vec_new();
+    _t8_reader_out = 0;
+    return 0;
+}
+
+fn _t8_ff_record(step) {
+    mutex_lock(_t8_ff_mtx);
+    _t8_ff_calls = _t8_ff_calls + 1;
+    vec_push(_t8_ff_log, load64(step));
+    mutex_unlock(_t8_ff_mtx);
+    return 0;
+}
+
+fn _t8_ran(id) {
+    var i = 0;
+    while (i < vec_len(_t8_ff_log)) {
+        if (streq(vec_get(_t8_ff_log, i), id) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Fails ids starting with 'f' or equal to "bad"; "reader" reads a's output.
+fn _t8_ff_exec(step, ctx) {
+    _t8_ff_record(step);
+    var id = load64(step);
+    if (load8(id) == 102) { return step_result_new(STEP_FAILED, 0, "f"); }
+    if (streq(id, "bad") == 1) { return step_result_new(STEP_FAILED, 0, "bad"); }
+    if (streq(id, "reader") == 1) {
+        var ra = context_get_step_result(ctx, "a");
+        if (ra == 0) { return step_result_new(STEP_FAILED, 0, "no a"); }
+        _t8_reader_out = load64(ra + 8) + 1;
+        return step_result_new(STEP_COMPLETED, _t8_reader_out, 0);
+    }
+    return step_result_new(STEP_COMPLETED, 7, 0);
+}
+
+fn _t8_ff_slow_exec(step, ctx) {
+    _t8_ff_record(step);
+    if (load8(load64(step)) == 102) { return step_result_new(STEP_FAILED, 0, "f"); }
+    _majra_sleep_ns(20000000);
+    return step_result_new(STEP_COMPLETED, 0, 0);
+}
+
+fn _t8_running_exec(step, ctx) {
+    _t8_ff_record(step);
+    return step_result_new(STEP_RUNNING, 0, 0);
+}
+
+fn _t8_skipped_exec(step, ctx) {
+    _t8_ff_record(step);
+    return step_result_new(STEP_SKIPPED, 0, 0);
+}
+
+fn _t8_ok_exec(step, ctx) {
+    _t8_ff_record(step);
+    return step_result_new(STEP_COMPLETED, 0, 0);
+}
+
+fn test_dag_policy_fail_is_fail_fast() {
+    _t8_ff_reset();
+    var def = workflow_def_new("ff", "failfast");
+    workflow_def_add_step(def, workflow_step_new("f0", "fails"));
+    workflow_def_add_step(def, workflow_step_new("b", "b"));
+    workflow_def_add_step(def, workflow_step_new("c", "c"));
+    assert_eq(workflow_execute(def, &_t8_ff_exec, 0), RUN_FAILED, "serial fail-fast: RUN_FAILED");
+    assert_eq(_t8_ff_calls, 1, "serial fail-fast: tier-mates after a POLICY_FAIL failure never ran");
+
+    _t8_ff_reset();
+    var d2 = workflow_def_new("ffp", "failfast par");
+    workflow_def_add_step(d2, workflow_step_new("f0", "fails"));
+    var i = 1;
+    while (i < 6) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "s");
+        str_builder_add_int(sb, i);
+        workflow_def_add_step(d2, workflow_step_new(str_cstr(str_builder_build(sb)), "s"));
+        i = i + 1;
+    }
+    workflow_def_set_parallel(d2, 2);
+    assert_eq(workflow_execute(d2, &_t8_ff_slow_exec, 0), RUN_FAILED, "parallel fail-fast: RUN_FAILED");
+    assert_eq(_t8_ff_calls, 2, "parallel fail-fast: no batch after the failing one started");
+    println("  dag_policy_fail_is_fail_fast: ok");
+}
+
+fn test_dag_non_terminal_status_is_a_failure() {
+    _t8_ff_reset();
+    var d = workflow_def_new("nt", "nt");
+    workflow_def_add_step(d, workflow_step_new("r", "r"));
+    assert_eq(workflow_execute(d, &_t8_running_exec, 0), RUN_FAILED, "STEP_RUNNING under POLICY_FAIL fails the run");
+
+    _t8_ff_reset();
+    var d2 = workflow_def_new("sk", "sk");
+    var s = workflow_step_new("k", "k");
+    step_set_retry(s, 3);
+    workflow_def_add_step(d2, s);
+    assert_eq(workflow_execute(d2, &_t8_skipped_exec, 0), RUN_COMPLETED, "an executor-returned SKIPPED completes");
+    assert_eq(_t8_ff_calls, 1, "an executor-returned SKIPPED is terminal, not retried");
+    println("  dag_non_terminal_status_is_a_failure: ok");
+}
+
+fn test_dag_retry_max_extremes() {
+    _t8_ff_reset();
+    var d = workflow_def_new("rm", "rm");
+    var s = workflow_step_new("m", "m");
+    step_set_retry(s, 0x7FFFFFFFFFFFFFFF);
+    workflow_def_add_step(d, s);
+    assert_eq(workflow_execute(d, &_t8_ok_exec, 0), RUN_COMPLETED, "INT64_MAX retry completes");
+    assert_eq(_t8_ff_calls, 1, "a successful step is not re-executed under INT64_MAX retry");
+
+    _t8_ff_reset();
+    var d2 = workflow_def_new("rn", "rn");
+    var s2 = workflow_step_new("n", "n");
+    step_set_retry(s2, 0 - 1);
+    workflow_def_add_step(d2, s2);
+    assert_eq(workflow_execute(d2, &_t8_ok_exec, 0), RUN_COMPLETED, "a negative retry still runs the step");
+    assert_eq(_t8_ff_calls, 1, "a negative retry calls the executor once");
+    println("  dag_retry_max_extremes: ok");
+}
+
+fn test_dag_dependency_semantics() {
+    _t8_ff_reset();
+    var def = workflow_def_new("deps", "deps");
+    var bad = workflow_step_new("bad", "bad");
+    step_set_error_policy(bad, POLICY_CONTINUE);
+    var a = workflow_step_new("a", "a");
+    var all = workflow_step_new("all", "all");
+    step_add_dep(all, "bad");
+    step_add_dep(all, "a");
+    var any = workflow_step_new("any", "any");
+    step_add_dep(any, "bad");
+    step_add_dep(any, "a");
+    step_set_trigger_mode(any, TRIGGER_ANY);
+    var reader = workflow_step_new("reader", "reader");
+    step_add_dep(reader, "a");
+    workflow_def_add_step(def, bad);
+    workflow_def_add_step(def, a);
+    workflow_def_add_step(def, all);
+    workflow_def_add_step(def, any);
+    workflow_def_add_step(def, reader);
+    assert_eq(workflow_execute(def, &_t8_ff_exec, 0), RUN_COMPLETED,
+      "deps: a POLICY_CONTINUE failure completes the run");
+    assert_eq(_t8_ran("bad"), 1, "deps: bad ran");
+    assert_eq(_t8_ran("a"), 1, "deps: a ran");
+    assert_eq(_t8_ran("all"), 0, "deps: a TRIGGER_ALL dependent of a failure did not run");
+    assert_eq(_t8_ran("any"), 1, "deps: a TRIGGER_ANY dependent with one success ran");
+    assert_eq(_t8_ran("reader"), 1, "deps: reader ran");
+    assert_eq(_t8_reader_out, 8, "deps: reader saw a's output (7) in the context");
+
+    _t8_ff_reset();
+    var def2 = workflow_def_new("pf", "pf");
+    workflow_def_add_step(def2, workflow_step_new("bad", "bad"));
+    var dep = workflow_step_new("dep", "dep");
+    step_add_dep(dep, "bad");
+    var dep2 = workflow_step_new("dep2", "dep2");
+    step_set_trigger_mode(dep2, TRIGGER_ANY);
+    step_add_dep(dep2, "bad");
+    workflow_def_add_step(def2, dep);
+    workflow_def_add_step(def2, dep2);
+    assert_eq(workflow_execute(def2, &_t8_ff_exec, 0), RUN_FAILED, "deps: POLICY_FAIL with dependents fails the run");
+    assert_eq(_t8_ran("dep"), 0, "deps: a dependent of a POLICY_FAIL failure never ran");
+    assert_eq(_t8_ran("dep2"), 0, "deps: nor did its TRIGGER_ANY dependent");
+    assert_eq(_t8_ff_calls, 1, "deps: only the failing step ran");
+
+    # A POLICY_FAIL failure also stops LATER tiers, including a step whose own
+    # dependency succeeded (so it is not merely skipped as unsatisfied).
+    _t8_ff_reset();
+    var def3 = workflow_def_new("pf3", "pf3");
+    workflow_def_add_step(def3, workflow_step_new("ok0", "ok0"));
+    workflow_def_add_step(def3, workflow_step_new("bad", "bad"));
+    var later = workflow_step_new("later", "later");
+    step_add_dep(later, "ok0");
+    workflow_def_add_step(def3, later);
+    assert_eq(workflow_execute(def3, &_t8_ff_exec, 0), RUN_FAILED, "deps: POLICY_FAIL fails a multi-tier run");
+    assert_eq(_t8_ran("ok0"), 1, "deps: the tier-mate before the failure ran");
+    assert_eq(_t8_ran("later"), 0, "deps: no later tier starts after a POLICY_FAIL failure");
+    assert_eq(_t8_ff_calls, 2, "deps: exactly ok0 and bad ran");
+    println("  dag_dependency_semantics: ok");
+}
+
+fn _t8_nop_ok(step, ctx) {
+    return step_result_new(STEP_COMPLETED, 0, 0);
+}
+
+fn test_dag_parallel_does_not_leak_per_step() {
+    var def = _par_def(8);
+    workflow_execute(def, &_t8_nop_ok, 0);
+    workflow_def_set_parallel(def, 8);
+    workflow_execute(def, &_t8_nop_ok, 0);
+    workflow_def_set_parallel(def, 1);
+    var u0 = alloc_used();
+    var r = 0;
+    while (r < 20) { workflow_execute(def, &_t8_nop_ok, 0); r = r + 1; }
+    var serial = alloc_used() - u0;
+    workflow_def_set_parallel(def, 8);
+    u0 = alloc_used();
+    r = 0;
+    while (r < 20) { workflow_execute(def, &_t8_nop_ok, 0); r = r + 1; }
+    var par = alloc_used() - u0;
+    assert(par <= serial + 16384, "parallel runs grow the heap like serial ones (no ~4.1 KB per spawned step)");
+    println("  dag_parallel_does_not_leak_per_step: ok");
+}
+
+# --- F034 / F038 / F109: barrier --------------------------------------------
+
+var _t8_cx_cbs = 0;
+var _t8_cx_ret = 99;
+var _t8_cx_done = 0;
+
+fn _t8_cx_worker(a) {
+    _t8_cx_ret = cbarrier_arrive_and_wait(_t8_cx_cbs, "wf", "x");
+    _t8_cx_done = 1;
+    return 0;
+}
+
+fn _t8_cx_case(mode) {
+    _t8_cx_cbs = cbarrier_set_new();
+    _t8_cx_ret = 99;
+    _t8_cx_done = 0;
+    var p = vec_new();
+    vec_push(p, "x");
+    vec_push(p, "y");
+    cbarrier_create(_t8_cx_cbs, "wf", p);
+    var th = thread_create(&_t8_cx_worker, 0);
+    _majra_sleep_ns(50000000);
+    assert_eq(_t8_cx_done, 0, "displaced waiter: parked before the barrier goes away");
+    if (mode == 0) { cbarrier_complete(_t8_cx_cbs, "wf"); }
+    else { cbarrier_create(_t8_cx_cbs, "wf", p); }
+    var w = 0;
+    while (_t8_cx_done == 0 && w < 100) { _majra_sleep_ns(10000000); w = w + 1; }
+    assert_eq(_t8_cx_done, 1, "displaced waiter: woke within 1 s");
+    if (_t8_cx_done == 1) {
+        thread_join(th);
+        assert_eq(_t8_cx_ret, MAJRA_ERR_BARRIER, "displaced waiter: gets MAJRA_ERR_BARRIER");
+    }
+    return 0;
+}
+
+fn test_cbarrier_displaced_waiter_wakes() {
+    _t8_cx_case(0);
+    _t8_cx_case(1);
+    println("  cbarrier_displaced_waiter_wakes: ok");
+}
+
+var _t8_mw_cbs = 0;
+var _t8_mw_done = 0;
+var _t8_mw_mtx = 0;
+
+fn _t8_mw_worker(name) {
+    cbarrier_arrive_and_wait(_t8_mw_cbs, "big", name);
+    mutex_lock(_t8_mw_mtx);
+    _t8_mw_done = _t8_mw_done + 1;
+    mutex_unlock(_t8_mw_mtx);
+    return 0;
+}
+
+# ⚠ ~0.6 s native, ~47 s under qemu-aarch64 (1010 TCG thread spawns) — main()
+# runs it on x86_64 only; the release path is unchanged by arch.
+fn test_cbarrier_release_wakes_over_1000() {
+    var N = 1010;
+    _t8_mw_cbs = cbarrier_set_new();
+    _t8_mw_mtx = mutex_new();
+    _t8_mw_done = 0;
+    var p = vec_new();
+    var i = 0;
+    while (i <= N) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "n");
+        str_builder_add_int(sb, i);
+        vec_push(p, str_cstr(str_builder_build(sb)));
+        i = i + 1;
+    }
+    cbarrier_create(_t8_mw_cbs, "big", p);
+    var spawned = 0;
+    i = 0;
+    while (i < N) {
+        if (thread_create_detached(&_t8_mw_worker, vec_get(p, i)) == 1) { spawned = spawned + 1; }
+        i = i + 1;
+    }
+    assert(spawned > 1000, "release precondition: more than 1000 waiters spawned");
+    _majra_sleep_ns(500000000);
+    cbarrier_arrive(_t8_mw_cbs, "big", vec_get(p, N));
+    var w = 0;
+    var done = 0;
+    while (w < 200) {
+        mutex_lock(_t8_mw_mtx);
+        done = _t8_mw_done;
+        mutex_unlock(_t8_mw_mtx);
+        if (done >= spawned) { w = 200; }
+        else { _majra_sleep_ns(10000000); w = w + 1; }
+    }
+    assert_eq(done, spawned, "a release wakes every parked waiter, not the first 1000");
+    println("  cbarrier_release_wakes_over_1000: ok");
+}
+
+fn test_barrier_content_equality() {
+    var bs = barrier_set_new();
+    var p = vec_new();
+    vec_push(p, _t8_heap_cstr("alpha"));
+    vec_push(p, _t8_heap_cstr("alpine"));
+    barrier_create(bs, "ce", p);
+    var r1 = barrier_arrive(bs, "ce", _t8_heap_cstr("alpha"));
+    assert_eq(load64(r1), BARRIER_WAITING, "content match on a different pointer: waiting");
+    assert_eq(load64(r1 + 8), 1, "content match on a different pointer: arrived 1");
+    var r2 = barrier_arrive(bs, "ce", _t8_heap_cstr("alpine"));
+    assert_eq(load64(r2), BARRIER_RELEASED, "same first byte, different string: still distinguished");
+    assert_eq(load64(r2 + 8), 2, "and counted as a second arrival");
+    var p2 = vec_new();
+    vec_push(p2, "ab");
+    barrier_create(bs, "ce2", p2);
+    assert_eq(load64(barrier_arrive(bs, "ce2", "ac")), BARRIER_WAITING, "a last-byte difference does not match");
+    assert_eq(load64(barrier_arrive(bs, "ce2", _t8_heap_cstr("ab"))), BARRIER_RELEASED, "the equal string releases");
+    println("  barrier_content_equality: ok");
+}
+
+# --- F050 / F111 / F077 / F051: fleet ---------------------------------------
+
+var _t8_fr_fq = 0;
+var _t8_fr_n = 20000;
+var _t8_fr_submitted = 0;
+var _t8_fr_done = 0;
+var _t8_fr_orphaned = 0;
+
+fn _t8_fr_submitter(arg) {
+    var i = 0;
+    while (i < _t8_fr_n) {
+        if (fleet_submit(_t8_fr_fq, PRIORITY_NORMAL, i + 1) != 0) { _t8_fr_submitted = _t8_fr_submitted + 1; }
+        i = i + 1;
+    }
+    _t8_fr_done = 1;
+    return 0;
+}
+
+fn _t8_fr_flapper(arg) {
+    while (_t8_fr_done == 0) {
+        _t8_fr_orphaned = _t8_fr_orphaned + fleet_deregister_node(_t8_fr_fq, "n2");
+        fleet_register_node(_t8_fr_fq, "n2");
+    }
+    return 0;
+}
+
+fn test_fleet_submit_deregister_race() {
+    _t8_fr_fq = fleet_new(fleet_config_new(1000000, 5, 0));
+    _t8_fr_submitted = 0;
+    _t8_fr_done = 0;
+    _t8_fr_orphaned = 0;
+    fleet_register_node(_t8_fr_fq, "n1");
+    fleet_register_node(_t8_fr_fq, "n2");
+    var t1 = thread_create(&_t8_fr_submitter, 0);
+    var t2 = thread_create(&_t8_fr_flapper, 0);
+    thread_join(t1);
+    thread_join(t2);
+    var st = fleet_stats(_t8_fr_fq);
+    assert_eq(_t8_fr_submitted, _t8_fr_n, "fleet race: every submit found a node");
+    assert_eq(load64(st + 8) + _t8_fr_orphaned, _t8_fr_submitted, "fleet race: submit vs deregister loses no job");
+    println("  fleet_submit_deregister_race: ok");
+}
+
+fn test_fleet_handle_survives_rebalance() {
+    var fq = fleet_new(fleet_config_new(1, 10, 0));
+    fleet_register_node(fq, "src");
+    fleet_register_node(fq, "dst");
+    var src = fleet_node_queue(fq, "src");
+    var dst = fleet_node_queue(fq, "dst");
+    var h1 = mq_enqueue(src, PRIORITY_NORMAL, 111);
+    var h2 = mq_enqueue(src, PRIORITY_NORMAL, 222);
+    var h3 = mq_enqueue(src, PRIORITY_NORMAL, 333);
+    assert_eq(fleet_rebalance(fq), 1, "rebalance: one job stolen");
+    # Churn the 40-byte class so a freed handle would be handed out again.
+    var k = 0;
+    while (k < 8) { queue_item_new(PRIORITY_LOW, 999); k = k + 1; }
+    assert_eq(mq_queued_count(dst), 1, "rebalance: dst holds the stolen job");
+    assert_eq(queue_item_payload(h1), 111, "rebalance: h1 payload intact");
+    assert_eq(queue_item_payload(h2), 222, "rebalance: h2 payload intact");
+    assert_eq(queue_item_payload(h3), 333, "rebalance: h3 payload intact");
+    mq_cancel(dst, h1);
+    assert_eq(mq_dequeue(dst), 0, "rebalance: cancel via the original handle took effect on dst");
+    assert(mq_dequeue(src) == h2, "rebalance: src still delivers the same handle objects");
+    println("  fleet_handle_survives_rebalance: ok");
+}
+
+fn test_fleet_rekey_on_collision() {
+    var fq = fleet_new(fleet_config_new(10, 5, 0));
+    fleet_register_node(fq, "n1");
+    fleet_register_node(fq, "n2");
+    var q1 = fleet_node_queue(fq, "n1");
+    var q2 = fleet_node_queue(fq, "n2");
+    var saved = _mq_next_job_id;
+    var h1 = mq_enqueue(q1, PRIORITY_NORMAL, 1);
+    _mq_next_job_id = saved;
+    var h2 = mq_enqueue(q2, PRIORITY_NORMAL, 2);
+    assert(str_eq(queue_item_key(h1), queue_item_key(h2)) == 1, "rekey precondition: the two jobs share a key");
+    assert_eq(fleet_deregister_node(fq, "n1"), 0, "rekey: n1's job rehomed, not orphaned");
+    assert_eq(mq_job_count(q2), 2, "rekey: the colliding key did not overwrite n2's job");
+    mq_cancel(q2, h1);
+    assert(mq_dequeue(q2) == h2, "rekey: h1 cancelled via its re-keyed handle, h2 delivered");
+    assert_eq(mq_dequeue(q2), 0, "rekey: nothing else");
+    println("  fleet_rekey_on_collision: ok");
+}
+
+fn test_fleet_deregister_rehomes() {
+    var fq = fleet_new(fleet_config_new(10, 5, 1));
+    fleet_register_node(fq, "n1");
+    fleet_register_node(fq, "n2");
+    var q1 = fleet_node_queue(fq, "n1");
+    var q2 = fleet_node_queue(fq, "n2");
+    var a = mq_enqueue(q1, PRIORITY_NORMAL, 1);
+    mq_enqueue(q1, PRIORITY_NORMAL, 2);
+    mq_enqueue(q1, PRIORITY_NORMAL, 3);
+    mq_enqueue(q2, PRIORITY_NORMAL, 4);
+    mq_enqueue(q2, PRIORITY_NORMAL, 5);
+    assert(mq_dequeue(q1) == a, "rehome: n1 at its cap");
+    assert_eq(fleet_deregister_node(fq, "n1"), 0, "rehome: no orphans while n2 survives");
+    assert_eq(mq_queued_count(q2), 4, "rehome: n1's queued jobs moved to n2 despite n1 at its cap");
+    assert_eq(mq_job_count(q2), 4, "rehome: the moved jobs are tracked on n2");
+    assert_eq(fleet_deregister_node(fq, "n2"), 4, "rehome: the last node leaving orphans its queue");
+    println("  fleet_deregister_rehomes: ok");
+}
+
+fn test_fleet_node_id_copied() {
+    var fq = fleet_new(fleet_config_new(10, 5, 0));
+    var buf = fl_alloc(16);
+    memcpy(buf, "gpu-0", 6);
+    assert_eq(fleet_register_node(fq, buf), 1, "node id: registered from a caller buffer");
+    memcpy(buf, "gpu-7", 6);
+    assert(fleet_node_queue(fq, "gpu-0") != 0, "node id: findable after the caller reuses its buffer");
+    assert_eq(fleet_node_queue(fq, "gpu-7"), 0, "node id: the overwritten bytes are not a node");
+    assert(fleet_submit(fq, PRIORITY_NORMAL, 5) != 0, "node id: submit works");
+    fl_free(buf);
+    assert_eq(fleet_deregister_node(fq, "gpu-0"), 1, "node id: the last node leaving orphans its 1 job");
+    assert_eq(fleet_node_count(fq), 0, "node id: node gone");
+    assert_eq(fleet_register_node(fq, "gpu-0"), 1, "node id: re-register after deregister creates");
+    assert(fleet_node_queue(fq, "gpu-0") != 0, "node id: re-registered node findable");
+    println("  fleet_node_id_copied: ok");
+}
+
+# --- F089: the concurrency cap holds under threads --------------------------
+
+var _t8_cap_mq = 0;
+var _t8_cap_inflight = 0;
+var _t8_cap_peak = 0;
+var _t8_cap_done = 0;
+var _t8_cap_mtx = 0;
+var _t8_cap_total = 100;
+
+fn _t8_cap_worker(arg) {
+    while (atomic_load(&_t8_cap_done) < _t8_cap_total) {
+        var d = mq_dequeue(_t8_cap_mq);
+        if (d != 0) {
+            var now_in = atomic_fetch_add(&_t8_cap_inflight, 1) + 1;
+            mutex_lock(_t8_cap_mtx);
+            if (now_in > _t8_cap_peak) { _t8_cap_peak = now_in; }
+            mutex_unlock(_t8_cap_mtx);
+            _majra_sleep_ns(1000000);
+            atomic_fetch_add(&_t8_cap_inflight, 0 - 1);
+            mq_complete(_t8_cap_mq, d);
+            queue_item_free(d);
+            atomic_fetch_add(&_t8_cap_done, 1);
+        }
+    }
+    return 0;
+}
+
+# test_mq_concurrency_cap_holds is sequential, so a check and increment split
+# across critical sections (the 2.6.9 HIGH it cites) passes it. Three workers
+# spin on mq_dequeue while one holds the only slot.
+fn test_mq_concurrency_cap_threaded() {
+    _t8_cap_mq = mq_new("cap1", 1);
+    _t8_cap_inflight = 0;
+    _t8_cap_peak = 0;
+    _t8_cap_done = 0;
+    if (_t8_cap_mtx == 0) { _t8_cap_mtx = mutex_new(); }
+    var i = 0;
+    while (i < _t8_cap_total) { mq_enqueue(_t8_cap_mq, PRIORITY_NORMAL, i + 1); i = i + 1; }
+    var t1 = thread_create(&_t8_cap_worker, 0);
+    var t2 = thread_create(&_t8_cap_worker, 0);
+    var t3 = thread_create(&_t8_cap_worker, 0);
+    var t4 = thread_create(&_t8_cap_worker, 0);
+    thread_join(t1); thread_join(t2); thread_join(t3); thread_join(t4);
+    assert_eq(_t8_cap_peak, 1, "threaded cap 1: never two jobs in flight");
+    assert_eq(_t8_cap_done, _t8_cap_total, "threaded cap 1: every job completed");
+    assert_eq(mq_running_count(_t8_cap_mq), 0, "threaded cap 1: running_count back to 0");
+    assert_eq(mq_job_count(_t8_cap_mq), 0, "threaded cap 1: job map empty");
+    println("  mq_concurrency_cap_threaded: ok");
 }
 
 # =============================================================================
@@ -1749,6 +3499,15 @@ fn main() {
     test_managed_queue_lifecycle();
     test_managed_queue_cancel();
     test_managed_queue_concurrent_enqueue();
+    test_counter_concurrent_no_lost_updates();
+    test_map_evict_grown();
+    test_pq_interleaved_model();
+    test_mq_multi_queue_concurrent_enqueue();
+    test_mq_take_queued_keeps_cancelled_handle();
+    test_mq_job_key_returns_to_freelist();
+    test_mq_metrics_dispatch();
+    test_cpq_dequeue_wait_park_and_wake();
+    test_mq_concurrency_cap_threaded();
 
     # PubSub
     test_pubsub_pattern_matching_extended();
@@ -1759,6 +3518,14 @@ fn main() {
     test_pubsub_no_head_of_line_block();
     test_direct_channel();
     test_hashed_channel();
+    test_pubsub_keys_are_owned();
+    test_pubsub_pattern_policy_and_drops();
+    test_pubsub_unsubscribe_policy_closed_channel();
+    test_pubsub_concurrent_drops_counted();
+    test_pubsub_subscribe_invalid_policy();
+    test_pubsub_unsubscribe_pattern();
+    test_pubsub_pattern_added_after_publishes();
+    test_matches_pattern_equivalence();
 
     # Relay
     test_relay_send_subscribe();
@@ -1767,14 +3534,27 @@ fn main() {
     test_relay_last_seq_and_gaps();
     test_relay_stats_layout_unchanged();
     test_relay_receive_is_reentrant();
+    test_relay_dedup_key_is_owned();
+    test_relay_bounded_dedup_no_uaf();
+    test_relay_send_frees_undelivered();
+    test_relay_null_sender_and_node_id();
+    test_relay_prunes_closed_subscribers();
+    test_relay_evict_stale_dedup();
+    test_relay_threaded_stress();
 
     # Barrier
     test_barrier_duplicate_arrival();
     test_cbarrier_force();
     test_cbarrier_arrive_and_wait();
+    test_barrier_content_equality();
+    test_cbarrier_displaced_waiter_wakes();
 
     # Heartbeat
     test_heartbeat_metadata();
+    test_chb_status_transitions();
+    test_chb_get_returns_owned_copy();
+    test_chb_heartbeat_stamp_never_regresses();
+    test_heartbeat_stats_allocate_nothing();
 
     # RateLimit
     test_relay_capacity_is_applied();
@@ -1787,6 +3567,11 @@ fn main() {
     test_ratelimit_evict_spares_live_keys();
     test_sliding_window_key_is_content_not_pointer();
     test_sliding_window_key_is_owned();
+    test_ratelimit_contention();
+    test_ratelimit_evict_requires_full_bucket();
+    test_sliding_window_evict_spares_active();
+    test_ratelimit_churn_reclaims_tombstones();
+    test_ratelimit_high_rate_refill();
 
     # Fleet
     test_namespace_prefix_validation();
@@ -1802,6 +3587,11 @@ fn main() {
     test_fleet_rebalance_running_count();
     test_fleet_routing();
     test_fleet_empty_submit();
+    test_fleet_submit_deregister_race();
+    test_fleet_handle_survives_rebalance();
+    test_fleet_rekey_on_collision();
+    test_fleet_deregister_rehomes();
+    test_fleet_node_id_copied();
 
     # DAG
     test_pubsub_unsubscribe();
@@ -1821,6 +3611,11 @@ fn main() {
     test_dag_retry();
     test_dag_skip_policy();
     test_dag_storage_crud();
+    test_dag_policy_fail_is_fail_fast();
+    test_dag_non_terminal_status_is_a_failure();
+    test_dag_retry_max_extremes();
+    test_dag_dependency_semantics();
+    test_dag_parallel_does_not_leak_per_step();
 
     # Transport
     test_circuit_breaker_lifecycle();
@@ -1830,8 +3625,20 @@ fn main() {
     test_integration_training_job();
     test_integration_namespaced_pubsub();
 
+    # Last: spawns 1010 detached threads. x86_64 only — see the test's note.
+    #ifdef CYRIUS_ARCH_X86
+    test_cbarrier_release_wakes_over_1000();
+    #endif
+
     return assert_summary();
 }
 
 var r = main();
-syscall(SYS_EXIT, r);
+# ⚠ exit_group, not SYS_EXIT (2.8.1). SYS_EXIT ends only the main thread: a
+# detached worker still unwinding (test_cbarrier_release_wakes_over_1000's
+# 1010 waiters, the DAG's parallel batch workers) outlived it and the process
+# reported THAT thread's status — exit 0 over a failing run, which is all CI
+# checks. It also let a thread parked by a failed liveness assertion hang the
+# run after the summary printed. lib/syscalls_linux_common.cyr: "Prefer
+# `sys_exit_group` in a program epilogue."
+sys_exit_group(r);

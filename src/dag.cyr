@@ -1,9 +1,9 @@
 # majra/dag — DAG workflow engine with dependency-tier scheduling
 #
 # Replaces Rust's WorkflowEngine, WorkflowDefinition, WorkflowRun, etc.
-# Steps are grouped into dependency tiers and executed SERIALLY within each
-# tier. (This line previously claimed thread_create/join parallelism; dag.cyr
-# calls neither. See the note on workflow_execute.)
+# Steps are grouped into dependency tiers. Within a tier they run serially by
+# default, or in bounded batches of detached worker threads when opted in via
+# workflow_def_set_parallel. See the note on workflow_execute.
 
 # Workflow step status
 enum StepStatus {
@@ -90,24 +90,28 @@ fn workflow_def_new(id, name) {
 # Run up to `max_parallel` steps of a tier concurrently. 1 (the default) is
 # serial. Returns the value actually stored.
 #
-# ⚠ MEASURE BEFORE ENABLING THIS. On this toolchain `thread_create` +
-# `thread_join` costs **~89us**, while a CPU-bound step body costs well under
-# a microsecond — a ratio around 486x. The break-even is a step that takes
-# roughly 89us; below that, parallel tiers are dramatically SLOWER than serial
-# ones, which is why the default is 1 and why majra will not choose for you.
+# ⚠ MEASURE BEFORE ENABLING THIS. Each parallel step pays for a detached worker
+# thread: **~50us** per step at 2.8.1 on an 8-wide batch (it was ~89us for
+# `thread_create` + `thread_join` when this note was first written; detached
+# spawns cost ~14us more than joined ones on the same host, the price of not
+# leaking ~4.1 KB of heap per step). A CPU-bound step body costs well under a
+# microsecond. The break-even is a step that takes roughly as long as the spawn;
+# below that, parallel tiers are dramatically SLOWER than serial ones, which is
+# why the default is 1 and why majra will not choose for you.
 #
-#   step ~10ms (an HTTP call, a query)  -> ~0.9% overhead, a large win
-#   step ~100us                         -> roughly break-even
+#   step ~10ms (an HTTP call, a query)  -> ~0.5% overhead, a large win
+#   step ~50-100us                      -> roughly break-even
 #   step ~1us (pure computation)        -> catastrophic; leave it serial
 #
 # ⚠ YOUR EXECUTOR MUST BE THREAD-SAFE. It is called from several threads at
 # once, and majra cannot check that.
 #
 # ⚠ POLICY_FAIL is weaker under parallelism. Serially, a POLICY_FAIL step
-# aborts the run before its later tier-mates start. In a parallel batch they
-# have already run by the time the failure is observed. Results are still
-# applied in tier order, so the run's outcome is deterministic — but the side
-# effects of a sibling are not prevented.
+# aborts the run before its later tier-mates start. In a parallel batch the
+# rest of the CURRENT batch has already run by the time the failure is
+# observed; no later batch is started. Results are still applied in tier
+# order, so the run's outcome is deterministic — but the side effects of a
+# batch-mate are not prevented.
 fn workflow_def_set_parallel(def, max_parallel) {
     if (def == 0) { return 1; }
     if (max_parallel < 1) { max_parallel = 1; }
@@ -282,44 +286,107 @@ fn workflow_context_free(ctx) {
 # Pure with respect to the context — it READS ctx (via the caller's dependency
 # check) but never writes it, which is what makes it safe to run several of
 # these on different threads. All context writes happen on the coordinating
-# thread after the batch joins.
+# thread after the batch finishes.
+#
+# The returned status is always COMPLETED, SKIPPED or FAILED.
 fn _dag_run_step(step, ctx, executor_fn) {
     var max_retries = load64(step + 40);
+    # ⚠ A negative retry_max made the loop condition false at once, so the
+    # executor never ran and the step failed as "executor returned null".
+    if (max_retries < 0) { max_retries = 0; }
     var attempt = 0;
     var result = 0;
+    var st = 0;
     while (attempt <= max_retries) {
         result = fncall2(executor_fn, step, ctx);
-        if (result != 0 && load64(result) == STEP_COMPLETED) {
-            attempt = max_retries + 1;
-        } else {
-            attempt = attempt + 1;
-            if (attempt <= max_retries) {
-                # Linear backoff: attempt * 10 ms. `_majra_sleep_ns`
-                # (src/envelope.cyr) sleeps to a monotonic deadline, so a
-                # signal landing mid-wait resumes rather than shortens it —
-                # the EINTR-with-remainder intent of the raw nanosleep loop
-                # this replaced. That loop spelled x86_64's 35, which on
-                # aarch64-Linux is unlinkat(2): it returned an error at once,
-                # never -4, and the backoff never slept.
-                _majra_sleep_ns(attempt * 10000000);
-            }
+        # ⚠ `break`, not `attempt = max_retries + 1`: with retry_max INT64_MAX
+        # that overflowed to INT64_MIN, kept the loop running, and re-executed
+        # a step that had already succeeded, forever. An executor-returned
+        # SKIPPED ("nothing to do") is terminal too — retrying repeats its side
+        # effects for a result that cannot change.
+        if (result != 0) {
+            st = load64(result);
+            if (st == STEP_COMPLETED) { break; }
+            if (st == STEP_SKIPPED) { break; }
+        }
+        attempt = attempt + 1;
+        if (attempt <= max_retries) {
+            # Linear backoff: attempt * 10 ms. `_majra_sleep_ns`
+            # (src/envelope.cyr) sleeps to a monotonic deadline, so a
+            # signal landing mid-wait resumes rather than shortens it —
+            # the EINTR-with-remainder intent of the raw nanosleep loop
+            # this replaced. That loop spelled x86_64's 35, which on
+            # aarch64-Linux is unlinkat(2): it returned an error at once,
+            # never -4, and the backoff never slept.
+            _majra_sleep_ns(attempt * 10000000);
         }
     }
     if (result == 0) {
-        result = step_result_new(STEP_FAILED, 0, "executor returned null");
+        return step_result_new(STEP_FAILED, 0, "executor returned null");
+    }
+    # ⚠ Any other final status (PENDING, RUNNING, out of range) was retried as a
+    # failure but then applied as a success: the apply phase checks only for
+    # FAILED, so POLICY_FAIL was bypassed and the run reported COMPLETED for a
+    # step that never completed. Coerce it into a FAILED result, as the
+    # null-result path does. A fresh StepResult — the executor's may be shared.
+    st = load64(result);
+    if (st != STEP_COMPLETED) {
+        if (st != STEP_SKIPPED) {
+            if (st != STEP_FAILED) {
+                var msg = load64(result + 16);
+                if (msg == 0) { msg = "executor returned a non-terminal status"; }
+                return step_result_new(STEP_FAILED, load64(result + 8), msg);
+            }
+        }
     }
     return result;
 }
 
-# Job struct handed to a worker thread (40 bytes):
+# Job struct handed to a worker thread (56 bytes, internal):
 #   offset  0: step
 #   offset  8: ctx
 #   offset 16: executor_fn
 #   offset 24: result   — the worker's OWN slot; no two jobs share one
 #   offset 32: skipped  — 1 if dependencies were unsatisfied
+#   offset 40: pending  — the batch's in-flight counter word (parallel only)
+#   offset 48: inline   — 1 if the spawn failed and the coordinator runs it
 fn _dag_worker(job) {
     if (load64(job + 32) == 1) { return 0; }
     store64(job + 24, _dag_run_step(load64(job), load64(job + 8), load64(job + 16)));
+    return 0;
+}
+
+# 1 if this job ran, failed, and its step's POLICY_FAIL aborts the run. The run
+# phase stops on exactly this condition and the apply loop aborts on the same
+# one, so it never reaches (or dereferences the 0 result of) an unstarted job.
+# ⚠ Keep the two in step if either changes.
+fn _dag_job_aborts(job) {
+    if (load64(job + 32) == 1) { return 0; }
+    var r = load64(job + 24);
+    if (r == 0) { return 0; }
+    if (load64(r) != STEP_FAILED) { return 0; }
+    if (load64(load64(job) + 32) != POLICY_FAIL) { return 0; }
+    return 1;
+}
+
+# Batch worker: run the job, then count it done and wake the coordinator.
+#
+# ⚠ Workers are spawned DETACHED and the coordinator waits on this counter
+# instead of thread_join. thread_create bump-allocates a 24 B handle and a
+# 4096 B TLS block that thread_join never returns — about 4.1 KB of heap lost
+# for good per parallel step. thread_create_detached allocates no handle and
+# carves its TLS from the stack mapping it unmaps on exit. Nothing here touches
+# the job after the decrement: the coordinator may free it from then on.
+fn _dag_batch_worker(job) {
+    _dag_worker(job);
+    var pending = load64(job + 40);
+    # Only the decrement that reaches 0 wakes: the coordinator waits for 0, and
+    # FUTEX_WAIT's value check covers any decrement that races its park.
+    if (atomic_fetch_add(pending, -1) == 1) {
+        #ifndef CYRIUS_TARGET_AGNOS
+        syscall(SYS_FUTEX, pending, FUTEX_WAKE, 0x7fffffff, 0, 0, 0);
+        #endif
+    }
     return 0;
 }
 
@@ -327,10 +394,14 @@ fn _dag_worker(job) {
 # executor_fn(step_ptr, ctx_ptr) -> StepResult ptr
 # Returns: RUN_COMPLETED, or RUN_FAILED (including for a malformed DAG).
 #
-# ⚠ Steps within a tier execute SERIALLY. The module header used to claim
-# parallel within-tier execution via thread_create/join; dag.cyr calls
-# neither, and never has. Tiers are a dependency-ordering construct here, not
-# a concurrency one. Parallel tier execution is a roadmap item.
+# Steps within a tier execute serially unless workflow_def_set_parallel raised
+# the width; then they run in bounded batches of detached worker threads.
+#
+# ⚠ A POLICY_FAIL failure stops the tier. Serially the next tier-mate never
+# starts; in parallel the current batch finishes but no later batch starts.
+# From 2.7.0 through 2.8.0 every tier-mate ran first and failures were checked
+# only afterwards, so siblings of a failed step still executed their side
+# effects.
 fn workflow_execute(def, executor_fn, input) {
     var ctx = workflow_context_new(input);
     var tiers = _compute_tiers(def);
@@ -359,7 +430,7 @@ fn workflow_execute(def, executor_fn, input) {
         # Every step's result lands in its OWN job slot; nothing is shared
         # between workers, and no worker touches the context. Steps in one tier
         # are by construction independent — that is what a tier means — so
-        # deferring all context writes until after the batch joins is
+        # deferring all context writes until after the batch finishes is
         # equivalent to writing them as we go, and it is what keeps the
         # executor from needing to synchronise against majra's own state.
         var width = load64(def + 32);
@@ -369,7 +440,7 @@ fn workflow_execute(def, executor_fn, input) {
         var s = 0;
         while (s < tier_len) {
             var step_j = vec_get(tier, s);
-            var job = fl_alloc(40);
+            var job = fl_alloc(56);
             store64(job, step_j);
             store64(job + 8, ctx);
             store64(job + 16, executor_fn);
@@ -377,6 +448,8 @@ fn workflow_execute(def, executor_fn, input) {
             var unsat = 0;
             if (_deps_satisfied(step_j, ctx) == 0) { unsat = 1; }
             store64(job + 32, unsat);
+            store64(job + 40, 0);
+            store64(job + 48, 0);
             store64(jobs + s * 8, job);
             s = s + 1;
         }
@@ -385,34 +458,69 @@ fn workflow_execute(def, executor_fn, input) {
             s = 0;
             while (s < tier_len) {
                 _dag_worker(load64(jobs + s * 8));
+                # Fail fast: later tier-mates keep result 0 and are never
+                # applied — the apply loop aborts at this same job.
+                if (_dag_job_aborts(load64(jobs + s * 8)) == 1) { break; }
                 s = s + 1;
             }
         } else {
             # Bounded batches rather than a thread per step: `width` is a
             # concurrency cap, not a suggestion.
+            var pending = fl_alloc(8);
             var base = 0;
             while (base < tier_len) {
                 var n = width;
                 if (base + n > tier_len) { n = tier_len - base; }
-                var handles = fl_alloc(n * 8);
+                # The counter is set BEFORE any worker can decrement it.
+                store64(pending, n);
                 var k = 0;
                 while (k < n) {
-                    store64(handles + k * 8,
-                      thread_create(&_dag_worker, load64(jobs + (base + k) * 8)));
+                    var bj = load64(jobs + (base + k) * 8);
+                    store64(bj + 40, pending);
+                    if (thread_create_detached(&_dag_batch_worker, bj) == 0) {
+                        store64(bj + 48, 1);
+                    }
                     k = k + 1;
                 }
+                # A failed spawn's step must still run — inline it rather than
+                # silently skipping it. It decrements the counter itself.
                 k = 0;
                 while (k < n) {
-                    var h = load64(handles + k * 8);
-                    # A failed spawn must not be joined, and its step must
-                    # still run — inline it rather than silently skipping it.
-                    if (h == 0) { _dag_worker(load64(jobs + (base + k) * 8)); }
-                    else { thread_join(h); }
+                    var ij = load64(jobs + (base + k) * 8);
+                    if (load64(ij + 48) == 1) { _dag_batch_worker(ij); }
                     k = k + 1;
                 }
-                fl_free(handles);
+                # Wait for the batch. One load per iteration feeds both the
+                # test and FUTEX_WAIT, so a decrement in between makes the
+                # kernel see a mismatch and return rather than park.
+                var left = load64(pending);
+                while (left != 0) {
+                    # agnos: detached bodies ran inline at spawn, so this is
+                    # never reached there; yield rather than futex regardless.
+                    #ifdef CYRIUS_TARGET_AGNOS
+                    sys_sched_yield();
+                    #endif
+                    #ifndef CYRIUS_TARGET_AGNOS
+                    syscall(SYS_FUTEX, pending, FUTEX_WAIT, left, 0, 0, 0);
+                    #endif
+                    left = load64(pending);
+                }
                 base = base + n;
+                # Fail fast between batches: every unstarted job comes after
+                # the failing one in tier order, so the apply loop stops first.
+                var stop = 0;
+                k = base - n;
+                while (k < base) {
+                    if (_dag_job_aborts(load64(jobs + k * 8)) == 1) { stop = 1; }
+                    k = k + 1;
+                }
+                if (stop == 1) { break; }
             }
+            # A worker's FUTEX_WAKE can land after this free (it decrements,
+            # then wakes). fl_free does not unmap, so that is at worst a
+            # spurious wake for a later user of the block, which every futex
+            # waiter in majra and the stdlib already re-checks for.
+            fl_free(pending);
         }
 
         # --- Apply results, in tier order ---

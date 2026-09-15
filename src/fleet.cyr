@@ -35,6 +35,12 @@ fn fleet_new(config) {
 # every job already queued or running on that node and leaking the old queue —
 # and a re-register on reconnect is exactly what a flapping node does.
 # Returns 1 if a node was created, 0 if it already existed.
+#
+# ⚠ node_id is COPIED. The hashmap stores the key pointer by reference, so a
+# caller that parsed the id out of a reused frame buffer (or freed it) left the
+# map keyed on overwritten bytes: the node became unfindable and the next
+# fleet_submit crashed. Same hazard _ratelimit_key_own closed. The queue gets
+# its own copy because it can outlive the map entry (fleet_node_queue handles).
 fn fleet_register_node(fq, node_id) {
     var mtx = load64(fq + 16);
     mutex_lock(mtx);
@@ -43,9 +49,108 @@ fn fleet_register_node(fq, node_id) {
         return 0;
     }
     var cfg = load64(fq + 8);
-    var mq = mq_new(node_id, load64(cfg + 16));
-    map_set(load64(fq), node_id, mq);
+    var mq = mq_new(_fleet_id_own(node_id), load64(cfg + 16));
+    map_set(load64(fq), _fleet_id_own(node_id), mq);
     mutex_unlock(mtx);
+    return 1;
+}
+
+fn _fleet_id_own(id) {
+    var n = strlen(id);
+    var p = fl_alloc(n + 1);
+    memcpy(p, id, n);
+    store8(p + n, 0);
+    return p;
+}
+
+# The map's own copy of node_id, or 0. Caller must hold the fleet mutex.
+fn _fleet_stored_id(nodes, node_id) {
+    var entries = map_entries(nodes);
+    var cap = map_cap(nodes);
+    var ki = 0;
+    while (ki < cap) {
+        var ep = entries + ki * 24;
+        if (load64(ep + 16) == 1) {
+            if (streq(load64(ep), node_id) == 1) { return load64(ep); }
+        }
+        ki = ki + 1;
+    }
+    return 0;
+}
+
+# Move the next QUEUED job from `src` to `dst` WITHOUT reallocating it.
+# Returns 0 if src had nothing queued, 1 if a job moved, 2 if dst is 0 and the
+# job was taken as an orphan. Caller must hold the fleet mutex.
+#
+# ⚠ Moving used to be mq_take_queued + mq_enqueue + queue_item_free, which
+# freed the QueueItem fleet_submit had handed to the caller. Their handle then
+# aliased whatever reused that 40-byte block, so queue_item_payload returned
+# another job's data and mq_cancel read a foreign key. The SAME item and its
+# ManagedItem (id, enqueued_at) now move; cancel against the node holding it.
+# Taken items are never freed here — cancelled or orphaned, the handle is
+# still the submitter's.
+fn _fleet_move_job(src, dst) {
+    var smtx = load64(src + 16);
+    var sjobs = load64(src + 8);
+    var item = 0;
+    var mi = 0;
+    var searching = 1;
+    while (searching == 1) {
+        mutex_lock(smtx);
+        var it = cpq_dequeue(load64(src));
+        if (it == 0) {
+            mutex_unlock(smtx);
+            return 0;
+        }
+        var skey = load64(it + 32);
+        var m = map_get(sjobs, skey);
+        if (m != 0) { map_delete(sjobs, skey); }
+        mutex_unlock(smtx);
+        if (m == 0) {
+            # Untracked item: give it a fresh tracking entry rather than drop
+            # it, as the old re-enqueue did.
+            m = fl_alloc(72);
+            store64(m, load64(it));
+            store64(m + 8, load64(it + 8));
+            store64(m + 16, load64(it + 16));
+            store64(m + 24, load64(it + 24));
+            store64(m + 32, JOB_QUEUED);
+            store64(m + 40, time_now_ns());
+            store64(m + 48, 0);
+            store64(m + 56, 0);
+            store64(m + 64, 0);
+        }
+        if (load64(m + 32) == JOB_CANCELLED) {
+            fl_free(m);
+        } else {
+            item = it;
+            mi = m;
+            searching = 0;
+        }
+    }
+
+    if (dst == 0) {
+        fl_free(mi);
+        return 2;
+    }
+
+    var dmtx = load64(dst + 16);
+    var djobs = load64(dst + 8);
+    mutex_lock(dmtx);
+    # ⚠ Keys are only unique per queue: _next_job_key's global is serialised
+    # by each queue's own mutex, not across queues. Re-key on a clash so the
+    # map_set cannot overwrite a job already tracked on dst.
+    var key = load64(item + 32);
+    while (map_get(djobs, key) != 0) { key = _next_job_key(); }
+    store64(item + 32, key);
+    map_set(djobs, key, mi);
+    mutex_unlock(dmtx);
+
+    cpq_enqueue(load64(dst), item);
+    var vt = load64(dst + 48);
+    if (vt != 0) {
+        metrics_queue_enqueued(vt, load64(dst + 24), load64(item + 16));
+    }
     return 1;
 }
 
@@ -62,25 +167,25 @@ fn fleet_deregister_node(fq, node_id) {
     var nodes = load64(fq);
     var mq = map_get(nodes, node_id);
     if (mq == 0) { mutex_unlock(mtx); return 0; }
+    var stored = _fleet_stored_id(nodes, node_id);
     map_delete(nodes, node_id);
+    # Free strictly AFTER the delete, which needs the key to find the entry;
+    # the tombstone's stale pointer is never key-compared.
+    if (stored != 0) { fl_free(stored); }
 
-    # mq_take_queued, NOT mq_dequeue. mq_dequeue refuses once running_count
-    # reaches max_concurrent, so a node with jobs already running would have
-    # dropped out of this loop immediately and discarded every QUEUED job —
-    # the same silent job loss deregister was supposed to stop.
+    # Take queued jobs directly, NOT via mq_dequeue. mq_dequeue refuses once
+    # running_count reaches max_concurrent, so a node with jobs already running
+    # would have dropped out of this loop immediately and discarded every
+    # QUEUED job — the same silent job loss deregister was supposed to stop.
     var orphaned = 0;
     var draining = 1;
     while (draining == 1) {
-        var item = mq_take_queued(mq);
-        if (item == 0) { draining = 0; }
-        else {
-            var tid = _fleet_select_node(fq);
-            if (tid == 0) { orphaned = orphaned + 1; }
-            else {
-                mq_enqueue(map_get(nodes, tid), queue_item_priority(item), queue_item_payload(item));
-            }
-            queue_item_free(item);
-        }
+        var tid = _fleet_select_node(fq);
+        var dst = 0;
+        if (tid != 0) { dst = map_get(nodes, tid); }
+        var moved = _fleet_move_job(mq, dst);
+        if (moved == 0) { draining = 0; }
+        elif (moved == 2) { orphaned = orphaned + 1; }
     }
     mutex_unlock(mtx);
     return orphaned;
@@ -140,8 +245,13 @@ fn fleet_submit(fq, priority, payload) {
         return 0;
     }
     var mq = map_get(load64(fq), node_id);
+    # ⚠ Enqueue BEFORE unlocking. Unlocking first let a concurrent
+    # fleet_deregister_node remove and drain `mq` in the gap, so the job landed
+    # in a queue nothing would ever read — lost, with a success-shaped return.
+    # fleet -> mq is the lock order deregister already takes.
+    var it = mq_enqueue(mq, priority, payload);
     mutex_unlock(mtx);
-    return mq_enqueue(mq, priority, payload);
+    return it;
 }
 
 # Rebalance: steal from overloaded nodes and assign to underloaded.
@@ -184,17 +294,14 @@ fn fleet_rebalance(fq) {
                         # configured.
                         var taking = 1;
                         while (taking == 1 && to_steal > 0 && mq_queued_count(tmq) < threshold) {
-                            # mq_take_queued, NOT mq_dequeue. A steal is not an
-                            # execution: mq_dequeue would mark the job RUNNING,
-                            # inflate the source's running_count, and — worse —
-                            # REFUSE outright once that count hit
+                            # Take the queued job, NOT mq_dequeue. A steal is
+                            # not an execution: mq_dequeue would mark the job
+                            # RUNNING, inflate the source's running_count, and
+                            # — worse — REFUSE outright once that count hit
                             # max_concurrent, which is exactly the saturated
                             # node a rebalance most needs to relieve.
-                            var item = mq_take_queued(mq);
-                            if (item == 0) { taking = 0; }
+                            if (_fleet_move_job(mq, tmq) == 0) { taking = 0; }
                             else {
-                                mq_enqueue(tmq, queue_item_priority(item), queue_item_payload(item));
-                                queue_item_free(item);
                                 stolen = stolen + 1;
                                 to_steal = to_steal - 1;
                             }

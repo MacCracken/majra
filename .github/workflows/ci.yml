@@ -120,9 +120,9 @@ jobs:
             echo "FAIL: raw syscall literal(s) in code — spell the peer's SYS_* name or call the wrapper:"
             echo "$hits"; exit 1
           fi
-          vars=$(grep -rnE '^var _?SYS_' src | grep -vE 'src/ipc\.cyr:[0-9]+:var _SYS_(SOCKET|CONNECT|ACCEPT|BIND|LISTEN) = (41|42|43|49|50);$' || true)
+          vars=$(grep -rnE '^var _?[A-Z_]*SYS_' src | grep -vE 'src/ipc\.cyr:[0-9]+:var (_SYS_(SOCKET|CONNECT|ACCEPT|BIND|LISTEN|SHUTDOWN) = (41|42|43|49|50|48)|_IPC_SYS_SENDTO = (44|206));$' || true)
           if [ -n "$vars" ]; then
-            echo "FAIL: syscall number declared in arch-neutral code (only src/ipc.cyr's five routed rows are allowed):"
+            echo "FAIL: syscall number declared in arch-neutral code (only src/ipc.cyr's routed rows and per-arch sendto are allowed):"
             echo "$vars"; exit 1
           fi
           echo "no raw syscall literals; no stray SYS_ declarations"

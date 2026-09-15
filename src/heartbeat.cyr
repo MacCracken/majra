@@ -94,11 +94,52 @@ fn gpu_telemetry_new(util_x100, mem_used, mem_total, temp_x100) {
 #   offset 40: total_vram_mb
 #   offset 48: available_vram_mb
 
-# --- HeartbeatTracker (single-threaded, for use within one thread) ---
+# Rebuild `m` in place when tombstones have eaten its empty slots. `empties` is
+# the count of state-0 slots the caller's sweep walk just saw. Returns 1 if it
+# rebuilt.
+#
+# ⚠ lib/hashmap.cyr grows on LIVE count only and never rehashes tombstones out,
+# and `_map_find` stops only at an empty slot — so a fleet that churns node ids
+# (deregister, eviction) trends to zero empties, after which every unknown-id
+# lookup and every new registration probes all `cap` slots under the tracker
+# mutex. Below cap/4 empties, copy the live pairs out, map_clear, re-insert: the
+# live count already fit this capacity, so no grow and no bump allocation.
+# Runs from the status sweeps only (already O(cap)); deregister's tombstones
+# are reclaimed by the next sweep. A private twin of ratelimit.cyr's
+# `_rl_map_compact` — soak_heartbeat and fuzz_heartbeat include this file alone.
+fn _hb_map_compact(m, empties) {
+    var cap = map_cap(m);
+    if (empties * 4 >= cap) { return 0; }
+    var live = map_size(m);
+    if (live == 0) {
+        map_clear(m);
+        return 1;
+    }
+    var scratch = fl_alloc(live * 16);
+    if (scratch == 0) { return 0; }
+    var entries = map_entries(m);
+    var n = 0;
+    var i = 0;
+    while (i < cap) {
+        var ep = entries + i * 24;
+        if (load64(ep + 16) == 1 && n < live) {
+            store64(scratch + n * 16, load64(ep));
+            store64(scratch + n * 16 + 8, load64(ep + 8));
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    map_clear(m);
+    i = 0;
+    while (i < n) {
+        map_set(m, load64(scratch + i * 16), load64(scratch + i * 16 + 8));
+        i = i + 1;
+    }
+    fl_free(scratch);
+    return 1;
+}
 
-# HeartbeatTracker struct (16 bytes):
-#   offset 0: nodes (i64) — hashmap: string -> NodeState ptr
-#   offset 8: config (i64) — HeartbeatConfig ptr
+# --- HeartbeatTracker (single-threaded, for use within one thread) ---
 
 # Tracker type tags. Distinctive values so a stray pointer, a small integer or
 # a zeroed block cannot be mistaken for a tracker.
@@ -142,8 +183,13 @@ fn hb_tracker_kind(t) {
 
 fn hb_register(ht, id, metadata) {
     var nodes = load64(ht + 8);
+    # Same re-registration leak chb_register closes: map_set replaces the
+    # entry's value and abandoned the previous NodeState.
+    var prev = map_get(nodes, id);
     var ns = _node_state_new(metadata);
     map_set(nodes, id, ns);
+    if (prev != 0) { fl_free(prev); }
+    return 0;
 }
 
 fn hb_heartbeat(ht, id) {
@@ -191,10 +237,13 @@ fn hb_update_statuses(ht) {
     # and relay and did not apply here.
     var entries = map_entries(nodes);
     var cap = map_cap(nodes);
+    var empties = 0;
     var i = 0;
     while (i < cap) {
         var ep = entries + i * 24;
-        if (load64(ep + 16) == 1) {
+        var st = load64(ep + 16);
+        if (st == 0) { empties = empties + 1; }
+        if (st == 1) {
             var id = load64(ep);
             var ns = load64(ep + 8);
             var elapsed = now - load64(ns + 8);
@@ -251,6 +300,8 @@ fn hb_update_statuses(ht) {
         }
         if (to_evict != 0) { fl_free(to_evict); }
     }
+    # Deletes only write tombstones, so `empties` is still exact here.
+    _hb_map_compact(nodes, empties);
 
     return transitions;
 }
@@ -268,17 +319,23 @@ fn hb_is_empty(ht) {
 }
 
 # List nodes by status — returns vec of id string pointers
+#
+# Slot-array walk, not map_keys + map_get: map_keys built a throwaway vec on the
+# never-freed bump allocator on every call (the sweeps dropped it at 2.6.10) and
+# map_get re-hashed each key to find the slot the walk is already standing on.
+# Slot order is map_keys' order, so the result order is unchanged.
 fn hb_list_by_status(ht, status) {
     var nodes = load64(ht + 8);
     var result = vec_new();
-    var keys = map_keys(nodes);
+    var entries = map_entries(nodes);
+    var cap = map_cap(nodes);
     var i = 0;
-    var len = vec_len(keys);
-    while (i < len) {
-        var id = vec_get(keys, i);
-        var ns = map_get(nodes, id);
-        if (load64(ns) == status) {
-            vec_push(result, id);
+    while (i < cap) {
+        var ep = entries + i * 24;
+        if (load64(ep + 16) == 1) {
+            if (load64(load64(ep + 8)) == status) {
+                vec_push(result, load64(ep));
+            }
         }
         i = i + 1;
     }
@@ -290,12 +347,6 @@ fn hb_online(ht) {
 }
 
 # --- ConcurrentHeartbeatTracker (thread-safe wrapper) ---
-
-# Same struct layout as HeartbeatTracker but adds a mutex at offset 16.
-# ConcurrentHeartbeatTracker struct (24 bytes):
-#   offset  0: nodes (i64) — hashmap
-#   offset  8: config (i64) — HeartbeatConfig ptr
-#   offset 16: mutex (i64)
 
 # ConcurrentHeartbeatTracker struct (32 bytes):
 #   offset  0: kind (i64) — HB_KIND_CONCURRENT
@@ -313,12 +364,14 @@ fn chb_tracker_new(cfg) {
 
 fn chb_register(cht, id, metadata) {
     var mtx = load64(cht + 24);
+    # Built before the lock so the clock syscall in _node_state_new is not held
+    # under it; the block is always inserted, so nothing leaks.
+    var ns = _node_state_new(metadata);
     mutex_lock(mtx);
     # Re-registering an existing id replaced the map entry and abandoned the
     # previous NodeState — and re-register on reconnect is exactly what a
     # flapping node does.
     var prev = map_get(load64(cht + 8), id);
-    var ns = _node_state_new(metadata);
     map_set(load64(cht + 8), id, ns);
     if (prev != 0) { fl_free(prev); }
     mutex_unlock(mtx);
@@ -328,16 +381,33 @@ fn chb_register_with_telemetry(cht, id, metadata, gpu_vec) {
     # Same re-registration leak chb_register closes: replacing an existing
     # entry abandoned the previous NodeState. 2.6.9 fixed only chb_register.
     var mtx = load64(cht + 24);
-    mutex_lock(mtx);
-    var prev = map_get(load64(cht + 8), id);
     var ns = _node_state_new(metadata);
     store64(ns + 24, gpu_vec);
+    mutex_lock(mtx);
+    var prev = map_get(load64(cht + 8), id);
     map_set(load64(cht + 8), id, ns);
     if (prev != 0) { fl_free(prev); }
     mutex_unlock(mtx);
 }
 
+# Stamp a heartbeat. Caller holds the tracker mutex; `now` was read before it.
+#
+# ⚠ The clock is read OUTSIDE the lock: holding the mutex across the clock
+# syscall serialised every heartbeat behind it (4 threads ran slower than 1).
+# A caller that lost the lock race carries an older `now`, so keep the newer
+# stamp — last_seen must never move backwards. Unlike ratelimit_check (which
+# reads under the lock on purpose) nothing here is a ledger: an earlier stamp
+# by one lock wait only ages the node by microseconds, and the sweep reads its
+# own `now` under the lock, so its elapsed stays >= 0.
+fn _chb_stamp(ns, now) {
+    store64(ns, STATUS_ONLINE);
+    if (now > load64(ns + 8)) { store64(ns + 8, now); }
+    store64(ns + 32, 0);
+    return 0;
+}
+
 fn chb_heartbeat(cht, id) {
+    var now = time_now_ns();
     var mtx = load64(cht + 24);
     mutex_lock(mtx);
     var ns = map_get(load64(cht + 8), id);
@@ -345,14 +415,13 @@ fn chb_heartbeat(cht, id) {
         mutex_unlock(mtx);
         return 0;
     }
-    store64(ns, STATUS_ONLINE);
-    store64(ns + 8, time_now_ns());
-    store64(ns + 32, 0);
+    _chb_stamp(ns, now);
     mutex_unlock(mtx);
     return 1;
 }
 
 fn chb_heartbeat_with_metadata(cht, id, metadata) {
+    var now = time_now_ns();
     var mtx = load64(cht + 24);
     mutex_lock(mtx);
     var ns = map_get(load64(cht + 8), id);
@@ -360,15 +429,14 @@ fn chb_heartbeat_with_metadata(cht, id, metadata) {
         mutex_unlock(mtx);
         return 0;
     }
-    store64(ns, STATUS_ONLINE);
-    store64(ns + 8, time_now_ns());
+    _chb_stamp(ns, now);
     store64(ns + 16, metadata);
-    store64(ns + 32, 0);
     mutex_unlock(mtx);
     return 1;
 }
 
 fn chb_heartbeat_with_telemetry(cht, id, gpu_vec) {
+    var now = time_now_ns();
     var mtx = load64(cht + 24);
     mutex_lock(mtx);
     var ns = map_get(load64(cht + 8), id);
@@ -376,10 +444,8 @@ fn chb_heartbeat_with_telemetry(cht, id, gpu_vec) {
         mutex_unlock(mtx);
         return 0;
     }
-    store64(ns, STATUS_ONLINE);
-    store64(ns + 8, time_now_ns());
+    _chb_stamp(ns, now);
     store64(ns + 24, gpu_vec);
-    store64(ns + 32, 0);
     mutex_unlock(mtx);
     return 1;
 }
@@ -406,10 +472,13 @@ fn chb_update_statuses(cht) {
     # Slot-array walk — see the note on the non-concurrent sweep above.
     var entries = map_entries(nodes);
     var cap = map_cap(nodes);
+    var empties = 0;
     var i = 0;
     while (i < cap) {
         var ep = entries + i * 24;
-        if (load64(ep + 16) == 1) {
+        var st = load64(ep + 16);
+        if (st == 0) { empties = empties + 1; }
+        if (st == 1) {
             var id = load64(ep);
             var ns = load64(ep + 8);
             var elapsed = now - load64(ns + 8);
@@ -465,6 +534,7 @@ fn chb_update_statuses(cht) {
         }
         if (to_evict != 0) { fl_free(to_evict); }
     }
+    _hb_map_compact(nodes, empties);
 
     mutex_unlock(mtx);
     return transitions;
@@ -525,14 +595,16 @@ fn chb_list_by_status(cht, status) {
     mutex_lock(mtx);
     var nodes = load64(cht + 8);
     var result = vec_new();
-    var keys = map_keys(nodes);
+    # Slot-array walk — see hb_list_by_status.
+    var entries = map_entries(nodes);
+    var cap = map_cap(nodes);
     var i = 0;
-    var len = vec_len(keys);
-    while (i < len) {
-        var id = vec_get(keys, i);
-        var ns = map_get(nodes, id);
-        if (load64(ns) == status) {
-            vec_push(result, id);
+    while (i < cap) {
+        var ep = entries + i * 24;
+        if (load64(ep + 16) == 1) {
+            if (load64(load64(ep + 8)) == status) {
+                vec_push(result, load64(ep));
+            }
         }
         i = i + 1;
     }
@@ -554,12 +626,18 @@ fn chb_fleet_stats(cht) {
     var j = 0;
     while (j < 7) { store64(s + j * 8, 0); j = j + 1; }
 
-    var keys = map_keys(nodes);
+    # Slot-array walk — see hb_list_by_status. This is what GET /fleet calls on
+    # every request, so map_keys' bump-allocated vec leaked per scrape.
+    var entries = map_entries(nodes);
+    var cap = map_cap(nodes);
     var i = 0;
-    var len = vec_len(keys);
-    while (i < len) {
-        var id = vec_get(keys, i);
-        var ns = map_get(nodes, id);
+    while (i < cap) {
+        var ep = entries + i * 24;
+        if (load64(ep + 16) != 1) {
+            i = i + 1;
+            continue;
+        }
+        var ns = load64(ep + 8);
         store64(s, load64(s) + 1);
         var st = load64(ns);
         if (st == STATUS_ONLINE) { store64(s + 8, load64(s + 8) + 1); }

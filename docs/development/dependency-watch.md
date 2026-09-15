@@ -52,7 +52,7 @@ rule, stated once here:
 | `vec.cyr`        | Dynamic i64 array (vec_new, vec_push, vec_get) | all |
 | `str.cyr`        | Fat string type (str_from, str_len, str_eq, str_builder) | all |
 | `hashmap.cyr`    | Hash table — `map_new()` for cstr keys, `map_new_str()` for Str-struct keys | all |
-| `syscalls.cyr`   | Linux syscall wrappers (auto-dispatched x86_64/aarch64 via per-arch peer files). The peers are the **only** place a syscall number may be spelled, bar the five routed networking numbers `src/ipc.cyr` keeps target-neutral — see the aarch64 `ESYSXLAT` bullet under Upgrade considerations (2.7.3) | all |
+| `syscalls.cyr`   | Linux syscall wrappers (auto-dispatched x86_64/aarch64 via per-arch peer files). The peers are the **only** place a syscall number may be spelled, bar the routed networking numbers (and the per-arch sendto) that `src/ipc.cyr` keeps target-neutral — see the aarch64 `ESYSXLAT` bullet under Upgrade considerations (2.7.3) | all |
 | `tls.cyr`        | TLS primitives (transitive — `sandhi` references `TLS_BACKEND_LIBSSL` at parse time; must be included before `sandhi.cyr`). Its default non-libssl backend `lib/tls_native.cyr` `include`s `lib/sigil.cyr`, which is how the `admin` unit comes to compile sigil (see the matrix footnote) | admin, backends |
 | `slice.cyr`      | First-class 16-byte slice helpers (`_slice_idx_get_W`) — toolchain-internal; provided by `cyrius lib sync --full` (a bare sync omits it — cyrius-quirks.md #7). No majra entry point or sidecar names it since agnosys left the graph (sigil 3.8.1) | — |
 | `ct.cyr`         | Constant-time compare (`ct_eq_bytes`, `ct_eq_bytes_lens`, `ct_select`) — sigil 3.x retired its bundled `ct_eq` and relies on this | signed, backends |

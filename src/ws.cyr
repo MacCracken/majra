@@ -16,6 +16,12 @@
 #
 # Frames are read with server semantics: client frames MUST be masked
 # (§5.1) and control frames MUST be <= 125 bytes and unfragmented (§5.5).
+#
+# SIGPIPE: on Linux every write in this module goes out as send(MSG_NOSIGNAL),
+# so a peer that reset the connection costs a -1 return, not the process. On
+# targets without that path (macOS, agnos, Windows) writes fall back to
+# write(2), and a consumer running its own accept loop there should
+# signal_ignore(SIGPIPE) itself.
 
 # --- SHA-1 Implementation (RFC 3174) ---
 # Required for WebSocket handshake: SHA1(client_key + magic_guid)
@@ -49,6 +55,7 @@ fn _majra_sha1(data, len) {
     # Pad message: append 0x80, zeros, then 64-bit BE length
     var padded_len = ((len + 9 + 63) / 64) * 64;
     var padded = fl_alloc(padded_len);
+    if (padded == 0) { return 0; }
     memset(padded, 0, padded_len);
     memcpy(padded, data, len);
     store8(padded + len, 0x80);
@@ -142,6 +149,7 @@ fn _majra_sha1(data, len) {
 
     # Output 20-byte digest in big-endian
     var digest = fl_alloc(20);
+    if (digest == 0) { return 0; }
     store8(digest, (h0>>24)&0xFF);
     store8(digest+1, (h0>>16)&0xFF);
     store8(digest+2, (h0>>8)&0xFF);
@@ -194,11 +202,44 @@ fn _ws_read_full(fd, buf, want) {
     return total;
 }
 
+# sendto(2)'s number, or 0 where majra has no MSG_NOSIGNAL send path.
+# ⚠ Spelled per arch: sendto has no ESYSXLAT row (quirk #9), so the x86_64 44
+# would run as fstatfs on aarch64. The peers declare no SYS_SENDTO and the
+# stdlib ships no sys_sendto wrapper. macOS has no MSG_NOSIGNAL and no Mach-O
+# row for either number; agnos and Windows have no BSD sockets.
+fn _majra_ws_sendto_nr() {
+    #ifdef CYRIUS_TARGET_LINUX
+    #ifdef CYRIUS_ARCH_X86
+    return 44;
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    return 206;
+    #endif
+    #endif
+    return 0;
+}
+
 # Write exactly `len` bytes, looping over short writes.
+#
+# ⚠ Sent with MSG_NOSIGNAL (0x4000). A bare write(2) to a socket the peer has
+# reset raises SIGPIPE, whose default action kills the process — so one
+# unauthenticated client doing SO_LINGER{1,0}+close took down every other
+# connection the moment the server answered it (a close frame, a fan-out
+# text). A non-socket fd gets ENOTSOCK (-88) and falls back to write(2).
 fn _ws_write_full(fd, buf, len) {
     var total = 0;
+    var nr = _majra_ws_sendto_nr();
     while (total < len) {
-        var w = syscall(SYS_WRITE, fd, buf + total, len - total);
+        var w = 0;
+        if (nr != 0) {
+            w = syscall(nr, fd, buf + total, len - total, 0x4000, 0, 0);
+            if (w == -88) {
+                nr = 0;
+                w = syscall(SYS_WRITE, fd, buf + total, len - total);
+            }
+        } else {
+            w = syscall(SYS_WRITE, fd, buf + total, len - total);
+        }
         if (w == -4) { w = 0; }
         elif (w <= 0) { return -1; }
         total = total + w;
@@ -217,13 +258,23 @@ enum WsOpcode {
 
 # --- WebSocket Handshake ---
 
-# Compute Sec-WebSocket-Accept value from client key.
+# Compute Sec-WebSocket-Accept value from client key. Returns an fl_alloc'd
+# cstr (caller fl_frees) or 0.
+#
+# ⚠ Built on the freelist. This and the 101 response in _ws_accept_upgrade
+# used str_builder, which draws from the never-reclaiming bump allocator:
+# ~792 bytes per handshake, unbounded growth from a peer that just reconnects
+# — the class the 2.6.9 sha1-schedule fix closed, left open one call up.
 fn _ws_accept_key(client_key) {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, client_key);
-    str_builder_add_cstr(sb, WS_MAGIC_GUID);
-    var combined = str_builder_build(sb);
-    var digest = _majra_sha1(str_data(combined), str_len(combined));
+    var klen = strlen(client_key);
+    var glen = strlen(WS_MAGIC_GUID);
+    var combined = fl_alloc(klen + glen);
+    if (combined == 0) { return 0; }
+    memcpy(combined, client_key, klen);
+    memcpy(combined + klen, WS_MAGIC_GUID, glen);
+    var digest = _majra_sha1(combined, klen + glen);
+    fl_free(combined);
+    if (digest == 0) { return 0; }
     var accept = majra_base64_encode(digest, 20);
     fl_free(digest);
     return accept;
@@ -443,25 +494,90 @@ fn ws_bridge_free(b) {
     return 0;
 }
 
+# --- Upgrade request parsing (RFC 6455 §4.2.1, RFC 9110 §5) ---
+
+fn _majra_ws_lower(c) {
+    if (c >= 65 && c <= 90) { return c + 32; }
+    return c;
+}
+
+fn _majra_ws_is_ows(c) {
+    if (c == 32 || c == 9) { return 1; }
+    return 0;
+}
+
+# 1 if p[0..len] equals the lower-case cstr `lit`, ignoring ASCII case.
+fn _majra_ws_ieq(p, len, lit) {
+    if (len != strlen(lit)) { return 0; }
+    var i = 0;
+    while (i < len) {
+        if (_majra_ws_lower(load8(p + i)) != load8(lit + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# 1 if the comma-separated list p[0..len] has an element equal to the
+# lower-case cstr `tok`, ignoring ASCII case and OWS around each element.
+fn _majra_ws_has_token(p, len, tok) {
+    var s = 0;
+    while (s <= len) {
+        var e = s;
+        while (e < len && load8(p + e) != 44) { e = e + 1; }
+        var a = s;
+        var b = e;
+        while (a < b && _majra_ws_is_ows(load8(p + a)) == 1) { a = a + 1; }
+        while (b > a && _majra_ws_is_ows(load8(p + b - 1)) == 1) { b = b - 1; }
+        if (_majra_ws_ieq(p + a, b - a, tok) == 1) { return 1; }
+        s = e + 1;
+    }
+    return 0;
+}
+
+# 1 if p[0..len] is a base64-encoded 16-byte nonce: 22 alphabet chars + "==".
+fn _majra_ws_key_ok(p, len) {
+    if (len != 24) { return 0; }
+    if (load8(p + 22) != 61 || load8(p + 23) != 61) { return 0; }
+    var i = 0;
+    while (i < 22) {
+        var c = load8(p + i);
+        var ok = 0;
+        if (c >= 65 && c <= 90) { ok = 1; }
+        elif (c >= 97 && c <= 122) { ok = 1; }
+        elif (c >= 48 && c <= 57) { ok = 1; }
+        elif (c == 43 || c == 47) { ok = 1; }
+        if (ok == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
 # Accept a WebSocket upgrade from a raw TCP connection.
 # Reads HTTP headers, extracts Sec-WebSocket-Key, sends 101 response.
-# Returns 1 on success, 0 on failure.
+# Returns 1 on success, 0 on failure. Nothing is written on failure; the
+# caller closes the fd.
 fn _ws_accept_upgrade(fd) {
     # Read HTTP request (up to 4KB)
     var buf = fl_alloc(4096);
     if (buf == 0) { return 0; }
     var total = 0;
-    # Read until we see \r\n\r\n
+    var hdr_done = 0;
+    # Read until we see \r\n\r\n. One byte at a time, so no frame bytes are
+    # consumed past the header block; _ws_read_full retries EINTR, which this
+    # loop's raw read used to treat as a dead connection.
     while (total < 4090) {
-        var n = syscall(SYS_READ, fd, buf + total, 1);
-        if (n <= 0) { fl_free(buf); return 0; }
+        if (_ws_read_full(fd, buf + total, 1) < 0) { fl_free(buf); return 0; }
         total = total + 1;
         # CR LF CR LF — the end of the HTTP header block.
         if (total >= 4 && load8(buf+total-4) == 13 && load8(buf+total-3) == 10
           && load8(buf+total-2) == 13 && load8(buf+total-1) == 10) {
+            hdr_done = 1;
             break;
         }
     }
+    # ⚠ A block that hit the cap was answered 101 anyway, and its unread tail
+    # was then parsed as WebSocket frames.
+    if (hdr_done == 0) { fl_free(buf); return 0; }
     store8(buf + total, 0);
 
     # §4.2.1: the handshake must be a GET. This used to send 101 Switching
@@ -470,48 +586,84 @@ fn _ws_accept_upgrade(fd) {
     # body rather than a header.
     if (total < 4 || memeq(buf, "GET ", 4) != 1) { fl_free(buf); return 0; }
 
-    # Find Sec-WebSocket-Key header
-    var key_header = "Sec-WebSocket-Key: ";
+    # ⚠ Header lines, not a substring search. Through 2.8.0 this was a
+    # case-sensitive memeq for "Sec-WebSocket-Key: " anywhere in the block: it
+    # refused conforming field-name casings (Go's Sec-Websocket-Key, the
+    # all-lowercase names HAProxy and Envoy forward), hashed trailing OWS into
+    # a wrong accept value, matched inside another header's value, and never
+    # checked Upgrade, Connection or the version.
     var key_pos = 0;
-    var i = 0;
-    while (i < total) {
-        if (memeq(buf + i, key_header, 19) == 1) {
-            key_pos = i + 19;
-            break;
+    var key_len = 0;
+    var key_count = 0;
+    var have_upgrade = 0;
+    var have_conn = 0;
+    var have_ver = 0;
+    var p = 0;
+    while (p < total && load8(buf + p) != 10) { p = p + 1; }
+    p = p + 1;
+    while (p < total) {
+        var eol = p;
+        while (eol < total && load8(buf + eol) != 10) { eol = eol + 1; }
+        var le = eol;
+        if (le > p && load8(buf + le - 1) == 13) { le = le - 1; }
+        if (le == p) { break; }
+        # RFC 9112 §5.2: obs-fold may be rejected; a header line with no
+        # colon is malformed.
+        if (_majra_ws_is_ows(load8(buf + p)) == 1) { fl_free(buf); return 0; }
+        var colon = p;
+        while (colon < le && load8(buf + colon) != 58) { colon = colon + 1; }
+        if (colon == le) { fl_free(buf); return 0; }
+        var vs = colon + 1;
+        var ve = le;
+        while (vs < ve && _majra_ws_is_ows(load8(buf + vs)) == 1) { vs = vs + 1; }
+        while (ve > vs && _majra_ws_is_ows(load8(buf + ve - 1)) == 1) { ve = ve - 1; }
+        var nlen = colon - p;
+        if (_majra_ws_ieq(buf + p, nlen, "sec-websocket-key") == 1) {
+            key_pos = vs;
+            key_len = ve - vs;
+            key_count = key_count + 1;
+        } elif (_majra_ws_ieq(buf + p, nlen, "upgrade") == 1) {
+            if (_majra_ws_has_token(buf + vs, ve - vs, "websocket") == 1) { have_upgrade = 1; }
+        } elif (_majra_ws_ieq(buf + p, nlen, "connection") == 1) {
+            if (_majra_ws_has_token(buf + vs, ve - vs, "upgrade") == 1) { have_conn = 1; }
+        } elif (_majra_ws_ieq(buf + p, nlen, "sec-websocket-version") == 1) {
+            if (_majra_ws_ieq(buf + vs, ve - vs, "13") == 1) { have_ver = 1; }
         }
-        i = i + 1;
+        p = eol + 1;
     }
-    if (key_pos == 0) { fl_free(buf); return 0; }
-
-    # Extract key value (until \r\n)
-    var key_end = key_pos;
-    while (key_end < total && load8(buf + key_end) != 13) {
-        key_end = key_end + 1;
+    if (have_upgrade == 0 || have_conn == 0 || have_ver == 0) { fl_free(buf); return 0; }
+    # §11.3.1: Sec-WebSocket-Key MUST NOT appear more than once.
+    if (key_count != 1 || _majra_ws_key_ok(buf + key_pos, key_len) == 0) {
+        fl_free(buf);
+        return 0;
     }
-    var key_len = key_end - key_pos;
-    # A base64-encoded 16-byte nonce is 24 characters; anything wildly off is
-    # not a conforming handshake.
-    if (key_len < 1 || key_len > 128) { fl_free(buf); return 0; }
     var client_key = fl_alloc(key_len + 1);
     if (client_key == 0) { fl_free(buf); return 0; }
     memcpy(client_key, buf + key_pos, key_len);
     store8(client_key + key_len, 0);
+    fl_free(buf);
 
     # Compute accept key
     var accept_key = _ws_accept_key(client_key);
-
-    # Send 101 Switching Protocols
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "HTTP/1.1 101 Switching Protocols\r\n");
-    str_builder_add_cstr(sb, "Upgrade: websocket\r\nConnection: Upgrade\r\n");
-    str_builder_add_cstr(sb, "Sec-WebSocket-Accept: ");
-    str_builder_add_cstr(sb, accept_key);
-    str_builder_add_cstr(sb, "\r\n\r\n");
-    var resp = str_builder_build(sb);
-    var rc = _ws_write_full(fd, str_data(resp), str_len(resp));
     fl_free(client_key);
+    if (accept_key == 0) { return 0; }
+
+    # Send 101 Switching Protocols — one freelist buffer, released on every path.
+    var status = "HTTP/1.1 101 Switching Protocols\r\n";
+    var fields = "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ";
+    var slen = strlen(status);
+    var flen = strlen(fields);
+    var alen = strlen(accept_key);
+    var rlen = slen + flen + alen + 4;
+    var resp = fl_alloc(rlen);
+    if (resp == 0) { fl_free(accept_key); return 0; }
+    memcpy(resp, status, slen);
+    memcpy(resp + slen, fields, flen);
+    memcpy(resp + slen + flen, accept_key, alen);
+    memcpy(resp + rlen - 4, "\r\n\r\n", 4);
     fl_free(accept_key);
-    fl_free(buf);
+    var rc = _ws_write_full(fd, resp, rlen);
+    fl_free(resp);
     if (rc < 0) { return 0; }
     return 1;
 }

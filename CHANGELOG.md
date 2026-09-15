@@ -5,6 +5,125 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.1] - 2026-09-15
+
+The P(-1) hardening sweep, run against 2.8.0. It confirmed **130 findings: 3
+critical, 17 high, 48 medium, 62 low**. 95 are fixed (17 of them in part), 27
+were test coverage gaps and got tests, and 5 need an API or wire change, so they
+are queued for 2.9.0. Full report:
+[`docs/audit/2026-09-15-audit.md`](docs/audit/2026-09-15-audit.md).
+
+**1,412 assertions** pass: core 199, expanded 623, backends 519, patra-queue 71.
+All suites also pass cross-built under `qemu-aarch64`, where the expanded suite
+reports 621 because one 47-second concurrency test runs on x86 only. The
+three fuzz harnesses, four soaks and both examples are clean on both arches.
+No public symbol was added or removed. **The wire format is unchanged**: a
+2.8.0 ↔ 2.8.1 encrypted-IPC interop probe (separate processes, both roles, both
+directions) passes all four pairings.
+
+### Security
+
+- **Encrypted IPC reused `(key, nonce)` across connections** *(critical)*. Every
+  connection under one PSK restarted its nonce at `(role, 0)`, so a reconnect
+  or a second client repeated the keystream. Each handle, and each rekey, now
+  draws a CSPRNG salt into nonce bytes 1-7. Receivers never read those bytes,
+  which is why the change is wire-compatible. `encrypted_ipc_new` returns 0 if
+  no entropy is available.
+  - ⚠ **Still open**: a frame captured on one connection can replay into a
+    later connection. The fix needs a handshake, which is a wire change, so it
+    is queued for 2.9.0.
+  - A frame carrying the receiver's own role now kills the handle.
+- **Admin endpoint: every route returned 404** *(critical)*. Routes were
+  compared with `str_eq` (Str) against the cstr from `sandhi_server_path_only`,
+  and a crafted path dereferenced request bytes. Routes are now matched with
+  `streq`.
+  - ⚠ **Behaviour change**: the handler answers **400** unless `Host` is absent,
+    an IP literal, or `localhost` (optional port). This blocks DNS rebinding
+    against a loopback bind. A reverse proxy must forward an IP-literal or
+    `localhost` Host.
+- **SIGPIPE killed the process** when a peer disconnected. The writes in
+  `ipc_send_frame`, WebSocket frames and handshakes, and the Redis/PostgreSQL
+  clients now use `MSG_NOSIGNAL`. A failed PostgreSQL connection is marked dead.
+- **`ratelimit_check` read the clock before taking its mutex**, so under
+  contention `elapsed_ns` went negative and drained buckets into a lasting
+  deficit.
+- **The limiters' eviction handed out fresh quota.** The token-bucket sweep
+  evicted buckets that had not refilled, and the sliding-window sweep evicted
+  keys that were being actively rejected.
+- **Relay dedup keyed on the caller's borrowed `from` pointer**, so a reused
+  buffer let replays through. Its eviction freed entries without checking
+  `map_delete`, a use-after-free and double free. Keys are owned now.
+- `signed_envelope_verify(se, 0)` is documented as proving only
+  self-consistency. Pass `expected_pk` whenever the result gates an action.
+
+### Fixed
+
+- **Pubsub topic/pattern keys were borrowed**, and compaction could re-point a
+  live topic at an unsubscribe caller's temporary buffer.
+- **`patra_queue_new` called `patra_init()` on every open**, swapping patra's
+  process-wide mutexes under concurrent users.
+- patra_queue ids from two handles on one file collided. Completing or failing
+  a job also completed its undelivered duplicate-id sibling; status updates now
+  require `status = 1`.
+- **Serial `workflow_execute` kept running tier-mates after a `POLICY_FAIL`
+  step failed** (fail-fast had regressed at 2.7.0).
+- `fleet_submit` could lose a job to a concurrent `fleet_deregister_node`, and
+  rebalance/deregister freed the `QueueItem` handle already handed to the
+  caller.
+- `encrypted_ipc_close` / `_rekey` wedged behind a reader parked in `read(2)`.
+- Memory:
+  - Redis commands and PostgreSQL queries no longer bump-allocate per call;
+    3,000 Redis commands now grow nothing.
+  - Ratelimit maps compact their tombstones.
+  - `chb_fleet_stats` and the list-by-status calls no longer leak a key vec per
+    call, including per `GET /fleet`.
+  - Re-registering a heartbeat node no longer abandons the old state.
+- `ManagedQueue` job ids came from one global shared by every queue but guarded
+  per queue, so duplicate keys lost jobs.
+- `counter_inc` / `counter_add` are one atomic add instead of a mutex round
+  trip. The struct layout is unchanged.
+- The remaining findings are in the audit report's table.
+
+### Changed — tests and CI
+
+- **A failing test binary could exit 0.** Every entry point ended with
+  `syscall(SYS_EXIT, r)`, which ends only the main thread. With detached threads
+  still alive, the process reported another thread's status, and CI checks exit
+  codes. All suites, fuzz harnesses, soaks, examples and the bench binary now
+  end with `sys_exit_group(r)`.
+- 108 new regression assertions from the sweep plus the patra-queue sibling
+  check. Most fail when their fix is reverted.
+- CI's syscall gate now matches any `*SYS_` var and allows exactly `src/ipc.cyr`'s
+  routed rows (41/42/43/48/49/50) plus its per-arch sendto (44/206).
+- Docs: threat-model rows for nonce salting, cross-connection replay, admin DNS
+  rebinding, anchored envelope verification and parked pubsub publishers. The
+  roadmap gains **2.9.0** (the API/wire deferrals) and **Next patch** (heartbeat
+  key ownership, relay tombstones, fuzz oracles).
+
+### Performance
+
+5-trial medians against a 2.8.0 baseline taken on the same machine the same day. No benchmark regressed by more than 1 %. The largest wins come from the atomic counter, the slot-walk `chb_fleet_stats`, and the pattern matcher and dequeue fast paths.
+
+| Benchmark | 2.8.0 | 2.8.1 | Δ |
+|---|---|---|---|
+| `envelope_new` | 2057 ns | 2062 ns | +0 % |
+| `pq_enqueue` | 608 ns | 616 ns | +1 % |
+| `pq_dequeue` | 32 ns | 13 ns | -59 % |
+| `pattern_exact` | 113 ns | 63 ns | -44 % |
+| `pattern_wildcard_+` | 109 ns | 67 ns | -39 % |
+| `pattern_wildcard_#` | 68 ns | 28 ns | -59 % |
+| `pattern_no_match` | 53 ns | 5 ns | -91 % |
+| `pubsub_publish_nosub` | 197 ns | 99 ns | -50 % |
+| `pubsub_1sub_publish` | 1108 ns | 1034 ns | -7 % |
+| `direct_channel_send` | 409 ns | 410 ns | +0 % |
+| `heartbeat_100nodes` | 1422 ns | 1440 ns | +1 % |
+| `fleet_stats_100` | 10942 ns | 2229 ns | -80 % |
+| `ratelimit_check` | 1699 ns | 1563 ns | -8 % |
+| `relay_send` | 1533 ns | 1426 ns | -7 % |
+| `barrier_cycle` | 2240 ns | 1703 ns | -24 % |
+| `circuit_state` | 3 ns | 3 ns | timer floor |
+| `counter_inc` | 48 ns | 4 ns | -92 % |
+
 ## [2.8.0] - 2026-09-15
 
 Namespace minor: majra's error codes gain a `MAJRA_` prefix, and the two

@@ -1,10 +1,10 @@
-# majra/counter — mutex-protected counter and map eviction helper
+# majra/counter — lock-free atomic counter and map eviction helper
 #
 # Replaces Rust's AtomicU64 Counter and evict_from_dashmap utility.
 
 # Counter struct layout (16 bytes):
 #   offset 0: value (i64)
-#   offset 8: mutex ptr (i64)
+#   offset 8: mutex ptr (i64) — unused since 2.8.1, kept for layout/ABI
 
 fn counter_new() {
     var c = fl_alloc(16);
@@ -13,18 +13,19 @@ fn counter_new() {
     return c;
 }
 
+# ⚠ Since 2.8.1 inc/add are a single `atomic_fetch_add` (x86 `lock xadd`,
+# aarch64 ldaxr/stlxr) instead of a futex mutex around a load/store: same
+# guarantee (no lost increments; counter_get, which never took the lock, still
+# reads a whole word) at ~4 ns instead of ~47 ns. Nothing else in src/ touches
+# the mutex at offset 8. `lib/atomic.cyr` arrives via `lib/freelist.cyr`.
 fn counter_inc(c) {
-    var m = load64(c + 8);
-    mutex_lock(m);
-    store64(c, load64(c) + 1);
-    mutex_unlock(m);
+    atomic_fetch_add(c, 1);
+    return 0;
 }
 
 fn counter_add(c, n) {
-    var m = load64(c + 8);
-    mutex_lock(m);
-    store64(c, load64(c) + n);
-    mutex_unlock(m);
+    atomic_fetch_add(c, n);
+    return 0;
 }
 
 fn counter_get(c) {

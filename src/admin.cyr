@@ -93,8 +93,8 @@ fn _admin_fleet_json(a) {
         var empty = "{\"error\":\"no fleet tracker\"}";
         ret2(empty, strlen(empty));
     }
-    # Only a concurrent tracker has the mutex chb_fleet_stats reads at +16.
-    # A basic hb_tracker is 16 bytes, so calling it would read past the
+    # Only a concurrent tracker (32 bytes) has the mutex chb_fleet_stats reads
+    # at +24. A basic hb_tracker is 24 bytes, so calling it would read past the
     # allocation and lock whatever it found.
     if (load64(a + 16) != ADMIN_TRACKER_CONCURRENT) {
         var basic = "{\"error\":\"fleet stats require a concurrent tracker\"}";
@@ -117,6 +117,8 @@ fn _admin_fleet_json(a) {
     str_builder_add_cstr(sb, ",\"vram_available\":");
     str_builder_add_int(sb, load64(s + 48));
     str_builder_add_cstr(sb, "}");
+    # chb_fleet_stats hands back an fl_alloc'd block; every /fleet leaked it.
+    fl_free(s);
     var body = str_builder_build(sb);
     ret2(str_data(body), str_len(body));
 }
@@ -169,6 +171,71 @@ fn _admin_ratelimit_json(a, key) {
     ret2(str_data(body), str_len(body));
 }
 
+# Host-header gate against DNS rebinding. A loopback bind does not stop a
+# browser page whose domain re-resolves to 127.0.0.1 from reading /fleet and
+# /ratelimit; rebinding needs a DNS NAME in Host, so only IP literals and
+# "localhost" (optional :port) are accepted. An absent Host is allowed (no
+# browser omits it). Behind a proxy, have it rewrite Host (nginx's default
+# $proxy_host does).
+fn _admin_host_ok(h) {
+    if (h == 0) { return 1; }
+    var n = strlen(h);
+    var i = 0;
+    var c = 0;
+    if (n > 0 && load8(h) == 91) {
+        # [IPv6 literal]
+        i = 1;
+        while (i < n && load8(h + i) != 93) {
+            c = load8(h + i);
+            if (_admin_is_hex(c) == 0 && c != 58 && c != 46) { return 0; }
+            i = i + 1;
+        }
+        if (i >= n || i == 1) { return 0; }
+        i = i + 1;
+    } elif (_admin_is_localhost(h, n) == 1) {
+        i = 9;
+    } else {
+        # Digits and dots only: a browser parses such a host as IPv4 (or
+        # refuses the URL), so it can never be a rebindable name.
+        while (i < n && load8(h + i) != 58) {
+            c = load8(h + i);
+            if (c != 46 && (c < 48 || c > 57)) { return 0; }
+            i = i + 1;
+        }
+        if (i == 0) { return 0; }
+    }
+    if (i == n) { return 1; }
+    if (load8(h + i) != 58) { return 0; }
+    i = i + 1;
+    while (i < n) {
+        c = load8(h + i);
+        if (c < 48 || c > 57) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _admin_is_hex(c) {
+    if (c >= 48 && c <= 57) { return 1; }
+    if (c >= 97 && c <= 102) { return 1; }
+    if (c >= 65 && c <= 70) { return 1; }
+    return 0;
+}
+
+# Case-insensitive "localhost", followed by end-of-host or ':'.
+fn _admin_is_localhost(h, n) {
+    if (n < 9) { return 0; }
+    var want = "localhost";
+    var k = 0;
+    while (k < 9) {
+        if ((load8(h + k) | 32) != load8(want + k)) { return 0; }
+        k = k + 1;
+    }
+    if (n == 9) { return 1; }
+    if (load8(h + 9) == 58) { return 1; }
+    return 0;
+}
+
 # HTTP handler matching the sandhi_server_run handler signature:
 #   fn handler(ctx, cfd, buf, blen)
 # where ctx is the MajraAdmin pointer.
@@ -178,19 +245,31 @@ fn majra_admin_handler(ctx, cfd, buf, blen) {
         sandhi_server_send_status(cfd, HTTP_BAD_REQUEST, "bad request");
         return 0;
     }
+    if (_admin_host_ok(sandhi_server_find_header(buf, blen, "Host")) == 0) {
+        sandhi_server_send_status(cfd, HTTP_BAD_REQUEST, "bad host");
+        return 0;
+    }
     var route = sandhi_server_path_only(path);
+    if (route == 0) {
+        sandhi_server_send_status(cfd, HTTP_BAD_REQUEST, "bad request");
+        return 0;
+    }
 
-    if (str_eq(route, str_from("/health")) == 1) {
+    # ⚠ streq, not str_eq. sandhi_server_path_only returns a cstr; str_eq read
+    # its bytes as a Str header — length from +8, data pointer from +0 — so no
+    # route ever matched (every request 404'd), and a path whose bytes 8..15
+    # spelled a route length made it dereference the path text as an address.
+    if (streq(route, "/health") == 1) {
         sandhi_server_send_response(cfd, HTTP_OK, "OK", "text/plain", "ok", 2, 0);
         return 0;
     }
-    if (str_eq(route, str_from("/fleet")) == 1) {
+    if (streq(route, "/fleet") == 1) {
         var body = _admin_fleet_json(ctx);
         var body_len = rethi();
         sandhi_server_send_response(cfd, HTTP_OK, "OK", "application/json", body, body_len, 0);
         return 0;
     }
-    if (str_eq(route, str_from("/ratelimit")) == 1) {
+    if (streq(route, "/ratelimit") == 1) {
         var key = sandhi_server_get_param(path, "key");
         var body = _admin_ratelimit_json(ctx, key);
         var body_len = rethi();

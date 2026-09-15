@@ -14,10 +14,17 @@ var AES_BLOCK_SIZE = 16;
 var AES_256_KEY_SIZE = 32;
 var AES_GCM_TAG_SIZE = 16;
 var AES_GCM_NONCE_SIZE = 12;
-# Warn at 2^31 frames, hard-fail at 2^32 — well below GCM's 2^32-2
-# block-reuse ceiling per RFC 5116 §5.1.
+# Per-key FRAME limits: warn at 2^31, hard-fail at 2^32. The counter occupies
+# nonce bytes 8-11, so 2^32 is also where it would stop fitting.
 var NONCE_WARN_THRESHOLD = 2147483648;
 var NONCE_HARD_LIMIT = 4294967296;
+# Per-key VOLUME limits, counted in encrypted bytes (payload + one tag block per
+# frame). A frame count alone let 1 MiB frames reach ~2^48 AES blocks under one
+# key — far past the AEAD usage limits (SP 800-38D; draft-irtf-cfrg-aead-limits:
+# confidentiality advantage ~ blocks^2 / 2^129). Warn at 2^34 blocks (2^38
+# bytes), hard-fail at 2^36 blocks (2^40 bytes). Whichever limit trips first wins.
+var _EIPC_VOLUME_WARN_BYTES = 274877906944;
+var _EIPC_VOLUME_HARD_BYTES = 1099511627776;
 
 # --- Base64 helpers ---
 # Kept here (not moved to lib/base64.cyr) because ws.cyr's WebSocket
@@ -42,13 +49,15 @@ fn _b64_encode_byte(idx) {
 # alphabet. This used to fold every invalid byte to 0 — the value of 'A' — so
 # corrupt or hostile input decoded silently to plausible-looking plaintext
 # instead of being rejected.
+#
+# '=' is -1 here too: padding is positional, so majra_base64_decode handles it
+# explicitly. Mapping it to 0 let '=' through in ANY position.
 fn _b64_decode_byte(ch) {
     if (ch >= 65 && ch <= 90) { return ch - 65; }
     if (ch >= 97 && ch <= 122) { return ch - 97 + 26; }
     if (ch >= 48 && ch <= 57) { return ch - 48 + 52; }
     if (ch == 43) { return 62; }
     if (ch == 47) { return 63; }
-    if (ch == 61) { return 0; }
     return -1;
 }
 
@@ -93,27 +102,34 @@ fn majra_base64_decode(data, len) {
     var out_len = len / 4 * 3;
     var out = fl_alloc(out_len + 1);
     if (out == 0) { return 0; }
+    # ⚠ '=' is legal ONLY in the final quantum, as "xx==" or "xxx=". This used
+    # to accept it anywhere and simply skip writing the padded output bytes, so
+    # "AA==AAAA" returned 6 bytes of which 2 were never written — stale heap
+    # (fl_alloc does not zero a recycled block) handed back as decoded data.
+    memset(out, 0, out_len + 1);
     var si = 0;
     var di = 0;
     while (si < len) {
+        var pad = 0;
+        if (load8(data + si + 3) == 61) {
+            if (si + 4 != len) { fl_free(out); return 0; }
+            pad = 1;
+            if (load8(data + si + 2) == 61) { pad = 2; }
+        }
         var a = _b64_decode_byte(load8(data + si));
         var b = _b64_decode_byte(load8(data + si + 1));
-        var c = _b64_decode_byte(load8(data + si + 2));
-        var d = _b64_decode_byte(load8(data + si + 3));
+        var c = 0;
+        var d = 0;
+        if (pad < 2) { c = _b64_decode_byte(load8(data + si + 2)); }
+        if (pad < 1) { d = _b64_decode_byte(load8(data + si + 3)); }
         if (a < 0 || b < 0 || c < 0 || d < 0) { fl_free(out); return 0; }
         var triple = (a << 18) | (b << 12) | (c << 6) | d;
         store8(out + di, (triple >> 16) & 0xFF);
-        if (load8(data + si + 2) != 61) {
-            store8(out + di + 1, (triple >> 8) & 0xFF);
-        }
-        if (load8(data + si + 3) != 61) {
-            store8(out + di + 2, triple & 0xFF);
-        }
+        if (pad < 2) { store8(out + di + 1, (triple >> 8) & 0xFF); }
+        if (pad < 1) { store8(out + di + 2, triple & 0xFF); }
         si = si + 4;
-        di = di + 3;
+        di = di + 3 - pad;
     }
-    if (len > 0 && load8(data + len - 1) == 61) { di = di - 1; }
-    if (len > 1 && load8(data + len - 2) == 61) { di = di - 1; }
     store8(out + di, 0);
     var result = fl_alloc(16);
     store64(result, out);
@@ -127,25 +143,34 @@ fn majra_base64_decode(data, len) {
 var ENCRYPTED_IPC_INITIATOR = 0;
 var ENCRYPTED_IPC_RESPONDER = 1;
 
-# EncryptedIpc struct (64 bytes):
+# EncryptedIpc struct (72 bytes):
 #   offset  0: ipc_fd (i64) — underlying IPC file descriptor
-#   offset  8: key (i64) — ptr to 32-byte key
+#   offset  8: key (i64) — ptr to the key block; its first 32 bytes are the key
 #   offset 16: send_counter (i64) — nonce counter
-#   offset 24: mutex (i64)
+#   offset 24: mutex (i64) — the send mutex
 #   offset 32: needs_rekey (i64) — 0 or 1
 #   offset 40: role (i64) — ENCRYPTED_IPC_INITIATOR | ENCRYPTED_IPC_RESPONDER
 #   offset 48: peer_counter (i64) — highest peer counter accepted, -1 initially
-#   offset 56: closed (i64) — 1 once encrypted_ipc_close has run
+#   offset 56: closed (i64) — 1 once encrypted_ipc_close or a fatal recv ran
 #   offset 64: recv_mutex (i64) — guards the receive half INDEPENDENTLY
 #
-# ⚠ TWO mutexes, deliberately. 2.6.9 put send and recv under ONE, then held it
-# across ipc_recv_frame — a BLOCKING read(2). A receiver parked waiting for a
-# peer that sends nothing therefore blocked every send on the same handle
-# indefinitely, which for a request/response protocol is a self-deadlock: the
-# reply can never arrive because the request can never be written. Splitting
-# them keeps each half internally serialised (nonce counter and write ordering
-# on one side, replay window and read ordering on the other) without coupling
-# the two directions.
+# Key block (_EIPC_KBLK_SIZE bytes, private — not part of the layout above):
+#   +0  : 32-byte AES-256 key
+#   +32 : nonce salt for this key epoch (see _write_nonce_salted)
+#   +40 : bytes encrypted under this key (volume limit)
+#   +48 : key lock (mutex) — guards the key bytes and peer_counter
+#   +56 : scratch for a salt being drawn
+#
+# ⚠ THREE locks, deliberately. The send mutex serialises the nonce counter and
+# write ordering; the recv mutex serialises read ordering and is held across
+# ipc_recv_frame — a BLOCKING read(2). 2.6.9 put both halves under one mutex, so
+# a receiver parked on a silent peer blocked every send: for request/response a
+# self-deadlock. 2.6.10 split them but still had rekey and close take the recv
+# mutex, which recreated the same wedge through those two calls. So: rekey takes
+# send + key lock and NEVER the recv mutex; recv takes the key lock only around
+# the replay check and decrypt, never across I/O; close shuts the socket down
+# (waking the parked reader) before it takes the recv mutex. Lock order is
+# send -> key, recv -> key, send -> recv; nothing takes them the other way.
 #
 # ⚠ THE ROLE ARGUMENT IS LOAD-BEARING AES-GCM SAFETY, NOT BOOKKEEPING.
 #
@@ -159,17 +184,51 @@ var ENCRYPTED_IPC_RESPONDER = 1;
 # counter collided, not just the first.
 #
 # The role now occupies nonce byte 0, so the two directions occupy disjoint
-# nonce spaces under the same key.
+# nonce spaces under the same key. A random per-handle salt (bytes 1-7) keeps
+# separate CONNECTIONS under one PSK apart too — see _write_nonce_salted.
+#
+# ⚠ REPLAY PROTECTION IS PER HANDLE AND PER KEY EPOCH. A fresh handle starts its
+# window at -1, so frames recorded from one connection are accepted by a new
+# connection under the same key. Closing that needs a per-session key agreed in
+# a handshake, which is a wire-format change. Until then, give each connection
+# its own key wherever cross-connection replay matters.
+var _EIPC_KBLK_SIZE = 64;
+# Salt bits: nonce bytes 1-7, with byte 4's top bit clear so the receiver's
+# 64-bit view of bytes 4-11 stays positive.
+var _EIPC_SALT_MASK = 0x00FFFFFF7FFFFFFF;
+
+# Draw a fresh salt from the kernel CSPRNG into the key block's scratch slot.
+# Returns 0, or -1 when entropy is unavailable — callers FAIL CLOSED, because a
+# predictable salt is exactly the (key, nonce) reuse it exists to prevent.
+fn _eipc_draw_salt(blk) {
+    store64(blk + 56, 0);
+    var got = 0;
+    var attempts = 0;
+    while (got < 8 && attempts < 8) {
+        var n = sys_getrandom(blk + 56 + got, 8 - got, 0);
+        if (n > 0) { got = got + n; }
+        attempts = attempts + 1;
+    }
+    if (got < 8) { store64(blk + 56, 0); return -1; }
+    store64(blk + 56, load64(blk + 56) & _EIPC_SALT_MASK);
+    return 0;
+}
+
 fn encrypted_ipc_new(ipc_fd, key_ptr, role) {
     if (role != ENCRYPTED_IPC_INITIATOR && role != ENCRYPTED_IPC_RESPONDER) { return 0; }
     aes_gcm_global_init();
     var e = fl_alloc(72);
     if (e == 0) { return 0; }
+    var blk = fl_alloc(_EIPC_KBLK_SIZE);
+    if (blk == 0) { fl_free(e); return 0; }
+    memset(blk, 0, _EIPC_KBLK_SIZE);
+    if (_eipc_draw_salt(blk) != 0) { fl_free(blk); fl_free(e); return 0; }
+    memcpy(blk, key_ptr, 32);
+    store64(blk + 32, load64(blk + 56));
+    store64(blk + 56, 0);
+    store64(blk + 48, mutex_new());
     store64(e, ipc_fd);
-    var kcopy = fl_alloc(32);
-    if (kcopy == 0) { fl_free(e); return 0; }
-    memcpy(kcopy, key_ptr, 32);
-    store64(e + 8, kcopy);
+    store64(e + 8, blk);
     store64(e + 16, 0);
     store64(e + 24, mutex_new());
     store64(e + 32, 0);
@@ -182,7 +241,7 @@ fn encrypted_ipc_new(ipc_fd, key_ptr, role) {
 
 fn encrypted_ipc_role(e) { return load64(e + 40); }
 
-# Write a 12-byte nonce for (role, counter) into `out`.
+# Write a 12-byte nonce for (role, counter) into `out` — the unsalted layout.
 #   byte  0   : role — separates the two directions' nonce spaces
 #   bytes 1-3 : zero
 #   bytes 4-11: big-endian counter
@@ -197,6 +256,30 @@ fn _write_nonce(out, role, counter) {
     store8(out + 9, (counter >> 16) & 0xFF);
     store8(out + 10, (counter >> 8) & 0xFF);
     store8(out + 11, counter & 0xFF);
+    return 0;
+}
+
+# The nonce encrypted_ipc_send actually emits:
+#   byte  0    : role
+#   bytes 1-7  : salt (_EIPC_SALT_MASK bits) — random per handle and per rekey
+#   bytes 8-11 : big-endian counter (< 2^32 by NONCE_HARD_LIMIT)
+#
+# ⚠ Unsalted, every connection under one PSK restarted at (role, 0), so a
+# reconnect or a second client reused (key, nonce) — identical keystream and a
+# GHASH-subkey leak that forges tags for every later session under that key.
+# Redrawing on rekey also stops a rekey BACK to an earlier key (A -> B -> A)
+# recreating a nonce already used under it. Wire-compatible: receivers check
+# byte 0 and read bytes 4-11 as the counter, which the constant salt keeps
+# strictly increasing within a key epoch.
+fn _write_nonce_salted(out, role, salt, counter) {
+    _write_nonce(out, role, counter & 0xFFFFFFFF);
+    store8(out + 1, (salt >> 48) & 0xFF);
+    store8(out + 2, (salt >> 40) & 0xFF);
+    store8(out + 3, (salt >> 32) & 0xFF);
+    store8(out + 4, (salt >> 24) & 0xFF);
+    store8(out + 5, (salt >> 16) & 0xFF);
+    store8(out + 6, (salt >> 8) & 0xFF);
+    store8(out + 7, salt & 0xFF);
     return 0;
 }
 
@@ -224,46 +307,43 @@ fn encrypted_ipc_needs_rekey(e) {
     return load64(e + 32);
 }
 
-# Rekey: install new 32-byte key and reset counter.
-# Install a new 32-byte key and restart the nonce sequence.
+# Install a new 32-byte key and restart the nonce sequence under a fresh salt.
 #
 # Returns Ok(0), or Err(MAJRA_ERR_IPC) if the new key is byte-identical to the
-# installed one. That check is load-bearing: resetting send_counter to 0 is
-# only safe because the key changed. Re-installing the same key restarts the
-# nonce sequence under it, which is exactly the (key, nonce) reuse AES-GCM
-# cannot survive — and "rekey with the key I already have" is an easy caller
-# mistake to make on a reconnect path.
+# installed one, the handle is closed, or no entropy is available for the salt.
+# The identical-key check is load-bearing: re-installing the same key restarts
+# the counter under it, and "rekey with the key I already have" is an easy
+# caller mistake on a reconnect path. The salt redraw covers the earlier-key case.
 fn encrypted_ipc_rekey(e, new_key_ptr) {
     if (e == 0 || new_key_ptr == 0) { return Err(MAJRA_ERR_IPC); }
-    # Touches both halves (key, send counter, replay window), so it takes both
-    # locks. Order is always send -> recv; nothing takes them the other way.
+    # Send mutex + key lock — NEVER the recv mutex (see the struct note).
     var mtx = load64(e + 24);
-    var rmtx = load64(e + 64);
     mutex_lock(mtx);
-    mutex_lock(rmtx);
-    if (load64(e + 56) == 1) {
-        mutex_unlock(rmtx);
+    var blk = load64(e + 8);
+    if (load64(e + 56) == 1 || blk == 0) {
         mutex_unlock(mtx);
         return Err(MAJRA_ERR_IPC);
     }
-    var cur = load64(e + 8);
-    if (cur == 0) {
-        mutex_unlock(rmtx);
+    if (ct_eq_bytes_lens(blk, AES_256_KEY_SIZE, new_key_ptr, AES_256_KEY_SIZE) == 1) {
         mutex_unlock(mtx);
         return Err(MAJRA_ERR_IPC);
     }
-    if (ct_eq_bytes_lens(cur, AES_256_KEY_SIZE, new_key_ptr, AES_256_KEY_SIZE) == 1) {
-        mutex_unlock(rmtx);
+    if (_eipc_draw_salt(blk) != 0) {
         mutex_unlock(mtx);
         return Err(MAJRA_ERR_IPC);
     }
-    memcpy(cur, new_key_ptr, 32);
+    var kmtx = load64(blk + 48);
+    mutex_lock(kmtx);
+    memcpy(blk, new_key_ptr, 32);
+    store64(blk + 32, load64(blk + 56));
+    store64(blk + 56, 0);
+    store64(blk + 40, 0);
     store64(e + 16, 0);
     store64(e + 32, 0);
     # The peer restarts its counter too, so the replay window must reopen or
     # every post-rekey frame would look like a replay.
     store64(e + 48, -1);
-    mutex_unlock(rmtx);
+    mutex_unlock(kmtx);
     mutex_unlock(mtx);
     return Ok(0);
 }
@@ -277,15 +357,18 @@ fn encrypted_ipc_send(e, data, len) {
     if (e == 0 || len < 0) { return Err(MAJRA_ERR_IPC); }
     var mtx = load64(e + 24);
     mutex_lock(mtx);
-    if (load64(e + 56) == 1) { mutex_unlock(mtx); return Err(MAJRA_ERR_IPC); }
+    var blk = load64(e + 8);
+    if (load64(e + 56) == 1 || blk == 0) { mutex_unlock(mtx); return Err(MAJRA_ERR_IPC); }
 
+    var used = load64(blk + 40) + len + AES_BLOCK_SIZE;
+    if (used > _EIPC_VOLUME_HARD_BYTES) { mutex_unlock(mtx); return Err(MAJRA_ERR_IPC); }
     var counter = _next_counter(e);
     if (counter < 0) {
         mutex_unlock(mtx);
         return Err(MAJRA_ERR_IPC);
     }
     var nonce[12];
-    _write_nonce(&nonce, load64(e + 40), counter);
+    _write_nonce_salted(&nonce, load64(e + 40), load64(blk + 32), counter);
 
     var frame_len = AES_GCM_NONCE_SIZE + len + AES_GCM_TAG_SIZE;
     var frame = fl_alloc(frame_len);
@@ -293,7 +376,7 @@ fn encrypted_ipc_send(e, data, len) {
     memcpy(frame, &nonce, AES_GCM_NONCE_SIZE);
     var ct_out = frame + AES_GCM_NONCE_SIZE;
     var tag_out = frame + AES_GCM_NONCE_SIZE + len;
-    var erc = aes_gcm_encrypt(load64(e + 8), &nonce, 0, 0, data, len, ct_out, tag_out);
+    var erc = aes_gcm_encrypt(blk, &nonce, 0, 0, data, len, ct_out, tag_out);
     if (erc != 0) {
         # Discarding this used to mean a sigil-side validation failure left
         # ct_out/tag_out untouched and majra transmitted the frame anyway.
@@ -302,6 +385,9 @@ fn encrypted_ipc_send(e, data, len) {
         mutex_unlock(mtx);
         return Err(MAJRA_ERR_IPC);
     }
+    # The keystream is spent once encryption ran, whether or not the write lands.
+    store64(blk + 40, used);
+    if (used >= _EIPC_VOLUME_WARN_BYTES) { store64(e + 32, 1); }
 
     # The write stays UNDER the mutex. Releasing it first let two threads
     # sharing one connection interleave ipc_send_frame's 4-byte header and its
@@ -314,14 +400,21 @@ fn encrypted_ipc_send(e, data, len) {
     return Ok(rc_v);
 }
 
-# Tear down a connection whose framing can no longer be trusted. Caller must
-# hold the mutex.
+# Tear down a connection whose framing or peer can no longer be trusted.
+# Caller must hold the recv mutex.
+#
+# ⚠ shutdown(2), NOT close(2). This runs without the send mutex, so a concurrent
+# encrypted_ipc_send may already hold the fd number and be blocked mid-write —
+# timing a hostile peer controls. close() freed the number for the next
+# open/accept anywhere in the process, and the stalled write then delivered the
+# frame body into that unrelated descriptor. shutdown fails the in-flight and
+# every later write (EPIPE; no SIGPIPE, see _ipc_write_full) while the number
+# stays allocated. encrypted_ipc_close, holding both mutexes, does the close(2)
+# and wipes the key.
 fn _encrypted_ipc_kill(e) {
     if (load64(e + 56) == 1) { return 0; }
     store64(e + 56, 1);
-    var fd = load64(e);
-    if (fd >= 0) { ipc_close(fd); }
-    store64(e, -1);
+    _ipc_shutdown(load64(e));
     return 0;
 }
 
@@ -335,9 +428,8 @@ fn encrypted_ipc_recv(e) {
     var frame_t, frame_v = ipc_recv_frame(load64(e));
     if (is_err_result(frame_t) == 1) {
         # MAJRA_ERR_IPC_FRAME_TOO_LARGE is terminal: the oversized body is still
-        # queued, so the framing can never resynchronise. We own the fd, so we
-        # are the ones who close it — and we poison the handle so a later send
-        # cannot write into a descriptor the kernel has since reassigned.
+        # queued, so the framing can never resynchronise. Poison the handle and
+        # shut the socket down; the caller's encrypted_ipc_close releases it.
         if (err_code_of(frame_t, frame_v) == MAJRA_ERR_IPC_FRAME_TOO_LARGE) {
             _encrypted_ipc_kill(e);
         }
@@ -355,16 +447,37 @@ fn encrypted_ipc_recv(e) {
     }
     var nonce = raw;
 
+    # Holding the recv mutex keeps encrypted_ipc_close from freeing the key
+    # block; the key lock keeps a concurrent rekey out of the key and window.
+    var blk = load64(e + 8);
+    var kmtx = load64(blk + 48);
+    mutex_lock(kmtx);
+    # close sets `closed` and shuts the socket down BEFORE it can take the recv
+    # mutex, so a frame that arrived in that window must not be delivered.
+    if (load64(e + 56) == 1) {
+        fl_free(raw);
+        fl_free(frame_ptr);
+        mutex_unlock(kmtx);
+        mutex_unlock(mtx);
+        return Err(MAJRA_ERR_IPC);
+    }
+
     # --- Direction + replay checks, BEFORE spending a decryption ---
     #
     # AEAD gives integrity, not freshness: a captured frame replays and
     # decrypts cleanly forever. The peer's counter must strictly increase, and
     # its nonce must carry the peer's role — otherwise an attacker could
     # reflect our own frames back at us and they would authenticate.
-    var peer_role = 1 - load64(e + 40);
-    if (load8(nonce) != peer_role) {
+    var own_role = load64(e + 40);
+    if (load8(nonce) != 1 - own_role) {
+        # ⚠ Our OWN role on an inbound frame means both endpoints were built with
+        # the same role — every counter then collides across the two directions
+        # under one key — or a reflection. Dropping just the frame kept both
+        # sides sending colliding nonces, so tear the connection down.
+        if (load8(nonce) == own_role) { _encrypted_ipc_kill(e); }
         fl_free(raw);
         fl_free(frame_ptr);
+        mutex_unlock(kmtx);
         mutex_unlock(mtx);
         return Err(MAJRA_ERR_IPC);
     }
@@ -375,6 +488,7 @@ fn encrypted_ipc_recv(e) {
     if (seen <= load64(e + 48)) {
         fl_free(raw);
         fl_free(frame_ptr);
+        mutex_unlock(kmtx);
         mutex_unlock(mtx);
         return Err(MAJRA_ERR_IPC);
     }
@@ -383,8 +497,14 @@ fn encrypted_ipc_recv(e) {
     var ct_len = raw_len - AES_GCM_NONCE_SIZE - AES_GCM_TAG_SIZE;
     var tag = raw + AES_GCM_NONCE_SIZE + ct_len;
     var pt = fl_alloc(ct_len + 1);
-    if (pt == 0) { fl_free(raw); fl_free(frame_ptr); mutex_unlock(mtx); return Err(MAJRA_ERR_IPC); }
-    var rc = aes_gcm_decrypt(load64(e + 8), nonce, 0, 0, ct, ct_len, tag, pt);
+    if (pt == 0) {
+        fl_free(raw);
+        fl_free(frame_ptr);
+        mutex_unlock(kmtx);
+        mutex_unlock(mtx);
+        return Err(MAJRA_ERR_IPC);
+    }
+    var rc = aes_gcm_decrypt(blk, nonce, 0, 0, ct, ct_len, tag, pt);
     if (rc != 0) {
         # Tag mismatch — AEAD contract says do NOT leak plaintext.
         # aes_gcm_decrypt already zeroes pt on failure, but belt-and-braces:
@@ -392,12 +512,14 @@ fn encrypted_ipc_recv(e) {
         fl_free(pt);
         fl_free(raw);
         fl_free(frame_ptr);
+        mutex_unlock(kmtx);
         mutex_unlock(mtx);
         return Err(MAJRA_ERR_IPC);
     }
     # Only advance the replay window once the tag has authenticated the frame,
     # so a forged nonce cannot burn counters and lock out the real peer.
     store64(e + 48, seen);
+    mutex_unlock(kmtx);
     store8(pt + ct_len, 0);
 
     fl_free(raw);
@@ -427,20 +549,25 @@ fn encrypted_ipc_close(e) {
     var mtx = load64(e + 24);
     var rmtx = load64(e + 64);
     mutex_lock(mtx);
-    mutex_lock(rmtx);
-    if (load64(e + 56) == 1) { mutex_unlock(rmtx); mutex_unlock(mtx); return 0; }
     store64(e + 56, 1);
-    # Zeroize the key buffer, then actually release it. Previously the key was
-    # wiped but never freed and the handle stayed usable, so a post-close send
-    # encrypted under an all-zero key and shipped it.
-    var k = load64(e + 8);
-    if (k != 0) {
-        memset(k, 0, AES_256_KEY_SIZE);
-        fl_free(k);
+    # ⚠ Shut down BEFORE taking the recv mutex. encrypted_ipc_recv holds that
+    # mutex across a blocking read(2); locking it first meant closing a handle
+    # whose reader waited on a silent peer — the usual way to unblock that
+    # reader — blocked forever while holding the send mutex. shutdown makes the
+    # parked read return, and the reader releases the lock.
+    _ipc_shutdown(load64(e));
+    mutex_lock(rmtx);
+    # ⚠ No early return on `closed`: _encrypted_ipc_kill sets it but leaves the
+    # key and the fd, and returning here left the PSK copy in cleartext on the
+    # heap for the life of the process. The two checks below make close
+    # idempotent. Zeroize the key block, then actually release it — a post-close
+    # send used to encrypt under an all-zero key and ship it.
+    var blk = load64(e + 8);
+    if (blk != 0) {
+        memset(blk, 0, _EIPC_KBLK_SIZE);
+        fl_free(blk);
         store64(e + 8, 0);
     }
-    # A poisoned fd (-1) means _encrypted_ipc_kill already closed it. Closing
-    # again would hand SYS_CLOSE a number the kernel may have reassigned.
     var fd = load64(e);
     if (fd >= 0) { ipc_close(fd); }
     store64(e, -1);

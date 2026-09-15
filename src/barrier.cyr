@@ -26,11 +26,38 @@ fn _barrier_result(kind, arrived, expected) {
 # --- Helper: vec-based string set ---
 # Since we don't have HashSet, use a vec of strings with dedup.
 
+# String equality with two cheap pre-checks. Participant names are usually the
+# very pointer the barrier was created with, or differ in their first byte, and
+# either decides the comparison without streq's two strlens. Same answer as
+# streq for every non-null pair; a null entry matches only a null probe.
+fn _set_eq(e, s) {
+    if (e == s) { return 1; }
+    if (e == 0) { return 0; }
+    if (s == 0) { return 0; }
+    if (load8(e) != load8(s)) { return 0; }
+    return streq(e, s);
+}
+
+# The hot path (every arrival runs O(|expected| x |arrived|) of these), so
+# _set_eq's checks are inlined here rather than paying a call per element.
 fn _set_contains(v, s) {
-    var i = 0;
     var len = vec_len(v);
+    if (len == 0) { return 0; }
+    var c0 = 0;
+    if (s != 0) { c0 = load8(s); }
+    var data = load64(v);
+    var e = 0;
+    var i = 0;
     while (i < len) {
-        if (streq(vec_get(v, i), s) == 1) { return 1; }
+        e = load64(data + i * 8);
+        if (e == s) { return 1; }
+        if (e != 0) {
+            if (s != 0) {
+                if (load8(e) == c0) {
+                    if (streq(e, s) == 1) { return 1; }
+                }
+            }
+        }
         i = i + 1;
     }
     return 0;
@@ -46,7 +73,7 @@ fn _set_remove(v, s) {
     var i = 0;
     var len = vec_len(v);
     while (i < len) {
-        if (streq(vec_get(v, i), s) == 1) {
+        if (_set_eq(vec_get(v, i), s) == 1) {
             vec_remove(v, i);
             return 1;
         }
@@ -73,7 +100,11 @@ fn _set_is_superset(arrived, expected) {
 #   offset  8: arrived (i64) — vec of participant name strings
 #   offset 16: was_forced (i64)
 
-# Takes a COPY of the participants vec.
+# Takes a COPY of the participants vec, deduplicated.
+#
+# ⚠ The copy is built with _set_add, not vec_push: `expected` is a set on every
+# other path. With ['a','a','b'], force('a') removed only the first 'a', so the
+# barrier never released and `expected` reported a count no arrival could reach.
 #
 # barrier_force mutates the expected set in place via _set_remove, so storing
 # the caller's vec by reference let two barriers built from one shared list
@@ -87,7 +118,7 @@ fn _barrier_state_new(participants_vec) {
     var pn = 0;
     if (participants_vec != 0) { pn = vec_len(participants_vec); }
     while (pi < pn) {
-        vec_push(owned, vec_get(participants_vec, pi));
+        _set_add(owned, vec_get(participants_vec, pi));
         pi = pi + 1;
     }
     store64(bs, owned);
@@ -162,10 +193,10 @@ fn barrier_set_is_empty(bs) {
 #   offset  0: expected vec
 #   offset  8: arrived vec
 #   offset 16: was_forced
-#   offset 24: released_flag (i64) — 0 or 1
+#   offset 24: released_flag (i64) — 0 waiting, 1 released, 2 cancelled
 #   offset 32: futex_addr (i64) — address for futex wait/wake
 
-# Takes a COPY of the participants vec.
+# Takes a COPY of the participants vec, deduplicated (see _barrier_state_new).
 #
 # The caller's vec used to be stored by reference, and cbarrier_force mutates
 # it in place via _set_remove — so two barriers created from one shared
@@ -179,7 +210,7 @@ fn _cbarrier_state_new(participants) {
     var n = 0;
     if (participants != 0) { n = vec_len(participants); }
     while (i < n) {
-        vec_push(owned, vec_get(participants, i));
+        _set_add(owned, vec_get(participants, i));
         i = i + 1;
     }
     store64(cbs, owned);
@@ -195,15 +226,41 @@ fn _cbarrier_check_release(state) {
     var expected = load64(state);
     if (_set_is_superset(arrived, expected) == 1) {
         store64(state + 24, 1);
-        store64(state + 32, load64(state + 32) + 1);
-        # agnos: no futex — cooperative waiters spin on the released flag +
-        # sched_yield, so the wake is a no-op (nothing parked to wake).
-        #ifndef CYRIUS_TARGET_AGNOS
-        syscall(SYS_FUTEX, state + 32, FUTEX_WAKE, 1000, 0, 0, 0);
-        #endif
+        _cbarrier_wake_all(state);
         return 1;
     }
     return 0;
+}
+
+# Bump the futex word and wake EVERY parked waiter. Caller holds the set mutex.
+#
+# ⚠ INT_MAX, not a small count: the number of parked arrive_and_wait callers is
+# unbounded (repeat arrivals under one name and non-members park too). This was
+# 1000, so a 1011-participant barrier left 10 threads in FUTEX_WAIT for good.
+fn _cbarrier_wake_all(state) {
+    store64(state + 32, load64(state + 32) + 1);
+    # agnos: no futex — cooperative waiters spin on the released flag +
+    # sched_yield, so the wake is a no-op (nothing parked to wake).
+    #ifndef CYRIUS_TARGET_AGNOS
+    syscall(SYS_FUTEX, state + 32, FUTEX_WAKE, 0x7fffffff, 0, 0, 0);
+    #endif
+    return 0;
+}
+
+# A state about to be displaced from the map (cbarrier_create over an existing
+# name, cbarrier_complete) is marked CANCELLED if it has not released, and its
+# waiters are woken. Caller holds the set mutex.
+#
+# ⚠ Without this, a thread parked in cbarrier_arrive_and_wait on the old state
+# hung forever: later arrivals reach the new state or BARRIER_UNKNOWN, so nothing
+# could ever release or wake the old one. The state is NOT freed — woken
+# waiters still read its flag.
+fn _cbarrier_cancel(state) {
+    if (state == 0) { return 0; }
+    if (load64(state + 24) != 0) { return 0; }
+    store64(state + 24, 2);
+    _cbarrier_wake_all(state);
+    return 1;
 }
 
 # ConcurrentBarrierSet struct (16 bytes):
@@ -222,6 +279,7 @@ fn cbarrier_create(cbs, name, participants) {
     mutex_lock(mtx);
     var barriers = load64(cbs);
     var existed = map_has(barriers, name);
+    if (existed == 1) { _cbarrier_cancel(map_get(barriers, name)); }
     map_set(barriers, name, _cbarrier_state_new(participants));
     mutex_unlock(mtx);
     return existed == 0;
@@ -309,8 +367,14 @@ fn cbarrier_arrive_and_wait(cbs, name, participant) {
     var val = load64(futex_addr);
     mutex_unlock(mtx);
 
+    # Flag 1 = released (0). Flag 2 = the barrier was re-created or completed
+    # while we were parked (_cbarrier_cancel) — the same code an unknown barrier
+    # gets, since that is what the name now is to this waiter.
+    var flag = 0;
     while (1) {
-        if (load64(released_addr) == 1) { return 0; }
+        flag = load64(released_addr);
+        if (flag == 1) { return 0; }
+        if (flag == 2) { return MAJRA_ERR_BARRIER; }
         # agnos: no futex_wait — yield to the cooperative scheduler and
         # re-check the released flag (spin-yield replaces the parked wait).
         #ifdef CYRIUS_TARGET_AGNOS
@@ -319,7 +383,9 @@ fn cbarrier_arrive_and_wait(cbs, name, participant) {
         #ifndef CYRIUS_TARGET_AGNOS
         syscall(SYS_FUTEX, futex_addr, FUTEX_WAIT, val, 0, 0, 0);
         #endif
-        if (load64(released_addr) == 1) { return 0; }
+        flag = load64(released_addr);
+        if (flag == 1) { return 0; }
+        if (flag == 2) { return MAJRA_ERR_BARRIER; }
         val = load64(futex_addr);
     }
 }
@@ -349,6 +415,7 @@ fn cbarrier_force(cbs, name, dead_participant) {
 fn cbarrier_complete(cbs, name) {
     var mtx = load64(cbs + 8);
     mutex_lock(mtx);
+    _cbarrier_cancel(map_get(load64(cbs), name));
     var r = map_delete(load64(cbs), name);
     mutex_unlock(mtx);
     return r;

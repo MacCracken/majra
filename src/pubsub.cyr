@@ -11,14 +11,18 @@
 
 fn matches_pattern(topic, pattern) {
     var td = topic;
-    var tlen = strlen(topic);
     var pd = pattern;
-    var plen = strlen(pattern);
     var ti = 0;
     var pi = 0;
 
-    while (pi < plen) {
+    # Single pass over both cstrs, NUL-terminated. There used to be a strlen of
+    # each first, so a mismatch at byte 0 still walked both strings. Every
+    # `pi < plen` / `ti < tlen` test became a read of that byte against NUL:
+    # both indices advance one byte at a time and never step past a NUL, so the
+    # two are the same test.
+    while (1) {
         var pc = load8(pd + pi);
+        if (pc == 0) { break; }
 
         # A wildcard is only a wildcard when it occupies a WHOLE level — i.e. it
         # sits at the start of the pattern or directly after a '/'. Without this
@@ -38,7 +42,7 @@ fn matches_pattern(topic, pattern) {
             var hash_aligned = 0;
             if (pi == 0) { hash_aligned = 1; }
             if (pi > 0 && load8(pd + pi - 1) == 47) { hash_aligned = 1; }
-            if (hash_aligned == 1 && pi + 1 == plen) {
+            if (hash_aligned == 1 && load8(pd + pi + 1) == 0) {
                 return 1;
             }
         }
@@ -52,44 +56,44 @@ fn matches_pattern(topic, pattern) {
 
             var plus_ok = 0;
             if (plus_aligned == 1) {
-                if (pi + 1 == plen) { plus_ok = 1; }
-                if (pi + 1 < plen && load8(pd + pi + 1) == 47) { plus_ok = 1; }
+                var pn = load8(pd + pi + 1);
+                if (pn == 0 || pn == 47) { plus_ok = 1; }
             }
             if (plus_ok == 1) {
-                # '+' matches one level (up to next /)
-                while (ti < tlen) {
-                    if (load8(td + ti) == 47) { break; }
+                # '+' matches one level (up to next / or end of topic)
+                var tcp = load8(td + ti);
+                while (tcp != 0 && tcp != 47) {
                     ti = ti + 1;
+                    tcp = load8(td + ti);
                 }
                 pi = pi + 1;
                 # Skip matching / in both
-                if (pi < plen && ti < tlen) {
-                    if (load8(pd + pi) == 47 && load8(td + ti) == 47) {
-                        pi = pi + 1;
-                        ti = ti + 1;
-                    }
+                if (load8(pd + pi) == 47 && tcp == 47) {
+                    pi = pi + 1;
+                    ti = ti + 1;
                 }
                 continue;
             }
         }
 
-        if (ti >= tlen) {
+        var tc = load8(td + ti);
+        if (tc == 0) {
             # Parent level: "<prefix>/#" also matches the bare topic "<prefix>",
             # because '#' includes the parent level (MQTT-3.1.1 §4.7.1.2 —
             # "sport/# also matches the singular sport"). Folded into the
             # existing exhausted-topic branch so it costs nothing until the
             # topic actually runs out.
-            if (pc == 47 && pi + 2 == plen && load8(pd + pi + 1) == 35) {
+            if (pc == 47 && load8(pd + pi + 1) == 35 && load8(pd + pi + 2) == 0) {
                 return 1;
             }
             return 0;
         }
-        if (pc != load8(td + ti)) { return 0; }
+        if (pc != tc) { return 0; }
         pi = pi + 1;
         ti = ti + 1;
     }
 
-    return ti >= tlen;
+    return load8(td + ti) == 0;
 }
 
 # --- Subscriber ---
@@ -130,9 +134,9 @@ enum PubSubLagPolicy {
 # walk, so unsubscribe clears `active` instead and the walk skips it. That
 # keeps the 2.5.3 head-of-line fix and the unsubscribe from being in tension.
 #
-# Reclamation happens by REPLACING the vec (see _pubsub_compact), never by
-# shifting one, so an in-flight snapshot keeps pointing at a still-valid
-# backing buffer.
+# Reclamation happens by REPLACING the vec's backing buffer (see
+# _pubsub_compact), never by shifting one, so an in-flight snapshot keeps
+# pointing at a still-valid backing buffer.
 # Prefixed in 2.7.1: libro also defines `_sub_new`, with a DIFFERENT signature
 # (`(pattern)`) and a different allocation size (24 bytes via alloc, against
 # this one's 40 via fl_alloc). Cyrius has one flat function namespace, so in a
@@ -164,31 +168,69 @@ fn pubsub_new() {
     return ps;
 }
 
+# Copy a topic/pattern key for a map that outlives the caller's buffer.
+#
+# ⚠ `map_set` stores the key POINTER, it does not copy. The hub maps were keyed
+# on the caller's topic, so a subscriber that built its topic in a reused or
+# freed buffer silently lost delivery once those bytes changed — and a pattern
+# key left the unlocked publish walk running matches_pattern over them. Same
+# class ratelimit fixed at 2.6.4. Entries in these maps are never deleted, so
+# this is a one-time copy per distinct topic. A null key stays null (it was
+# never usable as a cstr key; this keeps its prior behaviour rather than
+# faulting in strlen).
+fn _pubsub_key_own(key) {
+    if (key == 0) { return 0; }
+    var n = strlen(key);
+    var p = fl_alloc(n + 1);
+    memcpy(p, key, n);
+    store8(p + n, 0);
+    return p;
+}
+
+# Register a new subscription on the exact (map_off 0) or pattern (map_off 8)
+# map, with its lag policy already set. Returns the channel.
+# Caller must hold the hub mutex.
+#
+# The subscriber is complete before vec_push publishes it, and publishers
+# snapshot the vec under the same mutex, so no publish can see it under a
+# default policy it was never meant to have.
+fn _pubsub_subscribe_locked(ps, map_off, key, filter_fn, policy) {
+    var ch = chan_new(64);
+    var sub = _majra_sub_new(ch, filter_fn);
+    store64(sub + 24, policy);
+    var m = load64(ps + map_off);
+    var subs = map_get(m, key);
+    if (subs == 0) {
+        subs = vec_new();
+        map_set(m, _pubsub_key_own(key), subs);
+    } elif (vec_len(subs) >= vec_cap(subs)) {
+        # About to grow: reclaim tombstones first if they dominate. Checked
+        # only at a growth point so the O(n) scan amortises to O(1) per
+        # subscribe. This is the only compaction a PUBSUB_LAG_UNSUBSCRIBE
+        # self-deactivation ever gets, since it never calls _pubsub_deactivate.
+        _pubsub_maybe_compact(subs);
+    }
+    vec_push(subs, sub);
+    return ch;
+}
+
 # Subscribe to an exact topic. Returns a channel to recv from.
 fn pubsub_subscribe(ps, topic) {
     # The hub mutex is taken BEFORE chan_new/_sub_new, not after. `fl_alloc`
-    # (lib/freelist.cyr) pops its size-class free list with a plain
-    # load/store pair and carries no lock — unlike `alloc`, which has a CAS
+    # (lib/freelist.cyr) popped its size-class free list with a plain
+    # load/store pair and carried no lock — unlike `alloc`, which has a CAS
     # spinlock — so two concurrent subscribers could be handed the SAME
-    # 16-byte subscriber block. Both then wrote it, the vec got the same
+    # subscriber block. Both then wrote it, the vec got the same
     # pointer twice, and one caller walked away with a channel that was never
     # registered: its chan_recv blocks forever while `delivered` counts it.
     # Measured before the fix: 1-7 orphaned channels per 800 concurrent
     # subscribes. See CHANGELOG 2.5.3. (cyrius-quirks.md carried this as active quirk #8
     # until 2.7.0; cyrius 6.5.19 made fl_alloc thread-safe and it moved to that
-    # file's resolved archive. The lock-before-allocate ordering here is kept
-    # because it also covers the _mq_next_job_id read-modify-write.)
+    # file's resolved archive. The lock-before-allocate ordering is simply kept;
+    # the subscription still has to be built and registered under this lock.)
     var mtx = load64(ps + 16);
     mutex_lock(mtx);
-    var ch = chan_new(64);
-    var sub = _majra_sub_new(ch, 0);
-    var exact = load64(ps);
-    var subs = map_get(exact, topic);
-    if (subs == 0) {
-        subs = vec_new();
-        map_set(exact, topic, subs);
-    }
-    vec_push(subs, sub);
+    var ch = _pubsub_subscribe_locked(ps, 0, topic, 0, PUBSUB_LAG_BLOCK);
     mutex_unlock(mtx);
     return ch;
 }
@@ -198,15 +240,7 @@ fn pubsub_subscribe_pattern(ps, pattern) {
     # Lock before allocating — see pubsub_subscribe for why.
     var mtx = load64(ps + 16);
     mutex_lock(mtx);
-    var ch = chan_new(64);
-    var sub = _majra_sub_new(ch, 0);
-    var patterns = load64(ps + 8);
-    var subs = map_get(patterns, pattern);
-    if (subs == 0) {
-        subs = vec_new();
-        map_set(patterns, pattern, subs);
-    }
-    vec_push(subs, sub);
+    var ch = _pubsub_subscribe_locked(ps, 8, pattern, 0, PUBSUB_LAG_BLOCK);
     mutex_unlock(mtx);
     return ch;
 }
@@ -216,15 +250,7 @@ fn pubsub_subscribe_filtered(ps, topic, filter_fn) {
     # Lock before allocating — see pubsub_subscribe for why.
     var mtx = load64(ps + 16);
     mutex_lock(mtx);
-    var ch = chan_new(64);
-    var sub = _majra_sub_new(ch, filter_fn);
-    var exact = load64(ps);
-    var subs = map_get(exact, topic);
-    if (subs == 0) {
-        subs = vec_new();
-        map_set(exact, topic, subs);
-    }
-    vec_push(subs, sub);
+    var ch = _pubsub_subscribe_locked(ps, 0, topic, filter_fn, PUBSUB_LAG_BLOCK);
     mutex_unlock(mtx);
     return ch;
 }
@@ -234,6 +260,11 @@ fn pubsub_subscribe_filtered(ps, topic, filter_fn) {
 #
 # Called with the hub mutex NOT held — BLOCK genuinely blocks, and parking
 # inside the critical section is the 2.5.3 bug.
+#
+# ⚠ `dropped` is bumped with atomic_fetch_add (lib/atomic.cyr, which
+# lib/alloc.cyr, lib/freelist.cyr and lib/thread.cyr all include). This runs
+# unlocked, so a plain load/store pair lost increments whenever two publishers
+# dropped to the same subscriber at once.
 fn _pubsub_deliver(sub, payload) {
     if (load64(sub + 16) != 1) { return 0; }
     var ch = load64(sub);
@@ -248,27 +279,37 @@ fn _pubsub_deliver(sub, payload) {
     if (rc == 0) { return 1; }
     # -1 is a closed channel, -2 is a full one. Only the full case is lag.
     if (rc != 0 - 2) {
-        store64(sub + 32, load64(sub + 32) + 1);
+        # A closed channel is abandonment too — the case the self-healing
+        # policy exists for — and it can never accept again.
+        if (policy == PUBSUB_LAG_UNSUBSCRIBE) { store64(sub + 16, 0); }
+        atomic_fetch_add(sub + 32, 1);
         return 0;
     }
 
     if (policy == PUBSUB_LAG_DROP_NEWEST) {
-        store64(sub + 32, load64(sub + 32) + 1);
+        atomic_fetch_add(sub + 32, 1);
         return 0;
     }
     if (policy == PUBSUB_LAG_DROP_OLDEST) {
         # Evict one queued message to make room. A concurrent consumer may
         # take that slot first, in which case the retry simply succeeds.
+        #
+        # The eviction is counted even when chan_try_recv returns 0: 0 is both
+        # "ring empty" and a queued payload of 0 (lib/thread.cyr), and only the
+        # first — a consumer draining the whole ring inside this window — is an
+        # overcount.
         chan_try_recv(ch);
-        store64(sub + 32, load64(sub + 32) + 1);
+        atomic_fetch_add(sub + 32, 1);
         if (chan_try_send(ch, payload) == 0) { return 1; }
+        # Another publisher took the freed slot, so this payload is lost too.
+        atomic_fetch_add(sub + 32, 1);
         return 0;
     }
     if (policy == PUBSUB_LAG_UNSUBSCRIBE) {
         # Self-healing: an abandoned subscriber deactivates itself rather than
         # holding its topic hostage.
         store64(sub + 16, 0);
-        store64(sub + 32, load64(sub + 32) + 1);
+        atomic_fetch_add(sub + 32, 1);
         return 0;
     }
     return 0;
@@ -304,12 +345,14 @@ fn pubsub_publish(ps, topic, payload) {
     # test_pubsub_no_head_of_line_block, which asserts a parked publisher
     # resumes once its channel drains.
     #
-    # The residual risk is real and accepted: majra has no pubsub unsubscribe,
-    # so a subscriber that is ABANDONED without draining wedges any publish to
-    # its topic permanently. Dropping instead would trade that for silent
-    # message loss, which is the worse failure for a queue engine. Consumers
-    # must drain or exit the process. Tracked as a roadmap item (unsubscribe +
-    # a per-subscriber lag policy).
+    # The residual risk is real and accepted: under the default
+    # PUBSUB_LAG_BLOCK, a subscriber that is ABANDONED without draining wedges
+    # publishes to its topic. Since 2.7.0 a subscription can opt out per
+    # subscription (PUBSUB_LAG_DROP_NEWEST / _DROP_OLDEST / _UNSUBSCRIBE, drops
+    # counted by pubsub_dropped_count), and pubsub_unsubscribe stops future
+    # publishes from parking on it. Dropping is not the default because silent
+    # loss is often the worse failure for a queue engine. A publisher that is
+    # ALREADY parked is released only by draining the channel or chan_close.
     var mtx = load64(ps + 16);
     var delivered = 0;
 
@@ -331,14 +374,22 @@ fn pubsub_publish(ps, topic, payload) {
     # a concurrent subscribe that rehashes is picked up on the next publish.
     var pat_entries = map_entries(patterns);
     var pat_cap = map_cap(patterns);
+    # No pattern subscriptions at snapshot time: skip the slot walk (16+ state
+    # loads per publish). Only this all-or-nothing form is safe — stopping
+    # after `count` live slots is NOT, because a concurrent subscribe can fill
+    # an earlier slot in place and push a pre-existing pattern past the cutoff.
+    if (map_size(patterns) == 0) { pat_cap = 0; }
     mutex_unlock(mtx);
 
     var i = 0;
     while (i < slen) {
         var sub = load64(sdata + i * 8);
-        var filter = load64(sub + 8);
-        if (filter == 0 || fncall1(filter, payload) == 1) {
-            delivered = delivered + _pubsub_deliver(sub, payload);
+        # Skip tombstones before running their filter, not after.
+        if (load64(sub + 16) == 1) {
+            var filter = load64(sub + 8);
+            if (filter == 0 || fncall1(filter, payload) == 1) {
+                delivered = delivered + _pubsub_deliver(sub, payload);
+            }
         }
         i = i + 1;
     }
@@ -363,9 +414,11 @@ fn pubsub_publish(ps, topic, payload) {
             var k = 0;
             while (k < pnlen) {
                 var psub = load64(pdata + k * 8);
-                var pfilter = load64(psub + 8);
-                if (pfilter == 0 || fncall1(pfilter, payload) == 1) {
-                    delivered = delivered + _pubsub_deliver(psub, payload);
+                if (load64(psub + 16) == 1) {
+                    var pfilter = load64(psub + 8);
+                    if (pfilter == 0 || fncall1(pfilter, payload) == 1) {
+                        delivered = delivered + _pubsub_deliver(psub, payload);
+                    }
                 }
                 k = k + 1;
             }
@@ -387,6 +440,11 @@ fn pubsub_publish(ps, topic, payload) {
 # therefore remains VALID and owned by the caller — drain it, then close it
 # with chan_close if you own it. Do not free it out from under a concurrent
 # publish.
+#
+# ⚠ UNSUBSCRIBE PREVENTS A WEDGE; IT DOES NOT BREAK ONE ALREADY IN PROGRESS. A
+# BLOCK publisher already parked on this subscriber's full ring waits inside
+# chan_send, which never looks at `active`. To recover it, unsubscribe and then
+# drain the channel or chan_close it (a closed channel returns the parked send).
 fn pubsub_unsubscribe(ps, topic, ch) {
     if (ps == 0 || topic == 0 || ch == 0) { return 0; }
     var mtx = load64(ps + 16);
@@ -423,15 +481,37 @@ fn _pubsub_deactivate(m, key, ch) {
         if (load64(sub + 16) == 0) { dead = dead + 1; }
         i = i + 1;
     }
-    # Reclaim once tombstones dominate. Compaction REPLACES the vec rather than
-    # shifting it, so a publish already walking the old snapshot keeps reading
-    # valid memory — the same property that makes vec_push safe here.
-    if (dead > 8 && dead * 2 > n) { _pubsub_compact(m, key, subs); }
+    # Reclaim once tombstones dominate. Compaction REPLACES the backing buffer
+    # rather than shifting it, so a publish already walking the old snapshot
+    # keeps reading valid memory — the same property that makes vec_push safe.
+    if (dead > 8 && dead * 2 > n) { _pubsub_compact(subs); }
     return found;
 }
 
+# Compact `subs` if tombstones dominate. Caller must hold the hub mutex.
+fn _pubsub_maybe_compact(subs) {
+    var i = 0;
+    var n = vec_len(subs);
+    var dead = 0;
+    while (i < n) {
+        if (load64(vec_get(subs, i) + 16) != 1) { dead = dead + 1; }
+        i = i + 1;
+    }
+    if (dead > 8 && dead * 2 > n) { _pubsub_compact(subs); }
+    return 0;
+}
+
 # Caller must hold the hub mutex.
-fn _pubsub_compact(m, key, subs) {
+#
+# ⚠ REWRITES THE EXISTING VEC HEADER; NEVER map_set. This used to
+# `map_set(m, key, fresh)` with the unsubscribe caller's `key`, and map_set on
+# an existing slot overwrites the stored key POINTER — so a surviving topic
+# ended up keyed on the caller's temporary buffer and went dark once it was
+# reused. The map slot is now never touched. The old backing buffer is
+# abandoned, not freed (bump allocator), so a publish walking its (data, len)
+# snapshot stays valid. Header layout is lib/vec.cyr's { data, len, cap };
+# every reader of it holds this mutex.
+fn _pubsub_compact(subs) {
     var fresh = vec_new();
     var i = 0;
     var n = vec_len(subs);
@@ -440,7 +520,9 @@ fn _pubsub_compact(m, key, subs) {
         if (load64(sub + 16) == 1) { vec_push(fresh, sub); }
         i = i + 1;
     }
-    map_set(m, key, fresh);
+    store64(subs, load64(fresh));
+    store64(subs + 16, load64(fresh + 16));
+    store64(subs + 8, load64(fresh + 8));
     return 0;
 }
 
@@ -465,51 +547,69 @@ fn pubsub_subscriber_count(ps, topic) {
 
 # --- Lag policy control ---
 
-# Subscribe with an explicit lag policy. Returns the channel.
+# Subscribe with an explicit lag policy. Returns the channel, or 0 if `policy`
+# is not a PubSubLagPolicy (the same values pubsub_set_policy refuses).
+#
+# ⚠ An invalid policy used to subscribe anyway under BLOCK — the one behaviour a
+# caller asking for a non-blocking subscription was trying to avoid. The
+# subscription is also created with its policy already set, under one hold of
+# the hub mutex, so no publish can match it as BLOCK first.
 fn pubsub_subscribe_with_policy(ps, topic, policy) {
-    var ch = pubsub_subscribe(ps, topic);
-    pubsub_set_policy(ps, topic, ch, policy);
+    if (policy < PUBSUB_LAG_BLOCK || policy > PUBSUB_LAG_UNSUBSCRIBE) { return 0; }
+    var mtx = load64(ps + 16);
+    mutex_lock(mtx);
+    var ch = _pubsub_subscribe_locked(ps, 0, topic, 0, policy);
+    mutex_unlock(mtx);
     return ch;
 }
 
-# Set the lag policy for an existing subscription. Returns 1 if it matched.
+# The subscriber on `key` whose channel is `ch`, searching the exact map first
+# and then the pattern map, or 0. Caller must hold the hub mutex.
+#
+# ⚠ Lag policy and the drop counter used to look only in the exact map, so a
+# pattern subscriber could never leave BLOCK and always reported 0 drops.
+# Every subscription has its own channel, so matching on `ch` is unambiguous.
+fn _pubsub_find_sub(ps, key, ch) {
+    var off = 0;
+    while (off <= 8) {
+        var subs = map_get(load64(ps + off), key);
+        if (subs != 0) {
+            var i = 0;
+            var n = vec_len(subs);
+            while (i < n) {
+                var sub = vec_get(subs, i);
+                if (load64(sub) == ch) { return sub; }
+                i = i + 1;
+            }
+        }
+        off = off + 8;
+    }
+    return 0;
+}
+
+# Set the lag policy for an existing subscription (exact or pattern). Returns 1
+# if it matched.
 fn pubsub_set_policy(ps, topic, ch, policy) {
     if (ps == 0 || ch == 0) { return 0; }
     if (policy < PUBSUB_LAG_BLOCK || policy > PUBSUB_LAG_UNSUBSCRIBE) { return 0; }
     var mtx = load64(ps + 16);
     mutex_lock(mtx);
-    var subs = map_get(load64(ps), topic);
+    var sub = _pubsub_find_sub(ps, topic, ch);
     var found = 0;
-    if (subs != 0) {
-        var i = 0;
-        var n = vec_len(subs);
-        while (i < n) {
-            var sub = vec_get(subs, i);
-            if (load64(sub) == ch) { store64(sub + 24, policy); found = 1; }
-            i = i + 1;
-        }
-    }
+    if (sub != 0) { store64(sub + 24, policy); found = 1; }
     mutex_unlock(mtx);
     return found;
 }
 
-# How many messages this subscription has lost to lag. Always 0 under
-# PUBSUB_LAG_BLOCK, which never drops.
+# How many messages this subscription (exact or pattern) has lost to lag.
+# Always 0 under PUBSUB_LAG_BLOCK, which never drops.
 fn pubsub_dropped_count(ps, topic, ch) {
     if (ps == 0 || ch == 0) { return 0; }
     var mtx = load64(ps + 16);
     mutex_lock(mtx);
-    var subs = map_get(load64(ps), topic);
+    var sub = _pubsub_find_sub(ps, topic, ch);
     var n_dropped = 0;
-    if (subs != 0) {
-        var i = 0;
-        var n = vec_len(subs);
-        while (i < n) {
-            var sub = vec_get(subs, i);
-            if (load64(sub) == ch) { n_dropped = load64(sub + 32); }
-            i = i + 1;
-        }
-    }
+    if (sub != 0) { n_dropped = load64(sub + 32); }
     mutex_unlock(mtx);
     return n_dropped;
 }
@@ -553,7 +653,9 @@ fn _hc_get_or_create(hc, topic) {
     var ch = map_get(chans, topic);
     if (ch == 0) {
         ch = chan_new(64);
-        map_set(chans, topic, ch);
+        # Own the key — a borrowed topic buffer that is later reused would
+        # strand this channel. See _pubsub_key_own.
+        map_set(chans, _pubsub_key_own(topic), ch);
     }
     return ch;
 }

@@ -53,8 +53,8 @@ var PG_MAX_MSG = 16777216;
 # --- Connection ---
 
 # PgConn struct (16 bytes):
-#   offset 0: fd (i64)
-#   offset 8: ready (i64) — 1 if ready for query
+#   offset 0: fd (i64) — -1 once the connection is closed or poisoned
+#   offset 8: ready (i64) — 1 if ready for query, 0 once closed or poisoned
 
 fn _pg_write_be32(buf, offset, val) {
     store8(buf + offset, (val >> 24) & 0xFF);
@@ -100,11 +100,42 @@ fn _pg_read_full(fd, buf, want) {
     return total;
 }
 
+# sendto(2)'s number, or 0 where there is no MSG_NOSIGNAL send path.
+# ⚠ Spelled per arch: sendto has no ESYSXLAT row (quirk #9), so the x86_64 44
+# would run as fstatfs on aarch64. The peers declare no SYS_SENDTO. macOS has
+# no MSG_NOSIGNAL; agnos and Windows have no BSD sockets.
+fn _pg_sendto_nr() {
+    #ifdef CYRIUS_TARGET_LINUX
+    #ifdef CYRIUS_ARCH_X86
+    return 44;
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    return 206;
+    #endif
+    #endif
+    return 0;
+}
+
 # Write exactly `len` bytes, looping over short writes.
+#
+# ⚠ Sent with MSG_NOSIGNAL (0x4000). A bare write(2) to a connection the server
+# has reset (failover, pg_terminate_backend, an idle-timeout load balancer)
+# raises SIGPIPE, whose default action kills the consumer process. A non-socket
+# fd gets ENOTSOCK (-88) and falls back to write(2).
 fn _pg_write_full(fd, buf, len) {
     var total = 0;
+    var nr = _pg_sendto_nr();
     while (total < len) {
-        var w = syscall(SYS_WRITE, fd, buf + total, len - total);
+        var w = 0;
+        if (nr != 0) {
+            w = syscall(nr, fd, buf + total, len - total, 0x4000, 0, 0);
+            if (w == -88) {
+                nr = 0;
+                w = syscall(SYS_WRITE, fd, buf + total, len - total);
+            }
+        } else {
+            w = syscall(SYS_WRITE, fd, buf + total, len - total);
+        }
         if (w == -4) { w = 0; }
         elif (w <= 0) { return -1; }
         total = total + w;
@@ -112,35 +143,18 @@ fn _pg_write_full(fd, buf, len) {
     return total;
 }
 
-# Globals for PG startup to avoid local clobbering.
+# Mark a connection unusable: close the socket and fail every later call fast.
 #
-# These are process-wide and live across the whole blocking handshake, so two
-# threads calling pg_connect concurrently used to overwrite each other's fd and
-# credentials — thread A could complete the handshake against thread B's socket
-# using thread B's password. `_pg_connect_mtx` serialises the entire connect
-# path. Connections themselves are independent once returned; only the
-# handshake is serialised.
-var _pg_fd_g = 0;
-var _pg_user_g = 0;
-var _pg_db_g = 0;
-var _pg_pw_g = 0;
-var _pg_connect_mtx = 0;
-
-# Initialised eagerly at module load rather than lazily.
-#
-# The lazy `if (_pg_connect_mtx == 0) { _pg_connect_mtx = mutex_new(); }` was
-# itself unsynchronised, so the first two concurrent pg_connect calls could
-# each observe 0, each build a mutex, and each lock a DIFFERENT one — leaving
-# the connect globals unprotected in exactly the window the mutex exists for.
-var _pg_connect_mtx_init = _pg_connect_mtx_bootstrap();
-
-fn _pg_connect_mtx_bootstrap() {
-    _pg_connect_mtx = mutex_new();
-    return 1;
-}
-
-fn _pg_connect_lock() {
-    mutex_lock(_pg_connect_mtx);
+# pg_query used to return an empty vec on a failed read or write and leave the
+# fd in the handle. The next pg_query (or pg_close's Terminate) then wrote to a
+# reset socket — SIGPIPE — or, after an oversized or malformed message, parsed
+# the unread remainder of the previous result as its own reply.
+fn _pg_poison(conn) {
+    if (conn == 0) { return 0; }
+    var fd = load64(conn);
+    if (fd >= 0) { syscall(SYS_CLOSE, fd); }
+    store64(conn, -1);
+    store64(conn + 8, 0);
     return 0;
 }
 
@@ -159,17 +173,32 @@ fn _pg_msg_free(m) {
     return 0;
 }
 
-# Send startup message: protocol version 3.0, user, database
-fn _pg_startup() {
-    var user = _pg_user_g;
-    var database = _pg_db_g;
-    var fd = _pg_fd_g;
+# Largest frontend message majra will frame. The length field is 32 bits; a
+# longer message had its length silently TRUNCATED, and the server then parsed
+# the tail of the SQL as further protocol messages (the CVE-2024-27304 class).
+# PostgreSQL itself refuses anything above 0x3FFFFFFF.
+var _PG_MAX_FRONTEND_MSG = 0x3FFFFFFF;
+
+# The server's own cap on a startup packet (MAX_STARTUP_PACKET_LENGTH).
+var _PG_MAX_STARTUP = 10000;
+
+# Send startup message: protocol version 3.0, user, database.
+# Returns the byte count, -1 on a write failure, -2 if nothing was sent.
+#
+# Takes its arguments directly. They used to arrive through process-wide
+# globals (a quirk #1 precaution) guarded by a mutex held across connect(2) and
+# the whole untimed handshake, so one stalled server blocked every pg_connect
+# in the process.
+fn _pg_startup(fd, user, database) {
+    if (user == 0 || database == 0) { return -2; }
     var user_len = strlen(user);
     var db_len = strlen(database);
     # [4B len][4B protocol][user\0name\0database\0name\0\0]
     var payload_len = 4 + 5 + user_len + 1 + 9 + db_len + 1 + 1;
     var msg_len = 4 + payload_len;
+    if (msg_len > _PG_MAX_STARTUP) { return -2; }
     var msg = fl_alloc(msg_len);
+    if (msg == 0) { return -2; }
     _pg_write_be32(msg, 0, msg_len);
     _pg_write_be32(msg, 4, 196608);
     var pos = 8;
@@ -205,48 +234,183 @@ fn _pg_read_msg(fd) {
         store8(data + data_len, 0);
     }
     var result = fl_alloc(24);
+    if (result == 0) {
+        if (data != 0) { fl_free(data); }
+        return 0;
+    }
     store64(result, msg_type);
     store64(result + 8, data);
     store64(result + 16, data_len);
     return result;
 }
 
-# Append `s` to `sb` as a QUOTED, ESCAPED SQL string literal, including the
-# surrounding single quotes.
+# --- SQL literals ---
 #
 # majra's PostgreSQL client speaks the simple query protocol and implements no
 # prepared statements, so every value reaches the server inside a literal and
-# escaping is the only defence available. Standard SQL: a single quote inside a
-# literal is written twice. PostgreSQL has defaulted standard_conforming_strings
-# to on since 9.1, so a backslash is an ordinary character and needs no
-# treatment; majra never emits E'' strings, where that would not hold.
+# quoting is the only defence available.
 #
-# Returns 0 on success, -1 if `s` is null.
-fn _pg_add_literal(sb, s) {
-    if (s == 0) { return -1; }
-    str_builder_add_cstr(sb, "'");
-    var n = strlen(s);
+# ⚠ Values are DOLLAR-QUOTED: $m_$...$m_$. The body of a dollar-quoted string
+# is taken verbatim — no escape processing — so its safety does not depend on
+# any server setting. The '' doubling this used before was correct only while
+# standard_conforming_strings=on: a DBA's `ALTER DATABASE ... SET
+# standard_conforming_strings = off` turned `\'` back into an escaped quote and
+# a tenant-supplied id closed the literal. E'' strings trade that dependency
+# for backslash_quote and the client encoding; dollar quoting has neither.
+#
+# The tag is `$m` + k underscores + `$`, with k one longer than the longest run
+# of '_' in the value, so the value cannot contain the tag and cannot complete
+# one with the closing tag's own bytes. A literal must follow whitespace or
+# punctuation — after an identifier character the `$` would extend the
+# identifier.
+
+# k for `s` (length n): the longest run of '_' in it, plus one.
+fn _pg_dq_k(s, n) {
+    var best = 0;
+    var run = 0;
     var i = 0;
     while (i < n) {
-        var c = load8(s + i);
-        if (c == 39) { str_builder_add_cstr(sb, "''"); }
-        else {
-            var one[2];
-            store8(&one, c);
-            store8(&one + 1, 0);
-            str_builder_add_cstr(sb, &one);
+        if (load8(s + i) == 95) {
+            run = run + 1;
+            if (run > best) { best = run; }
+        } else {
+            run = 0;
         }
         i = i + 1;
     }
-    str_builder_add_cstr(sb, "'");
+    return best + 1;
+}
+
+# Write the k tag at dst. Returns its length (k + 3).
+fn _pg_dq_put(dst, k) {
+    store8(dst, 36);
+    store8(dst + 1, 109);
+    var i = 0;
+    while (i < k) {
+        store8(dst + 2 + i, 95);
+        i = i + 1;
+    }
+    store8(dst + 2 + k, 36);
+    return k + 3;
+}
+
+fn _pg_sb_dq_tag(sb, k) {
+    str_builder_putc(sb, 36);
+    str_builder_putc(sb, 109);
+    var i = 0;
+    while (i < k) {
+        str_builder_putc(sb, 95);
+        i = i + 1;
+    }
+    str_builder_putc(sb, 36);
     return 0;
 }
 
-# Send a simple query
+# Append `s` to `sb` as a quoted SQL string literal, including its delimiters.
+# Returns 0 on success, -1 if `s` is null.
+fn _pg_add_literal(sb, s) {
+    if (s == 0) { return -1; }
+    var k = _pg_dq_k(s, strlen(s));
+    _pg_sb_dq_tag(sb, k);
+    str_builder_add_cstr(sb, s);
+    _pg_sb_dq_tag(sb, k);
+    return 0;
+}
+
+# Growable SQL text on the freelist: {data, len, cap, err}, data always
+# NUL-terminated.
+#
+# ⚠ Not str_builder: its header, every grow and str_builder_build's copy all
+# come from the bump allocator, which never frees, so every workflow call —
+# carrying a steps_json of any size — grew the process permanently. This one is
+# released with _pg_q_free once the statement is sent.
+fn _pg_q_new() {
+    var q = fl_alloc(32);
+    if (q == 0) { return 0; }
+    var d = fl_alloc(256);
+    if (d == 0) { fl_free(q); return 0; }
+    store8(d, 0);
+    store64(q, d);
+    store64(q + 8, 0);
+    store64(q + 16, 256);
+    store64(q + 24, 0);
+    return q;
+}
+
+fn _pg_q_free(q) {
+    if (q == 0) { return 0; }
+    fl_free(load64(q));
+    fl_free(q);
+    return 0;
+}
+
+# Room for n more bytes plus the NUL. Returns 0, or -1 (and marks q failed).
+fn _pg_q_reserve(q, n) {
+    if (load64(q + 24) != 0) { return -1; }
+    var len = load64(q + 8);
+    var cap = load64(q + 16);
+    if (len + n + 1 <= cap) { return 0; }
+    var nc = cap * 2;
+    if (nc < len + n + 1) { nc = len + n + 1; }
+    var nd = fl_alloc(nc);
+    if (nd == 0) { store64(q + 24, 1); return -1; }
+    memcpy(nd, load64(q), len + 1);
+    fl_free(load64(q));
+    store64(q, nd);
+    store64(q + 16, nc);
+    return 0;
+}
+
+fn _pg_q_add(q, p, n) {
+    if (_pg_q_reserve(q, n) < 0) { return -1; }
+    var len = load64(q + 8);
+    memcpy(load64(q) + len, p, n);
+    store64(q + 8, len + n);
+    store8(load64(q) + len + n, 0);
+    return 0;
+}
+
+fn _pg_q_cstr(q, s) {
+    return _pg_q_add(q, s, strlen(s));
+}
+
+fn _pg_q_int(q, v) {
+    var nb[24];
+    var l = fmt_int_buf(v, &nb);
+    return _pg_q_add(q, &nb, l);
+}
+
+# _pg_add_literal for a _pg_q. Returns 0, or -1 if `s` is null or on OOM.
+fn _pg_q_lit(q, s) {
+    if (s == 0) { return -1; }
+    var n = strlen(s);
+    var k = _pg_dq_k(s, n);
+    if (_pg_q_reserve(q, n + 2 * (k + 3)) < 0) { return -1; }
+    var d = load64(q);
+    var p = load64(q + 8);
+    p = p + _pg_dq_put(d + p, k);
+    memcpy(d + p, s, n);
+    p = p + n;
+    p = p + _pg_dq_put(d + p, k);
+    store8(d + p, 0);
+    store64(q + 8, p);
+    return 0;
+}
+
+# The finished SQL text, or 0 if any append failed.
+fn _pg_q_sql(q) {
+    if (load64(q + 24) != 0) { return 0; }
+    return load64(q);
+}
+
+# Send a simple query. Returns the byte count, -1 on a write failure (the
+# stream is then in an unknown state), or -2 if nothing was sent.
 fn _pg_send_query(fd, sql) {
     var sql_len = strlen(sql);
+    if (sql_len > _PG_MAX_FRONTEND_MSG - 5) { return -2; }
     var msg_len = 4 + sql_len + 1;
     var msg = fl_alloc(1 + msg_len);
+    if (msg == 0) { return -2; }
     store8(msg, PG_MSG_QUERY);
     _pg_write_be32(msg, 1, msg_len);
     memcpy(msg + 5, sql, sql_len);
@@ -256,11 +420,14 @@ fn _pg_send_query(fd, sql) {
     return rc;
 }
 
-# Send password message (cleartext)
+# Send password message (cleartext). Same return convention as _pg_send_query.
 fn _pg_send_password(fd, password) {
+    if (password == 0) { return -2; }
     var pw_len = strlen(password);
+    if (pw_len > _PG_MAX_FRONTEND_MSG - 5) { return -2; }
     var msg_len = 4 + pw_len + 1;
     var msg = fl_alloc(1 + msg_len);
+    if (msg == 0) { return -2; }
     store8(msg, PG_MSG_PASSWORD);
     _pg_write_be32(msg, 1, msg_len);
     memcpy(msg + 5, password, pw_len);
@@ -277,7 +444,15 @@ fn _pg_terminate(fd) {
     var msg[8];
     store8(&msg, PG_MSG_TERMINATE);
     _pg_write_be32(&msg, 1, 4);
-    syscall(SYS_WRITE, fd, &msg, 5);
+    _pg_write_full(fd, &msg, 5);
+    return 0;
+}
+
+# Close a half-built connection's socket (and a message, if one is held).
+fn _pg_connect_fail(fd, msg) {
+    if (msg != 0) { _pg_msg_free(msg); }
+    syscall(SYS_CLOSE, fd);
+    return 0;
 }
 
 # Connect to PostgreSQL. Returns PgConn or 0.
@@ -291,57 +466,43 @@ fn pg_connect(host, port, user, database, password) {
         addr = majra_parse_ipv4(host);
         if (addr < 0) { return 0; }
     }
-    _pg_connect_lock();
     # `_SYS_SOCKET` / `_SYS_CONNECT`: see the note in src/redis_backend.cyr.
-    _pg_fd_g = syscall(_SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
-    if (_pg_fd_g < 0) { mutex_unlock(_pg_connect_mtx); return 0; }
+    var fd = syscall(_SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { return 0; }
     var sa = sockaddr_in(addr, port);
-    if (syscall(_SYS_CONNECT, _pg_fd_g, sa, 16) < 0) {
-        syscall(SYS_CLOSE, _pg_fd_g);
-        mutex_unlock(_pg_connect_mtx);
+    if (syscall(_SYS_CONNECT, fd, sa, 16) < 0) {
+        syscall(SYS_CLOSE, fd);
         return 0;
     }
-    _pg_user_g = user;
-    _pg_db_g = database;
-    _pg_pw_g = password;
 
-    _pg_startup();
-    var fd = _pg_fd_g;
+    # A startup message that was never sent would leave the read below blocked
+    # forever on a server still waiting for it.
+    if (_pg_startup(fd, user, database) < 0) { _pg_connect_fail(fd, 0); return 0; }
 
     # Read auth response
     var msg = _pg_read_msg(fd);
-    if (msg == 0) { syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
+    if (msg == 0) { _pg_connect_fail(fd, 0); return 0; }
 
     var msg_type = load64(msg);
     if (msg_type == PG_MSG_AUTH) {
         # A message whose declared length is exactly 4 carries no body, so
         # load64(msg + 8) is 0 — reading the auth type straight off it was a
         # null dereference on a malformed (or hostile) server reply.
-        if (load64(msg + 16) < 4) {
-            _pg_msg_free(msg); syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx);
-            return 0;
-        }
+        if (load64(msg + 16) < 4) { _pg_connect_fail(fd, msg); return 0; }
         var auth_type = _pg_read_be32(load64(msg + 8), 0);
         if (auth_type == PG_AUTH_CLEARTEXT) {
             _pg_msg_free(msg);
-            if (_pg_send_password(fd, _pg_pw_g) < 0) {
-                syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx);
-                return 0;
-            }
+            if (_pg_send_password(fd, password) < 0) { _pg_connect_fail(fd, 0); return 0; }
             msg = _pg_read_msg(fd);
-            if (msg == 0) { syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
-            if (load64(msg + 16) < 4) {
-                _pg_msg_free(msg); syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx);
-                return 0;
-            }
+            if (msg == 0) { _pg_connect_fail(fd, 0); return 0; }
+            if (load64(msg + 16) < 4) { _pg_connect_fail(fd, msg); return 0; }
             auth_type = _pg_read_be32(load64(msg + 8), 0);
         }
         _pg_msg_free(msg);
         if (auth_type != PG_AUTH_OK) {
             # Includes SASL/SCRAM-SHA-256 (type 10), which majra does not
             # implement — fail closed rather than proceed unauthenticated.
-            syscall(SYS_CLOSE, fd);
-            mutex_unlock(_pg_connect_mtx);
+            _pg_connect_fail(fd, 0);
             return 0;
         }
     } else {
@@ -356,89 +517,133 @@ fn pg_connect(host, port, user, database, password) {
     var done = 0;
     while (done == 0) {
         msg = _pg_read_msg(fd);
-        if (msg == 0) {
-            syscall(SYS_CLOSE, fd);
-            mutex_unlock(_pg_connect_mtx);
-            return 0;
-        }
+        if (msg == 0) { _pg_connect_fail(fd, 0); return 0; }
         if (load64(msg) == PG_MSG_READY) { done = 1; }
         _pg_msg_free(msg);
     }
 
     var conn = fl_alloc(16);
+    if (conn == 0) { _pg_connect_fail(fd, 0); return 0; }
     store64(conn, fd);
     store64(conn + 8, 1);
-    mutex_unlock(_pg_connect_mtx);
     return conn;
 }
 
+# Sends Terminate and closes the socket. The handle is not freed; afterwards it
+# reads as closed, so a second pg_close or a pg_query on it is a no-op rather
+# than a write to a reused fd number.
 fn pg_close(conn) {
-    _pg_terminate(load64(conn));
-    syscall(SYS_CLOSE, load64(conn));
+    if (conn == 0) { return 0; }
+    var fd = load64(conn);
+    if (fd >= 0) {
+        _pg_terminate(fd);
+        syscall(SYS_CLOSE, fd);
+    }
+    store64(conn, -1);
+    store64(conn + 8, 0);
+    return 0;
 }
 
-# Execute a SQL query. Returns vec of rows, where each row is a vec of column values (C strings).
-fn pg_query(conn, sql) {
+# Parse a DataRow body into a vec of fl_alloc'd C strings (0 for NULL).
+# Returns 0 if the row is malformed — validated before anything is allocated.
+fn _pg_parse_row(data, data_len) {
+    # Every offset below is derived from the wire, so each one is bounded
+    # against the message body the server actually sent.
+    if (data == 0 || data_len < 2) { return 0; }
+    var col_count = _pg_read_be16(data, 0);
+    # Each column costs at least its own 4-byte length prefix.
+    if (col_count > (data_len - 2) / 4) { return 0; }
+    var pos = 2;
+    var ci = 0;
+    while (ci < col_count) {
+        if (pos + 4 > data_len) { return 0; }
+        # SIGNED read: PostgreSQL encodes NULL as length -1, and the
+        # zero-extending _pg_read_be32 turned that into 4294967295 — a 4 GiB
+        # alloc + 4 GiB memcpy on any NULL.
+        var col_len = _pg_read_i32(data, pos);
+        pos = pos + 4;
+        if (col_len > data_len - pos) { return 0; }
+        if (col_len > 0) { pos = pos + col_len; }
+        ci = ci + 1;
+    }
+    var row = vec_new();
+    pos = 2;
+    ci = 0;
+    while (ci < col_count) {
+        var cl = _pg_read_i32(data, pos);
+        pos = pos + 4;
+        if (cl < 0) {
+            vec_push(row, 0);
+        } else {
+            var val = fl_alloc(cl + 1);
+            if (val == 0) {
+                var fi = 0;
+                while (fi < vec_len(row)) {
+                    var old = vec_get(row, fi);
+                    if (old != 0) { fl_free(old); }
+                    fi = fi + 1;
+                }
+                return 0;
+            }
+            memcpy(val, data + pos, cl);
+            store8(val + cl, 0);
+            vec_push(row, val);
+            pos = pos + cl;
+        }
+        ci = ci + 1;
+    }
+    return row;
+}
+
+# Run one simple query. Returns the rows (a vec when `collect` is 1, else 0)
+# with a status via ret2: 0 on success, -1 if the server answered with
+# ErrorResponse or the query could not be sent or read. Every failure other than
+# ErrorResponse poisons the connection.
+#
+# ⚠ An abort must never just stop reading. The unread remainder of the result —
+# the body of a message over PG_MAX_MSG, the rows after a malformed DataRow,
+# CommandComplete, ReadyForQuery — stayed queued, and the next query on the
+# handle consumed it as its own reply: an empty result first, then an earlier
+# query's rows reported as its own. ErrorResponse is the one case with a known
+# sync point, and it drains to it.
+fn _pg_query_st(conn, sql, collect) {
+    var rows = 0;
+    if (collect == 1) { rows = vec_new(); }
+    if (conn == 0 || sql == 0) { ret2(rows, -1); }
     var fd = load64(conn);
-    _pg_send_query(fd, sql);
+    if (fd < 0) { ret2(rows, -1); }
+    var sr = _pg_send_query(fd, sql);
+    if (sr < 0) {
+        if (sr == -1) { _pg_poison(conn); }
+        ret2(rows, -1);
+    }
 
-    var rows = vec_new();
-    var num_cols = 0;
-
-    while (1) {
+    var status = 0;
+    var done = 0;
+    while (done == 0) {
         var msg = _pg_read_msg(fd);
-        if (msg == 0) { break; }
+        if (msg == 0) { _pg_poison(conn); ret2(rows, -1); }
         var mtype = load64(msg);
-        var stop = 0;
 
         if (mtype == PG_MSG_ROW_DESC) {
-            if (load64(msg + 8) == 0 || load64(msg + 16) < 2) { _pg_msg_free(msg); break; }
-            num_cols = _pg_read_be16(load64(msg + 8), 0);
+            if (load64(msg + 8) == 0 || load64(msg + 16) < 2) {
+                _pg_msg_free(msg);
+                _pg_poison(conn);
+                ret2(rows, -1);
+            }
         }
         elif (mtype == PG_MSG_DATA_ROW) {
-            var data = load64(msg + 8);
-            var data_len = load64(msg + 16);
-            # Every offset below is derived from the wire, so each one is
-            # bounded against the message body the server actually sent.
-            if (data == 0 || data_len < 2) { _pg_msg_free(msg); break; }
-            var col_count = _pg_read_be16(data, 0);
-            # Each column costs at least its own 4-byte length prefix.
-            if (col_count > (data_len - 2) / 4) { _pg_msg_free(msg); break; }
-            var row = vec_new();
-            var pos = 2;
-            var ci = 0;
-            var bad = 0;
-            while (ci < col_count) {
-                if (pos + 4 > data_len) { bad = 1; ci = col_count; }
-                else {
-                    # SIGNED read: PostgreSQL encodes NULL as length -1, and
-                    # the zero-extending _pg_read_be32 turned that into
-                    # 4294967295 — a 4 GiB alloc + 4 GiB memcpy on any NULL.
-                    var col_len = _pg_read_i32(data, pos);
-                    pos = pos + 4;
-                    if (col_len < 0) {
-                        vec_push(row, 0);
-                    } elif (col_len > data_len - pos) {
-                        bad = 1;
-                        ci = col_count;
-                    } else {
-                        var val = fl_alloc(col_len + 1);
-                        if (val == 0) { bad = 1; ci = col_count; }
-                        else {
-                            memcpy(val, data + pos, col_len);
-                            store8(val + col_len, 0);
-                            vec_push(row, val);
-                            pos = pos + col_len;
-                        }
-                    }
-                    ci = ci + 1;
+            if (collect == 1) {
+                var row = _pg_parse_row(load64(msg + 8), load64(msg + 16));
+                # A server sending malformed DataRows cannot be trusted to
+                # reach ReadyForQuery either.
+                if (row == 0) {
+                    _pg_msg_free(msg);
+                    _pg_poison(conn);
+                    ret2(rows, -1);
                 }
+                vec_push(rows, row);
             }
-            if (bad == 1) { _pg_msg_free(msg); break; }
-            vec_push(rows, row);
-        }
-        elif (mtype == PG_MSG_CMD_COMPLETE) {
-            # Command completed
         }
         elif (mtype == PG_MSG_ERROR) {
             # PostgreSQL ALWAYS sends ReadyForQuery after ErrorResponse.
@@ -446,104 +651,142 @@ fn pg_query(conn, sql) {
             # previous query's ReadyForQuery as its own first message and
             # every subsequent result was offset by one. Drain to the real
             # sync point before returning.
-            var draining = 1;
-            while (draining == 1) {
+            status = -1;
+            while (done == 0) {
                 var m2 = _pg_read_msg(fd);
-                if (m2 == 0) { draining = 0; }
-                else {
-                    if (load64(m2) == PG_MSG_READY) { draining = 0; }
-                    _pg_msg_free(m2);
+                if (m2 == 0) {
+                    _pg_msg_free(msg);
+                    _pg_poison(conn);
+                    ret2(rows, -1);
                 }
+                if (load64(m2) == PG_MSG_READY) { done = 1; }
+                _pg_msg_free(m2);
             }
-            stop = 1;
         }
         elif (mtype == PG_MSG_READY) {
-            stop = 1;
+            done = 1;
         }
         _pg_msg_free(msg);
-        if (stop == 1) { break; }
     }
+    ret2(rows, status);
+}
 
-    return rows;
+# Execute a SQL query. Returns vec of rows, where each row is a vec of column values (C strings).
+fn pg_query(conn, sql) {
+    return _pg_query_st(conn, sql, 1);
 }
 
 # Execute a SQL statement (no result rows expected).
 fn pg_exec(conn, sql) {
-    pg_query(conn, sql);
+    return pg_query(conn, sql);
 }
 
 # --- Workflow Storage over PostgreSQL ---
 
+# Run a _pg_q statement and release it. Returns the _pg_query_st status (-1 if
+# the text could not be built).
+fn _pg_q_exec(conn, q) {
+    var sql = _pg_q_sql(q);
+    var st = -1;
+    if (sql != 0) {
+        _pg_query_st(conn, sql, 0);
+        st = rethi();
+    }
+    _pg_q_free(q);
+    return st;
+}
+
 # Initialize tables for workflow storage.
 fn pg_init_workflow_tables(conn) {
     {
-        var sb = str_builder_new();
-        str_builder_add_cstr(sb, "CREATE TABLE IF NOT EXISTS majra_workflow_definitions (id TEXT PRIMARY KEY, ");
-        str_builder_add_cstr(sb, "name TEXT NOT NULL, description TEXT, steps_json TEXT NOT NULL DEFAULT '[]', ");
-        str_builder_add_cstr(sb, "enabled BOOLEAN NOT NULL DEFAULT TRUE, version INTEGER NOT NULL DEFAULT 1, ");
-        str_builder_add_cstr(sb, "created_by TEXT NOT NULL DEFAULT 'system', created_at BIGINT NOT NULL, ");
-        str_builder_add_cstr(sb, "updated_at BIGINT NOT NULL)");
-        pg_exec(conn, str_data(str_builder_build(sb)));
+        var q = _pg_q_new();
+        if (q != 0) {
+            _pg_q_cstr(q, "CREATE TABLE IF NOT EXISTS majra_workflow_definitions (id TEXT PRIMARY KEY, ");
+            _pg_q_cstr(q, "name TEXT NOT NULL, description TEXT, steps_json TEXT NOT NULL DEFAULT '[]', ");
+            _pg_q_cstr(q, "enabled BOOLEAN NOT NULL DEFAULT TRUE, version INTEGER NOT NULL DEFAULT 1, ");
+            _pg_q_cstr(q, "created_by TEXT NOT NULL DEFAULT 'system', created_at BIGINT NOT NULL, ");
+            _pg_q_cstr(q, "updated_at BIGINT NOT NULL)");
+            _pg_q_exec(conn, q);
+        }
     }
     {
-        var sb = str_builder_new();
-        str_builder_add_cstr(sb, "CREATE TABLE IF NOT EXISTS majra_workflow_runs (id TEXT PRIMARY KEY, ");
-        str_builder_add_cstr(sb, "workflow_id TEXT NOT NULL, workflow_name TEXT NOT NULL, ");
-        str_builder_add_cstr(sb, "status TEXT NOT NULL DEFAULT 'pending', input_json TEXT, output_json TEXT, ");
-        str_builder_add_cstr(sb, "error TEXT, triggered_by TEXT NOT NULL DEFAULT 'manual', ");
-        str_builder_add_cstr(sb, "created_at BIGINT NOT NULL, ");
-        str_builder_add_cstr(sb, "started_at BIGINT, completed_at BIGINT)");
-        pg_exec(conn, str_data(str_builder_build(sb)));
+        var q = _pg_q_new();
+        if (q != 0) {
+            _pg_q_cstr(q, "CREATE TABLE IF NOT EXISTS majra_workflow_runs (id TEXT PRIMARY KEY, ");
+            _pg_q_cstr(q, "workflow_id TEXT NOT NULL, workflow_name TEXT NOT NULL, ");
+            _pg_q_cstr(q, "status TEXT NOT NULL DEFAULT 'pending', input_json TEXT, output_json TEXT, ");
+            _pg_q_cstr(q, "error TEXT, triggered_by TEXT NOT NULL DEFAULT 'manual', ");
+            _pg_q_cstr(q, "created_at BIGINT NOT NULL, ");
+            _pg_q_cstr(q, "started_at BIGINT, completed_at BIGINT)");
+            _pg_q_exec(conn, q);
+        }
     }
     {
-        var sb = str_builder_new();
-        str_builder_add_cstr(sb, "CREATE TABLE IF NOT EXISTS majra_workflow_step_runs (id TEXT PRIMARY KEY, ");
-        str_builder_add_cstr(sb, "run_id TEXT NOT NULL, step_id TEXT NOT NULL, step_name TEXT NOT NULL, ");
-        str_builder_add_cstr(sb, "status TEXT NOT NULL DEFAULT 'pending', input_json TEXT, output_json TEXT, ");
-        str_builder_add_cstr(sb, "error TEXT, attempt INTEGER NOT NULL DEFAULT 1, started_at BIGINT, ");
-        str_builder_add_cstr(sb, "completed_at BIGINT, duration_ms BIGINT)");
-        pg_exec(conn, str_data(str_builder_build(sb)));
+        var q = _pg_q_new();
+        if (q != 0) {
+            _pg_q_cstr(q, "CREATE TABLE IF NOT EXISTS majra_workflow_step_runs (id TEXT PRIMARY KEY, ");
+            _pg_q_cstr(q, "run_id TEXT NOT NULL, step_id TEXT NOT NULL, step_name TEXT NOT NULL, ");
+            _pg_q_cstr(q, "status TEXT NOT NULL DEFAULT 'pending', input_json TEXT, output_json TEXT, ");
+            _pg_q_cstr(q, "error TEXT, attempt INTEGER NOT NULL DEFAULT 1, started_at BIGINT, ");
+            _pg_q_cstr(q, "completed_at BIGINT, duration_ms BIGINT)");
+            _pg_q_exec(conn, q);
+        }
     }
     pg_exec(conn, "CREATE INDEX IF NOT EXISTS idx_majra_wf_runs_workflow ON majra_workflow_runs(workflow_id)");
     pg_exec(conn, "CREATE INDEX IF NOT EXISTS idx_majra_wf_step_runs_run ON majra_workflow_step_runs(run_id)");
 }
 
-# Save a workflow definition (upsert).
+# Save a workflow definition (upsert). Returns 0, or -1 on failure.
+#
+# ⚠ -1 includes a server-side rejection. This returned 0 whenever the SQL could
+# be built — a read-only hot standby after failover, a missing table, a
+# statement_timeout or a dead connection all reported the definition as
+# persisted.
 fn pg_save_workflow_def(conn, def_id, name, steps_json) {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "INSERT INTO majra_workflow_definitions ");
-    str_builder_add_cstr(sb, "(id, name, steps_json, created_at, updated_at) VALUES (");
-    if (_pg_add_literal(sb, def_id) < 0) { return -1; }
-    str_builder_add_cstr(sb, ", ");
-    if (_pg_add_literal(sb, name) < 0) { return -1; }
-    str_builder_add_cstr(sb, ", ");
-    if (_pg_add_literal(sb, steps_json) < 0) { return -1; }
+    var q = _pg_q_new();
+    if (q == 0) { return -1; }
+    _pg_q_cstr(q, "INSERT INTO majra_workflow_definitions ");
+    _pg_q_cstr(q, "(id, name, steps_json, created_at, updated_at) VALUES (");
+    if (_pg_q_lit(q, def_id) < 0) { _pg_q_free(q); return -1; }
+    _pg_q_cstr(q, ", ");
+    if (_pg_q_lit(q, name) < 0) { _pg_q_free(q); return -1; }
+    _pg_q_cstr(q, ", ");
+    if (_pg_q_lit(q, steps_json) < 0) { _pg_q_free(q); return -1; }
     var now = time_now_ns() / 1000000;
-    str_builder_add_cstr(sb, ", ");
-    str_builder_add_int(sb, now);
-    str_builder_add_cstr(sb, ", ");
-    str_builder_add_int(sb, now);
-    str_builder_add_cstr(sb, ") ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, ");
-    str_builder_add_cstr(sb, "steps_json = EXCLUDED.steps_json, updated_at = EXCLUDED.updated_at");
-    pg_exec(conn, str_data(str_builder_build(sb)));
+    _pg_q_cstr(q, ", ");
+    _pg_q_int(q, now);
+    _pg_q_cstr(q, ", ");
+    _pg_q_int(q, now);
+    _pg_q_cstr(q, ") ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, ");
+    _pg_q_cstr(q, "steps_json = EXCLUDED.steps_json, updated_at = EXCLUDED.updated_at");
+    if (_pg_q_exec(conn, q) != 0) { return -1; }
     return 0;
 }
 
-# Get a workflow definition by ID. Returns first row or 0.
+# Get a workflow definition by ID. Returns first row or 0 (not found, or the
+# query failed).
 fn pg_get_workflow_def(conn, def_id) {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "SELECT id, name, steps_json FROM majra_workflow_definitions WHERE id = ");
-    if (_pg_add_literal(sb, def_id) < 0) { return 0; }
-    var rows = pg_query(conn, str_data(str_builder_build(sb)));
+    var q = _pg_q_new();
+    if (q == 0) { return 0; }
+    _pg_q_cstr(q, "SELECT id, name, steps_json FROM majra_workflow_definitions WHERE id = ");
+    if (_pg_q_lit(q, def_id) < 0) { _pg_q_free(q); return 0; }
+    var sql = _pg_q_sql(q);
+    if (sql == 0) { _pg_q_free(q); return 0; }
+    var rows = _pg_query_st(conn, sql, 1);
+    var st = rethi();
+    _pg_q_free(q);
+    if (st != 0) { return 0; }
     if (vec_len(rows) == 0) { return 0; }
     return vec_get(rows, 0);
 }
 
-# Delete a workflow definition.
+# Delete a workflow definition. Returns 0, or -1 on failure (including a
+# server-side rejection — see pg_save_workflow_def).
 fn pg_delete_workflow_def(conn, def_id) {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "DELETE FROM majra_workflow_definitions WHERE id = ");
-    if (_pg_add_literal(sb, def_id) < 0) { return -1; }
-    pg_exec(conn, str_data(str_builder_build(sb)));
+    var q = _pg_q_new();
+    if (q == 0) { return -1; }
+    _pg_q_cstr(q, "DELETE FROM majra_workflow_definitions WHERE id = ");
+    if (_pg_q_lit(q, def_id) < 0) { _pg_q_free(q); return -1; }
+    if (_pg_q_exec(conn, q) != 0) { return -1; }
     return 0;
 }
