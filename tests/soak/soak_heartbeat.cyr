@@ -16,6 +16,7 @@ include "lib/vec.cyr"
 include "lib/str.cyr"
 include "lib/hashmap.cyr"
 include "lib/syscalls.cyr"
+include "lib/chrono.cyr"
 include "lib/tagged.cyr"
 include "lib/fnptr.cyr"
 include "lib/thread.cyr"
@@ -106,10 +107,7 @@ fn main() {
         return 1;
     }
     # Sleep 30ms to go offline
-    var ts[16];   # struct timespec = 2×i64 = 16 bytes (local var[N] is N bytes)
-    store64(&ts, 0);
-    store64(&ts + 8, 30000000);
-    syscall(35, &ts, 0);
+    _majra_sleep_ns(30000000);
 
     hb_update_statuses(ht2);
     if (hb_len(ht2) != subset) {

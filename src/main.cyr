@@ -11,6 +11,7 @@ include "lib/vec.cyr"
 include "lib/str.cyr"
 include "lib/hashmap.cyr"
 include "lib/syscalls.cyr"
+include "lib/chrono.cyr"
 include "lib/tagged.cyr"
 include "lib/fnptr.cyr"
 include "lib/thread.cyr"
@@ -93,6 +94,19 @@ fn test_envelope() {
     var b = envelope_new(from, TARGET_BROADCAST, 0, 0);
     assert(envelope_is_broadcast(b) == 1, "broadcast is_broadcast");
     assert(envelope_is_topic(b) == 0, "broadcast not topic");
+
+    # Two envelopes must not share an id. `uuid_generate` fails CLOSED (0/0)
+    # when entropy is unavailable, so `id_hi != 0` above catches a dead
+    # getrandom — but not a getrandom that returns the same bytes twice, and
+    # ids are what dedup and signature canonicalisation key on.
+    assert(envelope_id_hi(b) != 0, "second envelope id_hi non-zero");
+    assert(envelope_id_hi(e) != envelope_id_hi(b) || envelope_id_lo(e) != envelope_id_lo(b),
+      "two envelopes get distinct ids");
+
+    # _majra_sleep_ns sleeps to a monotonic deadline: it must not return early.
+    var t0 = time_now_ns();
+    _majra_sleep_ns(5000000);
+    assert(time_now_ns() - t0 >= 5000000, "_majra_sleep_ns(5ms) sleeps at least 5ms");
     println("  envelope: ok");
 }
 
@@ -153,15 +167,23 @@ fn test_metrics() {
 }
 
 fn test_ratelimit() {
-    # Token bucket: 1000 tokens/sec (*1000 = 1000000), burst 3
-    var rl = ratelimit_new(1000000, 3);
+    # Token bucket: 1 token/sec (*1000 = 1000), burst 3.
+    #
+    # This was 1000 tokens/sec, which makes the reject window 1 ms: the fourth
+    # check must land within a millisecond of the first or a token has already
+    # refilled. Natively four checks take ~14 µs; under qemu-aarch64 the FIRST
+    # call alone costs ~1.2 ms (TCG translating the map/alloc paths cold), so
+    # the "reject after burst" assertion failed there for a reason unrelated to
+    # the limiter. 1 token/sec keeps the assertion's meaning and widens the
+    # window to a second.
+    var rl = ratelimit_new(1000, 3);
     assert(ratelimit_check(rl, "a") == 1, "rl allow 1");
     assert(ratelimit_check(rl, "a") == 1, "rl allow 2");
     assert(ratelimit_check(rl, "a") == 1, "rl allow 3");
     assert(ratelimit_check(rl, "a") == 0, "rl reject after burst");
 
     # Separate keys are independent
-    var rl2 = ratelimit_new(1000000, 1);
+    var rl2 = ratelimit_new(1000, 1);
     assert(ratelimit_check(rl2, "a") == 1, "rl2 a allowed");
     assert(ratelimit_check(rl2, "b") == 1, "rl2 b allowed");
     assert(ratelimit_check(rl2, "a") == 0, "rl2 a rejected");
@@ -259,20 +281,10 @@ fn test_heartbeat_eviction() {
 
     hb_register(ht, "n1", 0);
 
-    # Sleep 30ms to go offline (offline_after = 20ms)
-    # Retry on EINTR (-4) with the kernel's remaining time. A null `rem` plus
-    # an ignored return meant a signal landing inside this window shortened
-    # the sleep below the eviction threshold and failed a correct module.
-    var ts[16];
-    var rem[16];
-    store64(&ts, 0);
-    store64(&ts + 8, 30000000);
-    var sr = syscall(35, &ts, &rem);
-    while (sr == -4) {
-        store64(&ts, load64(&rem));
-        store64(&ts + 8, load64(&rem + 8));
-        sr = syscall(35, &ts, &rem);
-    }
+    # Sleep 30ms to go offline (offline_after = 20ms). `_majra_sleep_ns`
+    # sleeps to a deadline, so a signal landing inside this window cannot
+    # shorten the sleep below the eviction threshold and fail a correct module.
+    _majra_sleep_ns(30000000);
 
     hb_update_statuses(ht);
     assert_eq(hb_len(ht), 1, "still present after cycle 1");

@@ -9,7 +9,24 @@
 # and majra performs no peer-credential check, so connecting IS authenticating.
 # A caller needing group access must widen the mode itself after ipc_bind.
 
-# Linux x86_64 syscall numbers for networking
+# Linux x86_64 syscall numbers for networking.
+#
+# These five are rows in the aarch64 backend's ESYSXLAT renumbering table
+# (41→198, 42→203, 43→202, 49→200, 50→201 — decoded from the 6.6.4 emitter),
+# so they issue the right syscall on both Linux arches. They are kept as
+# target-neutral `_SYS_*` names rather than the peers' `SYS_SOCKET` etc.
+# because the agnos and Windows peers do not declare those, and the backends
+# (`src/redis_backend.cyr`, `src/postgres_backend.cyr`) reuse the same numbers
+# without a target guard.
+#
+# ⚠ `fchmod` (91) was NOT a row and so ran as capset(2) on aarch64-Linux —
+# every `ipc_bind` failed there. It goes through the per-target `sys_fchmod`
+# wrapper now (see `ipc_bind`); do not re-add a `var _SYS_FCHMOD` here.
+# `sys_fchmod` exists on the two Linux peers and macOS (all via
+# `lib/syscalls_linux_common.cyr`); the `#ifndef CYRIUS_TARGET_AGNOS` arms
+# below are also what a Windows build would compile, and Windows has neither
+# the wrapper nor AF_UNIX sockets — this transport has never been a Windows
+# surface, and 2.7.2's raw 91 was no more meaningful there.
 var _SYS_SOCKET = 41;
 var _SYS_CONNECT = 42;
 var _SYS_ACCEPT = 43;
@@ -17,7 +34,6 @@ var _SYS_BIND = 49;
 var _SYS_LISTEN = 50;
 var _SOCK_STREAM = 1;
 var _AF_UNIX = 1;
-var _SYS_FCHMOD = 91;
 
 # Largest frame either direction will accept or emit. The receive side always
 # had this cap; the send side did not, so majra could emit a frame that every
@@ -118,7 +134,13 @@ fn ipc_bind(path) {
     # began promising owner-only access, and majra performs no peer-credential
     # check, so a consumer trusting that promise got a world-connectable
     # endpoint where connecting IS authenticating.
-    if (syscall(_SYS_FCHMOD, fd, 384) < 0) {
+    #
+    # `sys_fchmod` (lib/syscalls_linux_common.cyr) spells the peer's own
+    # SYS_FCHMOD — 91 on x86_64, 52 on aarch64. 2.7.2 and earlier issued a raw
+    # 91, which is not an ESYSXLAT row: on aarch64-Linux it ran as capset(2)
+    # with `fd` as the header pointer, returned -EFAULT, and this branch closed
+    # the socket — the Unix IPC transport could not bind on that arch at all.
+    if (sys_fchmod(fd, 384) < 0) {
         syscall(SYS_CLOSE, fd);
         fl_free(sa);
         return Err(ERR_IPC);

@@ -26,7 +26,6 @@ var _sha1_h2 = 0x98BADCFE;
 var _sha1_h3 = 0x10325476;
 var _sha1_h4 = 0xC3D2E1F0;
 
-
 fn _majra_sha1_rotl32(x, n) {
     x = x & 0xFFFFFFFF;
     return ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF;
@@ -330,7 +329,7 @@ fn ws_recv_frame(fd) {
         if (load8(&ext8) != 0 || load8(&ext8 + 1) != 0
           || load8(&ext8 + 2) != 0 || load8(&ext8 + 3) != 0) { return 0; }
         payload_len = (load8(&ext8 + 4) << 24) | (load8(&ext8 + 5) << 16)
-                    | (load8(&ext8 + 6) << 8) | load8(&ext8 + 7);
+        | (load8(&ext8 + 6) << 8) | load8(&ext8 + 7);
     }
 
     if (payload_len < 0 || payload_len > WS_MAX_PAYLOAD) { return 0; }

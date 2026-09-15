@@ -33,10 +33,13 @@ fn relay_msg_new(seq, from, to, topic, payload) {
     # `seq`, not by time — so this changes what the field MEANS without changing
     # any decision made inside majra.
     #
-    # ⚠ `time_epoch_ns` is majra's OWN (`src/envelope.cyr`), not the stdlib's
-    # `clock_epoch_ns` — `chrono` is not among the modules a `--no-deps` build
-    # prepends, and `--no-deps` is what CI runs, so the stdlib call compiled
-    # locally and failed there with `undefined function`.
+    # `time_epoch_ns` (`src/envelope.cyr`) is majra's one wall-clock entry
+    # point; since 2.7.3 it delegates to the stdlib's `clock_epoch_ns`, and
+    # every `--no-deps` entry point includes `lib/chrono.cyr` for it. (2.6.x
+    # rolled the read locally because a `--no-deps` build prepends nothing —
+    # the direct stdlib call compiled here and failed in CI with `undefined
+    # function`. Keep calling the majra name, not chrono's, so the include
+    # requirement stays in one place.)
     store64(m + 40, time_epoch_ns());
     store64(m + 48, 0);
     store64(m + 56, 0);

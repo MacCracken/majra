@@ -7,9 +7,9 @@ vec
 str
 hashmap
 syscalls
+chrono
 fnptr
 thread
-chrono
 net
 sandhi
 tls
@@ -20,6 +20,7 @@ sigil
 io
 thread_local
 async
+sys
 random
 fdlopen
 dynlib

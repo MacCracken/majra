@@ -10,6 +10,7 @@ include "lib/vec.cyr"
 include "lib/str.cyr"
 include "lib/hashmap.cyr"
 include "lib/syscalls.cyr"
+include "lib/chrono.cyr"
 include "lib/tagged.cyr"
 include "lib/fnptr.cyr"
 include "lib/thread.cyr"
@@ -117,12 +118,12 @@ fn test_queue_deep_fifo_and_compaction() {
     # near 400.
     var hi_tier = load64(pq2 + PRIORITY_HIGH * 8);
     assert_eq(vec_len(hi_tier) <= 64, 1,
-    "the consumed prefix is reclaimed — an uncompacted tier would hold all 400");
+      "the consumed prefix is reclaimed — an uncompacted tier would hold all 400");
 
     # Priority still wins over arrival order once several tiers are occupied.
     pq_enqueue(pq2, queue_item_new(PRIORITY_CRITICAL, 9999));
     assert_eq(queue_item_payload(pq_dequeue(pq2)), 9999,
-    "a later CRITICAL still preempts the 20 HIGH items already waiting");
+      "a later CRITICAL still preempts the 20 HIGH items already waiting");
 
     println("  queue_deep_fifo_and_compaction: ok");
 }
@@ -159,7 +160,7 @@ fn test_queue_priority_clamping() {
     pq_enqueue(pq2, queue_item_new(0 - 1, 1));
     pq_enqueue(pq2, queue_item_new(PRIORITY_CRITICAL, 2));
     assert_eq(queue_item_payload(pq_dequeue(pq2)), 2,
-    "a clamped item sits at NORMAL, so CRITICAL still preempts it");
+      "a clamped item sits at NORMAL, so CRITICAL still preempts it");
 
     println("  queue_priority_clamping: ok");
 }
@@ -580,7 +581,7 @@ fn test_relay_incoming_broadcast_flag() {
     var m3 = fl_alloc(64);
     store64(m3, 3); store64(m3 + 8, "node-2"); store64(m3 + 16, ""); store64(m3 + 24, "ann");
     assert(incoming_is_broadcast(relay_receive_ex(r, m3)) == 1,
-    "an empty target string is a broadcast");
+      "an empty target string is a broadcast");
 
     # relay_receive stays backward compatible: same accept/drop decision, and it
     # answers the bare message rather than the wrapper.
@@ -721,14 +722,23 @@ fn test_cbarrier_force() {
 var _aaw_cbs = 0;
 var _aaw_done_count = 0;
 var _aaw_done_mutex = 0;
+var _aaw_nonzero_returns = 0;
 
 fn _aaw_worker(participant) {
     var ret = cbarrier_arrive_and_wait(_aaw_cbs, "sync-mt", participant);
     # If we get here, barrier released
     mutex_lock(_aaw_done_mutex);
     _aaw_done_count = _aaw_done_count + 1;
+    if (ret != 0) { _aaw_nonzero_returns = _aaw_nonzero_returns + 1; }
     mutex_unlock(_aaw_done_mutex);
     return 0;
+}
+
+fn _aaw_done_count_locked() {
+    mutex_lock(_aaw_done_mutex);
+    var n = _aaw_done_count;
+    mutex_unlock(_aaw_done_mutex);
+    return n;
 }
 
 fn test_cbarrier_arrive_and_wait() {
@@ -742,6 +752,18 @@ fn test_cbarrier_arrive_and_wait() {
     var r2 = cbarrier_arrive(cbs, "sync", "b");
     assert_eq(load64(r2), BARRIER_RELEASED, "aaw non-blocking released");
 
+    # Single-participant barrier: arrive_and_wait must release at once and
+    # return 0. Through 2.7.2 it returned ERR_BARRIER here — it never found
+    # the barrier (see the note above `_cbarrier_do_arrive`), so nothing
+    # below that asserted only a done-count could tell.
+    var solo = vec_new();
+    vec_push(solo, "only");
+    cbarrier_create(cbs, "solo", solo);
+    assert_eq(cbarrier_arrive_and_wait(cbs, "solo", "only"), 0,
+      "single-participant arrive_and_wait releases immediately with 0");
+    assert_eq(cbarrier_arrive_and_wait(cbs, "no-such-barrier", "x"), ERR_BARRIER,
+      "an unknown barrier is ERR_BARRIER, not a hang");
+
     # Blocking path — 3 threads, each calls cbarrier_arrive_and_wait;
     # none return until the barrier is fully populated. Previously
     # crashed under 5.4.8 due to an RBP/child-stack race in
@@ -749,6 +771,7 @@ fn test_cbarrier_arrive_and_wait() {
     # (see the thread.cyr _thread_spawn inline-asm trampoline).
     _aaw_cbs = cbarrier_set_new();
     _aaw_done_count = 0;
+    _aaw_nonzero_returns = 0;
     _aaw_done_mutex = mutex_new();
 
     var p3 = vec_new();
@@ -757,19 +780,28 @@ fn test_cbarrier_arrive_and_wait() {
 
     var th1 = thread_create(&_aaw_worker, "t1");
     var th2 = thread_create(&_aaw_worker, "t2");
-    var th3 = thread_create(&_aaw_worker, "t3");
     assert(th1 != 0, "thread t1 spawned");
     assert(th2 != 0, "thread t2 spawned");
+
+    # Two of three have arrived: both must still be PARKED. A done-count of
+    # 3 after the joins is satisfied by an instant error return, which is
+    # exactly what 2.7.2 did; this is the assertion that separates a barrier
+    # from a no-op. 50 ms is ~500x the spawn cost, so a worker that did not
+    # block has counted itself by now.
+    _majra_sleep_ns(50000000);
+    assert_eq(_aaw_done_count_locked(), 0, "two arrivals of three stay parked");
+
+    var th3 = thread_create(&_aaw_worker, "t3");
     assert(th3 != 0, "thread t3 spawned");
 
     thread_join(th1);
     thread_join(th2);
     thread_join(th3);
     assert_eq(_aaw_done_count, 3, "all three threads released from barrier");
+    assert_eq(_aaw_nonzero_returns, 0, "every arrive_and_wait returned 0");
 
     println("  cbarrier_arrive_and_wait: ok");
 }
-
 
 # =============================================================================
 # Heartbeat — expanded tests (Rust: 17 tests)
@@ -805,13 +837,13 @@ fn test_relay_capacity_is_applied() {
     assert_eq(chan_try_send(sub, 1), 0, "first send fits");
     assert_eq(chan_try_send(sub, 2), 0, "second send fits");
     assert_eq(chan_try_send(sub, 3), 0 - 2,
-    "the THIRD is refused as full — a 0 here means the capacity never reached chan_new");
+      "the THIRD is refused as full — a 0 here means the capacity never reached chan_new");
 
     var d = relay_new("n2");
     assert_eq(relay_capacity(d), 256, "relay_new still defaults to 256");
     var zero = relay_with_capacity("n3", 0);
     assert_eq(relay_capacity(zero), 256,
-    "and a non-positive capacity falls back rather than building a dead channel");
+      "and a non-positive capacity falls back rather than building a dead channel");
     # ⚠ **A full subscriber ring must NOT wedge the sender.** Rust's
     # `broadcast::send` never blocks — a lagging receiver gets `Lagged`, the
     # sender proceeds. `chan_send` futex-waits for space, so honouring the
@@ -823,7 +855,7 @@ fn test_relay_capacity_is_applied() {
     relay_send(wedge, "b", "t", 0);
     relay_send(wedge, "b", "t", 0);
     assert_eq(relay_send(wedge, "b", "t", 0), 3,
-    "the third send RETURNS with the ring full — a hang here is the 2.6.5 deadlock");
+      "the third send RETURNS with the ring full — a hang here is the 2.6.5 deadlock");
     assert_eq(relay_send(wedge, "b", "t", 0), 4, "and so does the fourth");
 
     println("  relay_capacity_is_applied: ok");
@@ -836,20 +868,24 @@ fn test_relay_capacity_is_applied() {
 fn test_relay_timestamp_is_wall_clock() {
     var m = relay_msg_new(1, "a", "b", "t", 0);
     var ts = relay_msg_timestamp(m);
-    # ⚠ majra's OWN reader, not the stdlib's `clock_epoch_ns` — `chrono` is not
-    # prepended by a `--no-deps` build, and CI builds these tests that way.
+    # majra's wall-clock entry point (it wraps chrono's `clock_epoch_ns` since
+    # 2.7.3; this suite includes `lib/chrono.cyr` because `--no-deps` prepends
+    # nothing).
     var now = time_epoch_ns();
     # Epoch nanoseconds for 2020-01-01 — a monotonic reading (seconds since
     # boot) is orders of magnitude below this.
     assert(ts > 1577836800000000000,
-    "the stamp is an EPOCH instant, not seconds-since-boot");
+      "the stamp is an EPOCH instant, not seconds-since-boot");
     assert(ts <= now, "and it is not in the future");
     assert(now - ts < 60000000000, "and it is within a minute of now");
     println("  relay_timestamp_is_wall_clock: ok");
 }
 
 fn test_ratelimit_separate_keys() {
-    var rl = ratelimit_new(1000000, 2);
+    # 1 token/sec, not 1000: the reject assertions below need the burst to be
+    # exhausted before a token refills, and a 1 ms window is not enough under
+    # emulation (see test_ratelimit in src/main.cyr).
+    var rl = ratelimit_new(1000, 2);
     assert(ratelimit_check(rl, "k1") == 1, "rl k1 allow");
     assert(ratelimit_check(rl, "k2") == 1, "rl k2 allow");
     assert(ratelimit_check(rl, "k1") == 1, "rl k1 allow2");
@@ -880,7 +916,7 @@ fn _t_fresh_key(text) {
 # full-burst bucket every time, so the limiter never refused anything. Measured
 # through agnosai's HTTP handler as 3 identical requests -> 3 keys, 0 rejections.
 fn test_ratelimit_key_is_content_not_pointer() {
-    var rl = ratelimit_new(1000000, 2);
+    var rl = ratelimit_new(1000, 2);   # 1 token/sec — see test_ratelimit_separate_keys
     assert(ratelimit_check(rl, _t_fresh_key("1.2.3.4")) == 1, "rl fresh allow1");
     assert(ratelimit_check(rl, _t_fresh_key("1.2.3.4")) == 1, "rl fresh allow2");
     assert(ratelimit_check(rl, _t_fresh_key("1.2.3.4")) == 0, "rl fresh reject3");
@@ -1425,10 +1461,7 @@ fn _par_step(step, ctx) {
 
     # Long enough that overlapping is observable — the whole point of the
     # feature is steps far heavier than the ~89us spawn cost.
-    var ts[16];
-    store64(&ts, 0);
-    store64(&ts + 8, 40000000);
-    syscall(35, &ts, 0);
+    _majra_sleep_ns(40000000);
 
     mutex_lock(_par_mtx);
     _par_concurrent = _par_concurrent - 1;
@@ -1514,7 +1547,7 @@ fn test_dag_rejects_cycle() {
     workflow_def_add_step(def, a);
     workflow_def_add_step(def, b);
     assert_eq(workflow_execute(def, &_dag_always_ok, 0), RUN_FAILED,
-        "a dependency cycle FAILS the run rather than running a prefix");
+      "a dependency cycle FAILS the run rather than running a prefix");
     println("  dag_rejects_cycle: ok");
 }
 
@@ -1525,7 +1558,7 @@ fn test_dag_rejects_dangling_dep() {
     step_add_dep(a, "nonexistent");
     workflow_def_add_step(def, a);
     assert_eq(workflow_execute(def, &_dag_always_ok, 0), RUN_FAILED,
-        "a dangling dependency FAILS the run");
+      "a dangling dependency FAILS the run");
     println("  dag_rejects_dangling_dep: ok");
 }
 
@@ -1536,7 +1569,7 @@ fn test_dag_rejects_duplicate_ids() {
     workflow_def_add_step(def, workflow_step_new("same", "first"));
     workflow_def_add_step(def, workflow_step_new("same", "second"));
     assert_eq(workflow_execute(def, &_dag_always_ok, 0), RUN_FAILED,
-        "duplicate step ids FAIL the run");
+      "duplicate step ids FAIL the run");
     println("  dag_rejects_duplicate_ids: ok");
 }
 
@@ -1547,9 +1580,16 @@ fn test_dag_retry() {
     workflow_def_add_step(def, s1);
 
     _dag_attempt = 0;
+    var t0 = time_now_ns();
     var status = workflow_execute(def, &_dag_fail_then_succeed, 0);
+    var elapsed = time_now_ns() - t0;
     assert_eq(status, RUN_COMPLETED, "dag retry succeeded");
     assert_eq(_dag_attempt, 2, "dag retried once");
+    # The backoff before attempt 2 is attempt * 10 ms = 10 ms. Through 2.7.2
+    # this test asserted only the outcome and the attempt count, so a backoff
+    # that never slept passed it — which is exactly what the raw x86_64
+    # nanosleep number did on aarch64 (35 is unlinkat there). Bracket it.
+    assert(elapsed >= 10000000, "one retry waits at least the 10 ms backoff");
     println("  dag_retry: ok");
 }
 
@@ -1602,9 +1642,7 @@ fn test_circuit_breaker_lifecycle() {
     assert_eq(circuit_state(cb), CIRCUIT_OPEN, "cb open after 3 failures");
 
     # Wait for cooldown (50ms)
-    var ts[16];   # struct timespec = 2×i64 = 16 bytes (local var[N] is N bytes)
-    store64(&ts, 0); store64(&ts + 8, 60000000);
-    syscall(35, &ts, 0);
+    _majra_sleep_ns(60000000);
 
     assert_eq(circuit_state(cb), CIRCUIT_HALF_OPEN, "cb half-open after cooldown");
 

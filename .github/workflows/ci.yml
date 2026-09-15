@@ -50,14 +50,16 @@ jobs:
 
       - name: Resolve dependencies
         # Cyrius 6.x splits stdlib from git deps:
-        #   `cyrius lib sync` copies the version-pinned stdlib snapshot
-        #     (94 .cyr files incl slice/ct/chrono/async/sakshi/dynlib/
-        #     fdlopen — the modules sigil/sandhi/agnosys reach into) into
-        #     ./lib/. `cyrius deps` alone does NOT provide these toolchain
-        #     modules, and a partial ./lib/ makes agnosys's slice subscript
-        #     and sandhi's TLS_BACKEND_LIBSSL resolve to a `ud2` SIGILL.
-        #   `cyrius deps` then overlays the [deps.sigil] git dep + writes
-        #     cyrius.lock (94 entries) over the synced base.
+        #   `cyrius lib sync --full` copies the WHOLE version-pinned stdlib
+        #     snapshot (incl slice/ct/chrono/async/sakshi/dynlib/fdlopen/sys
+        #     — the modules sigil/sandhi reach into) into ./lib/. A bare
+        #     `lib sync` copies only the declared [deps].stdlib subset, and
+        #     a partial ./lib/ makes a missing toolchain module resolve to a
+        #     `ud2` SIGILL at runtime.
+        #   `cyrius deps` resolves nothing (majra declares no git deps since
+        #     2.6.8) but is what verifies cyrius.lock: one hash per synced
+        #     file plus the `cyrius <pin>` trailer (cyrius 6.6.4+ stamps it).
+        #     File counts and the pin live in docs/development/state.md.
         # Build steps below pass --no-deps so `cyrius build`'s auto-deps
         # doesn't re-resolve and perturb the synced lib's include order.
         run: |
@@ -102,14 +104,51 @@ jobs:
       - name: Verify ELF
         run: xxd -l 4 build/majra | grep -q "7f45 4c46"
 
-      # aarch64 cross-build remains unwired, but the historical blocker
-      # is GONE: the upstream `lib/agnosys.cyr:791` raw SYS_OPEN bug was
-      # fixed long ago in agnosys mainline, and the cyrius 6.1.24 + sigil
-      # 3.7.8 bump rolls the transitive agnosys pin forward to 1.3.2
-      # (zero SYS_OPEN refs). Wiring the cross-build is now a verification
-      # task, not a blocked-on-upstream one — deferred to a follow-up.
-      # majra consumers (daimon, AgnosAI, hoosh, sutra, stiva) are all
-      # x86_64-server-side, so no consumer is blocked.
+      - name: Raw syscall literal gate
+        # 2.7.3 removed three raw x86_64 syscall numbers that ran as
+        # DIFFERENT syscalls on aarch64 (fchmod 91→capset, getrandom 318→
+        # ENOSYS, nanosleep 35→unlinkat); two of the three emitted no
+        # build-time warning on any toolchain, and this lane is x86-only,
+        # so the assertions 2.7.3 added only catch a reintroduction when
+        # run on aarch64. This grep is the belt: no `syscall(<number>` in
+        # code (comments excepted), and no `var SYS_*` outside the five
+        # ESYSXLAT-routed networking rows src/ipc.cyr keeps target-neutral.
+        run: |
+          set -e
+          hits=$(grep -rnE 'syscall\([0-9]' src tests fuzz benches examples | grep -vE ':[[:space:]]*#' || true)
+          if [ -n "$hits" ]; then
+            echo "FAIL: raw syscall literal(s) in code — spell the peer's SYS_* name or call the wrapper:"
+            echo "$hits"; exit 1
+          fi
+          vars=$(grep -rnE '^var _?SYS_' src | grep -vE 'src/ipc\.cyr:[0-9]+:var _SYS_(SOCKET|CONNECT|ACCEPT|BIND|LISTEN) = (41|42|43|49|50);$' || true)
+          if [ -n "$vars" ]; then
+            echo "FAIL: syscall number declared in arch-neutral code (only src/ipc.cyr's five routed rows are allowed):"
+            echo "$vars"; exit 1
+          fi
+          echo "no raw syscall literals; no stray SYS_ declarations"
+
+      - name: aarch64 cross-build gate
+        # Build-only (the runner has no qemu-user): the cross-compile is
+        # free, and a `duplicate symbol 'SYS_…' redefined` or raw-syscall
+        # diagnostic from the aarch64 backend is what a stray x86_64 number
+        # looks like at build time when it looks like anything at all. The
+        # RUN half of the lane — every suite under qemu-aarch64, which is
+        # what actually caught the 2.7.3 defects — is verified locally
+        # (docs/guides/testing.md) and stays a roadmap item.
+        run: |
+          set -e
+          fail=0
+          for entry in src/main.cyr tests/test_core.tcyr tests/test_backends.tcyr tests/test_patra_queue.tcyr; do
+            out=$(cyrius build --aarch64 --no-deps "$entry" build/aarch64_probe 2>&1) || { echo "FAIL: aarch64 cross-build of $entry"; echo "$out"; fail=1; continue; }
+            if echo "$out" | grep -qE "duplicate symbol 'SYS_|redefined with conflicting value|raw syscall|undefined function"; then
+              echo "FAIL: aarch64 cross-build of $entry emitted a syscall/symbol diagnostic:"
+              echo "$out" | grep -E "duplicate symbol 'SYS_|redefined with conflicting value|raw syscall|undefined function"
+              fail=1
+            fi
+            echo "  $entry: aarch64 ELF ok"
+          done
+          [ $fail -eq 0 ] || exit 1
+          xxd -l 20 build/aarch64_probe | grep -q "b700" && echo "e_machine = AArch64"
 
       - name: Core tests
         run: ./build/majra

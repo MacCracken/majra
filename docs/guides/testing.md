@@ -11,8 +11,10 @@
 #   `ud2` (SIGILL at runtime, not a build error).
 cyrius lib sync --full && cyrius deps
 
-# Full audit (test + fmt + lint + vet + deny + bench)
+# Full audit (fmt + lint + docs + tests + bench); vet / deny are separate subcommands
 cyrius audit
+cyrius vet src/main.cyr
+cyrius deny src/main.cyr
 
 # Individual test suites (manual) — build with --no-deps so the build's
 # auto-deps doesn't perturb the lib-synced ./lib/ (see CLAUDE.md § Quick Start).
@@ -32,14 +34,16 @@ cyrius build --no-deps tests/soak/soak_queue.cyr build/soak_queue && ./build/soa
 
 | Suite | File | Assertions | Coverage |
 |-------|------|-----------|----------|
-| Core | `src/main.cyr` | 150 | All 15 core modules + revived relay dedup |
-| Expanded | `tests/test_core.tcyr` | 299 | Deep: queue lifecycle, pubsub patterns, DAG retry, fleet routing, circuit breaker, integration, multi-threaded barrier, plus the 2.5.3 concurrency + wildcard-alignment regressions and the 2.6.x relay / ratelimit / priority-queue regressions |
+| Core | `src/main.cyr` | 153 | All 15 core modules + relay dedup, envelope-id entropy (non-zero *and* distinct), `_majra_sleep_ns` floor |
+| Expanded | `tests/test_core.tcyr` | 304 | Deep: queue lifecycle, pubsub patterns, DAG retry (outcome + elapsed backoff), fleet routing, circuit breaker, integration, multi-threaded barrier (proves blocking, not just a counter), concurrency + wildcard-alignment, relay / ratelimit / priority-queue regressions. Per-release additions: CHANGELOG.md |
 | Backends | `tests/test_backends.tcyr` | 152 | base64, SHA-1, AES-256-GCM, signed envelopes, admin endpoint, WebSocket, RESP, PG wire |
 | Patra queue | `tests/test_patra_queue.tcyr` | 28 | Durable enqueue / priority dequeue / complete / counts / reopen persistence |
-| Live | `tests/test_live.tcyr` | 36 | 7 Redis + 4 PostgreSQL categories (see below). **CI-only** — needs Redis on :6379 + PostgreSQL on :5432, so a dev-box "full matrix" run is 629, not 665 |
-| **Total** | | **665** (629 CI + 36 live) | |
+| Live | `tests/test_live.tcyr` | 36 | 7 Redis + 4 PostgreSQL test functions in `tests/test_live.tcyr`. **CI-only** — needs Redis on :6379 + PostgreSQL on :5432, so a dev-box "full matrix" run is 637, not 673 |
+| **Total** | | **673** (637 CI + 36 live) | |
 
-`test_patra_queue` is a separate entry point because adding it to `test_backends` blows the cc5 16384 fixup-table cap (patra pulls sakshi + io + fs transitively).
+Every non-live suite, fuzz harness, soak, example and the benchmark binary also passes cross-built for aarch64 under `qemu-aarch64` as of 2.7.3 — see [aarch64 cross-build](#aarch64-cross-build-qemu-user) below.
+
+`test_patra_queue` was split out at 2.4.0 to stay under the then-16384 cc5 fixup cap (patra pulls sakshi + io + fs transitively); the cap is 1,048,576 at the 6.6.4 pin, and the split is kept as documented architecture.
 
 ## Test Categories
 
@@ -83,10 +87,85 @@ cyrius build --no-deps benches/bench_all.bcyr build/bench_all && ./build/bench_a
 
 Currently shipped (all four are run before a release, not in CI):
 - `soak_queue.cyr` — 5k ops (1k rounds × 5 jobs) managed-queue lifecycle; asserts `mq_total_completed`, `mq_job_count`, and per-round `queued_count`/`running_count` invariants.
+- `soak_pubsub.cyr` — 2000 distinct topics through `pubsub_new` + topic-map growth + subscribe + publish dispatch.
+- `soak_relay.cyr` — relay dedup correctness + eviction under the `max_dedup` cap; 20 senders × 50 msgs × 2 passes, then a 200-sender eviction phase.
+- `soak_heartbeat.cyr` — register / heartbeat / deregister cycles + auto-eviction; 100 nodes × 20 heartbeats, then an offline-timeout phase.
+
+## aarch64 cross-build (qemu-user)
+
+CI only **cross-builds** the four suites for aarch64 (a build-only gate that fails on syscall / symbol diagnostics); the run half needs `qemu-user` on the runner and is still a roadmap item, so run this before a release and after touching anything that issues a syscall. cyrius's aarch64 backend renumbers 44 source numbers at runtime (38 x86_64 numbers plus its six ≥1000 private aliases) and passes every other number through **verbatim**, so a stray x86_64 number is not a build error — it is a different, valid syscall. Through 2.7.2 majra shipped three of them (fchmod 91 → capset, getrandom 318 → ENOSYS, nanosleep 35 → unlinkat) and two built without a warning on any toolchain (CHANGELOG.md § [2.7.3]), which is why a build-only `--aarch64` step proves little here (it catches a `var SYS_*` that redefines a stdlib name, like the 318 site, but not a raw literal or a uniquely named constant, like 35 and 91): **the binaries have to run.**
+
+`qemu-aarch64` comes from the distro's `qemu-user` package (Arch: `qemu-user`, installs `/usr/bin/qemu-aarch64`). The same `lib/` serves both arches — `--aarch64` selects the peer stdlib and the emitter — so no second `lib sync`.
+
+```bash
+# Every entry point CI runs, plus the four soaks, cross-built and run under qemu-user. The live suite
+# cross-builds too but needs Redis + PostgreSQL to run (see Live Test Setup).
+# Shape: cyrius build --aarch64 --no-deps <entry> build/<name>_aarch64 && qemu-aarch64 ./build/<name>_aarch64
+cyrius build --aarch64 --no-deps src/main.cyr                build/majra_aarch64            && qemu-aarch64 ./build/majra_aarch64
+cyrius build --aarch64 --no-deps tests/test_core.tcyr        build/test_core_aarch64        && qemu-aarch64 ./build/test_core_aarch64
+cyrius build --aarch64 --no-deps tests/test_backends.tcyr    build/test_backends_aarch64    && qemu-aarch64 ./build/test_backends_aarch64
+cyrius build --aarch64 --no-deps tests/test_patra_queue.tcyr build/test_patra_queue_aarch64 && qemu-aarch64 ./build/test_patra_queue_aarch64
+cyrius build --aarch64 --no-deps benches/bench_all.bcyr      build/bench_all_aarch64        && qemu-aarch64 ./build/bench_all_aarch64   # all 17 targets print; the numbers are TCG's, not the CPU's
+
+for f in fuzz/*.fcyr; do            # each harness runs its built-in 1000 iterations — argv is ignored (CI's `500` is inert too)
+  n=$(basename "$f" .fcyr); cyrius build --aarch64 --no-deps "$f" "build/${n}_aarch64" && qemu-aarch64 "./build/${n}_aarch64" || { echo "FUZZ CRASH: $n"; exit 1; }
+done
+for f in tests/soak/*.cyr examples/*.cyr; do
+  n=$(basename "$f" .cyr);  cyrius build --aarch64 --no-deps "$f" "build/${n}_aarch64" && qemu-aarch64 "./build/${n}_aarch64" || { echo "FAIL: $n"; exit 1; }
+done
+```
+
+Timing under qemu is not native timing: TCG translates each path cold on first touch, so the **first** `ratelimit_check` costs ~1.2 ms where four native checks take ~14 µs. Any test that asserts inside a millisecond window will fail here for a reason unrelated to the code under test — budget the window in whole seconds (the ratelimit tests' burst buckets are 1 token/sec for exactly this).
+
+### Loop it
+
+A single green run proves little on a seed-dependent path: the `cbarrier_arrive_and_wait` defect fixed at 2.7.3 crashed **~7 % of native `tests/test_core.tcyr` runs at 2.7.2 (14 / 200)** and a green CI step hid it (CHANGELOG.md § [2.7.3]). Loop the expanded suite and count exit code 139 (qemu re-raises the guest's SIGSEGV on the host, so the shell sees it as it would natively):
+
+```bash
+crashes=0
+for i in $(seq 1 100); do
+  qemu-aarch64 ./build/test_core_aarch64 > /dev/null 2>&1
+  [ $? -eq 139 ] && crashes=$((crashes + 1))
+done
+echo "SIGSEGV: $crashes / 100"
+```
+
+2.7.3 baseline: `test_core` 0 / 100 under qemu and 0 / 200 native; core / backends / patra-queue 25× under qemu and 40× native, 0 failures. A non-zero count is a finding even when the plain run passes.
+
+### Localising a crash
+
+cyrius binaries carry no symbol table, so gdb shows every frame as `?? ()`. The recipe that found the barrier defect (`_map_find+0xf8`, reading through a hashmap *entry* that had been passed as a map):
+
+1. **Build with a symbol map.** `CYRIUS_SYMS=<file>` makes the compiler write one `<hex VA> <name>` line per function, sorted by address:
+
+   ```bash
+   CYRIUS_SYMS=build/test_core_aarch64.syms \
+     cyrius build --aarch64 --no-deps tests/test_core.tcyr build/test_core_aarch64
+   ```
+
+2. **Run under qemu's gdbstub and attach.** Plain `gdb` works if it was built with aarch64 support (Arch's is); otherwise `gdb-multiarch`. `continue` runs to the fault; the last command prints the faulting `pc` and the frame pointer:
+
+   ```bash
+   qemu-aarch64 -g 1234 ./build/test_core_aarch64 &
+   gdb -batch -ex "set architecture aarch64" \
+       -ex "target remote localhost:1234" \
+       -ex continue \
+       -ex "info registers pc x29" \
+       ./build/test_core_aarch64
+   ```
+
+3. **Resolve `pc` against the map** — the last symbol at or below it (substitute the `pc` step 2 printed; addresses differ per binary, and the 2.7.3 fault resolved to `_map_find+0xf8`):
+
+   ```bash
+   awk -v pc=0x415f4c 'BEGIN{pc=strtonum(pc)} {va=strtonum("0x"$1); if (va<=pc){sym=$2; base=va}} END{printf "%s+0x%x\n", sym, pc-base}' build/test_core_aarch64.syms
+   # _map_find+0xf8
+   ```
+
+4. **Read the frame.** cyrius's aarch64 frame convention is **parameters first, then locals, in declaration order, one 8-byte slot each below the frame pointer**: the first parameter at `[x29-8]`, the second at `[x29-16]`, the first local after the last parameter, and so on (`_map_find(m, key)` spills `x0` → `[x29-8]`, `x1` → `[x29-16]`, and its first local lands at `[x29-24]`). `x/4gx $x29-32` in the same session dumps the first four slots. `[x29]` is the caller's saved `x29` and `[x29+8]` the return address, so when the fault is inside a stdlib function — as it was — walk one frame up and read the caller's slots the same way; resolve the return address against the map to name it.
 
 ## Compiler Limitations
 
-Cyrius's fixup table cap is 16384 forward references (raised from 8192 in cc3, held at 16384 through the cc5 5.10.x line). Large test entry points that aggregate many src modules can still hit the cap — `test_patra_queue` is split out for this reason. If adding significant new test code causes a "fixup table full" error, create a new `.tcyr` entry point scoped to what you're testing.
+Cyrius's fixup-table cap at the 6.6.4 pin is 1,048,576 forward references (8192 on cc3, 16384 across the cc5 5.x line). Large test entry points that aggregate many src modules are no longer near it — `test_patra_queue` was split out under the 16384 cap and the split is kept as documented architecture — but the advice stands: if adding significant new test code causes a "fixup table full" error, create a new `.tcyr` entry point scoped to what you're testing.
 
 ## Live Test Setup
 

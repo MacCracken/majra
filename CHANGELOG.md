@@ -5,6 +5,212 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.3] - 2026-09-14
+
+Toolchain patch — **cyrius 6.6.2 → 6.6.4** — plus an aarch64 filing in the
+class 6.6.4 swept from its own stdlib, and a barrier defect the aarch64 run
+surfaced that turns out to be arch-independent and as old as `src/barrier.cyr`.
+**637 assertions** pass (core 153 · expanded 304 · backends 152 · patra-queue
+28), three fuzz harnesses, four soak runs and both examples are clean, and —
+new for this release — **every suite, fuzz harness, soak and example also passes
+cross-built for aarch64 under `qemu-aarch64`** (the expanded suite looped 100×
+there and 200× natively with zero crashes; the other three suites 25× each). Benchmarks are within noise of
+a 6.6.2 head-to-head (five-trial medians; largest move `pattern_exact` −7 %,
+`circuit_state` 3 ns → 2 ns is timer-floor quantisation).
+
+### Fixed — raw x86_64 syscall numbers ran as DIFFERENT syscalls on aarch64-Linux
+
+⛔ **P1 for any aarch64-Linux consumer; three independent failures in shipped
+code.** Filed 2026-09-14 by daimon from a `cyrius build --aarch64` of the
+vendored `dist/majra.cyr`
+([`docs/development/issues/2026-09-14-raw-x86-syscall-numbers-aarch64.md`](docs/development/issues/2026-09-14-raw-x86-syscall-numbers-aarch64.md));
+this is the class cyrius 6.6.4 swept from its own stdlib (its new
+`raw_syscall_literals_routed` gate scans `lib/` + `cbt/` only, and its
+consumer pin-sweep list does not name majra — nothing had cross-built majra
+until daimon did). cyrius's aarch64 backend renumbers 38 x86_64 syscall
+numbers at runtime (`ESYSXLAT`; 44 rows counting its six ≥1000 private
+aliases) and passes every other number through **verbatim** — so a stray
+x86_64 number is not an error, it is a different, valid syscall. Every claim in the filing was re-derived here
+against the 6.6.4 emitter before anything was changed.
+
+| site | was | on aarch64-Linux it issued | now |
+|---|---|---|---|
+| `src/ipc.cyr` `ipc_bind` | `syscall(91, fd, 0600)` — fchmod | **capset(2)** with `fd` as the header pointer → `-EFAULT` → **every `ipc_bind` failed** | `sys_fchmod(fd, 384)` |
+| `src/envelope.cyr` `uuid_generate` | `syscall(318, …)` — getrandom | `-ENOSYS` × 8 attempts → **every envelope id was 0/0** (fail-closed, but total) | `sys_getrandom(…)` on every target; the agnos/non-agnos split is gone |
+| `src/dag.cyr` retry backoff | `syscall(35, &ts, &rem)` — nanosleep | **unlinkat(2)** handed a stack address as `dirfd` → error at once, never `-EINTR` → **the backoff never slept**; a file-removal call with a pointer-derived path | `_majra_sleep_ns(attempt * 10 ms)` |
+
+Confirmed before the fix by running majra's own core suite cross-built under
+`qemu-aarch64` at 2.7.2: `envelope id_hi non-zero` and `evicted after cycle 2`
+both failed. **Only the 318 line ever produced a build-time warning**, and only
+because the name collided with the aarch64 peer's `SYS_GETRANDOM` (278) — as a
+dep bundle prepended after the stdlib leaves, majra's 318 also overrode the
+peer's for the consumer's whole translation unit. The same override hit the
+**agnos** peer (`SYS_GETRANDOM` = 45 there): the `#ifdef CYRIUS_TARGET_AGNOS`
+arm called `sys_getrandom`, which spells the enum name — so it issued 318,
+the kernel fell through to -1, and 2.7.2's envelope ids were 0/0 on agnos too,
+along with every other `sys_getrandom` caller in a unit that included the
+bundle. The other two sites were silent on every toolchain.
+
+**What changed.** majra no longer spells a syscall number in arch-neutral code:
+
+- `var SYS_CLOCK_GETTIME`, `var SYS_GETRANDOM` and `var _SYS_FCHMOD` are gone.
+  `time_now_ns` / `time_epoch_ns` delegate to `lib/chrono.cyr`'s `clock_now_ns`
+  / `clock_epoch_ns`; `uuid_generate` calls `sys_getrandom`; `ipc_bind` calls
+  `sys_fchmod`. On Linux chrono issues the same routed 228 — the difference is
+  that cyrius's `raw_syscall_literals_routed` gate scans stdlib code, so a
+  trimmed row would now be caught upstream instead of here.
+- **New `_majra_sleep_ns(total_ns)`** (`src/envelope.cyr`) — majra's one sleep
+  primitive, internal (leading underscore, no public listing) so that this
+  stays a PATCH under [`semver.md`](docs/development/semver.md). `sleep_ms` is `poll(NULL, 0, ms)` on Linux/macOS (7 is a routed
+  row), kernel32 `Sleep` on PE and #41 on agnos; it discards poll's return, so
+  the function sleeps to a **monotonic deadline** instead, which carries the
+  EINTR-with-remainder intent of the nanosleep loop it replaced. Each request
+  is clamped to 1 ms ≤ `ms` ≤ 1 s (`poll(…, 0)` returns immediately; x86_64
+  `poll` takes a C `int`, so ≥ 2^31 ms would truncate negative into an
+  infinite wait; the loop re-sleeps the remainder), and **termination does
+  not depend on the clock advancing**: a reading that has not moved past the
+  pre-sleep one (agnos #95 returns -1 for the whole uptime when the kernel
+  refused its TSC calibration) charges the request just made instead. The
+  review's first cut recomputed `left` from the deadline alone, which on a
+  dead clock never returned — worse than the bounded `sys_sleep_ms` it
+  replaced on that target. Probed with a stub clock: 10 ms → one sleep,
+  2.5 s → three, both return. The DAG backoff, `test_heartbeat_eviction`,
+  the parallel-tier and circuit-breaker tests and `soak_heartbeat` all use it.
+- The five networking numbers (`_SYS_SOCKET` 41 … `_SYS_LISTEN` 50) **stay as
+  target-neutral `var`s** — all five are routed rows, and the peers' `SYS_SOCKET`
+  spelling does not exist on agnos or Windows. `src/redis_backend.cyr` and
+  `src/postgres_backend.cyr` now reuse `_SYS_SOCKET` / `_SYS_CONNECT` from
+  `src/ipc.cyr` (earlier in every include order) instead of their own raw 41/42.
+- Test code: raw `socketpair` 53 → `SYS_SOCKETPAIR` (declared on both Linux
+  peers; 53 is `fchmodat` on aarch64), and the `ipc_bind` mode check reads
+  `st_mode` through `sys_stat` + the peer's `STAT_MODE` (16 on aarch64, 24 on
+  x86_64 — a hardcoded 24 reads `st_uid` there).
+- **Every entry point that reaches `src/envelope.cyr` includes
+  `lib/chrono.cyr`** — thirteen gained it at 2.7.3, right after
+  `lib/syscalls.cyr`; `tests/test_backends.tcyr` already had it. The header
+  of `src/envelope.cyr` records the requirement. The four `dist/*.deps`
+  sidecars have listed `chrono` since 2.7.1, so a consumer provisioning from
+  a sidecar — daimon's shape — needs nothing; a consumer hand-including the
+  bundle under `--no-deps` must add the include. Verified with a clean-room probe per profile (sidecar leaves in
+  order, then the bundle, then `envelope_new` + `_majra_sleep_ns` + `ipc_bind`):
+  zero undefined functions, all four run.
+
+⚠ **agnos behaviour change, stated rather than hidden**: chrono's
+`clock_now_ns` reads #95 (`sys_uptime_us`, rdtsc) since cyrius 6.6.1, where
+`time_now_ns` read #40 (`sys_uptime_ms`, timer ticks). #40 is frozen for a
+foreground `run` program (IF is cleared, the 100 Hz ISR never fires), so every
+majra timestamp on that path measured zero; #95 is the only correct monotonic
+source there, and the resolution improves from the 10 ms tick to µs.
+
+**Tests that would have caught it, added:** `test_dag_retry` now brackets the
+run with `time_now_ns()` and asserts ≥ 10 ms for one retry (it asserted only
+the outcome and the attempt count, which a never-sleeping backoff satisfies);
+`test_envelope` asserts two envelopes get **distinct** ids (a dead getrandom
+was caught by `id_hi != 0`; one returning the same bytes twice was not) and
+that `_majra_sleep_ns(5 ms)` sleeps ≥ 5 ms. All three are mutation-verified: a
+no-op `_majra_sleep_ns` fails six assertions across two suites; constant
+entropy fails the id check. ⚠ On the lane CI runs (x86 only) these detect a
+reintroduced raw number only when run on aarch64, so CI also gained a grep
+gate — no `syscall(<number>` in code, no `var SYS_*` outside `src/ipc.cyr`'s
+five routed rows — and an aarch64 **cross-build** gate that fails on any
+`duplicate symbol 'SYS_` / raw-syscall diagnostic. Both mutation-verified
+against a reintroduced 35 and a reintroduced `var SYS_GETRANDOM`.
+
+### Fixed — `cbarrier_arrive_and_wait` never arrived, and crashed one run in sixteen
+
+⛔ **Arch-independent, and as old as the file (2026-04-08).** Found because the
+aarch64 run of the expanded suite SIGSEGV'd intermittently after
+`cbarrier_force: ok`; bisected, then caught under qemu's gdbstub with a
+`CYRIUS_SYMS` map: `_map_find+0xf8`, reading through a pointer that was a
+hashmap *entry*, not a map.
+
+`cbarrier_arrive_and_wait` passed `load64(cbs)` — the map — to
+`_cbarrier_do_arrive`, whose first line is `load64(cbs_ptr)` again. So
+`map_get` received the map's **entries array** as a header. With slot 0
+empty the fake header has `cap = 0`, the probe loop never runs, and the call
+returned `ERR_BARRIER` immediately **without arriving** — every time, on every
+arch, since the 2.0.0 cutover the file arrived in. With slot 0 occupied (whichever hash seed put the name
+there: one run in sixteen), `cap` is that entry's value pointer, the probe
+index is masked against it, and `_map_find` reads through a wild pointer.
+**Measured at 2.7.2 on native x86: 14 SIGSEGVs in 200 runs of
+`tests/test_core.tcyr`** — the CI "Expanded tests" step has had a ~7 % chance
+of failing on every push, and two hardening passes walked past it because the
+threaded test asserted only that three workers incremented a counter, which an
+instant error return satisfies.
+
+The fix is the one argument. The test now proves the *blocking*: two of three
+workers arrive, 50 ms pass, and the done-count must still be **0** before the
+third is spawned; every return code must be 0; a single-participant barrier
+releases at once with 0; an unknown name is `ERR_BARRIER`, not a hang.
+Mutation-verified by restoring the 2.7.2 argument: three assertions fail, and
+one of three runs died mid-test. After the fix: **0 crashes in 200 native runs and
+100 `qemu-aarch64` runs.**
+
+### Fixed — the core ratelimit tests were sensitive to a 1 ms window
+
+`test_ratelimit` (and two expanded-suite siblings) built their burst-then-reject
+buckets at 1000 tokens/sec, so the fourth check had to land within 1 ms of the
+first or a token had already refilled. Natively four checks take ~14 µs;
+under `qemu-aarch64` the **first** call alone costs ~1.2 ms (TCG translating
+the map and allocator paths cold) and `rl reject after burst` failed for a
+reason unrelated to the limiter. Those buckets are 1 token/sec now — same
+assertions, a one-second window.
+
+### Changed — cyrius 6.6.2 → 6.6.4, and the lock grows a pin trailer
+
+- **Pin `6.6.2` → `6.6.4`.** `lib/` resynced from the 6.6.4 snapshot (110
+  files, `lib/unicode/` included); folded modules move **sigil 3.12.16 →
+  3.12.18, patra 1.14.1 → 1.14.3, sandhi 1.9.16 → 1.9.17, sakshi 2.5.1 →
+  2.5.2**. No `src/` symbol changed meaning under the new pin; the bundle
+  bodies moved only where this release's own fixes moved them.
+- **`cyrius.lock` is 110 hashes + a `cyrius<TAB>6.6.4` trailer, sorted.** Two
+  6.6.x resolver fixes land at once: 6.6.3 sorts the lock (it was written in
+  readdir order, so a lock committed from one filesystem could not verify on
+  another), and 6.6.4 stamps the pin as a trailer and **refuses** a stdlib leaf
+  whose snapshot hash moved under an unchanged pin (`cyrius deps --relock` is
+  the explicit accept). 2.7.2's 66-entry lock was the residue of a bare
+  `cyrius deps` into an empty `lib/`; this one is the full `lib sync --full`
+  snapshot, which is what CI provisions and verifies. `cyrius deps --verify`:
+  110 verified, 0 failed.
+- **sigil 3.12.18 depends on `lib/sys.cyr`** (its `agnosys_uname` routes
+  through `sys_uname` instead of a raw x86_64 `syscall(63, …)`, which is
+  `read(2)` on aarch64). `tests/test_backends.tcyr` includes `lib/sys.cyr`
+  before `lib/sigil.cyr` — without it the build still reported `OK` but warned
+  `undefined function 'sys_uname'` and lowered it to a trapping `ud2` — and
+  `"sys"` joins `[deps].stdlib`. Presence is what matters, not order: a unit
+  that includes sigil first and sys later builds and runs (forward references
+  resolve through the fixup table), which is the order the three named
+  sidecars use. `distlib`'s compile-verify infers `sys` into all four sidecars
+  on its own (measured: with the declaration removed, `dist/majra.deps` still
+  gains it as a "re-added leaf"); the declaration is what keeps `cyrius audit`
+  / `cyrius bench` — which prepend the declared list — building clean.
+- Formatter drift in five files (`src/dag.cyr`, `src/ipc_encrypted.cyr`,
+  `src/ws.cyr`, both `.tcyr` suites — continuation indent only, present under
+  6.6.2 as well) and eight pre-existing lint warnings (blank lines, three
+  >120-byte lines) cleared, so `cyrius fmt --check` and `cyrius lint` are
+  clean across `src/`, `tests/`, `fuzz/`, `benches/`, `examples/`.
+
+### Known issues
+
+- **`duplicate fn 'uname_release'` between `lib/sigil.cyr:746` and
+  `lib/sys.cyr:203`** — sigil 3.12.18 still defines a byte-identical copy of
+  the accessor it now depends on `lib/sys.cyr` for. Upstream (sigil), harmless
+  (last definition wins, same body), and visible to any consumer that links
+  both under the 6.6.4 snapshot — all four majra sidecars name both. The
+  warning names whichever file came second (`lib/sys.cyr:203:1 … first
+  defined in lib/sigil.cyr` when sigil precedes sys, as the three named
+  sidecars order them).
+- **aarch64 CI lane still build-only.** Everything this release fixes was
+  verified locally under `qemu-aarch64` (recipe in
+  [`docs/guides/testing.md`](docs/guides/testing.md)); CI now cross-builds
+  the four suites for aarch64 and fails on syscall diagnostics, but does not
+  run them. The filing's step 7 — a build-only lane proves little here, since
+  two of the three sites emitted no warning — stands as the roadmap item.
+- `ws_recv_frame` / `ws_send_text` still collide with `lib/ws.cyr` (unchanged
+  from 2.7.1). Queued for 2.8.0 as `majra_ws_send_text` /
+  `majra_ws_recv_frame` under `semver.md`'s collision exception — see
+  [`roadmap.md`](docs/development/roadmap.md) § 2.8.0.
+
 ## [2.7.2] - 2026-09-10
 
 Toolchain patch: **cyrius 6.5.36 → 6.6.2**, the `Result` / `Option` / `Either`

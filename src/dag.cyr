@@ -294,28 +294,14 @@ fn _dag_run_step(step, ctx, executor_fn) {
         } else {
             attempt = attempt + 1;
             if (attempt <= max_retries) {
-                #ifdef CYRIUS_TARGET_AGNOS
-                sys_sleep_ms(attempt * 10);
-                #endif
-                #ifndef CYRIUS_TARGET_AGNOS
-                # tv_nsec MUST be in [0, 999999999]. attempt * 10ms exceeds a
-                # second at attempt 100 and nanosleep then returns EINVAL
-                # immediately — the backoff silently stops backing off and the
-                # retry loop becomes a tight spin. Split into whole seconds +
-                # remainder, and retry on EINTR (-4) so a signal does not
-                # shorten the wait.
-                var total_ns = attempt * 10000000;
-                var ts[16];
-                var rem[16];
-                store64(&ts, total_ns / 1000000000);
-                store64(&ts + 8, total_ns - (total_ns / 1000000000) * 1000000000);
-                var sr = syscall(35, &ts, &rem);
-                while (sr == -4) {
-                    store64(&ts, load64(&rem));
-                    store64(&ts + 8, load64(&rem + 8));
-                    sr = syscall(35, &ts, &rem);
-                }
-                #endif
+                # Linear backoff: attempt * 10 ms. `_majra_sleep_ns`
+                # (src/envelope.cyr) sleeps to a monotonic deadline, so a
+                # signal landing mid-wait resumes rather than shortens it —
+                # the EINTR-with-remainder intent of the raw nanosleep loop
+                # this replaced. That loop spelled x86_64's 35, which on
+                # aarch64-Linux is unlinkat(2): it returned an error at once,
+                # never -4, and the backoff never slept.
+                _majra_sleep_ns(attempt * 10000000);
             }
         }
     }
@@ -412,7 +398,7 @@ fn workflow_execute(def, executor_fn, input) {
                 var k = 0;
                 while (k < n) {
                     store64(handles + k * 8,
-                            thread_create(&_dag_worker, load64(jobs + (base + k) * 8)));
+                      thread_create(&_dag_worker, load64(jobs + (base + k) * 8)));
                     k = k + 1;
                 }
                 k = 0;

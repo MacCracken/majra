@@ -241,10 +241,13 @@ fn redis_connect(host, port) {
         addr = majra_parse_ipv4(host);
         if (addr < 0) { return 0; }
     }
-    var fd = syscall(41, AF_INET, SOCK_STREAM, 0);
+    # `_SYS_SOCKET` / `_SYS_CONNECT` are src/ipc.cyr's target-neutral names for
+    # 41 / 42 (ESYSXLAT rows on aarch64) — not the peers' `SYS_SOCKET`, which the
+    # agnos and Windows peers do not declare and this file has no guard for.
+    var fd = syscall(_SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { return 0; }
     var sa = sockaddr_in(addr, port);
-    var ret = syscall(42, fd, sa, 16);
+    var ret = syscall(_SYS_CONNECT, fd, sa, 16);
     if (ret < 0) {
         syscall(SYS_CLOSE, fd);
         return 0;

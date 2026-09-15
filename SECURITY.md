@@ -29,7 +29,7 @@ backends. Written in Cyrius with zero external dependencies.
 
 | Version | Supported |
 | ------- | --------- |
-| 2.x (current: 2.7.0) | Yes — security fixes land on the latest 2.x patch |
+| 2.x (current: see `VERSION`) | Yes — security fixes land on the latest 2.x patch |
 | 1.x     | No (Rust implementation, archived at 2.0.0) |
 
 Report against the latest 2.x release. Fixes are not backported to earlier 2.x

@@ -19,6 +19,7 @@ include "lib/vec.cyr"
 include "lib/str.cyr"
 include "lib/hashmap.cyr"
 include "lib/syscalls.cyr"
+include "lib/chrono.cyr"
 include "lib/tagged.cyr"
 include "lib/fnptr.cyr"
 include "lib/thread.cyr"
@@ -62,7 +63,7 @@ fn main() {
     println("=== soak_relay ===");
     println("building names");
 
-    # ── Phase A: dedup correctness ────────────────────────────────
+    # ── Phase A: dedup correctness ────────────────────
     var r = relay_new("receiver");
     var names = vec_new();
     var si = 0;
@@ -122,7 +123,7 @@ fn main() {
     }
     println("  phase A: dedup correct");
 
-    # ── Phase B: eviction under max_dedup ─────────────────────────
+    # ── Phase B: eviction under max_dedup ────────────────────
     var r2 = relay_new("receiver");
     relay_set_max_dedup(r2, 16);
     var total_senders = 200;

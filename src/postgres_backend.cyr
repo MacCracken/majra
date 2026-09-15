@@ -112,7 +112,6 @@ fn _pg_write_full(fd, buf, len) {
     return total;
 }
 
-
 # Globals for PG startup to avoid local clobbering.
 #
 # These are process-wide and live across the whole blocking handshake, so two
@@ -293,10 +292,11 @@ fn pg_connect(host, port, user, database, password) {
         if (addr < 0) { return 0; }
     }
     _pg_connect_lock();
-    _pg_fd_g = syscall(41, AF_INET, SOCK_STREAM, 0);
+    # `_SYS_SOCKET` / `_SYS_CONNECT`: see the note in src/redis_backend.cyr.
+    _pg_fd_g = syscall(_SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
     if (_pg_fd_g < 0) { mutex_unlock(_pg_connect_mtx); return 0; }
     var sa = sockaddr_in(addr, port);
-    if (syscall(42, _pg_fd_g, sa, 16) < 0) {
+    if (syscall(_SYS_CONNECT, _pg_fd_g, sa, 16) < 0) {
         syscall(SYS_CLOSE, _pg_fd_g);
         mutex_unlock(_pg_connect_mtx);
         return 0;
@@ -317,14 +317,23 @@ fn pg_connect(host, port, user, database, password) {
         # A message whose declared length is exactly 4 carries no body, so
         # load64(msg + 8) is 0 — reading the auth type straight off it was a
         # null dereference on a malformed (or hostile) server reply.
-        if (load64(msg + 16) < 4) { _pg_msg_free(msg); syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
+        if (load64(msg + 16) < 4) {
+            _pg_msg_free(msg); syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx);
+            return 0;
+        }
         var auth_type = _pg_read_be32(load64(msg + 8), 0);
         if (auth_type == PG_AUTH_CLEARTEXT) {
             _pg_msg_free(msg);
-            if (_pg_send_password(fd, _pg_pw_g) < 0) { syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
+            if (_pg_send_password(fd, _pg_pw_g) < 0) {
+                syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx);
+                return 0;
+            }
             msg = _pg_read_msg(fd);
             if (msg == 0) { syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
-            if (load64(msg + 16) < 4) { _pg_msg_free(msg); syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx); return 0; }
+            if (load64(msg + 16) < 4) {
+                _pg_msg_free(msg); syscall(SYS_CLOSE, fd); mutex_unlock(_pg_connect_mtx);
+                return 0;
+            }
             auth_type = _pg_read_be32(load64(msg + 8), 0);
         }
         _pg_msg_free(msg);

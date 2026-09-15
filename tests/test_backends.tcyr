@@ -29,6 +29,12 @@ include "lib/sandhi.cyr"
 include "lib/keccak.cyr"
 include "lib/random.cyr"
 
+# sys precedes sigil — sigil 3.12.18 (cyrius 6.6.4) routes `agnosys_uname`
+# through `sys_uname` instead of a raw x86_64 `syscall(63, …)`, which on
+# aarch64-Linux is read(2). Without this line the build still reports OK
+# but warns `undefined function 'sys_uname'` and lowers it to a trapping ud2.
+include "lib/sys.cyr"
+
 # sigil (vendored dist, 2.8.4+) provides AES-256-GCM consumed by ipc_encrypted.
 include "lib/sigil.cyr"
 
@@ -331,7 +337,7 @@ fn test_ws_framing() {
     # These assertions used to run against fd = -1, where every path returns
     # -1 and removing the guards would not have failed the test.
     var sv[8];
-    syscall(53, 1, 1, 0, &sv);
+    syscall(SYS_SOCKETPAIR, 1, 1, 0, &sv);
     var wa = load32(&sv);
     var wb = load32(&sv + 4);
 
@@ -365,7 +371,7 @@ fn test_ipc() {
 
     # socketpair(AF_UNIX, SOCK_STREAM, 0, sv) — a real connected pair.
     var sv[8];
-    var rc = syscall(53, 1, 1, 0, &sv);
+    var rc = syscall(SYS_SOCKETPAIR, 1, 1, 0, &sv);
     assert_eq(rc, 0, "socketpair created");
     var a = load32(&sv);
     var b = load32(&sv + 4);
@@ -406,9 +412,12 @@ fn test_ipc() {
     assert_eq(is_err_result(br_t), 0, "ipc_bind succeeded");
     var st[144];
     memset(&st, 0, 144);
-    # stat(2) = syscall 4; st_mode is a u32 at offset 24 in struct stat.
-    assert_eq(syscall(4, "/tmp/majra_ipc_mode_test.sock", &st), 0, "stat on the bound socket");
-    var mode = load32(&st + 24) & 511;
+    # `sys_stat` + the peer's `STAT_MODE` offset, not a raw `syscall(4, …)`
+    # and a hardcoded 24: aarch64 has no bare stat (the peer routes to
+    # newfstatat) and its generic layout puts st_mode at 16 — a 24 there
+    # reads st_uid.
+    assert_eq(sys_stat("/tmp/majra_ipc_mode_test.sock", &st), 0, "stat on the bound socket");
+    var mode = load32(&st + STAT_MODE) & 511;
     assert_eq(mode, 384, "bound socket is 0600, not umask-derived");
     ipc_close(br_v);
     sys_unlink("/tmp/majra_ipc_mode_test.sock");
@@ -492,16 +501,16 @@ fn test_tracker_type_tags() {
     # The constructor DETECTS rather than trusting.
     var a_basic = majra_admin_new(basic, 0);
     assert_eq(majra_admin_tracker_kind(a_basic), ADMIN_TRACKER_BASIC,
-        "majra_admin_new detects a BASIC tracker (it used to assume CONCURRENT)");
+      "majra_admin_new detects a BASIC tracker (it used to assume CONCURRENT)");
     var a_conc = majra_admin_new(conc, 0);
     assert_eq(majra_admin_tracker_kind(a_conc), ADMIN_TRACKER_CONCURRENT,
-        "majra_admin_new detects a CONCURRENT tracker");
+      "majra_admin_new detects a CONCURRENT tracker");
 
     # An INCORRECT explicit kind cannot reintroduce the out-of-bounds read:
     # detection wins over the caller's claim.
     var lied = majra_admin_new_ex(basic, ADMIN_TRACKER_CONCURRENT, 0);
     assert_eq(majra_admin_tracker_kind(lied), ADMIN_TRACKER_BASIC,
-        "a wrong explicit kind is overridden by the tracker's own tag");
+      "a wrong explicit kind is overridden by the tracker's own tag");
 
     # And /fleet on a basic tracker degrades to an error rather than reading
     # out of bounds.
@@ -526,7 +535,7 @@ fn test_pg_literal_escaping() {
     _pg_add_literal(sb3, "x'; DROP TABLE majra_workflow_definitions; --");
     assert_eq(streq(str_data(str_builder_build(sb3)),
         "'x''; DROP TABLE majra_workflow_definitions; --'"), 1,
-        "injection payload stays inside one literal");
+      "injection payload stays inside one literal");
 
     var sb4 = str_builder_new();
     _pg_add_literal(sb4, "");
@@ -567,7 +576,7 @@ fn _mk_conn(fd) {
 # Returns the conn so the caller can inspect liveness; reply via ret2.
 fn _resp_parse(bytes, len) {
     var sv[8];
-    syscall(53, 1, 1, 0, &sv);
+    syscall(SYS_SOCKETPAIR, 1, 1, 0, &sv);
     var a = load32(&sv);
     var b = load32(&sv + 4);
     syscall(SYS_WRITE, a, bytes, len);

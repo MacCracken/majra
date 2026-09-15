@@ -59,11 +59,11 @@ jobs:
           "$HOME/.cyrius/bin/cyrius" --version
 
       - name: Resolve deps
-        # Cyrius 6.x: `cyrius lib sync` provides the version-pinned
-        # stdlib snapshot (slice/ct/chrono/async/sakshi/dynlib/fdlopen —
-        # the modules sigil/sandhi/agnosys reach into); `cyrius deps`
-        # overlays the [deps.sigil] git dep. A bare `cyrius deps` leaves
-        # a partial ./lib/ that ud2-SIGILLs. See ci.yml for detail.
+        # Cyrius 6.x: `cyrius lib sync --full` provides the whole
+        # version-pinned stdlib snapshot (the modules sigil/sandhi reach
+        # into included); `cyrius deps` resolves nothing (no git deps since
+        # 2.6.8) but verifies cyrius.lock. A bare `cyrius deps` leaves a
+        # partial ./lib/ that ud2-SIGILLs. See ci.yml for detail.
         run: |
           cyrius lib sync --full
           cyrius deps

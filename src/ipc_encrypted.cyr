@@ -369,9 +369,9 @@ fn encrypted_ipc_recv(e) {
         return Err(ERR_IPC);
     }
     var seen = (load8(nonce + 4) << 56) | (load8(nonce + 5) << 48)
-             | (load8(nonce + 6) << 40) | (load8(nonce + 7) << 32)
-             | (load8(nonce + 8) << 24) | (load8(nonce + 9) << 16)
-             | (load8(nonce + 10) << 8) | load8(nonce + 11);
+    | (load8(nonce + 6) << 40) | (load8(nonce + 7) << 32)
+    | (load8(nonce + 8) << 24) | (load8(nonce + 9) << 16)
+    | (load8(nonce + 10) << 8) | load8(nonce + 11);
     if (seen <= load64(e + 48)) {
         fl_free(raw);
         fl_free(frame_ptr);

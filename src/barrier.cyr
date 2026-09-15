@@ -259,6 +259,19 @@ fn cbarrier_arrive(cbs, name, participant) {
 # a barrier it never joined, or read B's error code and return it as its own.
 # agnosai runs one barrier set per workflow, so concurrent sets are the normal
 # case, not an edge case.
+#
+# `cbs_ptr` is the ConcurrentBarrierSet itself — this function loads the map
+# out of it. ⚠ Through 2.7.2 the one caller passed `load64(cbs)` (the map), so
+# the load below read the map's ENTRIES array and handed that to `map_get` as
+# a header. Slot 0 empty: the fake header has cap 0, the probe loop never
+# runs, and every `cbarrier_arrive_and_wait` returned ERR_BARRIER at once
+# without arriving. Slot 0 occupied: `cap` is that entry's value pointer, the
+# probe index is masked against it, and `_map_find` read through a wild
+# pointer — a SIGSEGV in roughly one run in sixteen (whichever hash seed put
+# the name in slot 0), on every arch. Found while running the suite under
+# qemu-aarch64 for the raw-syscall fix; measured at 14/200 on native x86 at
+# 2.7.2. The threaded test asserted only a done-count, which an instant error
+# return satisfies — it asserts the blocking now.
 fn _cbarrier_do_arrive(cbs_ptr, name, participant, out) {
     var barriers = load64(cbs_ptr);
     var state = map_get(barriers, name);
@@ -283,7 +296,7 @@ fn cbarrier_arrive_and_wait(cbs, name, participant) {
     var mtx = load64(cbs + 8);
     var res[16];
     mutex_lock(mtx);
-    _cbarrier_do_arrive(load64(cbs), name, participant, &res);
+    _cbarrier_do_arrive(cbs, name, participant, &res);
 
     if (load64(&res + 8) != 1) {
         mutex_unlock(mtx);

@@ -56,7 +56,7 @@ Before opening a PR, run `cyrius audit` to verify everything passes.
 2. Add `include "src/module.cyr"` to `src/main.cyr` in dependency order.
 3. Add unit tests to the appropriate test file (`tests/test_core.tcyr` or a new file).
 4. If the module adds significant code, it may need its own test compilation unit
-   (compiler fixup-table cap is 16384 forward references; `tests/test_patra_queue.tcyr` is its own entry point for exactly this reason).
+   (the compiler's fixup table has a cap — 1,048,576 forward references at the current pin, see `docs/development/cyrius-quirks.md` §2; `tests/test_patra_queue.tcyr` got its own entry point when the cc5-era cap was 16384, and the split is kept as documented architecture).
 5. Add the file to `[lib] modules` in `cyrius.cyml`, in the **same order** as
    the `include` in `src/main.cyr` — single-pass forward-reference resolution
    depends on it. Add it to `[lib.signed]` / `[lib.admin]` / `[lib.backends]`
@@ -82,8 +82,9 @@ Before opening a PR, run `cyrius audit` to verify everything passes.
 - Unit tests go in `src/main.cyr` or `tests/test_core.tcyr`
 - Backend protocol tests go in `tests/test_backends.tcyr`
 - Durable / patra-backed queue tests go in `tests/test_patra_queue.tcyr` — a
-  separate entry point on purpose; folding them into `test_backends.tcyr`
-  blows the 16384 fixup cap (patra pulls sakshi + io + fs transitively)
+  separate entry point on purpose; it was split out of `test_backends.tcyr`
+  to stay under the cc5-era 16384 fixup cap (patra pulls sakshi + io + fs
+  transitively), and the split is kept as documented architecture
 - Live integration tests go in `tests/test_live.tcyr`
 - All new features require tests before merge
 - Concurrent types should have multi-thread tests where feasible
@@ -92,8 +93,7 @@ Before opening a PR, run `cyrius audit` to verify everything passes.
 
 - **Local variable clobbering**: function calls may overwrite caller's local variables.
   Save values to globals before calling other functions when they must survive the call.
-- **Fixup table cap**: programs with >16384 forward references fail to compile. Split the entry point — reordering will not help. See `docs/development/cyrius-quirks.md` §2.
-  Split into multiple compilation units if needed.
+- **Fixup table cap**: a program with more forward references than the compiler's fixup table holds (1,048,576 at the current pin; 16384 on cc5 5.x, 8192 on cc3) fails with `fixup table full`. Split the entry point — reordering will not help. See `docs/development/cyrius-quirks.md` §2.
 
 ## License
 

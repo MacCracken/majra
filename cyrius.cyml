@@ -5,7 +5,7 @@ description = "Distributed queue & multiplex engine — pub/sub, queues, relay, 
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/majra"
 language = "cyrius"
-cyrius = "6.6.2"
+cyrius = "6.6.4"
 
 [build]
 entry = "src/main.cyr"
@@ -125,13 +125,17 @@ modules = [
 # here mirrors the top of src/main.cyr so the manifest stays
 # load-bearing for CI completeness checks.
 [deps]
-# Legacy stdlib hint list (cyrius 5.x model). Under cyrius 6.x the full
-# stdlib snapshot is provisioned by `cyrius lib sync --full` (108 files), so this
-# list is no longer the sole source of what lands in ./lib/ — it's kept
-# as a human-readable record of the stdlib surface majra's entry points
-# include. (Don't add toolchain-internal modules like `slice`/`ct` here:
-# they aren't separately resolvable as [deps] stdlib names — `cyrius deps`
-# errors with "cannot read ./lib/<name>.cyr". lib sync provides them.)
+# Stdlib modules majra's entry points reach. Under cyrius 6.x the whole
+# snapshot lands in ./lib/ via `cyrius lib sync --full` (file count in
+# docs/development/state.md), so this list does NOT decide what is on disk —
+# but it is still load-bearing (2.7.1 learned this the hard way): it is what
+# a plain `cyrius build` / `cyrius audit` / `cyrius bench` auto-prepends, what
+# a bare `cyrius lib sync` copies, and what `dist/majra.deps` mirrors. A
+# `--no-deps` build (CI) ignores it and uses each entry point's explicit
+# `include` lines, so a module named here must ALSO be included there.
+# (Don't add toolchain-internal modules like `slice`/`ct` here: they aren't
+# separately resolvable as [deps] stdlib names — `cyrius deps` errors with
+# "cannot read ./lib/<name>.cyr". lib sync provides them.)
 # (`sandhi` ships the HTTP server surface — folded into the cyrius
 # stdlib post-M6. `src/admin.cyr` consumes `HTTP_BAD_REQUEST` /
 # `sandhi_server_send_status` / `sandhi_server_run` from there. The
@@ -163,6 +167,7 @@ stdlib = [
     "async",
     "sandhi",
     "sakshi",
+    "sys",
     "sigil",
 ]
 

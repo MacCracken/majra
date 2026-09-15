@@ -6,7 +6,7 @@ is a `.cyr` file included via `include` directives in dependency order.
 ## Module Map
 
 ```
-majra (v2.7.0, ~8,100 lines across 22 modules)
+majra (v2.7.3, ~7,500 lines across 22 modules; state.md's `src/` total of 8,212 lines / 23 files also counts the 680-line src/main.cyr self-test entry)
 │
 │ ── Core (always included) ────────────────────
 ├── error           Error codes (enum) + result helpers
@@ -24,7 +24,7 @@ majra (v2.7.0, ~8,100 lines across 22 modules)
 ├── heartbeat       FSM health tracker + GPU telemetry + fleet stats
 ├── ratelimit       Token bucket + sliding window (fixed-point math)
 │
-│ ── Networking ────────────────────────────────
+│ ── Networking (ipc_encrypted, ws: [lib.backends] only) ─
 ├── ipc             Unix domain socket framing (4-byte BE length prefix)
 ├── ipc_encrypted   AES-256-GCM framing with nonce management (sigil AES-GCM)
 ├── transport       Transport vtable + circuit breaker + connection pool
@@ -57,7 +57,9 @@ Four bundles are produced by `cyrius distlib`. Consumers pick the smallest profi
 | `dist/majra.cyr`          | `[lib]` (default) | 15 core modules    | no  | In-process concurrency primitives; no network surface |
 | `dist/majra-signed.cyr`   | `[lib.signed]`    | 15 core + `signed_envelope` | **yes** | Cross-node integrity via Ed25519 signatures |
 | `dist/majra-admin.cyr`    | `[lib.admin]`     | 15 core + `admin`  | no  | Operator-facing HTTP observability endpoint |
-| `dist/majra-backends.cyr` | `[lib.backends]`  | 15 core + signed + admin + 5 network modules (ipc_encrypted, ws, redis_backend, postgres_backend, patra_queue) | **yes** | Full cross-process distribution with durability |
+| `dist/majra-backends.cyr` | `[lib.backends]`  | 15 core + signed + admin + 4 network modules (ipc_encrypted, ws, redis_backend, postgres_backend) + patra_queue (durable, file-backed) | **yes** | Full cross-process distribution with durability |
+
+"Needs sigil?" means majra's own code calls into it. Every `.deps` sidecar names `sigil` regardless — the core one because `sigil` sits in the declared `[deps].stdlib` list it mirrors, the admin one transitively via sandhi → tls — so a consumer provisioning from any sidecar gets it in `lib/`.
 
 ## Design Principles
 
@@ -66,9 +68,10 @@ Four bundles are produced by `cyrius distlib`. Consumers pick the smallest profi
 3. **Globals for cross-call state** — cc5 is better than cc3, but deeply nested
    call chains can still clobber locals. `postgres_backend` still promotes its
    connect-path values to globals (serialised behind `_pg_connect_mtx`).
-   `relay` and `barrier` **no longer do**: their result globals were removed at
-   2.6.1 and 2.6.9 respectively, because a global serialised only by a
-   per-object mutex is clobbered by a second object using a different lock.
+   `relay` and `barrier` **no longer do**: their file-scope globals (relay's
+   inputs and dedup state, barrier's results) were removed at 2.6.0 and 2.6.9
+   respectively, because a global serialised only by a per-object mutex is
+   clobbered by a second object using a different lock.
    Prefer a caller-provided out-buffer.
 4. **Fixed-point math** — no floating point; token buckets use x1000 scaling.
 5. **Eviction where it is asked for** — the keyed collections expose TTL
@@ -101,10 +104,10 @@ Four bundles are produced by `cyrius distlib`. Consumers pick the smallest profi
 ## Data Flow
 
 ```
-Producer ──► DirectChannel ──────────────────────► chan_recv     (368 ns/op)
+Producer ──► DirectChannel ──────────────────────► chan_recv     (send only ~390 ns/op, 2.7.3)
 Producer ──► HashedChannel ──► topic hash lookup ► chan_recv
-Producer ──► PubSub ──► exact O(1) + pattern ───► chan_recv     (1 us/op)
-                                                └──► WsBridge ──► WebSocket clients
+Producer ──► PubSub ──► exact O(1) + pattern ───► chan_recv     (publish + recv ~1.1 us/op, 2.7.3)
+                                                └──► consumer accept loop ──► ws_send_text ──► WebSocket clients
 
 Producer ──► ManagedQueue ──► priority dequeue ──► Consumer
                            └──► job state lifecycle (queued → running → completed)
@@ -115,6 +118,10 @@ Node B ──► relay_receive() ──► dedup filter ──────► su
 FleetQueue ──► select_node (least loaded) ──► ManagedQueue on target node
             ──► rebalance() ──► steal from overloaded ──► redistribute
 ```
+
+The two latencies are 5-trial medians from the 2.7.3 `cyrius bench` run: `direct_channel_send` (send only, no receive) and `pubsub_1sub_publish` (publish plus one `chan_recv`), so they are not a like-for-like comparison (see `benches/bench_all.bcyr`); point-in-time perf snapshots live in `docs/benchmarks/`.
+
+The WebSocket leg is consumer-owned: `ws` ships framing primitives only — there is no pub/sub → WebSocket loop in majra, and `ws_bridge_new` is a configuration holder with accessors (see the `src/ws.cyr` header).
 
 ## Distributed Architecture
 
@@ -134,14 +141,8 @@ Process A                        PostgreSQL                    Process B
 └──────────────────┘           └───────────┘              └──────────────────┘
 ```
 
+Box labels are abbreviated to fit: `redis_pub` / `redis_zpop` / `redis_exist` are `redis_publish` / `redis_zpopmin` / `redis_exists`; the other labels are the exact function names.
+
 ## Consumers
 
-| Project | Modules used | Profile |
-|---------|-------------|---------|
-| **daimon** | pubsub, relay, ipc, signed_envelope | `majra-signed` |
-| **AgnosAI** | pubsub, queue, relay, barrier, signed_envelope | `majra-signed` |
-| **hoosh** | queue, heartbeat, fleet | `majra` |
-| **sutra** | heartbeat, fleet, dag, admin | `majra-admin` |
-| **stiva** | dag, heartbeat, ipc, signed_envelope, patra_queue | `majra-backends` |
-
-Profiles are indicative — consumers pin whatever they need. A consumer wanting only the core can always pin `majra` regardless of what modules they reference.
+The consumer table (who pins which modules and profile) is live state and lives in [`docs/development/state.md` § Consumers](../development/state.md#consumers), refreshed every release. Profiles are indicative — consumers pin whatever they need, and a consumer wanting only the core can always pin `majra` regardless of what modules they reference.
