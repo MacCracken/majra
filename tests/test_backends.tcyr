@@ -325,7 +325,7 @@ fn test_ws_accept_key() {
     println("  ws_accept_key: ok");
 }
 
-# 2.6.9: RFC 6455 conformance. ws_recv_frame needs a socket, so these cover
+# 2.6.9: RFC 6455 conformance. majra_ws_recv_frame needs a socket, so these cover
 # the constants and the send path's framing decisions, which is where the
 # headerless-payload and truncated-control-length bugs lived.
 fn test_ws_framing() {
@@ -345,8 +345,8 @@ fn test_ws_framing() {
     assert_eq(ws_send_pong(wa, "x", 126), -1, "pong refuses len > 125 (RFC 6455 5.5)");
     assert_eq(ws_send_pong(wa, "x", -1), -1, "pong refuses negative len");
     assert_eq(ws_send_close(wa), 0, "close frame writes on a live fd");
-    assert_eq(ws_send_text(wa, "hi", 2), 0, "a short text frame SUCCEEDS on a live fd");
-    assert_eq(ws_send_text(wa, "x", -1), -1, "send_text refuses negative len");
+    assert_eq(majra_ws_send_text(wa, "hi", 2), 0, "a short text frame SUCCEEDS on a live fd");
+    assert_eq(majra_ws_send_text(wa, "x", -1), -1, "send_text refuses negative len");
 
     syscall(SYS_CLOSE, wa);
     syscall(SYS_CLOSE, wb);

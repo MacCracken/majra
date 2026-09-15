@@ -54,6 +54,16 @@ Renames taken under this exception:
 |----------|----------|-----|---------------|
 | `base64_encode` | `majra_base64_encode` | 2.6.8 | `lib/bayan.cyr` (wrapper over `bayan_base64_encode`) |
 | `base64_decode` | `majra_base64_decode` | 2.6.8 | `lib/bayan.cyr` — **return contracts disagreed**: majra returned a `{ptr, len}` struct, bayan returns a scalar `i64` |
+| `ws_send_text` | `majra_ws_send_text` | 2.8.0 | `lib/ws.cyr` — **arity and contract disagreed**: majra `(fd, data, len)` → 0 / -1, stdlib `(ws, msg)` → bytes written |
+| `ws_recv_frame` | `majra_ws_recv_frame` | 2.8.0 | `lib/ws.cyr` — **arity and contract disagreed**: majra `(fd)` → frame struct, stdlib `(ws, opcode_out, len_out)` → payload pointer |
+
+**Migration (2.8.0 `ws_*`)**: replace the two names at each call site; arguments
+and return values are unchanged. A missed call site cannot slip through. Under
+cyrius 6.6.4 a 3-argument `ws_send_text` against `lib/ws.cyr` is `expects 2
+arguments, got 3`, and without `lib/ws.cyr` it is an undefined function. Before
+the rename, a unit that included `lib/ws.cyr` next to `dist/majra-backends.cyr`
+did not build at all under 6.6.4: the compiler rejects a duplicate fn whose arity
+disagrees.
 
 ### Signature changes taken in 2.6.9 (a PATCH)
 
@@ -82,6 +92,17 @@ proposed public name against the `lib/` snapshot before adding it:
 grep -rn "^fn <name>\b" lib/
 ```
 
+## Deprecations
+
+Deprecated names keep compiling, with unchanged values and behaviour, for the
+rest of 2.x. They are removed at 3.0.0. The exception is a deprecated name that
+starts colliding with a stdlib symbol first; that name may go earlier under
+Documented exceptions above.
+
+| Deprecated | Replacement | Since | Why |
+|---|---|---|---|
+| bare `ERR_*` error codes (all 20: `ERR_NONE` … `ERR_WORKFLOW_STORAGE`, `ERR_IPC_FRAME_TOO_LARGE` … `ERR_IPC_JSON`) | `MAJRA_ERR_*`, same values | 2.8.0 | Enum constants share one flat namespace across linked libraries, and bare `ERR_*` is reserved for the sakshi base logger (cyrius lint, proposal `2026-07-11-error-enum-namespace-lint-gate`). Nothing collided at 2.8.0; the prefix keeps it that way. `src/main.cyr`'s `test_error` asserts every alias still equals its replacement. |
+
 ## API stability
 
 All public functions documented in `src/*.cyr` are stable, except where noted
@@ -89,11 +110,11 @@ under Documented exceptions above:
 
 | Module | Stable since |
 |--------|-------------|
-| error, counter, envelope, namespace | 2.0.0 |
+| error, counter, envelope, namespace | 2.0.0 (error codes `MAJRA_ERR_*` since 2.8.0; bare `ERR_*` deprecated — see Deprecations) |
 | metrics, ratelimit, heartbeat | 2.0.0 |
 | queue, pubsub, relay, barrier | 2.0.0 |
 | ipc, transport, fleet, dag | 2.0.0 |
-| redis_backend, postgres_backend, ws | 2.0.0 |
+| redis_backend, postgres_backend, ws | 2.0.0 (`ws_send_text` / `ws_recv_frame` renamed `majra_ws_*` at 2.8.0 — see Documented exceptions) |
 | ipc_encrypted (AES-256-GCM via sigil; framing, nonce/role separation, rekey) | 2.0.0 framing; role argument 2.6.9 — see Documented exceptions |
 | signed_envelope | 2.4.0 |
 | admin | 2.4.0 (`majra_admin_serve` signature changed at 2.6.9) |

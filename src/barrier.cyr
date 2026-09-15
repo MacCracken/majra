@@ -264,7 +264,7 @@ fn cbarrier_arrive(cbs, name, participant) {
 # out of it. ⚠ Through 2.7.2 the one caller passed `load64(cbs)` (the map), so
 # the load below read the map's ENTRIES array and handed that to `map_get` as
 # a header. Slot 0 empty: the fake header has cap 0, the probe loop never
-# runs, and every `cbarrier_arrive_and_wait` returned ERR_BARRIER at once
+# runs, and every `cbarrier_arrive_and_wait` returned MAJRA_ERR_BARRIER at once
 # without arriving. Slot 0 occupied: `cap` is that entry's value pointer, the
 # probe index is masked against it, and `_map_find` read through a wild
 # pointer — a SIGSEGV in roughly one run in sixteen (whichever hash seed put
@@ -277,7 +277,7 @@ fn _cbarrier_do_arrive(cbs_ptr, name, participant, out) {
     var state = map_get(barriers, name);
     if (state == 0) {
         store64(out, 0);
-        store64(out + 8, ERR_BARRIER);
+        store64(out + 8, MAJRA_ERR_BARRIER);
         return 0;
     }
     _set_add(load64(state + 8), participant);

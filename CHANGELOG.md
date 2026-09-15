@@ -5,6 +5,74 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.0] - 2026-09-15
+
+Namespace minor: majra's error codes gain a `MAJRA_` prefix, and the two
+WebSocket functions that collided with `lib/ws.cyr` are renamed. **638
+assertions** pass (core 154 · expanded 304 · backends 152 · patra-queue 28),
+natively and cross-built under `qemu-aarch64`, along with three fuzz harnesses,
+four soaks and both examples. `cyrius fmt --check` and `cyrius lint` (0
+warnings) are clean, `cyrius deny` reports 0 violations, and all four bundles
+are regenerated. No behaviour changed.
+
+### Changed — error codes are `MAJRA_ERR_*`; bare `ERR_*` is deprecated
+
+`src/error.cyr` declared its 20 codes bare (`ERR_NONE` … `ERR_WORKFLOW_STORAGE`,
+`ERR_IPC_FRAME_TOO_LARGE` … `ERR_IPC_JSON`). Enum constants share one flat
+namespace across every library a consumer links, and under cyrius 6.6.4 `cyrius
+lint` notes each bare name: `ERR_*` is reserved for the sakshi base logger. None
+collided with anything in the snapshot.
+
+- **New `MAJRA_ERR_*`** for all 20 codes, same values. Every in-tree use moved:
+  `src/error.cyr` (`err_name`), `src/barrier.cyr`, `src/ipc.cyr`,
+  `src/ipc_encrypted.cyr`, `src/main.cyr`, `tests/test_core.tcyr`.
+- **The bare names stay** as same-value aliases in the same enums, so existing
+  code compiles unchanged. A MINOR may add constants but not rename them
+  ([`semver.md`](docs/development/semver.md)). They are removed at 3.0.0, or
+  sooner for any single name that a stdlib module starts declaring.
+  `semver.md` gains a **Deprecations** section recording this.
+- `test_error` asserts that all 20 aliases still equal their replacements
+  (core 153 → 154).
+- ⚠ `cyrius lint` still notes the 20 aliases. The notes go away only when the
+  aliases do.
+
+### Changed — `ws_send_text` / `ws_recv_frame` → `majra_ws_send_text` / `majra_ws_recv_frame`
+
+**Breaking for `dist/majra-backends.cyr` callers**, the only profile carrying
+`src/ws.cyr`. It is taken under `semver.md`'s collision exception, and both
+conditions were probed under 6.6.4:
+
+| name | majra | `lib/ws.cyr` |
+|---|---|---|
+| `ws_send_text` | `(fd, data, len)` → 0 / -1 | `(ws, msg)` → bytes written |
+| `ws_recv_frame` | `(fd)` → frame struct | `(ws, opcode_out, len_out)` → payload pointer |
+
+- The old names were not merely order-fragile. A clean-room unit with the
+  backends sidecar leaves, `lib/ws.cyr` and the **2.7.3** bundle **fails to
+  build** under 6.6.4: `duplicate fn 'ws_send_text' disagrees about arity: this
+  one takes 3, the one in lib/ws.cyr takes 2`, and the same for `ws_recv_frame`.
+  The 2.8.0 bundle builds and runs in the same unit.
+- **Migration**: rename the two call sites. Arguments and return values are
+  unchanged. A missed site is a compile error (`expects 2 arguments, got 3`
+  against `lib/ws.cyr`, or an undefined function without it), never a silent
+  rebind. No aliases: keeping the old name *is* the collision.
+- Updated in-tree: `tests/test_backends.tcyr`, the `src/ws.cyr` header comments,
+  `README.md` and the `docs/architecture/overview.md` data-flow diagram. Both
+  rows are in `semver.md`'s renames table.
+
+### Removed — the hoosh `ratelimit_*` collision issue
+
+`docs/development/issues/2026-06-23-ratelimit-fn-collision-namespace.md` asked
+majra to rename `ratelimit_*` / `sliding_window_*` because hoosh defined its own
+`ratelimit_new` / `ratelimit_check`. That collision was the consumer's to
+resolve, and hoosh already has: its limiter has been `hoosh_ratelimit_new` /
+`hoosh_ratelimit_check` since 2026-07-23. The issue is deleted, and majra's
+limiter names stay as they are.
+
+### Roadmap
+
+The P(-1) hardening sweep, proposed for a 2.7.4, is now the 2.8.1 item.
+
 ## [2.7.3] - 2026-09-14
 
 Toolchain patch — **cyrius 6.6.2 → 6.6.4** — plus an aarch64 filing in the

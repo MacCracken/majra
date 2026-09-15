@@ -2,9 +2,36 @@
 #
 # Replaces Rust's MajraError enum + IpcError enum.
 # Uses integer error codes. Detail messages stored in a global buffer.
+#
+# ⚠ Enum constants share ONE flat namespace across every library a consumer
+# links, and bare `ERR_*` is reserved for the sakshi base logger (cyrius lint,
+# proposal 2026-07-11-error-enum-namespace-lint-gate). The codes are therefore
+# `MAJRA_ERR_*` since 2.8.0. The bare spellings remain as same-value aliases so
+# existing code compiles unchanged (a MINOR may add constants, not rename them —
+# docs/development/semver.md); they go at 3.0.0, or sooner for any one name a
+# stdlib module starts declaring, under semver.md's collision exception. Until
+# then `cyrius lint` keeps noting the aliases.
 
 # --- MajraError codes ---
 enum MajraErr {
+    MAJRA_ERR_NONE = 0;
+    MAJRA_ERR_QUEUE = 1;
+    MAJRA_ERR_PUBSUB = 2;
+    MAJRA_ERR_RELAY = 3;
+    MAJRA_ERR_IPC = 4;
+    MAJRA_ERR_HEARTBEAT = 5;
+    MAJRA_ERR_BARRIER = 6;
+    MAJRA_ERR_DAG_CYCLE = 7;
+    MAJRA_ERR_CAPACITY = 8;
+    MAJRA_ERR_INVALID_STATE = 9;
+    MAJRA_ERR_RESOURCE_UNAVAIL = 10;
+    MAJRA_ERR_PERSISTENCE = 11;
+    MAJRA_ERR_WORKFLOW_VALIDATION = 12;
+    MAJRA_ERR_WORKFLOW_STEP = 13;
+    MAJRA_ERR_WORKFLOW_NOT_FOUND = 14;
+    MAJRA_ERR_WORKFLOW_STORAGE = 15;
+
+    # Deprecated since 2.8.0 — same values, kept until 3.0.0. Use MAJRA_ERR_*.
     ERR_NONE = 0;
     ERR_QUEUE = 1;
     ERR_PUBSUB = 2;
@@ -25,6 +52,12 @@ enum MajraErr {
 
 # --- IpcError codes ---
 enum IpcErr {
+    MAJRA_ERR_IPC_FRAME_TOO_LARGE = 100;
+    MAJRA_ERR_IPC_CONN_CLOSED = 101;
+    MAJRA_ERR_IPC_IO = 102;
+    MAJRA_ERR_IPC_JSON = 103;
+
+    # Deprecated since 2.8.0 — same values, kept until 3.0.0. Use MAJRA_ERR_*.
     ERR_IPC_FRAME_TOO_LARGE = 100;
     ERR_IPC_CONN_CLOSED = 101;
     ERR_IPC_IO = 102;
@@ -78,25 +111,25 @@ fn majra_err(code, msg) {
 
 # Print an error code name for debugging.
 fn err_name(code) {
-    if (code == ERR_NONE) { return "ok"; }
-    if (code == ERR_QUEUE) { return "queue"; }
-    if (code == ERR_PUBSUB) { return "pubsub"; }
-    if (code == ERR_RELAY) { return "relay"; }
-    if (code == ERR_IPC) { return "ipc"; }
-    if (code == ERR_HEARTBEAT) { return "heartbeat"; }
-    if (code == ERR_BARRIER) { return "barrier"; }
-    if (code == ERR_DAG_CYCLE) { return "dag_cycle"; }
-    if (code == ERR_CAPACITY) { return "capacity"; }
-    if (code == ERR_INVALID_STATE) { return "invalid_state"; }
-    if (code == ERR_RESOURCE_UNAVAIL) { return "resource_unavail"; }
-    if (code == ERR_PERSISTENCE) { return "persistence"; }
-    if (code == ERR_WORKFLOW_VALIDATION) { return "workflow_validation"; }
-    if (code == ERR_WORKFLOW_STEP) { return "workflow_step"; }
-    if (code == ERR_WORKFLOW_NOT_FOUND) { return "workflow_not_found"; }
-    if (code == ERR_WORKFLOW_STORAGE) { return "workflow_storage"; }
-    if (code == ERR_IPC_FRAME_TOO_LARGE) { return "ipc_frame_too_large"; }
-    if (code == ERR_IPC_CONN_CLOSED) { return "ipc_conn_closed"; }
-    if (code == ERR_IPC_IO) { return "ipc_io"; }
-    if (code == ERR_IPC_JSON) { return "ipc_json"; }
+    if (code == MAJRA_ERR_NONE) { return "ok"; }
+    if (code == MAJRA_ERR_QUEUE) { return "queue"; }
+    if (code == MAJRA_ERR_PUBSUB) { return "pubsub"; }
+    if (code == MAJRA_ERR_RELAY) { return "relay"; }
+    if (code == MAJRA_ERR_IPC) { return "ipc"; }
+    if (code == MAJRA_ERR_HEARTBEAT) { return "heartbeat"; }
+    if (code == MAJRA_ERR_BARRIER) { return "barrier"; }
+    if (code == MAJRA_ERR_DAG_CYCLE) { return "dag_cycle"; }
+    if (code == MAJRA_ERR_CAPACITY) { return "capacity"; }
+    if (code == MAJRA_ERR_INVALID_STATE) { return "invalid_state"; }
+    if (code == MAJRA_ERR_RESOURCE_UNAVAIL) { return "resource_unavail"; }
+    if (code == MAJRA_ERR_PERSISTENCE) { return "persistence"; }
+    if (code == MAJRA_ERR_WORKFLOW_VALIDATION) { return "workflow_validation"; }
+    if (code == MAJRA_ERR_WORKFLOW_STEP) { return "workflow_step"; }
+    if (code == MAJRA_ERR_WORKFLOW_NOT_FOUND) { return "workflow_not_found"; }
+    if (code == MAJRA_ERR_WORKFLOW_STORAGE) { return "workflow_storage"; }
+    if (code == MAJRA_ERR_IPC_FRAME_TOO_LARGE) { return "ipc_frame_too_large"; }
+    if (code == MAJRA_ERR_IPC_CONN_CLOSED) { return "ipc_conn_closed"; }
+    if (code == MAJRA_ERR_IPC_IO) { return "ipc_io"; }
+    if (code == MAJRA_ERR_IPC_JSON) { return "ipc_json"; }
     return "unknown";
 }

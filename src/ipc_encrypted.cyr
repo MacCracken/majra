@@ -227,14 +227,14 @@ fn encrypted_ipc_needs_rekey(e) {
 # Rekey: install new 32-byte key and reset counter.
 # Install a new 32-byte key and restart the nonce sequence.
 #
-# Returns Ok(0), or Err(ERR_IPC) if the new key is byte-identical to the
+# Returns Ok(0), or Err(MAJRA_ERR_IPC) if the new key is byte-identical to the
 # installed one. That check is load-bearing: resetting send_counter to 0 is
 # only safe because the key changed. Re-installing the same key restarts the
 # nonce sequence under it, which is exactly the (key, nonce) reuse AES-GCM
 # cannot survive — and "rekey with the key I already have" is an easy caller
 # mistake to make on a reconnect path.
 fn encrypted_ipc_rekey(e, new_key_ptr) {
-    if (e == 0 || new_key_ptr == 0) { return Err(ERR_IPC); }
+    if (e == 0 || new_key_ptr == 0) { return Err(MAJRA_ERR_IPC); }
     # Touches both halves (key, send counter, replay window), so it takes both
     # locks. Order is always send -> recv; nothing takes them the other way.
     var mtx = load64(e + 24);
@@ -244,18 +244,18 @@ fn encrypted_ipc_rekey(e, new_key_ptr) {
     if (load64(e + 56) == 1) {
         mutex_unlock(rmtx);
         mutex_unlock(mtx);
-        return Err(ERR_IPC);
+        return Err(MAJRA_ERR_IPC);
     }
     var cur = load64(e + 8);
     if (cur == 0) {
         mutex_unlock(rmtx);
         mutex_unlock(mtx);
-        return Err(ERR_IPC);
+        return Err(MAJRA_ERR_IPC);
     }
     if (ct_eq_bytes_lens(cur, AES_256_KEY_SIZE, new_key_ptr, AES_256_KEY_SIZE) == 1) {
         mutex_unlock(rmtx);
         mutex_unlock(mtx);
-        return Err(ERR_IPC);
+        return Err(MAJRA_ERR_IPC);
     }
     memcpy(cur, new_key_ptr, 32);
     store64(e + 16, 0);
@@ -274,22 +274,22 @@ fn encrypted_ipc_rekey(e, new_key_ptr) {
 # and tag separately; we concatenate them into the frame.
 
 fn encrypted_ipc_send(e, data, len) {
-    if (e == 0 || len < 0) { return Err(ERR_IPC); }
+    if (e == 0 || len < 0) { return Err(MAJRA_ERR_IPC); }
     var mtx = load64(e + 24);
     mutex_lock(mtx);
-    if (load64(e + 56) == 1) { mutex_unlock(mtx); return Err(ERR_IPC); }
+    if (load64(e + 56) == 1) { mutex_unlock(mtx); return Err(MAJRA_ERR_IPC); }
 
     var counter = _next_counter(e);
     if (counter < 0) {
         mutex_unlock(mtx);
-        return Err(ERR_IPC);
+        return Err(MAJRA_ERR_IPC);
     }
     var nonce[12];
     _write_nonce(&nonce, load64(e + 40), counter);
 
     var frame_len = AES_GCM_NONCE_SIZE + len + AES_GCM_TAG_SIZE;
     var frame = fl_alloc(frame_len);
-    if (frame == 0) { mutex_unlock(mtx); return Err(ERR_IPC); }
+    if (frame == 0) { mutex_unlock(mtx); return Err(MAJRA_ERR_IPC); }
     memcpy(frame, &nonce, AES_GCM_NONCE_SIZE);
     var ct_out = frame + AES_GCM_NONCE_SIZE;
     var tag_out = frame + AES_GCM_NONCE_SIZE + len;
@@ -300,7 +300,7 @@ fn encrypted_ipc_send(e, data, len) {
         memset(frame, 0, frame_len);
         fl_free(frame);
         mutex_unlock(mtx);
-        return Err(ERR_IPC);
+        return Err(MAJRA_ERR_IPC);
     }
 
     # The write stays UNDER the mutex. Releasing it first let two threads
@@ -326,19 +326,19 @@ fn _encrypted_ipc_kill(e) {
 }
 
 fn encrypted_ipc_recv(e) {
-    if (e == 0) { return Err(ERR_IPC); }
+    if (e == 0) { return Err(MAJRA_ERR_IPC); }
     # The RECEIVE mutex — never the send mutex. See the struct note.
     var mtx = load64(e + 64);
     mutex_lock(mtx);
-    if (load64(e + 56) == 1) { mutex_unlock(mtx); return Err(ERR_IPC); }
+    if (load64(e + 56) == 1) { mutex_unlock(mtx); return Err(MAJRA_ERR_IPC); }
 
     var frame_t, frame_v = ipc_recv_frame(load64(e));
     if (is_err_result(frame_t) == 1) {
-        # ERR_IPC_FRAME_TOO_LARGE is terminal: the oversized body is still
+        # MAJRA_ERR_IPC_FRAME_TOO_LARGE is terminal: the oversized body is still
         # queued, so the framing can never resynchronise. We own the fd, so we
         # are the ones who close it — and we poison the handle so a later send
         # cannot write into a descriptor the kernel has since reassigned.
-        if (err_code_of(frame_t, frame_v) == ERR_IPC_FRAME_TOO_LARGE) {
+        if (err_code_of(frame_t, frame_v) == MAJRA_ERR_IPC_FRAME_TOO_LARGE) {
             _encrypted_ipc_kill(e);
         }
         mutex_unlock(mtx);
@@ -351,7 +351,7 @@ fn encrypted_ipc_recv(e) {
         fl_free(raw);
         fl_free(frame_ptr);
         mutex_unlock(mtx);
-        return Err(ERR_IPC);
+        return Err(MAJRA_ERR_IPC);
     }
     var nonce = raw;
 
@@ -366,7 +366,7 @@ fn encrypted_ipc_recv(e) {
         fl_free(raw);
         fl_free(frame_ptr);
         mutex_unlock(mtx);
-        return Err(ERR_IPC);
+        return Err(MAJRA_ERR_IPC);
     }
     var seen = (load8(nonce + 4) << 56) | (load8(nonce + 5) << 48)
     | (load8(nonce + 6) << 40) | (load8(nonce + 7) << 32)
@@ -376,14 +376,14 @@ fn encrypted_ipc_recv(e) {
         fl_free(raw);
         fl_free(frame_ptr);
         mutex_unlock(mtx);
-        return Err(ERR_IPC);
+        return Err(MAJRA_ERR_IPC);
     }
 
     var ct = raw + AES_GCM_NONCE_SIZE;
     var ct_len = raw_len - AES_GCM_NONCE_SIZE - AES_GCM_TAG_SIZE;
     var tag = raw + AES_GCM_NONCE_SIZE + ct_len;
     var pt = fl_alloc(ct_len + 1);
-    if (pt == 0) { fl_free(raw); fl_free(frame_ptr); mutex_unlock(mtx); return Err(ERR_IPC); }
+    if (pt == 0) { fl_free(raw); fl_free(frame_ptr); mutex_unlock(mtx); return Err(MAJRA_ERR_IPC); }
     var rc = aes_gcm_decrypt(load64(e + 8), nonce, 0, 0, ct, ct_len, tag, pt);
     if (rc != 0) {
         # Tag mismatch — AEAD contract says do NOT leak plaintext.
@@ -393,7 +393,7 @@ fn encrypted_ipc_recv(e) {
         fl_free(raw);
         fl_free(frame_ptr);
         mutex_unlock(mtx);
-        return Err(ERR_IPC);
+        return Err(MAJRA_ERR_IPC);
     }
     # Only advance the replay window once the tag has authenticated the frame,
     # so a forged nonce cannot burn counters and lock out the real peer.

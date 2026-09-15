@@ -44,20 +44,45 @@ include "src/dag.cyr"
 # =============================================================================
 
 fn test_error() {
-    assert(ERR_NONE == 0, "ERR_NONE is 0");
-    assert(ERR_QUEUE == 1, "ERR_QUEUE is 1");
-    assert(ERR_PUBSUB == 2, "ERR_PUBSUB is 2");
+    assert(MAJRA_ERR_NONE == 0, "MAJRA_ERR_NONE is 0");
+    assert(MAJRA_ERR_QUEUE == 1, "MAJRA_ERR_QUEUE is 1");
+    assert(MAJRA_ERR_PUBSUB == 2, "MAJRA_ERR_PUBSUB is 2");
 
-    var r_t, r_v = majra_err(ERR_QUEUE, str_from("queue full"));
+    var r_t, r_v = majra_err(MAJRA_ERR_QUEUE, str_from("queue full"));
     assert(is_err_result(r_t) == 1, "majra_err returns Err");
-    assert(err_code_of(r_t, r_v) == ERR_QUEUE, "error code matches");
+    assert(err_code_of(r_t, r_v) == MAJRA_ERR_QUEUE, "error code matches");
 
     var msg = get_err_msg();
     assert(str_len(msg) == 10, "err msg length");
 
-    assert(streq(err_name(ERR_QUEUE), "queue") == 1, "err_name queue");
-    assert(streq(err_name(ERR_BARRIER), "barrier") == 1, "err_name barrier");
+    assert(streq(err_name(MAJRA_ERR_QUEUE), "queue") == 1, "err_name queue");
+    assert(streq(err_name(MAJRA_ERR_BARRIER), "barrier") == 1, "err_name barrier");
     assert(streq(err_name(999), "unknown") == 1, "err_name unknown");
+
+    # 2.8.0 compat promise: every deprecated bare ERR_* still compiles and equals
+    # its MAJRA_ERR_* value (semver.md — a MINOR adds constants, never renames).
+    var compat = 0;
+    if (ERR_NONE == MAJRA_ERR_NONE) { compat = compat + 1; }
+    if (ERR_QUEUE == MAJRA_ERR_QUEUE) { compat = compat + 1; }
+    if (ERR_PUBSUB == MAJRA_ERR_PUBSUB) { compat = compat + 1; }
+    if (ERR_RELAY == MAJRA_ERR_RELAY) { compat = compat + 1; }
+    if (ERR_IPC == MAJRA_ERR_IPC) { compat = compat + 1; }
+    if (ERR_HEARTBEAT == MAJRA_ERR_HEARTBEAT) { compat = compat + 1; }
+    if (ERR_BARRIER == MAJRA_ERR_BARRIER) { compat = compat + 1; }
+    if (ERR_DAG_CYCLE == MAJRA_ERR_DAG_CYCLE) { compat = compat + 1; }
+    if (ERR_CAPACITY == MAJRA_ERR_CAPACITY) { compat = compat + 1; }
+    if (ERR_INVALID_STATE == MAJRA_ERR_INVALID_STATE) { compat = compat + 1; }
+    if (ERR_RESOURCE_UNAVAIL == MAJRA_ERR_RESOURCE_UNAVAIL) { compat = compat + 1; }
+    if (ERR_PERSISTENCE == MAJRA_ERR_PERSISTENCE) { compat = compat + 1; }
+    if (ERR_WORKFLOW_VALIDATION == MAJRA_ERR_WORKFLOW_VALIDATION) { compat = compat + 1; }
+    if (ERR_WORKFLOW_STEP == MAJRA_ERR_WORKFLOW_STEP) { compat = compat + 1; }
+    if (ERR_WORKFLOW_NOT_FOUND == MAJRA_ERR_WORKFLOW_NOT_FOUND) { compat = compat + 1; }
+    if (ERR_WORKFLOW_STORAGE == MAJRA_ERR_WORKFLOW_STORAGE) { compat = compat + 1; }
+    if (ERR_IPC_FRAME_TOO_LARGE == MAJRA_ERR_IPC_FRAME_TOO_LARGE) { compat = compat + 1; }
+    if (ERR_IPC_CONN_CLOSED == MAJRA_ERR_IPC_CONN_CLOSED) { compat = compat + 1; }
+    if (ERR_IPC_IO == MAJRA_ERR_IPC_IO) { compat = compat + 1; }
+    if (ERR_IPC_JSON == MAJRA_ERR_IPC_JSON) { compat = compat + 1; }
+    assert_eq(compat, 20, "all 20 deprecated ERR_* aliases equal their MAJRA_ERR_* codes");
 
     println("  error: ok");
 }

@@ -12,14 +12,14 @@ names the version it is aimed at and the condition that would move it.
 
 | Target | Theme |
 |---|---|
-| **2.8.0** | Committed to this cut. |
-| **2.7 line** | Larger capabilities, each taking the next MINOR as its trigger fires — or the next PATCH, where it adds no API. |
+| **2.8.1** | Committed to this cut. |
+| **2.8 line** | Larger capabilities, each taking the next MINOR as its trigger fires — or the next PATCH, where it adds no API. |
 | **Waiting on upstream** | Blocked outside this repo. Names the blocker. |
 | **Non-goals** | Deliberately out of scope, recorded so the question stops recurring. |
 
 > **Why these can't all be patch releases.** [`semver.md`](semver.md) reserves
 > PATCH for bug fixes, performance and documentation with no API changes, so
-> anything adding a public function takes the next MINOR. "The 2.7 line" below
+> anything adding a public function takes the next MINOR. "The 2.8 line" below
 > is therefore a *development line*, not a run of patch numbers — PostgreSQL
 > SCRAM and QUIC cannot share one.
 
@@ -29,89 +29,26 @@ promotion is a decision rather than a mood.
 
 ---
 
-## 2.8.0
+## 2.8.1
 
-### Prefix the error enums — `ERR_*` → `MAJRA_ERR_*`
+### P(-1) hardening sweep
 
-`src/error.cyr` declares its 20 error codes bare: `enum MajraErr` (`ERR_NONE`
-… `ERR_WORKFLOW_STORAGE`) and `enum IpcErr` (`ERR_IPC_FRAME_TOO_LARGE` …
-`ERR_IPC_JSON`). Under the 6.6.4 pin, `cyrius lint` notes every one of them:
-bare `ERR_*` is reserved for the sakshi base logger, and a leaf library must
-prefix its error enum, because enum constants share one flat namespace across
-libraries (the linter cites cyrius proposal
-`2026-07-11-error-enum-namespace-lint-gate`). The notes are advisory — lint
-still reports 0 warnings — and nothing collides today: none of majra's 20 names
-is among the 29 bare `ERR_*` names that `lib/sakshi.cyr` and `lib/sankoch.cyr`
-declare in the 6.6.4 snapshot. This is the `_sub_new` / `sha1` class from 2.7.1,
-caught before it collides rather than after.
+The full pass from CLAUDE.md § Process — cleanliness, benchmark baseline,
+module-by-module review, external research (RFC drift and CVE classes for RESP,
+PostgreSQL wire, WebSocket, HTTP, AES-GCM, Ed25519), security audit filed under
+`docs/audit/`, the tests and benchmarks those findings earn, post-review
+benchmarks against the baseline, doc audit, and bundle regeneration.
 
-**Scope**:
-- Add `MAJRA_ERR_*` for all 20 codes, with **the same values**.
-- Move every in-tree use to the new names: `src/barrier.cyr`, `src/ipc.cyr`,
-  `src/ipc_encrypted.cyr`, `src/main.cyr` and `tests/test_core.tcyr`.
-- Keep each bare `ERR_*` as a deprecated alias with the same value. One enum
-  can hold both spellings; a probe under 6.6.4 builds and compares them equal.
-- Regenerate the four bundles, and record the deprecation in `CHANGELOG.md` and
-  [`semver.md`](semver.md).
-
-⚠ **The aliases are what make this a MINOR.** [`semver.md`](semver.md) promises
-that a MINOR compiles existing code unchanged. Adding constants is allowed;
-renaming them is not. The collision exception there doesn't cover a straight
-rename either, because its condition 1 needs the definitions to actually
-disagree, and today they don't. So removing the bare names waits for 3.0.0,
-unless a stdlib module first declares one of these exact names. At that point
-the exception applies and that name may go in whatever cut is in flight. While
-the aliases remain, lint keeps noting them. The notes go away only when the
-aliases do.
-
-**Aimed at**: 2.8.0.
-**Trigger**: already met. The lint gate names this pattern, and every majra
-consumer that also includes sakshi shares the namespace.
-
-### Rename out of the `lib/ws.cyr` collision — `ws_send_text` / `ws_recv_frame`
-
-Two public functions in `src/ws.cyr` share their names with `lib/ws.cyr` in the
-6.6.4 snapshot. They disagree in parameter count and contract:
-
-| name | majra (`src/ws.cyr`) | stdlib (`lib/ws.cyr`) |
-|---|---|---|
-| `ws_send_text` | `(fd, data, len)` → 0 / -1 | `(ws, msg)` → bytes written; length from `strlen` |
-| `ws_recv_frame` | `(fd)` → frame struct, released with `ws_frame_free` | `(ws, opcode_out, len_out)` → payload pointer |
-
-A consumer that links both gets whichever definition came last in include
-order. This has been open since 2.7.1, and until now it was tracked only as a
-CHANGELOG known issue and a [`state.md`](state.md) blocker. It only affects
-the `backends` profile, the one bundle that carries `src/ws.cyr`.
-
-**Scope**: rename to `majra_ws_send_text` / `majra_ws_recv_frame`, following the
-2.6.8 `majra_base64_*` precedent. Update the in-tree references: the two calls
-in `tests/test_backends.tcyr`, the header comments in `src/ws.cyr`, the README
-module table, and the data-flow line in
-[`overview.md`](../architecture/overview.md). Add both rows to the renames table
-in [`semver.md`](semver.md) with a migration note, and regenerate the four
-bundles. Leave the other `ws_*` names (`ws_frame_*`, `ws_send_close`,
-`ws_send_pong`, `ws_bridge_*`) alone. None of them collides today, and renaming
-them would be an ordinary break, not an exception.
-
-⚠ **No aliases here, unlike the `ERR_*` item above.** Keeping the old name *is*
-the collision. That's fine: this rename qualifies for the semver.md collision
-exception, and a probe under 6.6.4 confirms both of its conditions:
-
-1. The two definitions disagree, per the table.
-2. A leftover call fails to compile. Against `lib/ws.cyr` it is
-   `'ws_send_text' expects 2 arguments, got 3` and `'ws_recv_frame' expects 3
-   arguments, got 1`. Without `lib/ws.cyr` it is a reachable undefined function,
-   which cyrius refuses to emit.
-
-So no consumer can pick up the change silently. The exception would allow this
-in a PATCH; it rides 2.8.0 to ship alongside the `ERR_*` deprecation.
-
-**Aimed at**: 2.8.0.
-**Trigger**: already met. The collision exists in the pinned snapshot.
+**Scope constraint**: 2.8.1 is a PATCH, so a finding whose fix needs a signature
+change or a new public function is queued here for the next MINOR, not taken in
+the sweep. **Workflow budget**: at most 75 agents for the orchestrated part.
+**Aimed at**: 2.8.1 — deferred from a proposed 2.7.4 so that the 2.8.0 renames
+landed first.
+**Trigger**: already met.
 
 ---
 
-## 2.7 line — larger capabilities
+## 2.8 line — larger capabilities
 
 Each takes the next available MINOR when its trigger fires — or the next
 PATCH, where it adds no public API. An item whose trigger has already fired

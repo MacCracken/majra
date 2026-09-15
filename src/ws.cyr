@@ -10,7 +10,7 @@
 # matching pub/sub messages as JSON text frames". No such loop exists: nothing
 # reads the hub or max_connections stored by ws_bridge_new, and there is no
 # accept/serve function. What ships here are the framing primitives; a
-# consumer wanting fan-out drives ws_recv_frame / ws_send_text against its own
+# consumer wanting fan-out drives majra_ws_recv_frame / majra_ws_send_text against its own
 # accept loop and its own pubsub hub. ws_bridge_new is retained as a
 # configuration holder with accessors, and wiring the loop is a roadmap item.
 #
@@ -240,7 +240,12 @@ fn _ws_accept_key(client_key) {
 # the socket with NO frame header at all — raw application bytes landing where
 # the peer expects a header, which corrupts the stream for the rest of the
 # connection.
-fn ws_send_text(fd, data, len) {
+# Named `majra_ws_send_text` since 2.8.0. Through 2.7.x it was `ws_send_text`,
+# which `lib/ws.cyr` also defines as `(ws, msg)` — a different arity and return
+# contract — so a consumer linking both got whichever came last in include
+# order. Renamed under semver.md's collision exception; a stale 3-argument call
+# is a compile error against either survivor, never a silent rebind.
+fn majra_ws_send_text(fd, data, len) {
     if (len < 0) { return -1; }
     if (len < 126) {
         var hdr[2];
@@ -294,7 +299,10 @@ fn ws_send_text(fd, data, len) {
 #   - never enforced §5.5's 125-byte, non-fragmented control-frame rule.
 #   - dropped RSV1-3 and FIN on the floor and never validated the opcode.
 #   - leaked the payload buffer on a short read.
-fn ws_recv_frame(fd) {
+# Named `majra_ws_recv_frame` since 2.8.0 (was `ws_recv_frame`, which
+# `lib/ws.cyr` defines as `(ws, opcode_out, len_out)` → payload pointer). Same
+# collision rename as majra_ws_send_text above.
+fn majra_ws_recv_frame(fd) {
     var hdr[2];
     if (_ws_read_full(fd, &hdr, 2) < 0) { return 0; }
 
@@ -378,7 +386,7 @@ fn ws_frame_payload(f) { return load64(f + 8); }
 fn ws_frame_len(f)     { return load64(f + 16); }
 fn ws_frame_fin(f)     { return load64(f + 24); }
 
-# Release a frame returned by ws_recv_frame.
+# Release a frame returned by majra_ws_recv_frame.
 fn ws_frame_free(f) {
     if (f == 0) { return 0; }
     var p = load64(f + 8);

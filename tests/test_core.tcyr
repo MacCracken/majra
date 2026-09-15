@@ -753,7 +753,7 @@ fn test_cbarrier_arrive_and_wait() {
     assert_eq(load64(r2), BARRIER_RELEASED, "aaw non-blocking released");
 
     # Single-participant barrier: arrive_and_wait must release at once and
-    # return 0. Through 2.7.2 it returned ERR_BARRIER here — it never found
+    # return 0. Through 2.7.2 it returned MAJRA_ERR_BARRIER here — it never found
     # the barrier (see the note above `_cbarrier_do_arrive`), so nothing
     # below that asserted only a done-count could tell.
     var solo = vec_new();
@@ -761,8 +761,8 @@ fn test_cbarrier_arrive_and_wait() {
     cbarrier_create(cbs, "solo", solo);
     assert_eq(cbarrier_arrive_and_wait(cbs, "solo", "only"), 0,
       "single-participant arrive_and_wait releases immediately with 0");
-    assert_eq(cbarrier_arrive_and_wait(cbs, "no-such-barrier", "x"), ERR_BARRIER,
-      "an unknown barrier is ERR_BARRIER, not a hang");
+    assert_eq(cbarrier_arrive_and_wait(cbs, "no-such-barrier", "x"), MAJRA_ERR_BARRIER,
+      "an unknown barrier is MAJRA_ERR_BARRIER, not a hang");
 
     # Blocking path — 3 threads, each calls cbarrier_arrive_and_wait;
     # none return until the barrier is fully populated. Previously

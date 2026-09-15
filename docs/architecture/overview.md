@@ -107,7 +107,7 @@ Four bundles are produced by `cyrius distlib`. Consumers pick the smallest profi
 Producer ──► DirectChannel ──────────────────────► chan_recv     (send only ~390 ns/op, 2.7.3)
 Producer ──► HashedChannel ──► topic hash lookup ► chan_recv
 Producer ──► PubSub ──► exact O(1) + pattern ───► chan_recv     (publish + recv ~1.1 us/op, 2.7.3)
-                                                └──► consumer accept loop ──► ws_send_text ──► WebSocket clients
+                                                └──► consumer accept loop ──► majra_ws_send_text ──► WebSocket clients
 
 Producer ──► ManagedQueue ──► priority dequeue ──► Consumer
                            └──► job state lifecycle (queued → running → completed)
