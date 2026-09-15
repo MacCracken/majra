@@ -1784,7 +1784,10 @@ fn test_connection_pool() {
     assert_eq(conn_pool_endpoint_count(pool), 2, "both breakers are registered");
     # Threshold 0: `failures < threshold` is false at once, so the breaker is
     # on its degraded path from birth — the first caller takes the probe.
-    conn_pool_with_circuit_breaker(pool, "ep0", 0, 3600000000000);
+    # ⚠ Cooldown 1 s, not 1 h: a fresh breaker's opened_at is 0, so "elapsed" is
+    # time since BOOT. A 1 h cooldown passed on a long-up dev box and failed on
+    # a freshly booted CI runner. The second check is microseconds later.
+    conn_pool_with_circuit_breaker(pool, "ep0", 0, 1000000000);
     assert_eq(conn_pool_endpoint_count(pool), 3, "a third breaker is registered");
     assert_eq(conn_pool_circuit_state(pool, "ep0"), CIRCUIT_HALF_OPEN,
       "the stored threshold-0 breaker is consulted, not defaulted to CLOSED");
