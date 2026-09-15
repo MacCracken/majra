@@ -23,7 +23,7 @@ a 6.6.2 head-to-head (five-trial medians; largest move `pattern_exact` −7 %,
 ⛔ **P1 for any aarch64-Linux consumer; three independent failures in shipped
 code.** Filed 2026-09-14 by daimon from a `cyrius build --aarch64` of the
 vendored `dist/majra.cyr`
-([`docs/development/issues/2026-09-14-raw-x86-syscall-numbers-aarch64.md`](docs/development/issues/2026-09-14-raw-x86-syscall-numbers-aarch64.md));
+([`docs/development/issues/archived/2026-09-14-raw-x86-syscall-numbers-aarch64.md`](docs/development/issues/archived/2026-09-14-raw-x86-syscall-numbers-aarch64.md));
 this is the class cyrius 6.6.4 swept from its own stdlib (its new
 `raw_syscall_literals_routed` gate scans `lib/` + `cbt/` only, and its
 consumer pin-sweep list does not name majra — nothing had cross-built majra
