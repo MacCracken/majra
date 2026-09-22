@@ -5,7 +5,7 @@ description = "Distributed queue & multiplex engine — pub/sub, queues, relay, 
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/majra"
 language = "cyrius"
-cyrius = "6.6.4"
+cyrius = "6.6.6"
 
 [build]
 entry = "src/main.cyr"

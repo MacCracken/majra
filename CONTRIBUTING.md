@@ -56,7 +56,7 @@ Before opening a PR, run `cyrius audit` to verify everything passes.
 2. Add `include "src/module.cyr"` to `src/main.cyr` in dependency order.
 3. Add unit tests to the appropriate test file (`tests/test_core.tcyr` or a new file).
 4. If the module adds significant code, it may need its own test compilation unit
-   (the compiler's fixup table has a cap — 1,048,576 forward references at the current pin, see `docs/development/cyrius-quirks.md` §2; `tests/test_patra_queue.tcyr` got its own entry point when the cc5-era cap was 16384, and the split is kept as documented architecture).
+   (the compiler's fixup table starts at 1,048,576 forward references at the current pin and grows on demand since cyrius 6.2.0, see `docs/development/cyrius-quirks.md` §2; `tests/test_patra_queue.tcyr` got its own entry point when the cc5-era cap was 16384, and the split is kept as documented architecture).
 5. Add the file to `[lib] modules` in `cyrius.cyml`, in the **same order** as
    the `include` in `src/main.cyr` — single-pass forward-reference resolution
    depends on it. Add it to `[lib.signed]` / `[lib.admin]` / `[lib.backends]`
@@ -93,7 +93,7 @@ Before opening a PR, run `cyrius audit` to verify everything passes.
 
 - **Local variable clobbering**: function calls may overwrite caller's local variables.
   Save values to globals before calling other functions when they must survive the call.
-- **Fixup table cap**: a program with more forward references than the compiler's fixup table holds (1,048,576 at the current pin; 16384 on cc5 5.x, 8192 on cc3) fails with `fixup table full`. Split the entry point — reordering will not help. See `docs/development/cyrius-quirks.md` §2.
+- **Fixup table cap**: on cc5 5.x (16384) and cc3 (8192) a program with more forward references than the table held failed with `fixup table full`; at the current 6.x pin the table starts at 1,048,576 and doubles on demand (64M ceiling), so the failure is `fixup table exceeds 64M entries` and no real program reaches it. If it ever does, split the entry point — reordering will not help. See `docs/development/cyrius-quirks.md` §2.
 
 ## License
 

@@ -5,6 +5,143 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.1] - 2026-09-21
+
+Toolchain patch — **cyrius 6.6.4 → 6.6.6**, and with it the whole stdlib
+snapshot majra consumes (majra declares zero git deps; the pin is the one knob).
+No source change beyond four comment blocks the new pin made untrue. **1,466
+assertions** pass (core 203 · expanded 645 · backends 547 · patra-queue 71),
+natively and cross-built under `qemu-aarch64` (643 there — the documented
+x86-only pair); three fuzz harnesses, four soaks and both examples are clean on
+both arches; the expanded suite looped **100× native and 100× under qemu** with
+zero failures and zero crashes, the other three suites 40× / 25×. `cyrius vet`
+28 deps / 0 untrusted; `cyrius deny` 28 deps / 0 violations; `cyrius fmt
+--check` clean across `src/`, `tests/`, `fuzz/`, `benches/`, `examples/`.
+Benchmarks head-to-head against a 6.6.4 build of the same tree (five-trial
+medians, quiet box): **no regression** — every target within noise or slightly
+faster, the largest move `pattern_exact` −11.8 % (the `pattern_*` trio sits at
+−9…−12 % with non-overlapping trial ranges; `matches_pattern` is a `load8` loop
+over stdlib code that did not change, so this is the 6.6.5/6.6.6 emitter work,
+recorded rather than claimed).
+
+### Changed — cyrius pin 6.6.4 → 6.6.6
+
+- **What moved in the snapshot: 110 → 111 files, 27 of them changed, none of
+  them a first-party fold.** `lib/sigil.cyr` (3.12.18), `lib/patra.cyr`
+  (1.14.3), `lib/sandhi.cyr` (1.9.17), `lib/sakshi.cyr` (2.5.2) and
+  `lib/bayan.cyr` (1.5.6) are byte-identical to 6.6.4's and each is its repo's
+  latest tag as of this bump — cyrius 6.6.5's own note says the nine folds
+  "already sit at their latest tags", and the three it refolded (sankoch, mabda,
+  ganita) are not in majra's graph. The 27 that changed are core stdlib —
+  `alloc`, `vec`, `string`, `fmt`, `io`, `sys`, `sync`, `chrono`, `assert`,
+  `bench`, `fnptr` and every syscall peer among them. The one new file is
+  `alloc_cx.cyr`, the allocator peer for cyrius's cx bytecode target, which
+  nothing in majra reaches (a bare `cyrius lib sync` now copies 53 files, was
+  52). `cyrius.lock`: **111 sorted hashes + a `cyrius<TAB>6.6.6` trailer**,
+  written by a plain `cyrius deps` after `lib sync --full` in one step;
+  `--verify` 111 / 0. All four bundle bodies are byte-identical apart from the
+  banner and the comment blocks below; all four `.deps` sidecars are unchanged.
+- **What 6.6.5 / 6.6.6 fix that reaches majra** (from their CHANGELOGs, each
+  checked against this tree): `switch` / `match` / `for … in` used to park
+  their subject in a *global* slot, so eight threads through one `switch`
+  shared a word — majra uses none of the three constructs, so nothing here was
+  exposed; a `var` declared in a top-level `{ }` block used to leak out of it
+  and could overwrite an outer global of the same name — majra has no
+  top-level blocks; a declaration-zone redeclaration that changes a global's
+  type or size is now a compile error — `_IPC_SYS_SENDTO` is declared twice in
+  `src/ipc.cyr`, but under mutually exclusive `#ifdef CYRIUS_ARCH_*` arms, so
+  only one ever compiles and the rule does not fire (measured: the build's
+  diagnostic set is unchanged); the pair-return shape (`ret2` / `rethi`, used
+  across `src/queue.cyr`, both network backends and `src/admin.cyr`) is now a
+  compile error when a branch returns a single value — every majra path returns
+  a pair on all branches, so the four suites build exactly as before; on
+  Windows `O_APPEND` did not append and `O_TRUNC` did not truncate — majra's
+  IPC declines on PE by design and spells neither flag; `lib/string.cyr` and
+  `lib/fmt.cyr` are self-sufficient now (they include what they call), which
+  changes nothing for entry points that already include `alloc` first.
+- **The aarch64 `ESYSXLAT` routed set grew 44 → 60 rows** (decoded at each tag
+  with the same awk pipeline cyrius's `raw_syscall_literals_routed` gate uses;
+  58 at 6.6.5). Among the sixteen new sources are the two numbers 2.7.3's
+  story turns on: **`nanosleep` 35→101** (the raw literal that ran as
+  `unlinkat` and never slept — 2.7.3 already removed it, so nothing changes)
+  and **`sendto` 44→206**. majra spells sendto per arch at four sites
+  (`_IPC_SYS_SENDTO` in `src/ipc.cyr` and the `_*_sendto_nr()` helpers in
+  `src/ws.cyr`, `src/redis_backend.cyr`, `src/postgres_backend.cyr`), and each
+  carried a comment saying it had to be that way because 44 was not a row.
+  That was true through 6.6.4 and is false since 6.6.5; the **code is
+  unchanged and correct under both toolchains** — the aarch64 arm emits native
+  206, which is no row's source number, so nothing re-translates it — and it
+  stays per-arch because a consumer builds the bundle under *its* pin, not
+  majra's. The four comments now say so. CI's raw-literal gate: no literals,
+  no stray `SYS_` declarations. Also newly routed: 33 dup2, 45–47 recvfrom /
+  sendmsg / recvmsg, 76/77 truncate / ftruncate, 83/84 mkdir / rmdir, 87
+  unlink, 89 readlink, 263 unlinkat, 319 memfd_create (6.6.5), 137/138 statfs
+  / fstatfs (6.6.6) — none spelled anywhere in majra.
+- **A blocker closed upstream.** The agnos build of the `backends` profile had
+  one thing left at 2.7.3: `undefined function '_agnos_getenv'` (`lib/io.cyr`'s
+  agnos `getenv` reached `lib/args_agnos.cyr`, which no sidecar names — a
+  trapping `ud2` if reached), and an open question of whether majra should
+  declare the module or io.cyr should include it. 6.6.6 made `lib/io.cyr`
+  self-sufficient — it includes `lib/args_agnos.cyr` itself — and a clean-room
+  probe of every profile (sidecar leaves in order, then the bundle, then
+  `envelope_new` + `pubsub_new` + `_majra_sleep_ns`) builds with **zero**
+  undefined functions on x86_64, and the core and backends probes do the same
+  under `--agnos`. The roadmap's "Waiting on upstream" section is empty; the
+  majra-side half (the backends and patra-queue *suites* still use Linux
+  arities and socket names the agnos peer lacks — re-measured, they fail at
+  those sites while core and expanded build `OK`) moves to the 2.9 line as a
+  PATCH-shaped item with its trigger written down.
+- **Build footprint moved with the compiler, not the source**: `build/majra`
+  215,536 → 219,792 B, `test_core` 294,488 → 298,744, `test_backends`
+  2,222,128 → 2,234,576, `test_patra_queue` 394,400 → 402,744, `bench_all`
+  233,888 → 242,696 (cyrius 6.6.6's own note attributes its growth to new
+  refusals, the checked write path and the PE flag decoder). Bundle line
+  counts +6 / +6 / +6 / +15 — the re-tensed comments only.
+
+### Known issues (carried, re-checked at 6.6.6)
+
+- `duplicate fn 'uname_release'` — `lib/sigil.cyr:746` vs `lib/sys.cyr:203`,
+  upstream (sigil), harmless, unchanged: sigil 3.12.18 is byte-identical to the
+  6.6.4 fold. Still warns on every unit that links both (`test_backends`,
+  `cyrius audit`, every sidecar-provisioned consumer of the three named
+  profiles).
+- **New warning line, same behaviour** — `lib/sigil.cyr:25118:12: array local
+  over the per-fn frame budget gets STATIC storage: one buffer shared by all
+  calls and all threads`. sigil's crypto-bank init declares `var buf[262144]`,
+  which has always fallen back to static storage; 6.6.5 promoted the compiler's
+  `note:` for that fallback to a `warning:` and stopped registering the static
+  under a program-wide global name (so it can no longer collide with a
+  consumer's own `buf`). Same storage, same code, one more line on the same
+  units as the duplicate above. Upstream (sigil); tracked in
+  [`docs/development/dependency-watch.md`](docs/development/dependency-watch.md).
+- Pre-existing, unchanged, out of this patch's scope: `cyrius lint
+  src/main.cyr` reports one "untracked deferral" — the regex matches the test
+  string `"XXXX-XXXXX"` at `src/main.cyr:302` (a buffer-overwrite pattern in the
+  heartbeat owned-key test), not a deferral; identical under 6.6.4. And
+  `tests/test_live.tcyr` (CI-only) exits with SIGSEGV rather than a verdict
+  when no Redis is listening — also identical under 6.6.4, and CI provisions
+  Redis + PostgreSQL before running it.
+
+### Docs
+
+- `docs/development/roadmap.md` — its "Moving the cyrius pin to 6.6.6"
+  section shipped and was deleted (the roadmap is forward-facing; its measured
+  claims — pair returns, the `#ifdef`-split `_IPC_SYS_SENDTO`, no PE flags —
+  are re-checked and recorded above), and the agnos item left "Waiting on
+  upstream" (now empty, with a note saying why) for the 2.9 line. `state.md`
+  rebuilt from measurement
+  (111-file snapshot, 111-hash lock with the `6.6.6` trailer, bundle and
+  sidecar rows re-measured — the signed / backends sidecar counts had read 19 /
+  23 since 2.8.1 while the files hold 20 / 25). `dependency-watch.md` answers
+  the question its own `ESYSXLAT` bullet asked ("check whether the row count
+  moved"), banks 6.6.6's `cyrius deps --lock` refusal of unhashable files, and
+  gains the frame-budget warning as a second watched-upstream sigil item.
+  `cyrius-quirks.md` §9 re-derived (60 rows; 35 and 44 re-tensed), §2
+  restated — the fixup table is an *initial* capacity of 1,048,576, growable
+  since 6.2.0, not a cap — §7 re-measured (53 / 111). `testing.md`'s suite
+  table had drifted through 2.8.x–2.9.0 (still 637); re-anchored to 1,466 CI
+  + 36 live and 19 bench targets. `README.md`, `threat-model.md` re-anchored.
+
 ## [2.9.0] - 2026-09-15
 
 The six items the 2.8.1 P(-1) sweep confirmed but could not take in a PATCH.

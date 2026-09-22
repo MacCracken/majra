@@ -87,6 +87,28 @@ that nobody has.
 
 ---
 
+### agnos-portable `backends` and `patra-queue` suites
+
+The four bundles cross-build clean for agnos (core since 2.5.0; `backends`
+since 2.7.3 with one warning, and with none since the 6.6.6 pin closed the
+`_agnos_getenv` gap upstream — 2.9.1). The **suites** are what cannot follow:
+`tests/test_backends.tcyr` and `tests/test_patra_queue.tcyr` call `sys_unlink`
+/ `sys_stat` with the Linux arity and name `SYS_SOCKETPAIR` / `SYS_RECVFROM` /
+`SYS_GETSOCKNAME`, which the agnos peer does not declare (re-measured under
+6.6.6: core and expanded suites build `OK` with `--agnos`; the other two fail
+at those sites). Until they build, "agnos-clean" is a claim about linking, not
+about behaviour.
+
+**Scope**: port the two suites' Linux-only call sites behind the per-target
+wrappers or `#ifdef` arms (the shape `src/ipc.cyr` already uses), then add
+`--agnos` to the cross-build gate next to `--aarch64`. No `src/` change.
+**Aimed at**: the next PATCH — adds no API.
+**Trigger**: a consumer builds the `backends` profile for agnos (the daemon
+`--agnos` build that first exposed the profile), or the aarch64 run lane above
+lands and the matrix grows a second non-x86 column anyway.
+
+---
+
 ## 3.0.0
 
 ### Remove the deprecated bare `ERR_*` codes
@@ -104,23 +126,12 @@ and `cyrius lint` keeps noting them while they live.
 
 ## Waiting on upstream
 
-### agnos `--agnos` build for the non-core profiles
-
-`src/patra_queue.cyr` pulls patra. The **core** profile (`dist/majra.cyr`) has
-been agnos-clean since 2.5.0; only the `backends` profile and a daemon
-`--agnos` build were ever affected, and `dist/majra-backends.cyr` plus its
-sidecar leaves now cross-build `OK` under `--agnos`.
-
-**Blocked on**: what is left is a warning, not an error — that fold reports
-`undefined function '_agnos_getenv'` (`lib/io.cyr`'s agnos `getenv` reaches
-`lib/args_agnos.cyr`, which no sidecar names; a trapping `ud2` if reached).
-Whether that is a `[deps].stdlib` declaration on majra's side, as `sys` was at
-2.7.3, or an `io.cyr` include upstream is the question to settle before this
-item is re-homed.
-**majra-side work when it lands**: the `backends` and `patra-queue` suites do
-not cross-build for agnos — they call `sys_unlink` / `sys_stat` with the Linux
-arity and `syscall(SYS_SOCKETPAIR, …)`, which has no agnos row; port those,
-then re-run the matrix.
+Nothing at 2.9.1. The one item that sat here — the `_agnos_getenv` warning on
+an agnos build of the `backends` profile — closed upstream: cyrius 6.6.6's
+`lib/io.cyr` includes `lib/args_agnos.cyr` itself, and a clean-room probe of
+`dist/majra-backends.cyr` plus its sidecar leaves cross-builds `OK` under
+`--agnos` with **zero** undefined functions (2.9.1). The majra-side half moved
+to the 2.9 line (agnos-portable backends + patra-queue suites).
 
 ---
 
@@ -149,52 +160,3 @@ then re-run the matrix.
   fixed in cyrius 5.4.10 but never moved to `issues/archived/` with a
   `— RESOLVED` suffix. Per that repo's `issues/README.md` lifecycle someone on
   the Cyrius side should archive it. Recorded here only so it is not lost.
-
-## Moving the cyrius pin to 6.6.6
-
-**Current pin: `cyrius = "6.6.4"` (cyrius.cyml:8).** Nothing has to change
-first — bump the pin.
-
-**⚠ majra is the one repo in this sibling slice that uses pair returns at
-scale, and that is the 6.6.6 change to watch.** 6.6.6 turns "a pair-return fn
-returning anything but a same-shaped pair" from a silent miscompile into a
-compile error. `ret2` / `rethi` are used across `src/queue.cyr:46`,
-`src/redis_backend.cyr` (155/159/162/166, read back at 239),
-`src/postgres_backend.cyr` (612/614/618/625/632/643/660/671, read back at
-719/802) and `src/admin.cyr:94`. Every one of those paths returns a two-value
-pair on all branches today — **measured**: `cyrius build` under 6.6.4 and under
-6.6.6 both exit 0 with the identical two diagnostics
-(`lib/sigil.cyr:746 duplicate fn 'uname_release'`, and the 451,552-byte
-static-data note). So this is a "a build that stops is the fix working" item
-that does not stop majra's build — but it is now a hard error, so any future
-`ret2` path that returns a single value on one branch will fail the build
-instead of handing the caller a dropped tag.
-
-**Windows: not exposed.** `src/ipc.cyr:157` is `#ifdef CYRIUS_TARGET_WIN
-return -1;` — the IPC path declines on PE by design — and a grep for
-`O_APPEND` / `O_TRUNC` across `src/`, `programs/` and `tests/` (excluding
-vendored `lib/`) returns nothing. 6.6.6's PE append/truncate data-corruption fix
-does not reach majra.
-
-**Global redeclaration (6.6.6 makes "last definition wins" true from program
-start, and a different type/size a compile error):** `_IPC_SYS_SENDTO` is
-declared twice, `src/ipc.cyr:50` (x86, 44) and `:53` (aarch64, 206) — but inside
-mutually exclusive `#ifdef CYRIUS_ARCH_X86` / `#ifdef CYRIUS_ARCH_AARCH64` arms,
-so only one ever compiles. Not a redeclaration; neither rule fires. The
-`sendto` / `fstatfs` collision notes at `src/ipc.cyr:45`, `src/ws.cyr:207`,
-`src/postgres_backend.cyr:105` and `src/redis_backend.cyr:30` are comments about
-the aarch64 remap and are unaffected — 6.6.6 names `SYS_STATFS` / `SYS_FSTATFS`
-in the Linux peers, which does not touch majra's raw `sendto`.
-
-**The rest of the 6.6.6 list is absent:** zero `struct` declarations, zero
-`async` fns, zero `operator` fns, zero top-level `{ }` blocks, zero
-`: cstring` parameters, no locally defined `vec_*` (so assert.cyr's new
-transitive `include "lib/vec.cyr"` cannot collide — `vec` and `assert` are both
-already in `[deps] stdlib`). `lib/regression.cyr` is vendored but majra calls no
-`regression_*` helper, so the new exec deadline (`CYRIUS_CHECK_TIMEOUT`, 120 s)
-changes nothing here.
-
-**Verify after bumping:** re-run `cyrius deps` (6.6.6's `lib/io.cyr` is now
-self-sufficient and `xrmdir` routes to `RemoveDirectoryW` on PE), then
-`cyrius build` + `cyrius distlib` and confirm the diagnostic set is still the
-same two lines.

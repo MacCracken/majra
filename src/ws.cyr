@@ -203,10 +203,13 @@ fn _ws_read_full(fd, buf, want) {
 }
 
 # sendto(2)'s number, or 0 where majra has no MSG_NOSIGNAL send path.
-# ⚠ Spelled per arch: sendto has no ESYSXLAT row (quirk #9), so the x86_64 44
-# would run as fstatfs on aarch64. The peers declare no SYS_SENDTO and the
-# stdlib ships no sys_sendto wrapper. macOS has no MSG_NOSIGNAL and no Mach-O
-# row for either number; agnos and Windows have no BSD sockets.
+# Spelled per arch. Through cyrius 6.6.4 it had to be — sendto had no ESYSXLAT
+# row (quirk #9), so the x86_64 44 ran as fstatfs on aarch64; 6.6.5 added a
+# `sendto 44→206` row, and the per-arch form is kept because it is correct
+# under both toolchains (see `_IPC_SYS_SENDTO` in `src/ipc.cyr`). The peers
+# declare no SYS_SENDTO and the stdlib ships no sys_sendto wrapper. macOS has
+# no MSG_NOSIGNAL and no Mach-O row for either number; agnos and Windows have
+# no BSD sockets.
 fn _majra_ws_sendto_nr() {
     #ifdef CYRIUS_TARGET_LINUX
     #ifdef CYRIUS_ARCH_X86

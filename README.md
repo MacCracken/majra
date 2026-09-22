@@ -265,7 +265,7 @@ Majra was originally a Rust library (v1.0.4, ~13,000 lines). It was ported to Cy
 | Source lines | 12,969 | 8,212 (all of `src/`, incl. the 680-line `src/main.cyr` test entry; 7,532 in the 22 modules) |
 | Modules | 22 | 22 (QUIC transport not ported — deferred until a consumer needs multiplexed streams or connection migration; see roadmap § QUIC transport) |
 | Dependencies | 25 crates | 0 — sigil is a folded stdlib module |
-| Toolchain | cargo + rustc + LLVM | cyrius 6.6.4 |
+| Toolchain | cargo + rustc + LLVM | cyrius 6.6.6 |
 
 ## License
 
