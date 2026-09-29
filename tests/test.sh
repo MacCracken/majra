@@ -29,6 +29,8 @@ echo "=== Results ==="
 
 echo ""
 echo "--- benchmarks ---"
-cyrius build benches/bench_all.cyr "$BUILD/bench_all" && "$BUILD/bench_all"
+# 2.9.2: the benches are a .bcyr run by `cyrius bench`; this built a benches/bench_all.cyr that
+# no longer exists and printed "FAILED" on every run (non-fatal, so it went unnoticed).
+cyrius bench benches/bench_all.bcyr
 
 exit $(( CORE + EXPANDED ))

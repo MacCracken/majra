@@ -6,7 +6,7 @@ type: state
 
 # Current State — majra
 
-> **Last refresh**: 2026-09-21 (post-2.9.1) | **Refresh cadence**: every release (ideally bumped by the release post-hook).
+> **Last refresh**: 2026-09-28 (post-2.9.2) | **Refresh cadence**: every release (ideally bumped by the release post-hook).
 > **What this file is**: volatile state. The companion `CLAUDE.md` holds durable rules; this file holds whatever drifts release-to-release. Per [first-party-documentation § CLAUDE.md](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/first-party-documentation.md#claudemd), version numbers, test counts, consumer lists, and in-flight work all live here, not in `CLAUDE.md`.
 
 ---
@@ -15,15 +15,15 @@ type: state
 
 | File | Value | Source |
 |---|---|---|
-| `VERSION` | **2.9.1** | single source of truth |
+| `VERSION` | **2.9.2** | single source of truth |
 | `cyrius.cyml [package].version` | `${file:VERSION}` | reads `VERSION` |
-| Latest git tag | `2.9.0` (2.9.1 pending tag) | release workflow asserts `VERSION == tag` |
+| Latest git tag | `2.9.0` (2.9.1 and 2.9.2 pending tag) | release workflow asserts `VERSION == tag` |
 
 ## Toolchain
 
 | Pin | Value | Source |
 |---|---|---|
-| Cyrius | **6.6.6** | `cyrius.cyml [package].cyrius` |
+| Cyrius | **6.6.9** | `cyrius.cyml [package].cyrius` |
 | Cyrius floor for `signed`/`backends` | **≥ 6.4.64** | historical — sigil 3.12.x calls `thread_local_alloc()`, absent before 6.4.64. Since 2.6.8 this is no longer a *pairing* constraint: sigil is a folded stdlib module, so the cyrius pin and the sigil version are one knob |
 | aarch64 cross-build (`cycc_aarch64`) | **verified locally at 2.7.3; CI has a build-only cross-build gate, the run lane is still unwired** — every suite, fuzz harness, soak and example passes cross-built (`cyrius build --aarch64 --no-deps`) under `qemu-aarch64` | `.github/workflows/ci.yml` "aarch64 cross-build gate" (build-only); why the lane must *run* the binaries: see In-flight |
 
@@ -177,6 +177,7 @@ profiles (all three named sidecars list `sigil` — admin reaches it through
 
 | Tag | Date | Headline |
 |---|---|---|
+| 2.9.2 | 2026-09-28 | **Toolchain patch: cyrius 6.6.6 → 6.6.9**, from cyrius 6.6.10 bite 14. No `src/` change: the bite's WebSocket reader fix (CVE-53 in cyrius `lib/ws.cyr`) was premise-checked here and `majra_ws_recv_frame` already reads exactly and bounds the length (the 2.6.9 repair). 1,466 assertions (core 203 · expanded 645 · backends 547 · patra-queue 71). `tests/test.sh` ran a bench file renamed to `.bcyr` long ago and printed FAILED on every run — now `cyrius bench benches/bench_all.bcyr`. `cyrius-quirks.md` #6 notes cyrius 6.6.10 corrects the inverted "(call site may be unreachable)" suffix. |
 | 2.9.1 | 2026-09-21 | **Toolchain patch: cyrius 6.6.4 → 6.6.6.** Snapshot 110 → 111 files (27 changed, all core stdlib; the new one is `alloc_cx.cyr`), no first-party fold moved — sigil 3.12.18 / patra 1.14.3 / sandhi 1.9.17 / sakshi 2.5.2 byte-identical and each at its latest tag. Lock 111 sorted hashes + `cyrius\t6.6.6` trailer. The aarch64 `ESYSXLAT` routed set grew 44 → 60 rows and now routes `nanosleep` 35 and `sendto` 44; majra's code is unchanged and correct under both toolchains, four `sendto` comments re-tensed (the only `src/` diff — bundle bodies comment-only, sidecars untouched). 1,466 assertions natively and under `qemu-aarch64`; expanded suite 100× on each with 0 crashes; benchmarks head-to-head vs 6.6.4 within noise or faster (largest `pattern_exact` −11.8 %). One new upstream warning line (sigil's over-budget `var buf[262144]`, `note:` → `warning:` at 6.6.5; same storage). Roadmap's pin-move section shipped and deleted. |
 | 2.9.0 | 2026-09-15 | **Two wire breaks, both security fixes** (semver.md gains the exception that permits them in a MINOR). Encrypted IPC derives a per-connection key from a 32-byte session handshake, closing cross-connection replay; signed envelopes gain a domain prefix and `verify(se, 0)` now returns 4 so unanchored callers fail closed. Adds a WebSocket Origin policy, `pg_rows_free` / `redis_array_free` / `hb_transitions_free`, relay unsubscribe and message refcounting. 1,466 assertions. |
 | 2.8.2 | 2026-09-15 | Heartbeat trackers own their node-id keys (transitions still return the caller's pointer). Relay dedup eviction compacts tombstones, with the helper shared in `counter.cyr`. Fuzz harnesses gain model oracles, CI's iteration arg and a printed seed. New `mq_lifecycle` / `mq_enqueue_4producers` benches; `soak_queue` at 500k ops. 1,419 assertions. |

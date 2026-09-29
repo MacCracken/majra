@@ -11,12 +11,9 @@ syscalls
 chrono
 fnptr
 thread
-net
 sigil
-sys
 ct
 bayan
-io
 random
 thread_local
 keccak

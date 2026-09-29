@@ -11,17 +11,12 @@ syscalls
 chrono
 fnptr
 thread
-io
 net
 patra
 sandhi
-sys
 sigil
 tls
 async
 ct
 bayan
-random
 keccak
-fdlopen
-dynlib

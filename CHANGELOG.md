@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.2] - 2026-09-28
+
+Toolchain patch — **cyrius 6.6.6 → 6.6.9**, from cyrius 6.6.10 bite 14. No `src/` change.
+**1,466 assertions** pass (core 203 · expanded 645 · backends 547 · patra-queue 71); benchmarks
+run; `cyrius fmt --check` clean; the four `dist/` bundles regenerate reproducibly. Three `.deps`
+sidecars shrink under 6.6.9's distlib (admin drops `sys` / `random` / `fdlopen` / `dynlib` / `io`,
+backends drops `sys` / `random` / `fdlopen` / `dynlib` / `net`, signed drops `sys` / `io` — modules
+that now pull those themselves); a clean-room build of each bundle against ONLY its sidecar's leaves
+compiles with zero undefined functions for all four.
+
+### Verified (no change needed)
+
+- **The WebSocket frame reader.** cyrius 6.6.10 fixes CVE-53 in its `lib/ws.cyr` `ws_recv_frame`
+  (unchecked short reads of the extended length, mask and payload; a peer-chosen allocation
+  length). majra's own `majra_ws_recv_frame` was checked for the same shapes and has none: every
+  part goes through `_ws_read_full` (EINTR retried, EOF/error fails), a 64-bit length with any top
+  32 bit set is rejected, the length is bounded by `WS_MAX_PAYLOAD`, and the allocation is checked —
+  the 2.6.9 repair.
+
+### Fixed
+
+- **`tests/test.sh`'s benchmark step built `benches/bench_all.cyr`, which no longer exists** (it is
+  `bench_all.bcyr`), so every run ended with `error: no such file` and `FAILED` — non-fatal, since
+  the exit status sums only core + expanded, which is why it went unnoticed. It now runs
+  `cyrius bench benches/bench_all.bcyr`.
+- **`docs/development/cyrius-quirks.md` #6** now says the inverted `(call site may be unreachable)`
+  suffix — printed for the REACHABLE case — is corrected in cyrius 6.6.10, and that the bare
+  `warning: undefined function` prefix (what to grep for) is unchanged.
+
 ## [2.9.1] - 2026-09-21
 
 Toolchain patch — **cyrius 6.6.4 → 6.6.6**, and with it the whole stdlib
