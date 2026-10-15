@@ -151,12 +151,38 @@ fn conn_pool_new() {
     return p;
 }
 
+# Register (or re-register) a breaker for `endpoint`.
+#
+# ⚠ 2.10.1. The map was keyed on the CALLER's endpoint pointer (map_set stores
+# keys by reference), so an endpoint built in a reused buffer re-keyed or lost
+# its breaker; the pool now owns a copy. Re-registering used to replace the
+# breaker and leak the old one — and freeing it instead would race
+# conn_pool_circuit_state, which reads the breaker after unlocking — so the
+# existing breaker is reconfigured and reset in place.
 fn conn_pool_with_circuit_breaker(pool, endpoint, threshold, cooldown_ns) {
-    var cb = circuit_breaker_new(threshold, cooldown_ns);
+    if (pool == 0 || endpoint == 0) { return 0; }
     var mtx = load64(pool + 16);
     mutex_lock(mtx);
-    map_set(load64(pool + 8), endpoint, cb);
+    var m = load64(pool + 8);
+    var cb = map_get(m, endpoint);
+    if (cb != 0) {
+        var cmtx = load64(cb + 32);
+        mutex_lock(cmtx);
+        store64(cb, 0);
+        store64(cb + 8, 0);
+        store64(cb + 16, threshold);
+        store64(cb + 24, cooldown_ns);
+        store64(cb + 40, 0);
+        mutex_unlock(cmtx);
+    } else {
+        var n = strlen(endpoint);
+        var k = fl_alloc(n + 1);
+        memcpy(k, endpoint, n);
+        store8(k + n, 0);
+        map_set(m, k, circuit_breaker_new(threshold, cooldown_ns));
+    }
     mutex_unlock(mtx);
+    return 0;
 }
 
 fn conn_pool_circuit_state(pool, endpoint) {

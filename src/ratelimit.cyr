@@ -466,7 +466,13 @@ fn sliding_window_check(sw, key) {
     if (elapsed < 0) { elapsed = 0; }
 
     # Advance windows if needed
-    if (elapsed >= window_ns * 2) {
+    # ⚠ `window_ns * 2` wraps negative past 2^62 ns (sliding_window_evict_stale
+    # clamps the same product). Unclamped, every check saw `elapsed >= negative`
+    # and reset the window, so a limiter with a huge window — an "N ever" limit
+    # spelled with INT64_MAX — never counted anything and FAILED OPEN (2.10.1).
+    var two_windows = window_ns * 2;
+    if (window_ns > 0x3FFFFFFFFFFFFFFF) { two_windows = 0x7FFFFFFFFFFFFFFF; }
+    if (elapsed >= two_windows) {
         store64(wc_ptr, 0);
         store64(wc_ptr + 8, 0);
         store64(wc_ptr + 16, now);
@@ -482,7 +488,14 @@ fn sliding_window_check(sw, key) {
     # Using x1000 scaling:
     var elapsed_in_current = now - load64(wc_ptr + 16);
     if (elapsed_in_current < 0) { elapsed_in_current = 0; }
-    var weight_x1000 = 1000 - elapsed_in_current * 1000 / window_ns;
+    # Divide first once `elapsed * 1000` could overflow (elapsed < window_ns, so
+    # only for windows past ~9.2e15 ns); the multiply-first form stays exact below.
+    var weight_x1000 = 0;
+    if (elapsed_in_current > 9000000000000000) {
+        weight_x1000 = 1000 - elapsed_in_current / (window_ns / 1000);
+    } else {
+        weight_x1000 = 1000 - elapsed_in_current * 1000 / window_ns;
+    }
     if (weight_x1000 < 0) { weight_x1000 = 0; }
     var prev = load64(wc_ptr);
     var curr = load64(wc_ptr + 8);

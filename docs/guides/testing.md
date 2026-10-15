@@ -35,13 +35,13 @@ cyrius build --no-deps tests/soak/soak_queue.cyr build/soak_queue && ./build/soa
 | Suite | File | Assertions | Coverage |
 |-------|------|-----------|----------|
 | Core | `src/main.cyr` | 203 | All 15 core modules + relay dedup, envelope-id entropy (non-zero *and* distinct), `_majra_sleep_ns` floor |
-| Expanded | `tests/test_core.tcyr` | 647 | Deep: queue lifecycle, pubsub patterns, DAG retry (outcome + elapsed backoff), fleet routing, circuit breaker, integration, multi-threaded barrier (proves blocking, not just a counter), concurrency + wildcard-alignment, relay / ratelimit / priority-queue regressions. Per-release additions: CHANGELOG.md |
-| Backends | `tests/test_backends.tcyr` | 547 | base64, SHA-1, AES-256-GCM, signed envelopes, admin endpoint, WebSocket, RESP, PG wire |
+| Expanded | `tests/test_core.tcyr` | 664 | Deep: queue lifecycle, pubsub patterns, DAG retry (outcome + elapsed backoff), fleet routing, circuit breaker, integration, multi-threaded barrier (proves blocking, not just a counter), concurrency + wildcard-alignment, relay / ratelimit / priority-queue regressions. Per-release additions: CHANGELOG.md |
+| Backends | `tests/test_backends.tcyr` | 557 | base64, SHA-1, AES-256-GCM, signed envelopes, admin endpoint, WebSocket, RESP, PG wire |
 | Patra queue | `tests/test_patra_queue.tcyr` | 71 | Durable enqueue / priority dequeue / complete / counts / reopen persistence |
-| Live | `tests/test_live.tcyr` | 36 | 7 Redis + 4 PostgreSQL test functions in `tests/test_live.tcyr`. **CI-only** — needs Redis on :6379 + PostgreSQL on :5432, so a dev-box "full matrix" run is 1,468, not 1,504 |
-| **Total** | | **1,504** (1,468 CI + 36 live) | |
+| Live | `tests/test_live.tcyr` | 36 | 7 Redis + 4 PostgreSQL test functions in `tests/test_live.tcyr`. **CI-only** — needs Redis on :6379 + PostgreSQL on :5432, so a dev-box "full matrix" run is 1,495, not 1,531 |
+| **Total** | | **1,531** (1,495 CI + 36 live) | |
 
-Every non-live suite, fuzz harness, soak, example and the benchmark binary also passes cross-built for aarch64 under `qemu-aarch64` (since 2.7.3; re-verified at 2.9.3 under 6.6.20 and at 2.10.0 under 6.7.9 — the expanded suite reports 644 there, its one x86-only test carrying three asserts) — see [aarch64 cross-build](#aarch64-cross-build-qemu-user) below.
+Every non-live suite, fuzz harness, soak, example and the benchmark binary also passes cross-built for aarch64 under `qemu-aarch64` (since 2.7.3; re-verified at 2.9.3 under 6.6.20, at 2.10.0 under 6.7.9 and at 2.10.1 — the expanded suite reports three fewer there (661 at 2.10.1), its one x86-only test carrying three asserts) — see [aarch64 cross-build](#aarch64-cross-build-qemu-user) below.
 
 `test_patra_queue` was split out at 2.4.0 to stay under the then-16384 cc5 fixup cap (patra pulls sakshi + io + fs transitively); the table starts at 1,048,576 entries and grows on demand at the 6.7.9 pin (growable since cyrius 6.2.0), and the split is kept as documented architecture.
 

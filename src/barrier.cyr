@@ -65,7 +65,7 @@ fn _set_contains(v, s) {
 
 fn _set_add(v, s) {
     if (_set_contains(v, s) == 0) {
-        vec_push(v, s);
+        _majra_vec_push(v, s);
     }
 }
 
@@ -95,10 +95,20 @@ fn _set_is_superset(arrived, expected) {
     return 1;
 }
 
-# BarrierState struct (24 bytes):
+# BarrierState struct (32 bytes, then the name):
 #   offset  0: expected (i64) — vec of participant name strings
 #   offset  8: arrived (i64) — vec of participant name strings
 #   offset 16: was_forced (i64)
+#   offset 24: name (i64) — the set's OWN copy of the barrier name, its map key;
+#                           points into this block, right after the fields
+#                           (2.10.1, APPENDED)
+#
+# ⚠ Both barrier sets keyed their map on the CALLER's name pointer until 2.10.1
+# (map_set stores keys by reference) — the borrowed-key class 2.8.x fixed in
+# pubsub, relay, heartbeat, ratelimit and fleet. A name built in a temporary
+# or reused buffer left a dangling key every lookup in the set could compare.
+# The vecs are freelist vecs since 2.10.1, so a completed barrier is released.
+# Participant names are still the caller's and must outlive the barrier.
 
 # Takes a COPY of the participants vec, deduplicated.
 #
@@ -111,9 +121,12 @@ fn _set_is_superset(arrived, expected) {
 # corrupt each other's membership, and silently modified the caller's own vec.
 # 2.6.9 fixed exactly this in _cbarrier_state_new and left the non-concurrent
 # twin alone.
-fn _barrier_state_new(participants_vec) {
-    var bs = fl_alloc(24);
-    var owned = vec_new();
+fn _barrier_state_new(participants_vec, name) {
+    var nl = strlen(name);
+    var bs = fl_alloc(32 + nl + 1);
+    memcpy(bs + 32, name, nl);
+    store8(bs + 32 + nl, 0);
+    var owned = _majra_vec_new();
     var pi = 0;
     var pn = 0;
     if (participants_vec != 0) { pn = vec_len(participants_vec); }
@@ -122,9 +135,18 @@ fn _barrier_state_new(participants_vec) {
         pi = pi + 1;
     }
     store64(bs, owned);
-    store64(bs + 8, vec_new());
+    store64(bs + 8, _majra_vec_new());
     store64(bs + 16, 0);
+    store64(bs + 24, bs + 32);
     return bs;
+}
+
+# Frees a non-concurrent state's vecs and block (its name lives in the block).
+fn _barrier_state_free(st) {
+    _majra_vec_free(load64(st));
+    _majra_vec_free(load64(st + 8));
+    fl_free(st);
+    return 0;
 }
 
 fn _check_barrier(bs) {
@@ -149,9 +171,17 @@ fn barrier_set_new() {
 # Create a barrier. participants is a vec of name strings.
 fn barrier_create(bs, name, participants) {
     var barriers = load64(bs);
-    var existed = map_has(barriers, name);
-    map_set(barriers, name, _barrier_state_new(participants));
-    return existed == 0;
+    var st = _barrier_state_new(participants, name);
+    var prev = map_get(barriers, name);
+    # An overwrite re-points the slot's key at the new state's copy, so the
+    # old state (and the name inside it) can go: nothing else can reach a
+    # single-threaded one.
+    map_set(barriers, load64(st + 24), st);
+    if (prev != 0) {
+        _barrier_state_free(prev);
+        return 0;
+    }
+    return 1;
 }
 
 fn barrier_arrive(bs, name, participant) {
@@ -176,7 +206,12 @@ fn barrier_force(bs, name, dead_participant) {
 
 # Complete and remove a barrier. Returns 1 if found, 0 otherwise.
 fn barrier_complete(bs, name) {
-    return map_delete(load64(bs), name);
+    var barriers = load64(bs);
+    var st = map_get(barriers, name);
+    if (st == 0) { return map_delete(barriers, name); }
+    var r = map_delete(barriers, load64(st + 24));
+    _barrier_state_free(st);
+    return r;
 }
 
 fn barrier_set_len(bs) {
@@ -195,6 +230,10 @@ fn barrier_set_is_empty(bs) {
 #   offset 16: was_forced
 #   offset 24: released_flag (i64) — 0 waiting, 1 released, 2 cancelled
 #   offset 32: futex_addr (i64) — address for futex wait/wake
+#   offset 40: name (i64) — the set's owned copy of the name, in this block right
+#                           after the fields (2.10.1, APPENDED). The block — and
+#                           so the name — outlives complete / re-create, because
+#                           parked waiters read the flag.
 
 # Takes a COPY of the participants vec, deduplicated (see _barrier_state_new).
 #
@@ -203,9 +242,12 @@ fn barrier_set_is_empty(bs) {
 # participant list corrupted each other's expected set, and the caller's own
 # vec was silently modified out from under it. A barrier's membership must not
 # depend on what the caller does with its list afterwards.
-fn _cbarrier_state_new(participants) {
-    var cbs = fl_alloc(40);
-    var owned = vec_new();
+fn _cbarrier_state_new(participants, name) {
+    var nl = strlen(name);
+    var cbs = fl_alloc(48 + nl + 1);
+    memcpy(cbs + 48, name, nl);
+    store8(cbs + 48 + nl, 0);
+    var owned = _majra_vec_new();
     var i = 0;
     var n = 0;
     if (participants != 0) { n = vec_len(participants); }
@@ -214,10 +256,11 @@ fn _cbarrier_state_new(participants) {
         i = i + 1;
     }
     store64(cbs, owned);
-    store64(cbs + 8, vec_new());
+    store64(cbs + 8, _majra_vec_new());
     store64(cbs + 16, 0);
     store64(cbs + 24, 0);
     store64(cbs + 32, 0);
+    store64(cbs + 40, cbs + 48);
     return cbs;
 }
 
@@ -276,13 +319,16 @@ fn cbarrier_set_new() {
 
 fn cbarrier_create(cbs, name, participants) {
     var mtx = load64(cbs + 8);
+    var st = _cbarrier_state_new(participants, name);
     mutex_lock(mtx);
     var barriers = load64(cbs);
-    var existed = map_has(barriers, name);
-    if (existed == 1) { _cbarrier_cancel(map_get(barriers, name)); }
-    map_set(barriers, name, _cbarrier_state_new(participants));
+    var prev = map_get(barriers, name);
+    # A cancelled state stays allocated (parked waiters read its flag); the
+    # overwrite re-points the slot's key at the new state's own copy.
+    if (prev != 0) { _cbarrier_cancel(prev); }
+    map_set(barriers, load64(st + 40), st);
     mutex_unlock(mtx);
-    return existed == 0;
+    return prev == 0;
 }
 
 fn cbarrier_arrive(cbs, name, participant) {
@@ -415,8 +461,16 @@ fn cbarrier_force(cbs, name, dead_participant) {
 fn cbarrier_complete(cbs, name) {
     var mtx = load64(cbs + 8);
     mutex_lock(mtx);
-    _cbarrier_cancel(map_get(load64(cbs), name));
-    var r = map_delete(load64(cbs), name);
+    var st = map_get(load64(cbs), name);
+    _cbarrier_cancel(st);
+    var r = 0;
+    if (st == 0) {
+        r = map_delete(load64(cbs), name);
+    } else {
+        # The state block — and the name in it — stays for any waiter still
+        # reading the flag.
+        r = map_delete(load64(cbs), load64(st + 40));
+    }
     mutex_unlock(mtx);
     return r;
 }

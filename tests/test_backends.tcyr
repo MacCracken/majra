@@ -308,6 +308,17 @@ fn test_signed_envelope_args() {
     assert_eq(signed_envelope_verify(se, pk), 0, "and verifies anchored");
     assert_eq(memeq(signed_envelope_signer_pk(se), pk, 32), 1, "signer pk is a copy of pk");
     signed_envelope_free(se);
+
+    # 2.10.1: an sk whose public half is not derived from its seed passes the
+    # pk_ptr == sk[32..64] check; sigil refuses to sign it (-1, zeroed sig), and
+    # the envelope must be refused too, not shipped with a zero signature.
+    var sk2 = fl_alloc(64);
+    var pk2 = fl_alloc(32);
+    ed25519_generate_keypair(sk2, pk2);
+    var mixed = fl_alloc(64);
+    memcpy(mixed, sk, 32);
+    memcpy(mixed + 32, pk2, 32);
+    assert_eq(signed_envelope_new(e, mixed, pk2), 0, "an sk whose pk half is not its seed's is refused");
     println("  signed_envelope_args: ok");
 }
 
@@ -530,7 +541,7 @@ fn test_admin() {
     assert(majra_admin_ratelimiter(admin) == rl, "ratelimiter wired");
 
     # JSON-body builders — pure functions, no socket required.
-    var fleet_body = _admin_fleet_json(admin);
+    var fleet_body = _admin_fleet_json(admin, default_alloc());
     var fleet_len = rethi();
     assert(fleet_len > 0, "fleet json non-empty");
     var fleet_s = str_new(fleet_body, fleet_len);
@@ -538,7 +549,7 @@ fn test_admin() {
     assert(str_contains_cstr(fleet_s, "total") == 1, "fleet json has 'total'");
 
     # 2.7.0: /ratelimit?key=<k> reports THAT KEY, not the limiter-wide totals.
-    var rl_body = _admin_ratelimit_json(admin, "k1");
+    var rl_body = _admin_ratelimit_json(admin, "k1", default_alloc());
     var rl_len = rethi();
     assert(rl_len > 0, "ratelimit json non-empty");
     var rl_s = str_new(rl_body, rl_len);
@@ -548,7 +559,7 @@ fn test_admin() {
     assert(str_contains_cstr(rl_s, "evicted") == 0, "keyed json does NOT leak global counters");
 
     # Omitting the key still reports limiter-wide totals, explicitly labelled.
-    var g_body = _admin_ratelimit_json(admin, 0);
+    var g_body = _admin_ratelimit_json(admin, 0, default_alloc());
     var g_len = rethi();
     var g_s = str_new(g_body, g_len);
     assert(str_contains_cstr(g_s, "\"scope\":\"global\"") == 1, "unkeyed query is global-scoped");
@@ -556,7 +567,7 @@ fn test_admin() {
 
     # An unseen key is reported as unknown, not as zeroes that look like a
     # quiet tenant.
-    var u_body = _admin_ratelimit_json(admin, "never-seen");
+    var u_body = _admin_ratelimit_json(admin, "never-seen", default_alloc());
     var u_len = rethi();
     var u_s = str_new(u_body, u_len);
     assert(str_contains_cstr(u_s, "unknown key") == 1, "an unseen key is reported unknown");
@@ -673,6 +684,22 @@ fn test_admin_handler() {
     assert(_fa_roundtrip_n(admin, crafted, plen + 7 + qlen) > 0, "crafted path gets a response, no crash");
     assert_eq(_fa_status_is("404"), 1, "crafted path is 404");
     fl_free(crafted);
+
+    # 2.10.1: a request allocates from the admin's arena, reset after it; the
+    # default-allocator helpers took bump memory for good on every route, 404s
+    # included. Warm the arena on each route first: it keeps its high-water mark.
+    _fa_roundtrip(admin, "GET /fleet HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    _fa_roundtrip(admin, "GET /ratelimit?key=k1 HTTP/1.1\r\n\r\n");
+    _fa_roundtrip(admin, "GET /nope HTTP/1.1\r\n\r\n");
+    var u0 = alloc_used();
+    var rq = 0;
+    while (rq < 200) {
+        _fa_roundtrip(admin, "GET /fleet HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        _fa_roundtrip(admin, "GET /ratelimit?key=k1 HTTP/1.1\r\n\r\n");
+        _fa_roundtrip(admin, "GET /nope HTTP/1.1\r\n\r\n");
+        rq = rq + 1;
+    }
+    assert_eq(alloc_used() - u0, 0, "600 admin requests take no bump memory once the arena is warm");
 
     assert_eq(majra_admin_serve(admin, "localhost", 0), -1, "serve refuses a non-literal bind address");
     println("  admin_handler: ok");
@@ -1979,7 +2006,7 @@ fn test_tracker_type_tags() {
 
     # And /fleet on a basic tracker degrades to an error rather than reading
     # out of bounds.
-    var body = _admin_fleet_json(a_basic);
+    var body = _admin_fleet_json(a_basic, default_alloc());
     var blen = rethi();
     assert(blen > 0, "basic tracker yields a body");
     assert_eq(memeq(body, "{\"error\"", 8), 1, "basic tracker yields an ERROR json, not a fleet read");
@@ -2095,6 +2122,36 @@ fn _resp_parse(bytes, len) {
 # 2.6.10: these used to assert only that three constants were positive and
 # that i64 addition wraps — neither of which can detect the guards being
 # removed. Now they drive the parser over a real socket.
+# 2.10.1: RESP integer fields are strict — digits only, no i64 overflow. A
+# length or count that is malformed, wraps, or is negative other than -1 used
+# to read as nil (or as the digits it did contain) and left the server's bytes
+# to be parsed as the next reply; now it poisons the connection.
+fn _tb_resp_dead(bytes, len) {
+    var c = _resp_parse(bytes, len);
+    rethi();
+    return redis_is_alive(c) == 0;
+}
+
+fn _tb_resp_live(bytes, len, want) {
+    var c = _resp_parse(bytes, len);
+    var r = rethi();
+    if (redis_is_alive(c) != 1) { return 0; }
+    syscall(SYS_CLOSE, load64(c));
+    return r == want;
+}
+
+fn test_resp_strict_integers() {
+    assert_eq(_tb_resp_dead("$1x2\r\nAAAAAAAAAAAA\r\n", 20), 1, "a bulk length with a non-digit poisons");
+    assert_eq(_tb_resp_dead("*10000000000000000000\r\n", 23), 1, "an array count that wraps i64 poisons");
+    assert_eq(_tb_resp_dead("$-5\r\nhello\r\n", 12), 1, "a bulk length below -1 poisons");
+    assert_eq(_tb_resp_dead(":12a\r\n", 6), 1, "an integer reply with a non-digit poisons");
+    assert_eq(_tb_resp_live("$-1\r\n", 5, 0), 1, "$-1 is nil on a live connection");
+    assert_eq(_tb_resp_live("*-1\r\n", 5, 0), 1, "*-1 is a nil array on a live connection");
+    assert_eq(_tb_resp_live(":9223372036854775807\r\n", 22, 9223372036854775807), 1, "INT64_MAX parses");
+    assert_eq(_tb_resp_live(":-42\r\n", 6, 0 - 42), 1, "a negative integer parses");
+    println("  resp_strict_integers: ok");
+}
+
 fn test_resp_parser() {
     # A nil bulk string is a VALID reply, not a failure. 2.6.9's
     # `if (elem == 0) { return arr; }` truncated arrays containing one.
@@ -2643,6 +2700,7 @@ fn main() {
     test_admin_handler();
     test_admin_host_gate();
     test_resp_reply_free();
+    test_resp_strict_integers();
     test_redis_no_bump_growth();
     test_pg_query_offline();
     test_ws_frame_bytes();

@@ -169,20 +169,33 @@ fn _resp_read_line(fd) {
     ret2(0, 0);
 }
 
-# Parse a RESP integer field in place — same rules as str_to_int (an optional
-# leading '-', non-digits skipped) without allocating a Str header for it.
+# Parse a RESP integer field in place: an optional '-', then one or more
+# digits, nothing else. Returns the value; rethi() is 1 when the field was
+# well-formed and fits an i64, 0 otherwise.
+#
+# ⚠ 2.10.1. This used to skip non-digits ("$1x2" read 12) and never checked for
+# overflow, so a 20-digit length wrapped — a wrapped `*` count or `$` length
+# came back negative and was returned as nil WITHOUT poisoning, leaving the
+# bytes the server sent to be parsed as the next reply (the class of the 2026
+# redis-parser multi-bulk-length reports). Every caller poisons on 0.
 fn _resp_int(p, n) {
     var result = 0;
     var neg = 0;
     var i = 0;
     if (n > 0 && load8(p) == 45) { neg = 1; i = 1; }
+    if (i >= n) { ret2(0, 0); }
     while (i < n) {
         var c = load8(p + i);
-        if (c >= 48 && c <= 57) { result = result * 10 + c - 48; }
+        if (c < 48 || c > 57) { ret2(0, 0); }
+        var d = c - 48;
+        # result * 10 + d must stay <= INT64_MAX (9223372036854775807)
+        if (result > 922337203685477580) { ret2(0, 0); }
+        if (result == 922337203685477580 && d > 7) { ret2(0, 0); }
+        result = result * 10 + d;
         i = i + 1;
     }
     if (neg == 1) { result = 0 - result; }
-    return result;
+    ret2(result, 1);
 }
 
 # A Str header over an fl_alloc'd reply buffer. The header itself is fl_alloc'd
@@ -268,13 +281,18 @@ fn _resp_read_reply_d(rc, depth) {
     if (type_byte == 58) {
         # :integer — the line is fully consumed here
         var iv = _resp_int(line + 1, llen - 1);
+        var iok = rethi();
         fl_free(line);
+        if (iok == 0) { _resp_poison(rc); return 0; }
         return iv;
     }
     if (type_byte == 36) {
         # $bulk string
         var blen = _resp_int(line + 1, llen - 1);
+        var bok = rethi();
         fl_free(line);
+        # `$-1` is nil; any other negative length is not RESP.
+        if (bok == 0 || blen < 0 - 1) { _resp_poison(rc); return 0; }
         if (blen < 0) { return 0; }
         # Without this cap, `$9223372036854775807` makes `blen + 2` WRAP
         # NEGATIVE; _fl_class sends any negative size down the size<=16 path,
@@ -309,7 +327,10 @@ fn _resp_read_reply_d(rc, depth) {
     if (type_byte == 42) {
         # *array
         var count = _resp_int(line + 1, llen - 1);
+        var cok = rethi();
         fl_free(line);
+        # `*-1` is a nil array; any other negative count is not RESP.
+        if (cok == 0 || count < 0 - 1) { _resp_poison(rc); return 0; }
         if (count < 0) { return 0; }
         # An oversized count spins this loop growing `arr` long after the
         # socket has stopped producing, and unbounded nesting turns
@@ -334,7 +355,14 @@ fn _resp_read_reply_d(rc, depth) {
             # poisoned the handle aborts the array like every other failure,
             # rather than padding it out to `count` with zeros.
             _majra_vec_push(arr, _resp_read_reply_d(rc, depth + 1));
-            if (load64(rc) < 0) { return 0; }
+            if (load64(rc) < 0) {
+                # Release the array's own storage (2.10.1: it leaked). The
+                # elements are untyped here — an integer reply is its value,
+                # not a pointer — so they are left, as redis_array_free_shallow
+                # leaves them.
+                _majra_vec_free(arr);
+                return 0;
+            }
             j = j + 1;
         }
         return arr;

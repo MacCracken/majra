@@ -109,6 +109,25 @@ lands and the matrix grows a second non-x86 column anyway.
 
 ---
 
+### Release functions for the blocks the API still hands out unpaired
+
+The 2.10.1 P(-1) pass found the last returns a caller cannot release cleanly:
+
+- **Bump vecs, which cannot be freed at all** — `hb_list_by_status`,
+  `chb_list_by_status` (and `hb_online` / `chb_online`), `storage_list_defs`.
+  A caller polling `chb_online` leaks a vec per call.
+- **Freelist blocks with no documented release** — the barrier result from
+  `barrier_arrive` / `_force` and `cbarrier_arrive` / `_force`, `relay_stats`,
+  `fleet_stats`. `fl_free` works, but nothing says so.
+
+**Scope**: build the four list returns on `_majra_vec_*` and add one release
+for them (`majra_list_free`); add `barrier_result_free`, `relay_stats_free`,
+`fleet_stats_free`, and document each pairing beside its constructor.
+**Aimed at**: 2.11.0 — new public functions take a MINOR (`semver.md`).
+**Trigger**: the next MINOR, or a consumer that polls one of the list calls.
+
+---
+
 ### Retire `_majra_map_compact` at the ratelimit and heartbeat sites
 
 cyrius 6.6.20's `lib/hashmap.cyr` counts `map_delete`'s tombstones and

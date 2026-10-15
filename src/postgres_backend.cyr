@@ -586,6 +586,7 @@ fn _pg_parse_row(data, data_len) {
                     if (old != 0) { fl_free(old); }
                     fi = fi + 1;
                 }
+                _majra_vec_free(row);   # 2.10.1: the cells were freed, the row was not
                 return 0;
             }
             memcpy(val, data + pos, cl);
@@ -761,8 +762,9 @@ fn pg_init_workflow_tables(conn) {
             _pg_q_exec(conn, q);
         }
     }
-    pg_exec(conn, "CREATE INDEX IF NOT EXISTS idx_majra_wf_runs_workflow ON majra_workflow_runs(workflow_id)");
-    pg_exec(conn, "CREATE INDEX IF NOT EXISTS idx_majra_wf_step_runs_run ON majra_workflow_step_runs(run_id)");
+    # Non-collecting (2.10.1): pg_exec collects a rows vec, which these dropped.
+    _pg_query_st(conn, "CREATE INDEX IF NOT EXISTS idx_majra_wf_runs_workflow ON majra_workflow_runs(workflow_id)", 0);
+    _pg_query_st(conn, "CREATE INDEX IF NOT EXISTS idx_majra_wf_step_runs_run ON majra_workflow_step_runs(run_id)", 0);
 }
 
 # Save a workflow definition (upsert). Returns 0, or -1 on failure.

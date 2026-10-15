@@ -157,9 +157,19 @@ fn signed_envelope_new(e, sk_ptr, pk_ptr) {
     if (canon == 0) { return 0; }
 
     var sig = fl_alloc(SIGNED_ENV_SIG_LEN);
-    ed25519_sign(sk_ptr, canon, canon_len, sig);
+    if (sig == 0) { fl_free(canon); return 0; }
+    # ⚠ sigil re-derives the public key from sk's seed and compares it with
+    # sk[32..64]; on a mismatch it zeroes the signature and returns -1 (the
+    # double-public-key oracle). The check above only ties pk_ptr to sk[32..64],
+    # so a corrupt sk passes it — and until 2.10.1 the -1 was ignored and the
+    # envelope shipped with an all-zero signature.
+    var src = ed25519_sign(sk_ptr, canon, canon_len, sig);
     # The canonical buffer is scratch — free it once it has been signed over.
     fl_free(canon);
+    if (src != 0) {
+        fl_free(sig);
+        return 0;
+    }
 
     var pk_copy = fl_alloc(SIGNED_ENV_PK_LEN);
     memcpy(pk_copy, pk_ptr, SIGNED_ENV_PK_LEN);

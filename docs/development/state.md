@@ -6,7 +6,7 @@ type: state
 
 # Current State — majra
 
-> **Last refresh**: 2026-10-15 (post-2.10.0) | **Refresh cadence**: every release (ideally bumped by the release post-hook).
+> **Last refresh**: 2026-10-15 (post-2.10.1) | **Refresh cadence**: every release (ideally bumped by the release post-hook).
 > **What this file is**: volatile state. The companion `CLAUDE.md` holds durable rules; this file holds whatever drifts release-to-release. Per [first-party-documentation § CLAUDE.md](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/first-party-documentation.md#claudemd), version numbers, test counts, consumer lists, and in-flight work all live here, not in `CLAUDE.md`.
 
 ---
@@ -15,9 +15,9 @@ type: state
 
 | File | Value | Source |
 |---|---|---|
-| `VERSION` | **2.10.0** | single source of truth |
+| `VERSION` | **2.10.1** | single source of truth |
 | `cyrius.cyml [package].version` | `${file:VERSION}` | reads `VERSION` |
-| Latest git tag | `2.9.3` (2.10.0 pending tag) | release workflow asserts `VERSION == tag` |
+| Latest git tag | `2.10.0` (2.10.1 pending tag) | release workflow asserts `VERSION == tag` |
 
 ## Toolchain
 
@@ -97,11 +97,15 @@ provisions. CI's `cyrius deps --verify` enforces match: 113 verified, 0 failed.
 
 | Target | Lines | Bytes |
 |---|---|---|
-| `dist/majra.cyr` (core) | 6,008 | 216 KB |
-| `dist/majra-signed.cyr` | 6,263 | 227 KB |
-| `dist/majra-admin.cyr` | 6,307 | 228 KB |
-| `dist/majra-backends.cyr` | 9,865 | 360 KB |
-| `src/` total | 10,661 lines across 23 files | — |
+| `dist/majra.cyr` (core) | 6,216 | 225 KB |
+| `dist/majra-signed.cyr` | 6,481 | 237 KB |
+| `dist/majra-admin.cyr` | 6,554 | 238 KB |
+| `dist/majra-backends.cyr` | 10,152 | 373 KB |
+| `src/` total | 10,948 lines across 23 files | — |
+
+> 2.10.1 (the P(-1) pass) grew every bundle with its nine code fixes and their
+> rationale comments (`src/` +287 lines); sidecars unchanged. `build/majra`
+> 248,728 → 252,824 B.
 
 > 2.10.0 moved the bundles by their version stamp and, in admin / backends, one
 > re-worded `src/admin.cyr` comment; sidecars unchanged. Binaries shrank slightly
@@ -130,13 +134,13 @@ provisions. CI's `cyrius deps --verify` enforces match: 113 verified, 0 failed.
 | Suite | Entry point | Assertions | Notes |
 |---|---|---|---|
 | Core | `src/main.cyr` (binary self-tests) | 203 | runs as part of `cyrius build` smoke. 150 → 153 at 2.7.3; 154 at 2.8.0; 199 at 2.8.1 (P(-1) sweep regressions); 203 at 2.8.2 (heartbeat owned keys) |
-| Expanded | `tests/test_core.tcyr` | 647 | broader unit coverage; grew across the 2.6.x relay/ratelimit/queue fix arc. 299 → 304 at 2.7.3 — the barrier checks now prove *blocking*, not a counter; 623 at 2.8.1 (P(-1) sweep; 621 under qemu, where one 47-second test is x86-only); 626 at 2.8.2 (relay dedup tombstone compaction; 624 under qemu); 645 at 2.9.0 (relay ownership + unsubscribe); 647 at 2.9.3 (the churn tests starve their maps by hand now that 6.6.20's hashmap reclaims tombstones itself, +1; the >1000-waiter barrier test waits for every arrival, +1; 644 under qemu) |
-| Backends | `tests/test_backends.tcyr` | 547 | redis / pg / ws / aes-gcm / signed_envelope / admin — 152 → 519 at 2.8.1 (P(-1) sweep: admin routes, SIGPIPE, ws handshake, encrypted-IPC salt/close); 547 at 2.9.0 (session handshake, Origin gate, anchored verify) |
+| Expanded | `tests/test_core.tcyr` | 664 | broader unit coverage; grew across the 2.6.x relay/ratelimit/queue fix arc. 299 → 304 at 2.7.3 — the barrier checks now prove *blocking*, not a counter; 623 at 2.8.1 (P(-1) sweep; 621 under qemu, where one 47-second test is x86-only); 626 at 2.8.2 (relay dedup tombstone compaction; 624 under qemu); 645 at 2.9.0 (relay ownership + unsubscribe); 664 at 2.10.1 (P(-1): relay refcount atomicity, huge sliding windows, DAG run teardown, barrier name ownership, conn-pool keys; 661 under qemu); 647 at 2.9.3 (the churn tests starve their maps by hand now that 6.6.20's hashmap reclaims tombstones itself, +1; the >1000-waiter barrier test waits for every arrival, +1; 644 under qemu) |
+| Backends | `tests/test_backends.tcyr` | 557 | redis / pg / ws / aes-gcm / signed_envelope / admin — 152 → 519 at 2.8.1 (P(-1) sweep: admin routes, SIGPIPE, ws handshake, encrypted-IPC salt/close); 547 at 2.9.0 (session handshake, Origin gate, anchored verify); 557 at 2.10.1 (P(-1): mixed-seed sk, admin arena, strict RESP integers) |
 | Patra-queue | `tests/test_patra_queue.tcyr` | 71 | separate entry — split out at 2.4.0 to stay under the then-16384 cc5 fixup cap (the table starts at 1,048,576 and grows on demand at the 6.7.9 pin — growable since cyrius 6.2.0); split kept as documented architecture |
-| **CI total** | | **1,468** | |
+| **CI total** | | **1,495** | |
 | Live integration | `tests/test_live.tcyr` | 36 | requires Redis + PostgreSQL. **CI-only** — not runnable on a dev box without `redis:7-alpine` + `postgres:16-alpine` up; 7 Redis + 4 PostgreSQL categories |
 | Fuzz harnesses | `fuzz/*.fcyr` | 3 binaries | model/oracle-checked since 2.8.2; `<harness> [iterations] [seed]`, seed printed; CI runs 500 iterations × 10 s timeout |
-| Benchmarks | `benches/bench_all.bcyr` | 19 targets (`mq_lifecycle` + `mq_enqueue_4producers` since 2.8.2) | history tracked via `bench-history.csv` (never committed — **not present on a fresh clone**, so cross-release comparison means rebuilding the prior pin, as 2.6.8 and 2.7.3 did) |
+| Benchmarks | `benches/bench_all.bcyr` | 19 targets (`mq_lifecycle` + `mq_enqueue_4producers` since 2.8.2) | history in `bench-history.csv`, a **tracked** file (this row called it never-committed until 2.10.1) with rows for 2.8.0, 2.8.1, 2.10.0 and 2.10.1 only — rows taken on different days and loads are not comparable, so a release head-to-head still rebuilds the prior tree and runs interleaved A/B, as 2.6.8, 2.7.3 and every release since 2.9.3 did |
 | Examples | `examples/*.cyr` | 2 binaries | `managed_queue`, `pubsub_tiers`; CI builds + runs both |
 | Soak | `tests/soak/soak_*.cyr` (4 files) | queue 5k ops, pubsub 2k topics, relay dedup+evict, heartbeat 100×20 + auto-evict | on-demand; all 4 clean under 6.6.4 at 2.7.3, under 6.6.6 at 2.9.1, under 6.6.20 at 2.9.3 and under 6.7.9 at 2.10.0, natively and under `qemu-aarch64`. `soak_queue`'s job_count assertion was rewritten at 2.6.9 — it had been asserting the unbounded-growth leak |
 | **aarch64, cross-built** | every entry above via `cyrius build --aarch64 --no-deps <entry> build/<name>_aarch64 && qemu-aarch64 ./build/<name>_aarch64` | same counts (expanded 644 under qemu — the x86-only test's three asserts) | **verified locally at 2.7.3, re-verified at 2.9.1 under 6.6.6, at 2.9.3 under 6.6.20 and at 2.10.0 under 6.7.9; CI cross-builds the four suites (build-only gate), the run lane is still unwired.** All four suites + fuzz + soak + both examples pass. At 2.9.3 the expanded suite looped 100× natively per build on a box at load 10–38 (other toolchain work): the >1000-waiter barrier test failed 2/100 under 6.6.20 and 1/100 under 6.6.9 with the old fixed-sleep test — a test timing defect, fixed (100/100 after). The 100× qemu loop then caught a second one, the rate limiter's fail-open check (a 1 ms window at 1000 tokens/s, 1/100) — fixed the same way. The final suite then looped 100/100 natively and 50/50 under qemu. At 2.10.0 (6.7.9) the expanded suite looped 100/100 natively and 50/50 under qemu at load 5–10. At 2.9.1 the expanded suite looped 100× under qemu and 100× natively with 0 failures / 0 crashes; core / backends / patra-queue 25× under qemu and 40× natively. (2.7.3: 100× qemu / 200× native, same result.) At 2.7.2 the expanded suite SIGSEGV'd 14/200 natively (~7 %) from the `cbarrier_arrive_and_wait` bug. Needs `qemu-user` on the runner; recipe in [`../guides/testing.md`](../guides/testing.md) |
@@ -202,6 +206,7 @@ x86_64-windows only (`SYS_FUTEX`, `FUTEX_WAIT`/`_WAKE`, `sys_lstat`,
 
 | Tag | Date | Headline |
 |---|---|---|
+| 2.10.1 | 2026-10-15 | **P(-1) hardening pass after two language bumps** — 12 findings (1 high, 5 medium, 6 low), report `docs/audit/2026-10-15-audit.md`. High: the 2.9.0 RelayMessage refcount was non-atomic and retained after publishing the pointer (use-after-free window). Medium: `sliding_window_check` failed open past 2^62 ns; `signed_envelope_new` shipped a zero signature on sigil's refusal; `workflow_execute` leaked ~2.9 KB per run; barrier sets borrowed the caller's name keys; every admin request leaked bump memory. Low: conn-pool keys, strict RESP integers, two PG leaks, two comments, and a 2.11.0 roadmap item (release functions). 1,495 assertions, natively and under qemu-aarch64; every code fix but two has a test that fails on 2.10.0. `barrier_cycle` +13.6 % (flagged: freelist vecs, the price of releasing barriers). |
 | 2.10.0 | 2026-10-15 | **Toolchain minor: cyrius 6.6.20 → 6.7.9**, the 6.7 language line. No API or `src/` code change (one `src/admin.cyr` comment). Snapshot holds at 113, 67 files changed — sigil 3.13.11, patra 1.16.0, sandhi 1.10.9, sakshi 2.5.8. The 6.7 changes that alter what existing code means (a lone `!` was silently dropped before 6.7.3; new reserved words; unary `-`/`~` on a constant) were checked across the tree — none applies; patra 1.16.0's five new refusals miss `src/patra_queue.cyr`'s INT-only queries. 1,468 assertions on the first build, natively and under qemu-aarch64; expanded 100× native / 50× qemu clean; sidecars unchanged; `distlib`'s listing-order bug fixed upstream (6.7.7). Benchmarks within ±2 % except `pattern_*` — 3–4 % slower by minimum on a quiet batch, 5–12 % on a noisy one. |
 | 2.9.3 | 2026-10-15 | **Toolchain patch: cyrius 6.6.9 → 6.6.20.** Snapshot 111 → 113, every first-party fold moved (sigil 3.13.10, patra 1.15.2, sandhi 1.10.8, sakshi 2.5.7). No `src/` code change — three hashmap comment blocks. 6.6.18's `distlib` makes sidecars compile-verified only (core 27 → 14 leaves; `result`/`sync`/`atomic` in, `sys`/`random`/`keccak`/`bayan`/`tls`/… out) and puts a `# Requires` include block in every bundle, so each is raw-includable — clean-room 0 undefined on x86_64, aarch64 and agnos. 6.6.20's hashmap counts tombstones, which broke four expanded-suite asserts that used churn to starve a map (now starved by hand; the heartbeat twin had gone vacuous and gained a precondition) — mutation-verified at all three compaction sites. Two pre-existing load flakes fixed in the tests: the >1000-waiter barrier test (2/100 at 6.6.20, 1/100 at 6.6.9) and the rate limiter's 1 ms fail-open window (1/100 under qemu). `src/admin.cyr` includes `lib/sandhi.cyr` so `distlib`'s output is host-independent (CI had derived an extra `http` leaf — an upstream listing-order dependence). 1,468 assertions natively and under qemu-aarch64; channel benches −68 % / −83 % (6.6.16's syscall-free uncontended path), the rest within noise. |
 | 2.9.2 | 2026-09-28 | **Toolchain patch: cyrius 6.6.6 → 6.6.9**, from cyrius 6.6.10 bite 14. No `src/` change: the bite's WebSocket reader fix (CVE-53 in cyrius `lib/ws.cyr`) was premise-checked here and `majra_ws_recv_frame` already reads exactly and bounds the length (the 2.6.9 repair). 1,466 assertions (core 203 · expanded 645 · backends 547 · patra-queue 71). `tests/test.sh` ran a bench file renamed to `.bcyr` long ago and printed FAILED on every run — now `cyrius bench benches/bench_all.bcyr`. `cyrius-quirks.md` #6 notes cyrius 6.6.10 corrects the inverted "(call site may be unreachable)" suffix. |

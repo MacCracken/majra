@@ -184,24 +184,35 @@ fn relay_send(r, to, topic, payload) {
 }
 
 # Take a reference. Returns the new count.
+#
+# ⚠ ATOMIC (2.10.1). The holders are different threads — every subscriber's
+# consumer releases its own reference, and the sender drops the creator's after
+# unlocking — so the 2.9.0 load/store pair lost updates: two concurrent releases
+# left the count one too high (a leak), and a release racing a retain could drop
+# a live count to 0 and free a message another holder was still reading.
 fn relay_msg_retain(msg) {
     if (msg == 0) { return 0; }
-    store64(msg + 64, load64(msg + 64) + 1);
-    return load64(msg + 64);
+    return atomic_fetch_add(msg + 64, 1) + 1;
 }
 
 # Drop a reference; the last one frees the message. Returns the count left (0
 # when it was freed). The strings the message points at belong to whoever
 # built it — this frees the 72-byte block only.
+#
+# An over-release (a count already at 0) is refused rather than freeing the
+# block a second time; it returns 0 and touches nothing.
 fn relay_msg_release(msg) {
     if (msg == 0) { return 0; }
-    var n = load64(msg + 64) - 1;
-    if (n <= 0) {
+    var prev = atomic_fetch_add(msg + 64, 0 - 1);
+    if (prev == 1) {
         fl_free(msg);
         return 0;
     }
-    store64(msg + 64, n);
-    return n;
+    if (prev < 1) {
+        atomic_fetch_add(msg + 64, 1);
+        return 0;
+    }
+    return prev - 1;
 }
 
 fn relay_msg_refcount(msg) {
@@ -227,10 +238,16 @@ fn _relay_fan_out(subs, msg) {
     # caller names — `relay_with_capacity(id, 2)` deadlocks on the third send.
     # Dropping when full is the behaviour that matches the oracle.
     while (i < vec_len(subs)) {
+        # ⚠ Take the subscriber's reference BEFORE the send (2.10.1). Once
+        # chan_try_send returns, a consumer thread can already have received
+        # the pointer, used it and released it — taking the count 1 -> 0 and
+        # freeing the message while this loop still offers it to the next
+        # subscriber. A failed send gives the reference back; the caller still
+        # holds its own, so that release can never be the last.
+        relay_msg_retain(msg);
         var rc = chan_try_send(vec_get(subs, i), msg);
+        if (rc != 0) { relay_msg_release(msg); }
         if (rc == 0) {
-            # The subscriber now holds a reference of its own (2.9.0).
-            relay_msg_retain(msg);
             delivered = delivered + 1;
             i = i + 1;
         } elif (rc == 0 - 1) {

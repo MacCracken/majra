@@ -150,7 +150,7 @@ fn step_result_new(status, output, error_msg) {
 
 fn workflow_context_new(input) {
     var ctx = fl_alloc(16);
-    store64(ctx, map_new());
+    store64(ctx, _majra_map_new());
     store64(ctx + 8, input);
     return ctx;
 }
@@ -160,7 +160,7 @@ fn context_get_step_result(ctx, step_id) {
 }
 
 fn context_set_step_result(ctx, step_id, result) {
-    map_set(load64(ctx), step_id, result);
+    _majra_map_set(load64(ctx), step_id, result);
 }
 
 # Check if a step's dependencies are satisfied.
@@ -193,7 +193,7 @@ fn _deps_satisfied(step, ctx) {
 fn _compute_tiers(def) {
     var steps = load64(def + 16);
     var num_steps = vec_len(steps);
-    var tiers = vec_new();
+    var tiers = _majra_vec_new();
 
     # Build in-degree map: step_id -> count of dependencies.
     #
@@ -201,27 +201,31 @@ fn _compute_tiers(def) {
     # into ONE map entry and every duplicate after the first is silently
     # dropped from the schedule. Detect it and refuse the workflow instead:
     # returning a partial DAG that looks complete is the worse failure.
-    var in_degree = map_new();
+    var in_degree = _majra_map_new();
     var i = 0;
     while (i < num_steps) {
         var s = vec_get(steps, i);
         var sid = load64(s);
-        if (map_has(in_degree, sid) == 1) { return 0; }
-        map_set(in_degree, sid, vec_len(load64(s + 16)));
+        if (map_has(in_degree, sid) == 1) {
+            _majra_map_free(in_degree);
+            _dag_tiers_free(tiers);
+            return 0;
+        }
+        _majra_map_set(in_degree, sid, vec_len(load64(s + 16)));
         i = i + 1;
     }
 
     # Iteratively collect steps with 0 in-degree
     var remaining = num_steps;
     while (remaining > 0) {
-        var tier = vec_new();
+        var tier = _majra_vec_new();
         i = 0;
         while (i < num_steps) {
             var s = vec_get(steps, i);
             var sid = load64(s);
             if (map_get(in_degree, sid) == 0) {
-                vec_push(tier, s);
-                map_set(in_degree, sid, -1);
+                _majra_vec_push(tier, s);
+                _majra_map_set(in_degree, sid, -1);
             }
             i = i + 1;
         }
@@ -233,6 +237,9 @@ fn _compute_tiers(def) {
             # workflow_execute ran part of the DAG and reported success — a
             # workflow silently missing its tail. Return 0 so the caller can
             # tell a malformed DAG from a completed one.
+            _majra_vec_free(tier);
+            _majra_map_free(in_degree);
+            _dag_tiers_free(tiers);
             return 0;
         }
         # Reduce in-degree for dependents
@@ -253,7 +260,7 @@ fn _compute_tiers(def) {
                         var sid = load64(s);
                         var cur = map_get(in_degree, sid);
                         if (cur > 0) {
-                            map_set(in_degree, sid, cur - 1);
+                            _majra_map_set(in_degree, sid, cur - 1);
                         }
                     }
                     k = k + 1;
@@ -263,21 +270,37 @@ fn _compute_tiers(def) {
             j = j + 1;
         }
         remaining = remaining - vec_len(tier);
-        vec_push(tiers, tier);
+        _majra_vec_push(tiers, tier);
     }
 
+    _majra_map_free(in_degree);
     return tiers;
 }
 
-# Release a workflow context.
+# Release what _compute_tiers built (2.10.1: freelist vecs, so they can be).
+fn _dag_tiers_free(tiers) {
+    if (tiers == 0) { return 0; }
+    var i = 0;
+    while (i < vec_len(tiers)) {
+        _majra_vec_free(vec_get(tiers, i));
+        i = i + 1;
+    }
+    _majra_vec_free(tiers);
+    return 0;
+}
+
+# Release a workflow context: its step-result map and the block.
 #
-# workflow_execute still leaks its tier vecs and StepResults (both from the
-# bump allocator, which cannot free), so this is not a complete teardown — it
-# covers the context block itself, which is the one thing the malformed-DAG
-# early return can cleanly reclaim. Full run teardown needs the tier
-# structures to move off the bump allocator; tracked on the roadmap.
+# The StepResults in it are NOT freed — each belongs to whoever made it (an
+# executor may return one result for every step). workflow_execute frees the
+# ones majra itself made. Until 2.10.1 the map came from the bump allocator,
+# the comment here said full teardown was "tracked on the roadmap" (it was
+# not), and workflow_execute leaked the context, its map and its tier
+# structures on every run but the malformed-DAG one.
 fn workflow_context_free(ctx) {
-    if (ctx != 0) { fl_free(ctx); }
+    if (ctx == 0) { return 0; }
+    _majra_map_free(load64(ctx));
+    fl_free(ctx);
     return 0;
 }
 
@@ -288,7 +311,9 @@ fn workflow_context_free(ctx) {
 # these on different threads. All context writes happen on the coordinating
 # thread after the batch finishes.
 #
-# The returned status is always COMPLETED, SKIPPED or FAILED.
+# The returned status is always COMPLETED, SKIPPED or FAILED. rethi() is 1 when
+# majra built the result (the null / non-terminal wrappers) — the run frees those
+# — and 0 when it is the executor's own.
 fn _dag_run_step(step, ctx, executor_fn) {
     var max_retries = load64(step + 40);
     # ⚠ A negative retry_max made the loop condition false at once, so the
@@ -322,7 +347,7 @@ fn _dag_run_step(step, ctx, executor_fn) {
         }
     }
     if (result == 0) {
-        return step_result_new(STEP_FAILED, 0, "executor returned null");
+        ret2(step_result_new(STEP_FAILED, 0, "executor returned null"), 1);
     }
     # ⚠ Any other final status (PENDING, RUNNING, out of range) was retried as a
     # failure but then applied as a success: the apply phase checks only for
@@ -335,14 +360,14 @@ fn _dag_run_step(step, ctx, executor_fn) {
             if (st != STEP_FAILED) {
                 var msg = load64(result + 16);
                 if (msg == 0) { msg = "executor returned a non-terminal status"; }
-                return step_result_new(STEP_FAILED, load64(result + 8), msg);
+                ret2(step_result_new(STEP_FAILED, load64(result + 8), msg), 1);
             }
         }
     }
-    return result;
+    ret2(result, 0);
 }
 
-# Job struct handed to a worker thread (56 bytes, internal):
+# Job struct handed to a worker thread (64 bytes, internal):
 #   offset  0: step
 #   offset  8: ctx
 #   offset 16: executor_fn
@@ -350,9 +375,13 @@ fn _dag_run_step(step, ctx, executor_fn) {
 #   offset 32: skipped  — 1 if dependencies were unsatisfied
 #   offset 40: pending  — the batch's in-flight counter word (parallel only)
 #   offset 48: inline   — 1 if the spawn failed and the coordinator runs it
+#   offset 56: made     — 1 if majra built the result (2.10.1); the run frees those
 fn _dag_worker(job) {
     if (load64(job + 32) == 1) { return 0; }
-    store64(job + 24, _dag_run_step(load64(job), load64(job + 8), load64(job + 16)));
+    var r = _dag_run_step(load64(job), load64(job + 8), load64(job + 16));
+    var made = rethi();
+    store64(job + 24, r);
+    store64(job + 56, made);
     return 0;
 }
 
@@ -416,6 +445,9 @@ fn workflow_execute(def, executor_fn, input) {
     }
     var num_tiers = vec_len(tiers);
     var final_status = RUN_COMPLETED;
+    # StepResults majra builds (SKIPPED for unmet dependencies and POLICY_SKIP,
+    # the null / non-terminal wrappers); freed with the run. 2.10.1.
+    var made = _majra_vec_new();
 
     var t = 0;
     while (t < num_tiers) {
@@ -440,7 +472,7 @@ fn workflow_execute(def, executor_fn, input) {
         var s = 0;
         while (s < tier_len) {
             var step_j = vec_get(tier, s);
-            var job = fl_alloc(56);
+            var job = fl_alloc(64);
             store64(job, step_j);
             store64(job + 8, ctx);
             store64(job + 16, executor_fn);
@@ -450,6 +482,7 @@ fn workflow_execute(def, executor_fn, input) {
             store64(job + 32, unsat);
             store64(job + 40, 0);
             store64(job + 48, 0);
+            store64(job + 56, 0);
             store64(jobs + s * 8, job);
             s = s + 1;
         }
@@ -532,7 +565,9 @@ fn workflow_execute(def, executor_fn, input) {
             var step_id = load64(step2);
 
             if (load64(job2 + 32) == 1) {
-                context_set_step_result(ctx, step_id, step_result_new(STEP_SKIPPED, 0, 0));
+                var skr = step_result_new(STEP_SKIPPED, 0, 0);
+                _majra_vec_push(made, skr);
+                context_set_step_result(ctx, step_id, skr);
             } else {
                 var result = load64(job2 + 24);
                 context_set_step_result(ctx, step_id, result);
@@ -544,7 +579,9 @@ fn workflow_execute(def, executor_fn, input) {
                         abort = 1;
                     }
                     if (policy == POLICY_SKIP) {
-                        context_set_step_result(ctx, step_id, step_result_new(STEP_SKIPPED, 0, 0));
+                        var psr = step_result_new(STEP_SKIPPED, 0, 0);
+                        _majra_vec_push(made, psr);
+                        context_set_step_result(ctx, step_id, psr);
                     }
                     # POLICY_CONTINUE: keep going
                 }
@@ -553,14 +590,39 @@ fn workflow_execute(def, executor_fn, input) {
         }
 
         s = 0;
-        while (s < tier_len) { fl_free(load64(jobs + s * 8)); s = s + 1; }
+        while (s < tier_len) {
+            var jf = load64(jobs + s * 8);
+            if (load64(jf + 56) == 1) { _majra_vec_push(made, load64(jf + 24)); }
+            fl_free(jf);
+            s = s + 1;
+        }
         fl_free(jobs);
 
-        if (abort == 1) { return final_status; }
+        if (abort == 1) {
+            _dag_run_free(ctx, tiers, made);
+            return final_status;
+        }
         t = t + 1;
     }
 
+    _dag_run_free(ctx, tiers, made);
     return final_status;
+}
+
+# Tear down one run: the results majra built, the context and its map, and the
+# tier structures. Every worker has finished before this runs (each batch waits
+# for its pending count), so nothing still reads them.
+fn _dag_run_free(ctx, tiers, made) {
+    var i = 0;
+    while (i < vec_len(made)) {
+        var r = vec_get(made, i);
+        if (r != 0) { fl_free(r); }
+        i = i + 1;
+    }
+    _majra_vec_free(made);
+    workflow_context_free(ctx);
+    _dag_tiers_free(tiers);
+    return 0;
 }
 
 # InMemoryWorkflowStorage: hashmap-based storage for definitions and runs.

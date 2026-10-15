@@ -166,6 +166,33 @@ fn _majra_vec_push(v, val) {
 }
 
 # Release a vector built by _majra_vec_new. Elements are the caller's business.
+# --- Releasable cstr maps (2.10.1) ---
+#
+# The freelist twin of map_new for majra-internal maps that must be torn down.
+# ⚠ Set through `_majra_map_set`, never `map_set`: a rehash allocates the new
+# slot array through the map's allocator and abandons the old one (lib/hashmap
+# `_map_rehash_a`), so this frees the superseded array — safe because nothing
+# else can hold it. An in-place rebuild (cyrius 6.6.20+) keeps the array.
+fn _majra_map_new() {
+    return map_new_a(_majra_fl_allocator());
+}
+
+fn _majra_map_set(m, key, value) {
+    var old = load64(m);
+    var rc = map_set_a(_majra_fl_allocator(), m, key, value);
+    var now = load64(m);
+    if (now != old && old != 0) { fl_free(old); }
+    return rc;
+}
+
+# Frees the slot array and the header. Keys and values are the caller's.
+fn _majra_map_free(m) {
+    if (m == 0) { return 0; }
+    fl_free(load64(m));
+    fl_free(m);
+    return 0;
+}
+
 fn _majra_vec_free(v) {
     if (v == 0) { return 0; }
     fl_free(load64(v));

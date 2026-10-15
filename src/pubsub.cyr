@@ -372,6 +372,15 @@ fn pubsub_publish(ps, topic, payload) {
     # and can never be freed. The slot array itself is stable while the lock is
     # held; the loop below re-locks per pattern to read its subscriber list, so
     # a concurrent subscribe that rehashes is picked up on the next publish.
+    #
+    # ⚠ The walk is UNLOCKED, which is safe only while a concurrent new-key
+    # map_set cannot MOVE an entry of the array being walked. A doubling rehash
+    # writes a fresh array and leaves this one intact (bump: never freed); but
+    # since cyrius 6.6.20 a map with tombstones can be rebuilt IN PLACE, moving
+    # live entries to earlier slots — a pattern moved behind the walk would miss
+    # this publish. Tombstones come only from map_delete, and pubsub never
+    # deletes a key from either map (unsubscribe deactivates the subscriber, it
+    # keeps the key). Keep it that way, or snapshot the patterns under the lock.
     var pat_entries = map_entries(patterns);
     var pat_cap = map_cap(patterns);
     # No pattern subscriptions at snapshot time: skip the slot walk (16+ state

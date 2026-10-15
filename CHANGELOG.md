@@ -5,6 +5,67 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.1] - 2026-10-15
+
+**P(-1) hardening pass** after two toolchain language bumps in a row (cyrius 6.6.9 → 6.6.20 →
+6.7.9). 12 findings — 1 high, 5 medium, 6 low — of which nine are fixed in code, two are comment
+fixes, and one (new release functions) is queued for 2.11.0. Full report:
+[`docs/audit/2026-10-15-audit.md`](docs/audit/2026-10-15-audit.md). No wire or public-API change;
+three structs grew by appended fields. **1,495 assertions** (core 203 · expanded 664 · backends
+557 · patra-queue 71), natively and cross-built under `qemu-aarch64`; every code fix but two has a
+regression test that fails on the 2.10.0 source. Benchmarks (interleaved A/B vs 2.10.0, 15 trials):
+within noise except `barrier_cycle` **+13.6 %** — the barrier fix's freelist vectors and owned name,
+flagged and accepted (the bench never completes a barrier, so it pays the allocation and never
+the release) — and `relay_send` +2 % (the atomic refcount).
+
+### Fixed
+
+- **High — the RelayMessage refcount raced across threads** (`src/relay.cyr`, since 2.9.0).
+  Subscribers release on their own threads and the sender after unlocking, but retain / release
+  were a plain load and store, and the fan-out retained only *after* `chan_try_send` had
+  published the pointer. Lost decrements leaked; a consumer releasing in that window freed the
+  message while the fan-out still offered it to the next subscriber. Now `atomic_fetch_add`,
+  retain-before-send with an undo, and an over-release is refused instead of freeing twice.
+- **`sliding_window_check` failed OPEN for windows past 2^62 ns** — `window_ns * 2` wrapped
+  negative and every check reset the window, so an "N ever" limiter (`INT64_MAX`) admitted
+  everything. Clamped, as `sliding_window_evict_stale` already was; the weight divides first
+  for huge windows.
+- **`signed_envelope_new` shipped an all-zero signature** when sigil refused to sign (an sk
+  whose public half does not derive from its seed passes majra's `pk == sk[32..64]` check).
+  It returns 0 now.
+- **`workflow_execute` leaked ~2.9 KB per run** — its context and map, the tier vecs and
+  in-degree map (bump), and every StepResult majra builds; the context is never returned, so no
+  caller could free them. All torn down on every exit now; executor-returned results stay the
+  executor's. `workflow_context_free` frees the context's map too. ⚠ An executor must not keep
+  the `ctx` pointer past the run — it is freed when `workflow_execute` returns.
+- **Barrier sets keyed their maps on the caller's name pointer** (both kinds), and
+  `barrier_complete` leaked each state. The set owns its names now; single-threaded states are
+  released on complete / re-create (concurrent ones stay allocated for parked waiters, as
+  before). Participant names are still the caller's.
+- **Every admin request leaked bump memory** — sandhi's default-allocator helpers and the JSON
+  builder, on every route including 400 / 404, on an unauthenticated endpoint. Each admin handle
+  now carries a per-request arena (reset after each request) and a mutex; the handle grew 32 → 48
+  bytes, appended.
+- **`conn_pool_with_circuit_breaker` keyed on the caller's endpoint pointer** and leaked a
+  breaker per re-registration. The pool owns the key; re-registering reconfigures and resets the
+  breaker in place.
+- **RESP integer fields are strict** — `_resp_int` skipped non-digits and never caught overflow,
+  so a wrapped length or count read as nil without poisoning and desynced the stream (the 2026
+  `redis-parser` multi-bulk-length class). Malformed, overflowing, or negative-other-than-`-1`
+  fields poison the connection; a failed array frees its own storage.
+- **PostgreSQL**: `_pg_parse_row`'s allocation-failure path freed the cells but not the row, and
+  `pg_init_workflow_tables` dropped two collected rows vecs.
+- **Comments**: `pubsub_publish`'s unlocked pattern walk now states the invariant it depends on
+  since cyrius 6.6.20 (pubsub never deletes a map key, so no in-place rebuild can move an entry
+  under it); `workflow_context_free` no longer claims a roadmap item that did not exist.
+
+### Changed
+
+- `src/counter.cyr` gains `_majra_map_new` / `_majra_map_set` / `_majra_map_free`, freelist-backed
+  cstr maps that free the slot array a rehash supersedes (internal).
+- `bench-history.csv` gains the two `mq_*` columns (added to the bench at 2.8.2) and rows for
+  2.10.0 and 2.10.1. It is a tracked file; `state.md` and `doc-health.md` had called it gitignored.
+
 ## [2.10.0] - 2026-10-15
 
 Toolchain minor — **cyrius 6.6.20 → 6.7.9**, the 6.7 language line (traits, generics, `const`,

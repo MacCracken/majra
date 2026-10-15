@@ -1808,6 +1808,26 @@ fn test_connection_pool() {
     conn_pool_reset_circuit(pool, "ep0");
     assert_eq(conn_pool_circuit_state(pool, "ep0"), CIRCUIT_HALF_OPEN,
       "reset reached the stored breaker and re-armed its probe");
+
+    # 2.10.1: the pool owns its endpoint keys, and re-registering reconfigures
+    # the breaker it has instead of leaking a new one per call.
+    var eb = fl_alloc(16);
+    memcpy(eb, "epA", 4);
+    conn_pool_with_circuit_breaker(pool, eb, 0, 1000000000);
+    memcpy(eb, "epB", 4);
+    assert_eq(conn_pool_circuit_state(pool, "epA"), CIRCUIT_HALF_OPEN,
+      "epA resolves after the caller's buffer changed");
+    conn_pool_with_circuit_breaker(pool, "epA", 0, 1000000000);
+    var u0 = alloc_used();
+    var fa0 = _fl_arena;
+    var fp0 = _fl_arena_pos;
+    var i = 0;
+    while (i < 200) { conn_pool_with_circuit_breaker(pool, "epA", 0, 1000000000); i = i + 1; }
+    assert(alloc_used() == u0 && _fl_arena == fa0 && _fl_arena_pos == fp0,
+      "200 re-registrations allocate nothing");
+    assert_eq(conn_pool_circuit_state(pool, "epA"), CIRCUIT_HALF_OPEN,
+      "and the re-registered breaker starts afresh");
+    fl_free(eb);
     println("  connection_pool: ok");
 }
 
@@ -2073,6 +2093,22 @@ fn test_ratelimit_evict_requires_full_bucket() {
 }
 
 # --- F003: an actively rejected sliding window is not "idle" ----------------
+
+# 2.10.1: `window_ns * 2` wrapped negative past 2^62, every check reset the
+# window, and an "N ever" limiter (window INT64_MAX) admitted everything.
+fn test_sliding_window_huge_window_holds() {
+    var sw = sliding_window_new(3, 0x7FFFFFFFFFFFFFFF);
+    var allowed = 0;
+    var i = 0;
+    while (i < 6) { allowed = allowed + sliding_window_check(sw, "k"); i = i + 1; }
+    assert_eq(allowed, 3, "an INT64_MAX window admits its quota and no more");
+    var sw2 = sliding_window_new(2, 0x4000000000000001);
+    allowed = 0;
+    i = 0;
+    while (i < 5) { allowed = allowed + sliding_window_check(sw2, "k"); i = i + 1; }
+    assert_eq(allowed, 2, "a window just past 2^62 ns admits its quota and no more");
+    println("  sliding_window_huge_window_holds: ok");
+}
 
 fn test_sliding_window_evict_spares_active() {
     var sw = sliding_window_new(3, 10000000000);
@@ -2664,6 +2700,58 @@ fn test_relay_msg_ownership_and_unsubscribe() {
     relay_msg_release(chan_try_recv(c));
     assert_eq(relay_unsubscribe(r, 0), 0, "unsubscribing 0 is a no-op");
     println("  relay_msg_ownership_and_unsubscribe: ok");
+}
+
+# --- 2.10.1: the RelayMessage refcount is shared across threads -------------
+
+var _t10_rc_msg = 0;
+var _t10_rc_done = 0;
+var _t10_rc_mtx = 0;
+
+fn _t10_rc_worker(arg) {
+    var i = 0;
+    while (i < 20000) {
+        relay_msg_retain(_t10_rc_msg);
+        relay_msg_release(_t10_rc_msg);
+        i = i + 1;
+    }
+    mutex_lock(_t10_rc_mtx);
+    _t10_rc_done = _t10_rc_done + 1;
+    mutex_unlock(_t10_rc_mtx);
+    return 0;
+}
+
+# Each subscriber's consumer releases on its own thread and the sender drops
+# its reference after unlocking, so retain / release race. The 2.9.0 load/store
+# pair lost updates; atomic ones cannot. A floor of 1001 references keeps a
+# lost update from ever freeing the block mid-test — it shows as a wrong count.
+fn test_relay_refcount_is_atomic() {
+    _t10_rc_msg = relay_msg_new(1, "n", 0, "t", 0);
+    var f = 0;
+    while (f < 1000) { relay_msg_retain(_t10_rc_msg); f = f + 1; }
+    _t10_rc_mtx = mutex_new();
+    _t10_rc_done = 0;
+    var spawned = 0;
+    var i = 0;
+    while (i < 4) {
+        if (thread_create_detached(&_t10_rc_worker, 0) == 1) { spawned = spawned + 1; }
+        i = i + 1;
+    }
+    assert_eq(spawned, 4, "refcount precondition: four racing threads");
+    var w = 0;
+    var done = 0;
+    while (w < 3000) {
+        mutex_lock(_t10_rc_mtx);
+        done = _t10_rc_done;
+        mutex_unlock(_t10_rc_mtx);
+        if (done >= spawned) { w = 3000; }
+        else { _majra_sleep_ns(10000000); w = w + 1; }
+    }
+    assert_eq(relay_msg_refcount(_t10_rc_msg), 1001,
+      "80,000 racing retain/release pairs leave the count where it was");
+    f = 0;
+    while (f < 1001) { relay_msg_release(_t10_rc_msg); f = f + 1; }
+    println("  relay_refcount_is_atomic: ok");
 }
 
 fn test_relay_null_sender_and_node_id() {
@@ -3312,6 +3400,58 @@ fn test_dag_parallel_does_not_leak_per_step() {
     println("  dag_parallel_does_not_leak_per_step: ok");
 }
 
+# --- 2.10.1: a run releases what it builds -----------------------------------
+
+var _t10_ok = 0;
+var _t10_failed = 0;
+var _t10_running = 0;
+
+# One shared result per outcome, so the executor itself allocates nothing.
+fn _t10_exec(step, ctx) {
+    var name = load64(step + 8);
+    if (streq(name, "fail") == 1) { return _t10_failed; }
+    if (streq(name, "null") == 1) { return 0; }
+    if (streq(name, "odd") == 1) { return _t10_running; }
+    return _t10_ok;
+}
+
+fn _t10_step(def, id, name, policy) {
+    var st = workflow_step_new(id, name);
+    step_set_error_policy(st, policy);
+    workflow_def_add_step(def, st);
+    return st;
+}
+
+# workflow_execute released nothing it built on any path but the malformed-DAG
+# one: the context and its map, the tier vecs and in-degree map (bump), and the
+# StepResults majra makes. 15 steps grow both maps past their first 16 slots;
+# f1 / f2 / n1 / o1 / d1 are the five places majra builds a result itself.
+fn test_dag_run_frees_what_it_builds() {
+    _t10_ok = step_result_new(STEP_COMPLETED, 0, 0);
+    _t10_failed = step_result_new(STEP_FAILED, 0, "boom");
+    _t10_running = step_result_new(STEP_RUNNING, 0, 0);
+    var def = workflow_def_new("wf10", "wf10");
+    var i = 0;
+    while (i < 10) { _t10_step(def, _t8_intkey(9100 + i), "ok", POLICY_CONTINUE); i = i + 1; }
+    _t10_step(def, "f1", "fail", POLICY_CONTINUE);
+    _t10_step(def, "f2", "fail", POLICY_SKIP);
+    _t10_step(def, "n1", "null", POLICY_CONTINUE);
+    _t10_step(def, "o1", "odd", POLICY_CONTINUE);
+    var d1 = _t10_step(def, "d1", "ok", POLICY_CONTINUE);
+    step_add_dep(d1, "f1");
+    assert_eq(workflow_execute(def, &_t10_exec, 0), RUN_COMPLETED,
+      "run precondition: CONTINUE / SKIP failures still complete the run");
+    workflow_execute(def, &_t10_exec, 0);
+    var u0 = alloc_used();
+    var fa0 = _fl_arena;
+    var fp0 = _fl_arena_pos;
+    var r = 0;
+    while (r < 300) { workflow_execute(def, &_t10_exec, 0); r = r + 1; }
+    assert_eq(alloc_used() - u0, 0, "300 runs take no bump memory");
+    assert(_fl_arena == fa0 && _fl_arena_pos == fp0, "300 runs carve no new freelist memory");
+    println("  dag_run_frees_what_it_builds: ok");
+}
+
 # --- F034 / F038 / F109: barrier --------------------------------------------
 
 var _t8_cx_cbs = 0;
@@ -3416,6 +3556,51 @@ fn test_cbarrier_release_wakes_over_1000() {
     }
     assert_eq(done, spawned, "a release wakes every parked waiter, not the first 1000");
     println("  cbarrier_release_wakes_over_1000: ok");
+}
+
+# 2.10.1: both barrier sets keyed their map on the caller's name pointer, so a
+# name built in a reused buffer re-keyed or lost the barrier; and a completed
+# single-threaded barrier released nothing.
+fn test_barrier_owns_names() {
+    var parts = vec_new();
+    vec_push(parts, "a");
+    vec_push(parts, "b");
+    var nb = fl_alloc(16);
+    var bs = barrier_set_new();
+    memcpy(nb, "round-1", 8);
+    assert_eq(barrier_create(bs, nb, parts), 1, "round-1 created");
+    memcpy(nb, "round-2", 8);
+    assert_eq(barrier_create(bs, nb, parts), 1, "round-2 created from the same buffer");
+    var r1 = barrier_arrive(bs, "round-1", "a");
+    assert_eq(load64(r1), BARRIER_WAITING, "round-1 still resolves after the caller's buffer changed");
+    fl_free(r1);
+    var cbs = cbarrier_set_new();
+    memcpy(nb, "phase-1", 8);
+    cbarrier_create(cbs, nb, parts);
+    memcpy(nb, "phase-2", 8);
+    var c1 = cbarrier_arrive(cbs, "phase-1", "a");
+    assert_eq(load64(c1), BARRIER_WAITING, "a concurrent barrier resolves by its own name too");
+    fl_free(c1);
+    assert_eq(cbarrier_complete(cbs, "phase-1"), 1, "and completes by it");
+
+    # Warm on the measured cycle itself: a re-create holds two states at once.
+    barrier_create(bs, "cycle", parts);
+    barrier_create(bs, "cycle", parts);
+    barrier_complete(bs, "cycle");
+    var u0 = alloc_used();
+    var fa0 = _fl_arena;
+    var fp0 = _fl_arena_pos;
+    var i = 0;
+    while (i < 200) {
+        barrier_create(bs, "cycle", parts);
+        barrier_create(bs, "cycle", parts);
+        barrier_complete(bs, "cycle");
+        i = i + 1;
+    }
+    assert_eq(alloc_used() - u0, 0, "200 create / re-create / complete cycles take no bump memory");
+    assert(_fl_arena == fa0 && _fl_arena_pos == fp0, "and carve no new freelist memory");
+    fl_free(nb);
+    println("  barrier_owns_names: ok");
 }
 
 fn test_barrier_content_equality() {
@@ -3666,6 +3851,7 @@ fn main() {
     test_relay_bounded_dedup_no_uaf();
     test_relay_send_frees_undelivered();
     test_relay_msg_ownership_and_unsubscribe();
+    test_relay_refcount_is_atomic();
     test_relay_null_sender_and_node_id();
     test_relay_prunes_closed_subscribers();
     test_relay_evict_stale_dedup();
@@ -3676,6 +3862,7 @@ fn main() {
     test_barrier_duplicate_arrival();
     test_cbarrier_force();
     test_cbarrier_arrive_and_wait();
+    test_barrier_owns_names();
     test_barrier_content_equality();
     test_cbarrier_displaced_waiter_wakes();
 
@@ -3699,6 +3886,7 @@ fn main() {
     test_sliding_window_key_is_owned();
     test_ratelimit_contention();
     test_ratelimit_evict_requires_full_bucket();
+    test_sliding_window_huge_window_holds();
     test_sliding_window_evict_spares_active();
     test_ratelimit_churn_reclaims_tombstones();
     test_ratelimit_high_rate_refill();
@@ -3746,6 +3934,7 @@ fn main() {
     test_dag_retry_max_extremes();
     test_dag_dependency_semantics();
     test_dag_parallel_does_not_leak_per_step();
+    test_dag_run_frees_what_it_builds();
 
     # Transport
     test_circuit_breaker_lifecycle();
