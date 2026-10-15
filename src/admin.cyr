@@ -17,6 +17,13 @@
 # For high-throughput observability, front with Prometheus or a
 # pull-scraping agent rather than making this multi-threaded.
 
+# Requires: lib/sandhi.cyr. Included HERE (a no-op after an entry point's own
+# include) so `cyrius distlib` seeds its sidecar verify with sandhi: HTTP_OK /
+# HTTP_NOT_FOUND are also declared by lib/http.cyr, and cyrius 6.6.20's verify
+# otherwise credits them to whichever its snapshot directory LISTS first — so the
+# admin / backends sidecars differed between hosts (2.9.3).
+include "lib/sandhi.cyr"
+
 # Tracker kinds, mirroring src/heartbeat.cyr's HB_KIND_* tags.
 var ADMIN_TRACKER_CONCURRENT = 0;
 var ADMIN_TRACKER_BASIC = 1;

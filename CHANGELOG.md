@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Toolchain patch — **cyrius 6.6.9 → 6.6.20**, and with it the stdlib snapshot majra consumes
 (sigil 3.13.3 → 3.13.10, patra 1.15.0 → 1.15.2, sandhi 1.10.1 → 1.10.8, sakshi 2.5.5 → 2.5.7,
-bayan 1.5.7 → 1.5.12). No `src/` code change — three comment blocks the new hashmap made untrue.
+bayan 1.5.7 → 1.5.12). No `src/` behaviour change: comment blocks the new hashmap made untrue, and
+one `include` in `src/admin.cyr` that makes `distlib`'s output the same on every host.
 **1,468 assertions** pass (core 203 · expanded 647 · backends 547 · patra-queue 71), natively and
 cross-built under `qemu-aarch64` (644 expanded there — the x86-only test); three fuzz harnesses,
 four soaks and both examples are clean on both arches. Benchmarks, interleaved A/B against a
@@ -25,13 +26,14 @@ then +8 %), is +1.5 % by minimum. `build/majra` 219,952 → 249,224 B (+13 %, co
   neither reached by majra's code; 85 others changed, every first-party fold among them).
   `cyrius.lock` is 113 sorted hashes plus a `cyrius\t6.6.20` trailer; `--verify` 113/0.
 - **The `.deps` sidecars are now computed, and they shrank** (cyrius 6.6.18 makes the
-  compile-verify the only source of a sidecar). Core 27 → 14 leaves, signed 17 → 16, admin
-  20 → 15, backends 20 → 19. The core sidecar no longer mirrors `[deps].stdlib`, so it stops
-  naming `sigil`, `patra`, `tls`, `assert`, `bench` and the rest the core engine never calls; the
-  folds now include their own leaves, so `sys`, `random`, `keccak`, `bayan`, `thread_local`,
-  `tls`, `async` and `sakshi` left the named profiles (admin also drops `sigil`, `net` and `io`,
-  which `sandhi` brings); `result`, `sync` and `atomic` — which
-  majra's code calls directly — joined. ⚠ A consumer that compiled its *own* code against a leaf
+  compile-verify the only source of a sidecar, and a sidecar names only the leaves nothing else in
+  the unit includes). Core 27 → 14 leaves, signed 17 → 16, admin 20 → 2 (`sandhi`, `syscalls`),
+  backends 20 → 3 (`sandhi`, `patra`, `syscalls`). The core sidecar no longer mirrors
+  `[deps].stdlib`, so it stops naming `sigil`, `patra`, `tls`, `assert`, `bench` and the rest the
+  core engine never calls, and gains `result`, `sync` and `atomic`, which majra's code calls
+  directly. The folds include their own leaves, so signed drops `sys`, `random`, `keccak`,
+  `bayan` and `thread_local` (sigil brings them), and admin / backends shrink to `sandhi` (which
+  brings `net`, `tls`, `sigil`, `str`, `hashmap`, …) plus what nothing else includes. ⚠ A consumer that compiled its *own* code against a leaf
   only majra's old sidecar provisioned must now declare it in its own `[deps].stdlib` (cyrius
   `docs/development/ecosystem-migration-6.6.18.md`).
 - **Every bundle opens with a compile-verified `# Requires` block** (6.6.18): one
@@ -39,10 +41,22 @@ then +8 %), is +1.5 % by minimum. `build/majra` 219,952 → 249,224 B (+13 %, co
   hand-including it under `--no-deps` no longer has to add `lib/chrono.cyr` / `lib/sys.cyr` itself.
   Include-once is keyed on the literal path, so a `cyrius deps` consumer sees no change. A
   clean-room build of each bundle against only its sidecar's leaves has 0 undefined functions for
-  x86_64, aarch64 (the core probe runs under qemu) and agnos.
+  x86_64, aarch64 (each probe also runs under qemu) and agnos.
 
 ### Fixed
 
+- **CI's dist-freshness gate failed: `distlib` derived different admin / backends sidecars on
+  CI than locally** (an extra `http` leaf). Same toolchain (the 6.6.20 release tarball is
+  byte-identical to the local install), same tree; the difference is the order the host lists
+  the stdlib snapshot directory. 6.6.20's sidecar verify walks its snapshot index in directory
+  order, and `src/admin.cyr`'s `HTTP_OK` / `HTTP_NOT_FOUND` are declared by both `lib/sandhi.cyr`
+  and `lib/http.cyr`: when the first round reaches them before any sandhi-only name, it credits
+  them to `http` (reproduced locally by copying the snapshot in alphabetical vs reverse order —
+  16 leaves vs 15). `src/admin.cyr` now includes `lib/sandhi.cyr` itself, which seeds the verify
+  with sandhi, so those names resolve before any attribution runs. All four profiles now come out
+  byte-identical under three listing orders; a no-op for every `--no-deps` entry point (each
+  already includes sandhi first; `test_backends` builds byte-identical). The ordering is an
+  upstream defect — the snapshot index wants sorting — noted under Known issues.
 - **Four expanded-suite failures under 6.6.20, all in tests that assumed a stdlib defect.**
   6.6.20's `lib/hashmap.cyr` counts `map_delete`'s tombstones and rebuilds on a new-key insert,
   so delete+insert churn no longer starves a map of empty slots — and
@@ -104,6 +118,10 @@ then +8 %), is +1.5 % by minimum. `build/majra` 219,952 → 249,224 B (+13 %, co
 
 - sigil's over-budget `var buf[262144]` warning still prints (`lib/sigil.cyr:28046`) on every
   unit that links sigil. Same static storage as before; upstream's to move.
+- cyrius 6.6.20's `distlib` sidecar verify is **host-dependent** where two stdlib leaves declare
+  the same name: it walks the snapshot index in directory-listing order. majra's case is fixed
+  above; any profile that later references such a name outside an included leaf can flip again.
+  Upstream's to fix (sort the index).
 - `cyrius distlib` warns six names undefined for **x86_64-windows only** (`SYS_FUTEX`,
   `FUTEX_WAIT` / `_WAKE`, `sys_lstat`, `sys_fchmod`, `sys_accept4`). Windows is not a majra target.
 
