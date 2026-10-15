@@ -166,6 +166,19 @@ fn _majra_vec_push(v, val) {
 }
 
 # Release a vector built by _majra_vec_new. Elements are the caller's business.
+# --- Released lists (2.11.0) ---
+#
+# Release a list majra handed out: hb_list_by_status / chb_list_by_status,
+# hb_online / chb_online, storage_list_defs. Frees the list, not its elements —
+# they point into majra's own tables (node ids, workflow definitions).
+# Until 2.11.0 those lists came from the bump allocator and could never be
+# released: a caller polling chb_online leaked a vec per call.
+# ⚠ Do not grow a returned list with `vec_push` — that moves its storage onto
+# the bump heap, which this would then hand to fl_free. Copy it to append.
+fn majra_list_free(v) {
+    return _majra_vec_free(v);
+}
+
 # --- Releasable cstr maps (2.10.1) ---
 #
 # The freelist twin of map_new for majra-internal maps that must be torn down.

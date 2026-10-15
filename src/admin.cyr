@@ -145,7 +145,7 @@ fn _admin_fleet_json(a, al) {
     str_builder_add_int_a(al, sb, load64(s + 48));
     str_builder_add_cstr_a(al, sb, "}");
     # chb_fleet_stats hands back an fl_alloc'd block; every /fleet leaked it.
-    fl_free(s);
+    chb_fleet_stats_free(s);
     var body = str_builder_build_a(al, sb);
     ret2(str_data(body), str_len(body));
 }

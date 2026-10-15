@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.11.0] - 2026-10-15
+
+**Release functions for every block the API still handed out unpaired** — the 2.11.0 roadmap
+item the 2.10.1 P(-1) pass filed. Additive only: five new public functions, no signature or wire
+change, and existing code compiles unchanged. **1,499 assertions** (core 203 · expanded 668 ·
+backends 557 · patra-queue 71), natively and cross-built under `qemu-aarch64`; the expanded suite
+looped 50× natively and 25× under qemu clean. Benchmarks vs 2.10.1 (interleaved, 9 trials): every
+median within ±3 % — the bench calls none of the changed list paths.
+
+### Added
+
+| Release | for what |
+|---|---|
+| `majra_list_free(v)` | a list from `hb_list_by_status`, `chb_list_by_status`, `hb_online`, `chb_online` or `storage_list_defs` — the list, not its elements (node ids / definitions stay majra's) |
+| `barrier_result_free(r)` | the result of `barrier_arrive` / `barrier_force` / `cbarrier_arrive` / `cbarrier_force` |
+| `relay_stats_free(s)` | a `relay_stats` block |
+| `fleet_stats_free(s)` | a `fleet_stats` block |
+| `chb_fleet_stats_free(s)` | a `chb_fleet_stats` block (the same class; the audit's list missed it) |
+
+### Changed
+
+- **The five list calls return freelist vecs.** They were built on the bump allocator, which
+  never frees, so a caller polling `chb_online` leaked a vec per call with no way to stop it.
+  Contents and order are unchanged; `storage_list_defs` walks the slots itself instead of
+  `map_values`, in the same order. ⚠ Do not grow a returned list with `vec_push` before
+  releasing it — that moves its storage onto the bump heap; copy it to append.
+- The four stats / result blocks were already freelist blocks (`fl_free` worked, undocumented);
+  the new functions are what to call, and each constructor's comment names its pair. The admin
+  handler and the heartbeat fuzz harness use them.
+- Tested by `test_release_functions`: after a warm round, 200 rounds of every list call and every
+  stats / result call with its release take no bump memory and carve no freelist memory. Both
+  mutants fail it — no-op releases (freelist growth) and the 2.10.1 bump lists (408,000 bytes).
+
 ## [2.10.1] - 2026-10-15
 
 **P(-1) hardening pass** after two toolchain language bumps in a row (cyrius 6.6.9 → 6.6.20 →

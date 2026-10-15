@@ -645,6 +645,8 @@ fn relay_evict_stale_dedup(r, max_idle_ns) {
 #   offset 32: dedup_table_size
 #   offset 40: sequence_gaps        (2.6.0 — APPENDED, so offsets 0..32 are
 #                                    unchanged and existing readers still work)
+#
+# A fresh block per call; release it with relay_stats_free (2.11.0).
 fn relay_stats(r) {
     var s = fl_alloc(48);
     store64(s, counter_get(load64(r + 48)));
@@ -654,4 +656,9 @@ fn relay_stats(r) {
     store64(s + 32, map_size(load64(r + 16)));
     store64(s + 40, counter_get(load64(r + 88)));
     return s;
+}
+
+fn relay_stats_free(s) {
+    if (s != 0) { fl_free(s); }
+    return 0;
 }

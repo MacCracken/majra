@@ -328,9 +328,12 @@ fn hb_is_empty(ht) {
 # never-freed bump allocator on every call (the sweeps dropped it at 2.6.10) and
 # map_get re-hashed each key to find the slot the walk is already standing on.
 # Slot order is map_keys' order, so the result order is unchanged.
+#
+# The list is the caller's: release it with majra_list_free (2.11.0 — it was a
+# bump vec nothing could free). Its elements are the node ids as registered.
 fn hb_list_by_status(ht, status) {
     var nodes = load64(ht + 8);
-    var result = vec_new();
+    var result = _majra_vec_new();
     var entries = map_entries(nodes);
     var cap = map_cap(nodes);
     var i = 0;
@@ -338,7 +341,7 @@ fn hb_list_by_status(ht, status) {
         var ep = entries + i * 24;
         if (load64(ep + 16) == 1) {
             if (load64(load64(ep + 8)) == status) {
-                vec_push(result, load64(load64(ep + 8) + 40));
+                _majra_vec_push(result, load64(load64(ep + 8) + 40));
             }
         }
         i = i + 1;
@@ -346,6 +349,7 @@ fn hb_list_by_status(ht, status) {
     return result;
 }
 
+# Release with majra_list_free.
 fn hb_online(ht) {
     return hb_list_by_status(ht, STATUS_ONLINE);
 }
@@ -584,11 +588,12 @@ fn chb_is_empty(cht) {
     return map_size(load64(cht + 8)) == 0;
 }
 
+# Release with majra_list_free (see hb_list_by_status).
 fn chb_list_by_status(cht, status) {
     var mtx = load64(cht + 24);
     mutex_lock(mtx);
     var nodes = load64(cht + 8);
-    var result = vec_new();
+    var result = _majra_vec_new();
     # Slot-array walk — see hb_list_by_status.
     var entries = map_entries(nodes);
     var cap = map_cap(nodes);
@@ -597,7 +602,7 @@ fn chb_list_by_status(cht, status) {
         var ep = entries + i * 24;
         if (load64(ep + 16) == 1) {
             if (load64(load64(ep + 8)) == status) {
-                vec_push(result, load64(load64(ep + 8) + 40));
+                _majra_vec_push(result, load64(load64(ep + 8) + 40));
             }
         }
         i = i + 1;
@@ -606,11 +611,13 @@ fn chb_list_by_status(cht, status) {
     return result;
 }
 
+# Release with majra_list_free.
 fn chb_online(cht) {
     return chb_list_by_status(cht, STATUS_ONLINE);
 }
 
-# Fleet stats aggregation
+# Fleet stats aggregation. The 56-byte block is the caller's: release it with
+# chb_fleet_stats_free (2.11.0; fl_free was the only way before).
 fn chb_fleet_stats(cht) {
     var mtx = load64(cht + 24);
     mutex_lock(mtx);
@@ -658,4 +665,9 @@ fn chb_fleet_stats(cht) {
     }
     mutex_unlock(mtx);
     return s;
+}
+
+fn chb_fleet_stats_free(s) {
+    if (s != 0) { fl_free(s); }
+    return 0;
 }

@@ -3603,6 +3603,71 @@ fn test_barrier_owns_names() {
     println("  barrier_owns_names: ok");
 }
 
+# --- 2.11.0: every block the API hands out has a release ---------------------
+
+var _t11_cbs = 0;
+var _t11_bs = 0;
+
+fn _t11_round(cht, ht, ws, r, fq) {
+    majra_list_free(chb_list_by_status(cht, STATUS_ONLINE));
+    majra_list_free(chb_online(cht));
+    majra_list_free(hb_list_by_status(ht, STATUS_ONLINE));
+    majra_list_free(hb_online(ht));
+    majra_list_free(storage_list_defs(ws));
+    relay_stats_free(relay_stats(r));
+    fleet_stats_free(fleet_stats(fq));
+    chb_fleet_stats_free(chb_fleet_stats(cht));
+    barrier_result_free(barrier_arrive(_t11_bs, "b11", "a"));
+    barrier_result_free(barrier_force(_t11_bs, "b11", "zz"));
+    barrier_result_free(cbarrier_arrive(_t11_cbs, "c11", "a"));
+    barrier_result_free(cbarrier_force(_t11_cbs, "c11", "zz"));
+    return 0;
+}
+
+# The list calls returned bump vecs nothing could free (a poller of chb_online
+# leaked one per call); the stats blocks and barrier results needed fl_free,
+# which nothing documented. After a warm round, 200 rounds of every one of
+# them with its release must take no memory of either kind.
+fn test_release_functions() {
+    var cht = chb_tracker_new(heartbeat_config_default());
+    var ht = hb_tracker_new(heartbeat_config_default());
+    var ws = workflow_storage_new();
+    var i = 0;
+    while (i < 20) {
+        var id = _t8_intkey(11000 + i);
+        chb_register(cht, id, 0);
+        hb_register(ht, id, 0);
+        storage_save_def(ws, workflow_def_new(id, "wf"));
+        i = i + 1;
+    }
+    var l1 = chb_list_by_status(cht, STATUS_ONLINE);
+    var l2 = storage_list_defs(ws);
+    assert_eq(vec_len(l1), 20, "chb_list_by_status still lists every node");
+    assert_eq(vec_len(l2), 20, "storage_list_defs still lists every definition");
+    majra_list_free(l1);
+    majra_list_free(l2);
+    var r = relay_new("n11");
+    var fq = fleet_new(fleet_config_new(4, 2, 0));
+    fleet_register_node(fq, "f1");
+    var parts = vec_new();
+    vec_push(parts, "a");
+    vec_push(parts, "b");
+    _t11_bs = barrier_set_new();
+    barrier_create(_t11_bs, "b11", parts);
+    _t11_cbs = cbarrier_set_new();
+    cbarrier_create(_t11_cbs, "c11", parts);
+
+    _t11_round(cht, ht, ws, r, fq);
+    var u0 = alloc_used();
+    var fa0 = _fl_arena;
+    var fp0 = _fl_arena_pos;
+    i = 0;
+    while (i < 200) { _t11_round(cht, ht, ws, r, fq); i = i + 1; }
+    assert_eq(alloc_used() - u0, 0, "200 rounds of lists, stats and barrier results take no bump memory");
+    assert(_fl_arena == fa0 && _fl_arena_pos == fp0, "and carve no new freelist memory");
+    println("  release_functions: ok");
+}
+
 fn test_barrier_content_equality() {
     var bs = barrier_set_new();
     var p = vec_new();
@@ -3863,6 +3928,7 @@ fn main() {
     test_cbarrier_force();
     test_cbarrier_arrive_and_wait();
     test_barrier_owns_names();
+    test_release_functions();
     test_barrier_content_equality();
     test_cbarrier_displaced_waiter_wakes();
 

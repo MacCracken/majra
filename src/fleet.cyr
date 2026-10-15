@@ -331,6 +331,8 @@ fn fleet_node_count(fq) {
 #   offset  8: total_queued
 #   offset 16: total_running
 #   offset 24: total_completed
+#
+# A fresh block per call; release it with fleet_stats_free (2.11.0).
 fn fleet_stats(fq) {
     var s = fl_alloc(32);
     var mtx = load64(fq + 16);
@@ -360,4 +362,9 @@ fn fleet_stats(fq) {
     store64(s + 24, total_c);
     mutex_unlock(mtx);
     return s;
+}
+
+fn fleet_stats_free(s) {
+    if (s != 0) { fl_free(s); }
+    return 0;
 }

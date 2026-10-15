@@ -649,6 +649,19 @@ fn storage_delete_def(ws, id) {
     return map_delete(load64(ws), id);
 }
 
+# Every stored definition, in slot order. The list is the caller's: release it
+# with majra_list_free (2.11.0 — map_values built it on the bump allocator,
+# which never frees). The definitions themselves stay the storage's.
 fn storage_list_defs(ws) {
-    return map_values(load64(ws));
+    var m = load64(ws);
+    var out = _majra_vec_new();
+    var entries = map_entries(m);
+    var cap = map_cap(m);
+    var i = 0;
+    while (i < cap) {
+        var ep = entries + i * 24;
+        if (load64(ep + 16) == 1) { _majra_vec_push(out, load64(ep + 8)); }
+        i = i + 1;
+    }
+    return out;
 }

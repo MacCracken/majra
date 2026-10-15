@@ -14,6 +14,9 @@ enum BarrierResultKind {
 #   offset 0: kind (i64)
 #   offset 8: arrived (i64)
 #   offset 16: expected (i64)
+#
+# Every arrive / force (both barrier kinds) returns a fresh block; release it
+# with barrier_result_free (2.11.0; fl_free was the only way before).
 
 fn _barrier_result(kind, arrived, expected) {
     var r = fl_alloc(24);
@@ -21,6 +24,11 @@ fn _barrier_result(kind, arrived, expected) {
     store64(r + 8, arrived);
     store64(r + 16, expected);
     return r;
+}
+
+fn barrier_result_free(r) {
+    if (r != 0) { fl_free(r); }
+    return 0;
 }
 
 # --- Helper: vec-based string set ---
