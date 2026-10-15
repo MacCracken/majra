@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+**Roadmap re-organised and a repo-wide doc sweep.** No code change: `src/queue.cyr`
+re-points one comment, so each bundle moves by three comment lines; sidecars unchanged.
+All four suites pass (203 · 668 · 557 · 71).
+
+### Roadmap
+
+- Re-checked every open item against the 2.11.0 tree and, for upstream items, the latest
+  **tagged** cyrius (6.7.11) and sigil (3.13.12), then scheduled them by release target:
+  **2.12.0** (rate-limiter force-evict for agnosai's key cap; metrics hook arguments),
+  **2.12.x** (aarch64 run lane, agnos-portable suites, pin move past 6.7.9, retiring
+  `_majra_map_compact`), **later MINORs** (PostgreSQL SCRAM + `SSLRequest`, WebSocket
+  pub/sub bridge, QUIC, shared-memory IPC) and **3.0.0** (the bare `ERR_*` aliases, the
+  metrics globals).
+- *Waiting on upstream* is empty: sigil's over-budget `var buf[262144]` — the STATIC-storage
+  warning every signed / admin / backends build prints — is gone from sigil 3.13.12,
+  folded from cyrius 6.7.10, and clears with the pin move.
+- **New item, found by the sweep:** `src/metrics.cyr` still passes the third / fourth
+  argument of four hooks through the unsynchronised globals `_metrics_arg3` /
+  `_metrics_arg4` — a LOW finding from the 2026-08-22 pass-2 audit that was never fixed
+  or scheduled. Now 2.12.0 (dispatch through `fncall3` / `fncall4`), with the globals'
+  removal at 3.0.0.
+
+### Docs
+
+- `README.md`, `docs/architecture/overview.md`: line counts and module notes re-measured
+  at 2.11.0; the sidecar description matches the computed sidecars (only `signed` names
+  sigil); the overview's postgres "connect-path globals" paragraph described code removed
+  at 2.8.1; its two latencies now quote the 2.11.0 bench row.
+- `SECURITY.md`: the attack-surface rows re-checked against the code (atomics, admin
+  arena, dollar-quoting, per-connection IPC keys, nonce and volume limits); a
+  "WebSocket bridge" row described a loop majra does not ship.
+- `CONTRIBUTING.md`: named two helpers that no longer exist; `cyrius audit` does not run
+  `deny`; the local-clobbering note is re-tensed (not seen on cyrius 6.x).
+- `docs/development/state.md`: the in-flight table keeps open items only, each pointing at
+  its roadmap target; per-release footprint and lockfile history condensed into the
+  CHANGELOG pointer it duplicated.
+- `threat-model.md` gains the 2026-10-15 audit row; `dependency-watch.md`, `semver.md`,
+  `cyrius-quirks.md` §3, `testing.md`, `tests/soak/README.md` and `doc-health.md`
+  re-anchored. The soak README's two "known limitations" were both resolved (job keys on
+  a freelist since 2.8.1; the Str-key hash collision fixed upstream).
+
+### Tests
+
+- `tests/test.sh` builds with `--no-deps`, runs the patra-queue suite it had skipped, and
+  fails if any of the four suites fails (it ignored the backends result).
+
 ## [2.11.0] - 2026-10-15
 
 **Release functions for every block the API still handed out unpaired** — the 2.11.0 roadmap
@@ -2953,8 +3001,6 @@ refresh libro did in its 1.1.0 → 2.0 arc, catching majra up.
 ### Changed
 - Cyrius toolchain pinned to v3.2.5 (cc3 compiler, minimum version)
 
-## [Unreleased]
-
 ## [2.1.0] — 2026-04-09
 
 ### Changed
@@ -3226,7 +3272,7 @@ refresh libro did in its 1.1.0 → 2.0 arc, catching majra up.
 - `error` — Shared error types (MajraError, IpcError)
 - Feature-gated modules: default = pubsub + queue + relay + heartbeat
 
-[Unreleased]: https://github.com/MacCracken/majra/compare/v1.0.4...HEAD
+[Unreleased]: https://github.com/MacCracken/majra/compare/2.11.0...HEAD
 [1.0.4]: https://github.com/MacCracken/majra/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/MacCracken/majra/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/MacCracken/majra/compare/v1.0.1...v1.0.2

@@ -6,7 +6,7 @@ Starting with version 2.0.0 (Cyrius port), majra follows [Semantic Versioning 2.
 
 - **PATCH** (2.0.x): Bug fixes, performance improvements, documentation. No API changes.
 - **MINOR** (2.x.0): New features, new modules, new functions. All existing code compiles without changes.
-- **MAJOR** (3.0.0): Reserved for breaking changes. Not planned.
+- **MAJOR** (3.0.0): Reserved for breaking changes. No date set; what it will remove is listed in [`roadmap.md` § 3.0.0](roadmap.md#300).
 
 ## What counts as a breaking change
 

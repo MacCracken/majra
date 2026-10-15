@@ -30,8 +30,9 @@ is the toolchain snapshot, covered by `cyrius.lock`'s 113 hashes and CI's
 | Date | Scope | Result |
 |---|---|---|
 | 2026-08-22 | First P(-1) pass — all 23 `src/` modules, six review lenses, adversarial verification | 115 confirmed / 2 refuted; 2 critical, 30 high (shipped as 2.6.9). [`../audit/2026-08-22-audit.md`](../audit/2026-08-22-audit.md) |
-| 2026-09-15 | Third P(-1) pass — all modules, plus test-suite, perf, concurrency/memory and external protocol/crypto research | 130 confirmed; 3 critical, 17 high (shipped as 2.8.1, with the API/wire items in 2.9.0). [`../audit/2026-09-15-audit.md`](../audit/2026-09-15-audit.md) |
 | 2026-08-22 | Second P(-1) pass — adversarial re-review of the ~7,000 lines 2.6.9 rewrote | 68 confirmed / 10 refuted; 1 critical, 15 high. **50 of the 68 are 2.6.9's own regressions** (shipped as 2.6.10). [`../audit/2026-08-22-audit-pass2.md`](../audit/2026-08-22-audit-pass2.md) |
+| 2026-09-15 | Third P(-1) pass — all modules, plus test-suite, perf, concurrency/memory and external protocol/crypto research | 130 confirmed; 3 critical, 17 high (shipped as 2.8.1, with the API/wire items in 2.9.0). [`../audit/2026-09-15-audit.md`](../audit/2026-09-15-audit.md) |
+| 2026-10-15 | Fourth P(-1) pass — after the cyrius 6.6.20 and 6.7.9 language bumps; inline, one reviewer | 12 confirmed; 1 high, 5 medium, 6 low (shipped as 2.10.1; the release functions it called for shipped as 2.11.0). [`../audit/2026-10-15-audit.md`](../audit/2026-10-15-audit.md) |
 
 > **IPC access control changed at 2.6.9 and became effective at 2.6.10.**
 > `ipc_bind` now chmods the socket to 0600 *before* `bind(2)` — 2.6.9 issued
@@ -81,7 +82,7 @@ is the toolchain snapshot, covered by `cyrius.lock`'s 113 hashes and CI's
 | relay | Shared RelayMessage across subscriber threads | Use-after-free / double free | Since **2.10.1** the 2.9.0 refcount is atomic and the fan-out retains before it publishes the pointer; through 2.10.0 a consumer releasing in that window could free a message still being offered |
 | heartbeat | Node registration | Unbounded node tracking | Eviction policy auto-removes stale nodes |
 | ipc | Frame parsing | Oversized frames | 1 MB max frame size check |
-| ipc_encrypted | Nonce reuse / exhaustion | Key+nonce reuse | Role byte separates the two directions; since **2.9.0** the key itself is per connection (handshake + HKDF), so two connections under one PSK never share a keystream. `encrypted_ipc_needs_rekey()` warns at 2^31 frames, hard-fail at 2^32 |
+| ipc_encrypted | Nonce reuse / exhaustion | Key+nonce reuse | Role byte separates the two directions; since **2.9.0** the key itself is per connection (handshake + HKDF), so two connections under one PSK never share a keystream. `encrypted_ipc_needs_rekey()` warns at 2^31 frames or 256 GiB, and the send hard-fails at 2^32 frames or 1 TiB |
 | ipc_encrypted | Captured frames | Replay | **Closed at 2.9.0.** Each connection derives its key by HKDF over the PSK and both sides' handshake salts, so a frame captured on one connection authenticates on no other. Within a connection the strictly-increasing peer counter still rejects a stale or reflected frame |
 | redis_backend | RESP protocol | Injection | Commands built via structured builder, not string concat |
 | redis_backend | RESP replies from the server | Desync / resource exhaustion | Depth (8), array (1M) and bulk (64 MiB) caps; since **2.10.1** length, count and integer fields are strict (digits only, i64-bounded, `-1` the only nil), and any violation poisons the connection rather than reading as nil and parsing the server's next bytes as the next reply |

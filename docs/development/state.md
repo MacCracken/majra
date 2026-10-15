@@ -6,7 +6,7 @@ type: state
 
 # Current State — majra
 
-> **Last refresh**: 2026-10-15 (post-2.11.0) | **Refresh cadence**: every release (ideally bumped by the release post-hook).
+> **Last refresh**: 2026-10-15 (post-2.11.0: roadmap re-organised, repo doc sweep) | **Refresh cadence**: every release (ideally bumped by the release post-hook).
 > **What this file is**: volatile state. The companion `CLAUDE.md` holds durable rules; this file holds whatever drifts release-to-release. Per [first-party-documentation § CLAUDE.md](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/first-party-documentation.md#claudemd), version numbers, test counts, consumer lists, and in-flight work all live here, not in `CLAUDE.md`.
 
 ---
@@ -17,7 +17,7 @@ type: state
 |---|---|---|
 | `VERSION` | **2.11.0** | single source of truth |
 | `cyrius.cyml [package].version` | `${file:VERSION}` | reads `VERSION` |
-| Latest git tag | `2.10.1` (2.11.0 pending tag) | release workflow asserts `VERSION == tag` |
+| Latest git tag | `2.11.0` | release workflow asserts `VERSION == tag` |
 
 ## Toolchain
 
@@ -78,20 +78,15 @@ type: state
 Lockfile (`cyrius.lock`) carries SHA-256 over **113** resolved files — the whole
 `lib sync --full` snapshot (106 top-level + 7 under `lib/unicode/`), **sorted**, plus a
 `cyrius<TAB>6.7.9` trailer stamping the pin. Both are 6.6.x resolver changes:
-6.6.3 sorts the lock (it was written in readdir order, so a lock committed from
-one filesystem could not verify on another), and 6.6.4 stamps the pin as a
-trailer and **refuses** a stdlib leaf whose snapshot hash moved under an
-unchanged pin (`cyrius deps --relock` is the explicit accept). The 2.10.0 pin
-move (6.6.20 → 6.7.9) rewrote 67 hashes — every first-party fold among them —
-added and removed none, and 6.7.6's `cyrius deps --locked` (check, write nothing)
-agrees. The 2.9.3 move (6.6.9 → 6.6.20) rewrote 85 hashes — every first-party fold among them —
-added two (`poison.cyr`, `tls_hostid.cyr`, neither reached by majra's own code)
-and moved the trailer; a plain `cyrius deps` after `lib sync --full` wrote it in
-one step. (2.9.1's 6.6.4 → 6.6.6 move rewrote 27 and added `alloc_cx.cyr`.) **No commit-pin line since 2.6.8** (zero git deps). Held at 108 across 6.5.31 → 6.5.36; was 99
-under 6.4.62–6.4.83, 97 under 6.2.11. 2.7.2's lock had **66** entries and no
-trailer — the residue of a bare `cyrius deps` into an empty `lib/`, which
-resolves only the declared `[deps].stdlib` subset rather than the snapshot CI
-provisions. CI's `cyrius deps --verify` enforces match: 113 verified, 0 failed.
+6.6.3 sorts the lock (readdir order could not verify across filesystems), and
+6.6.4 stamps the pin and **refuses** a stdlib leaf whose snapshot hash moved
+under an unchanged pin (`cyrius deps --relock` is the explicit accept). The
+2.10.0 pin move (6.6.20 → 6.7.9) rewrote 67 hashes and added or removed none;
+6.7.6's `cyrius deps --locked` (check, write nothing) agrees. **No commit-pin
+line since 2.6.8** (zero git deps). A bare `cyrius deps` into an *empty* `lib/`
+resolves only the declared `[deps].stdlib` subset — how 2.7.2 shipped a
+66-entry lock — so always `lib sync --full` first. CI's `cyrius deps --verify`
+enforces match: 113 verified, 0 failed.
 
 ## Build footprint
 
@@ -106,47 +101,24 @@ provisions. CI's `cyrius deps --verify` enforces match: 113 verified, 0 failed.
 > 2.11.0 added the five release functions and moved the list calls onto freelist
 > vecs (`src/` +60 lines); sidecars unchanged.
 
-> 2.10.1 (the P(-1) pass) grew every bundle with its nine code fixes and their
-> rationale comments (`src/` +287 lines); sidecars unchanged. `build/majra`
-> 248,728 → 252,824 B.
-
-> 2.10.0 moved the bundles by their version stamp and, in admin / backends, one
-> re-worded `src/admin.cyr` comment; sidecars unchanged. Binaries shrank slightly
-> under 6.7.9: `build/majra` 249,224 → 248,728 B.
-
-> 2.9.3 moved every bundle by the `# Requires` block cyrius 6.6.18's `distlib`
-> now writes (one `include "lib/<leaf>.cyr"` per sidecar leaf: +16 / +18 / +4 /
-> +5 lines), by +8 comment lines (the hashmap notes 6.6.20 made untrue) and, in
-> admin / backends, by `src/admin.cyr`'s new `include "lib/sandhi.cyr"` (+7 with
-> its comment); bodies otherwise identical. Binaries grew with the compiler, not the source:
-> `build/majra` 219,952 → 249,224 B (+13.3 %) under 6.6.20.
-
-> 2.9.1 moved every bundle by comment lines only (+6 / +6 / +6 / +15 — the
-> four re-tensed `sendto` notes); bodies otherwise byte-identical to 2.9.0's,
-> sidecars unchanged. Binaries grew with the compiler, not the source:
-> `build/majra` 215,536 → 219,792 B under 6.6.6.
-
-> **Both hardening passes moved every bundle.** `src/` grew 5,813 → 7,166
-> (2.6.9) → 7,633 lines (2.6.10), much of it rationale comments recording what
-> each guard defends against — and, after the second pass, why several of
-> 2.6.9's guards were wrong. 2.7.3 moved all four again (core 4,843 → 4,923;
-> `CHANGELOG.md` § [2.7.3]).
+> Earlier per-release footprint moves are recorded in each release's
+> CHANGELOG stanza.
 
 ## Test surface
 
 | Suite | Entry point | Assertions | Notes |
 |---|---|---|---|
-| Core | `src/main.cyr` (binary self-tests) | 203 | runs as part of `cyrius build` smoke. 150 → 153 at 2.7.3; 154 at 2.8.0; 199 at 2.8.1 (P(-1) sweep regressions); 203 at 2.8.2 (heartbeat owned keys) |
-| Expanded | `tests/test_core.tcyr` | 668 | broader unit coverage; grew across the 2.6.x relay/ratelimit/queue fix arc. 299 → 304 at 2.7.3 — the barrier checks now prove *blocking*, not a counter; 623 at 2.8.1 (P(-1) sweep; 621 under qemu, where one 47-second test is x86-only); 626 at 2.8.2 (relay dedup tombstone compaction; 624 under qemu); 645 at 2.9.0 (relay ownership + unsubscribe); 668 at 2.11.0 (release functions; 665 under qemu); 664 at 2.10.1 (P(-1): relay refcount atomicity, huge sliding windows, DAG run teardown, barrier name ownership, conn-pool keys; 661 under qemu); 647 at 2.9.3 (the churn tests starve their maps by hand now that 6.6.20's hashmap reclaims tombstones itself, +1; the >1000-waiter barrier test waits for every arrival, +1; 644 under qemu) |
-| Backends | `tests/test_backends.tcyr` | 557 | redis / pg / ws / aes-gcm / signed_envelope / admin — 152 → 519 at 2.8.1 (P(-1) sweep: admin routes, SIGPIPE, ws handshake, encrypted-IPC salt/close); 547 at 2.9.0 (session handshake, Origin gate, anchored verify); 557 at 2.10.1 (P(-1): mixed-seed sk, admin arena, strict RESP integers) |
+| Core | `src/main.cyr` (binary self-tests) | 203 | runs as part of `cyrius build` smoke; unchanged since 2.8.2 |
+| Expanded | `tests/test_core.tcyr` | 668 | broader unit coverage. 664 → 668 at 2.11.0 (release functions); 665 under qemu, where one x86-only test's three asserts do not run. Per-release growth is in the CHANGELOG |
+| Backends | `tests/test_backends.tcyr` | 557 | redis / pg / ws / aes-gcm / signed_envelope / admin; 547 → 557 at 2.10.1 (P(-1): mixed-seed sk, admin arena, strict RESP integers) |
 | Patra-queue | `tests/test_patra_queue.tcyr` | 71 | separate entry — split out at 2.4.0 to stay under the then-16384 cc5 fixup cap (the table starts at 1,048,576 and grows on demand at the 6.7.9 pin — growable since cyrius 6.2.0); split kept as documented architecture |
 | **CI total** | | **1,499** | |
 | Live integration | `tests/test_live.tcyr` | 36 | requires Redis + PostgreSQL. **CI-only** — not runnable on a dev box without `redis:7-alpine` + `postgres:16-alpine` up; 7 Redis + 4 PostgreSQL categories |
 | Fuzz harnesses | `fuzz/*.fcyr` | 3 binaries | model/oracle-checked since 2.8.2; `<harness> [iterations] [seed]`, seed printed; CI runs 500 iterations × 10 s timeout |
-| Benchmarks | `benches/bench_all.bcyr` | 19 targets (`mq_lifecycle` + `mq_enqueue_4producers` since 2.8.2) | history in `bench-history.csv`, a **tracked** file (this row called it never-committed until 2.10.1) with rows for 2.8.0, 2.8.1, 2.10.0 and 2.10.1 only — rows taken on different days and loads are not comparable, so a release head-to-head still rebuilds the prior tree and runs interleaved A/B, as 2.6.8, 2.7.3 and every release since 2.9.3 did |
+| Benchmarks | `benches/bench_all.bcyr` | 19 targets | history in `bench-history.csv` (tracked; rows for 2.8.0, 2.8.1, 2.10.0, 2.10.1, 2.11.0). Rows taken on different days and loads are not comparable, so a release head-to-head rebuilds the prior tree and runs interleaved A/B |
 | Examples | `examples/*.cyr` | 2 binaries | `managed_queue`, `pubsub_tiers`; CI builds + runs both |
-| Soak | `tests/soak/soak_*.cyr` (4 files) | queue 5k ops, pubsub 2k topics, relay dedup+evict, heartbeat 100×20 + auto-evict | on-demand; all 4 clean under 6.6.4 at 2.7.3, under 6.6.6 at 2.9.1, under 6.6.20 at 2.9.3 and under 6.7.9 at 2.10.0, natively and under `qemu-aarch64`. `soak_queue`'s job_count assertion was rewritten at 2.6.9 — it had been asserting the unbounded-growth leak |
-| **aarch64, cross-built** | every entry above via `cyrius build --aarch64 --no-deps <entry> build/<name>_aarch64 && qemu-aarch64 ./build/<name>_aarch64` | same counts (expanded 644 under qemu — the x86-only test's three asserts) | **verified locally at 2.7.3, re-verified at 2.9.1 under 6.6.6, at 2.9.3 under 6.6.20 and at 2.10.0 under 6.7.9; CI cross-builds the four suites (build-only gate), the run lane is still unwired.** All four suites + fuzz + soak + both examples pass. At 2.9.3 the expanded suite looped 100× natively per build on a box at load 10–38 (other toolchain work): the >1000-waiter barrier test failed 2/100 under 6.6.20 and 1/100 under 6.6.9 with the old fixed-sleep test — a test timing defect, fixed (100/100 after). The 100× qemu loop then caught a second one, the rate limiter's fail-open check (a 1 ms window at 1000 tokens/s, 1/100) — fixed the same way. The final suite then looped 100/100 natively and 50/50 under qemu. At 2.10.0 (6.7.9) the expanded suite looped 100/100 natively and 50/50 under qemu at load 5–10. At 2.9.1 the expanded suite looped 100× under qemu and 100× natively with 0 failures / 0 crashes; core / backends / patra-queue 25× under qemu and 40× natively. (2.7.3: 100× qemu / 200× native, same result.) At 2.7.2 the expanded suite SIGSEGV'd 14/200 natively (~7 %) from the `cbarrier_arrive_and_wait` bug. Needs `qemu-user` on the runner; recipe in [`../guides/testing.md`](../guides/testing.md) |
+| Soak | `tests/soak/soak_*.cyr` (4 files) | queue 500k ops, pubsub 2k topics, relay dedup+evict, heartbeat 100×20 + auto-evict | on-demand; all 4 clean under 6.7.9 at 2.10.0, natively and under `qemu-aarch64` |
+| **aarch64, cross-built** | every entry above via `cyrius build --aarch64 --no-deps <entry> build/<name>_aarch64 && qemu-aarch64 ./build/<name>_aarch64` | same counts (expanded 665 under qemu) | **verified by hand at most releases since 2.7.3** (last at 2.11.0 under 6.7.9); CI cross-builds the four suites (build-only gate) and nothing runs them — roadmap § 2.12.x. Loop the expanded suite: single green runs have hidden 1-in-100 timing defects twice (2.9.3). Recipe in [`../guides/testing.md`](../guides/testing.md) |
 
 ## Distribution bundles (4 profiles)
 
@@ -244,18 +216,19 @@ Full history in [`../../CHANGELOG.md`](../../CHANGELOG.md).
 
 ## In-flight / blockers
 
+Open items only, each pointing at where it is scheduled in
+[`roadmap.md`](roadmap.md). A row is dropped once its fix ships; the history is
+in the CHANGELOG.
+
 | Item | Status | Where to look |
 |---|---|---|
-| **PostgreSQL: cleartext auth, no TLS** | Open — credentials and queries cross the wire in the clear; the connect fails closed on SCRAM rather than downgrading | plan: [roadmap § 2.10 line](roadmap.md) |
-| ~~**`base64_*` collides with `lib/bayan.cyr`**~~ | **RESOLVED** at 2.6.8 — renamed to `majra_base64_encode` / `majra_base64_decode`. All four profiles emit zero `base64_*` duplicate-fn warnings (the unrelated upstream `uname_release` duplicate since 2.7.3 is tracked below) | CHANGELOG 2.6.8 · [`semver.md`](semver.md) § Documented exceptions |
-| **Shared-memory IPC transport** | parked until a consumer hits the syscall-per-message ceiling | plan: [roadmap § 2.10 line](roadmap.md) |
-| ~~**agnos `--agnos` full build (non-core)**~~ | **RESOLVED upstream at the 6.6.6 pin (2.9.1)** — the one thing left at 2.7.3 was a warning, `undefined function '_agnos_getenv'` (`lib/io.cyr` → `lib/args_agnos.cyr`, which no sidecar names), and the open question was whether majra declares the module or io.cyr includes it. cyrius 6.6.6 made `lib/io.cyr` self-sufficient: it includes `lib/args_agnos.cyr` itself. Re-measured at 2.9.1: a clean-room probe of `dist/majra-backends.cyr` + its sidecar leaves builds `OK` under `--agnos` with **zero** undefined functions; core has been agnos-clean since 2.5.0. What remains is majra-side and is not a blocker: `tests/test_backends.tcyr` and `tests/test_patra_queue.tcyr` do not cross-build for agnos (Linux `sys_unlink` / `sys_stat` arities, `SYS_SOCKETPAIR` / `SYS_RECVFROM` / `SYS_GETSOCKNAME` undeclared on that peer) — re-homed to the roadmap's 2.10 line | plan: [roadmap § agnos-portable suites](roadmap.md) · CHANGELOG 2.9.1 |
-| **aarch64 CI lane (run, not just build)** | **raw-syscall class RESOLVED at 2.7.3** — majra spells no *unrouted* syscall number in arch-neutral code (only `src/ipc.cyr`'s `ESYSXLAT`-routed networking vars and its per-arch sendto remain), and every suite, fuzz harness, soak and example passes cross-built under `qemu-aarch64` (verified locally). CI now cross-builds the four suites (build-only gate) and greps for raw syscall literals, but the lane that *runs* the binaries under `qemu-aarch64` is still unwired — and it is the half that matters: two of the three defects emitted no build-time warning, so a build-only lane proves nothing. The roadmap trigger (formerly "any non-x86_64 consumer") is met — daimon ships a `daimon-aarch64` asset | [issues/archived/2026-09-14-raw-x86-syscall-numbers-aarch64.md](issues/archived/2026-09-14-raw-x86-syscall-numbers-aarch64.md) · plan: [roadmap § aarch64 CI lane](roadmap.md) · recipe: [`../guides/testing.md`](../guides/testing.md) |
-| ~~**`duplicate fn 'uname_release'` — `lib/sigil.cyr:746` vs `lib/sys.cyr:203`**~~ | **RESOLVED upstream** — sigil 3.13.x (the 6.6.9 snapshot) takes `uname_release` from `lib/sys.cyr` instead of defining a copy; no build prints the warning at 6.6.9 or 6.6.20 (re-checked at 2.9.3). History: was open **upstream (sigil), harmless** — sigil 3.12.18 still defines a byte-identical copy of the accessor it now depends on `lib/sys.cyr` for; last definition wins, same body. Warns on any build that includes both under the 6.6.4 snapshot — **and the 6.6.6 one: re-checked at 2.9.1, `lib/sigil.cyr` is byte-identical across 6.6.4 → 6.6.6** (`test_backends`, `cyrius audit`, and consumers provisioning from any of the four sidecars — all four name both `sigil` and `sys`), majra or not. Nothing to do here; goes away when sigil drops its copy |
-| **`array local over the per-fn frame budget gets STATIC storage` — `lib/sigil.cyr:25118`** (28103 at 6.7.9) | Open **upstream (sigil), harmless** — still printed at 2.10.0 (`test_backends`, and every sidecar-provisioned consumer of the signed / admin / backends profiles) — new *line* at the 6.6.5 pin, not new behaviour: sigil's crypto-bank init declares `var buf[262144]`, which has always fallen back to shared static storage; 6.6.5 promoted the compiler's `note:` for that fallback to a `warning:` ("one buffer shared by all calls and all threads") and scoped the static's name so it can no longer collide with a consumer's own `buf`. Prints on the same units as the duplicate above. Nothing to do here; clears if sigil moves the bank to `alloc()` | CHANGELOG 2.9.1 § Known issues · [dependency-watch.md](dependency-watch.md) | CHANGELOG 2.7.3 § Known issues · [dependency-watch.md](dependency-watch.md) |
-| ~~**`ws_recv_frame` / `ws_send_text` collide with `lib/ws.cyr`**~~ | **RESOLVED** at 2.8.0 — renamed `majra_ws_send_text` / `majra_ws_recv_frame` under the collision exception; the backends bundle now builds next to `lib/ws.cyr` under 6.6.4 | CHANGELOG 2.8.0 · [`semver.md`](semver.md) § Documented exceptions |
-| ~~**sigil pin lags the toolchain fold**~~ | **RESOLVED** at 2.6.8 — sigil is a `[deps].stdlib` module now and tracks the pin. The whole class is closed: majra declares zero git deps | `cyrius.cyml [deps]` |
-| ~~**sigil asm-offset drift**~~ | **RESOLVED** at 2.4.5 | [dependency-watch.md](dependency-watch.md) |
+| **Rate limiter cannot hold a hard key cap** | Open — `ratelimit_evict_stale` only evicts refilled buckets, so a key-spraying caller cannot bound the map (agnosai, 2026-09-26). Scheduled for **2.12.0** | [issue](issues/2026-09-26-agnosai-ratelimit-no-way-to-enforce-a-key-cap.md) · roadmap § 2.12.0 |
+| **Metrics hooks pass extra arguments through globals** | Open, LOW — `_metrics_arg3` / `_metrics_arg4` are unsynchronised; filed by the 2026-08-22 pass-2 audit and unscheduled until now. Scheduled for **2.12.0**; the globals go at 3.0.0 | roadmap § 2.12.0 · [pass-2 audit](../audit/2026-08-22-audit-pass2.md) |
+| **aarch64 CI lane (run, not just build)** | Open — CI cross-builds the four suites (build-only gate) but nothing runs them under `qemu-aarch64`, and two of the three raw-syscall defects 2.7.3 fixed emitted no build-time warning. Every suite passes under qemu when run by hand (2.11.0). Trigger met (daimon ships `daimon-aarch64`) | roadmap § 2.12.x · recipe: [`../guides/testing.md`](../guides/testing.md) · [archived issue](issues/archived/2026-09-14-raw-x86-syscall-numbers-aarch64.md) |
+| **agnos-portable `backends` / `patra-queue` suites** | Open, majra-side — all four bundles build agnos-clean (since the 6.6.6 pin, 2.9.1); the two suites do not (Linux `sys_unlink` / `sys_stat` arities, socket syscalls the agnos peer does not declare): 27 and 6 errors at 2.11.0 | roadmap § 2.12.x |
+| **`array local over the per-fn frame budget gets STATIC storage` — `lib/sigil.cyr:28103`** | **Fixed upstream, not yet adopted** — harmless: sigil's crypto-bank init declares `var buf[262144]`, which has always fallen back to static storage (cyrius 6.6.5 made the note a warning). Printed by `test_backends` and by any sidecar-provisioned signed / admin / backends consumer at the 6.7.9 pin. Gone from sigil 3.13.12, folded from cyrius 6.7.10; clears with the 2.12.x pin move | roadmap § 2.12.x · [dependency-watch.md](dependency-watch.md) |
+| **PostgreSQL: cleartext auth, no TLS** | Open — credentials and queries cross the wire in the clear; the connect fails closed on SCRAM rather than downgrading. Trigger-gated | roadmap § Later MINORs |
+| **Shared-memory IPC transport** | Parked until a consumer hits the syscall-per-message ceiling | roadmap § Later MINORs |
 
 ## Refresh procedure
 

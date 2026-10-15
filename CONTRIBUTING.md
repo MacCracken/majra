@@ -28,16 +28,17 @@ cyrius lib sync --full && cyrius deps
 # include order; every CI build passes it.
 cyrius build --no-deps src/main.cyr build/majra && ./build/majra
 
-# Run tests
-cyrius test
+# All four offline suites + benches (each suite is also buildable on its own;
+# see docs/guides/testing.md for the matrix, soak, fuzz and qemu runs)
+sh tests/test.sh
 
 # Run benchmarks (with history)
 cyrius bench
 
-# Full audit (self-host, test, fmt, lint, vet, deny, bench)
+# Project sweep: fmt, lint, docs, tests, bench
 cyrius audit
 
-# Policy enforcement
+# Syscall / network policy — not part of `cyrius audit`
 cyrius deny src/main.cyr
 
 # Live integration tests. Requires Redis on :6379 and PostgreSQL on :5432
@@ -48,7 +49,7 @@ cyrius deny src/main.cyr
 cyrius build --no-deps tests/test_live.tcyr build/test_live && ./build/test_live
 ```
 
-Before opening a PR, run `cyrius audit` to verify everything passes.
+Before opening a PR, run `cyrius audit` and `cyrius deny src/main.cyr`; both must pass.
 
 ## Adding a New Module
 
@@ -72,14 +73,14 @@ Before opening a PR, run `cyrius audit` to verify everything passes.
 - Functions: `snake_case` — `fn pubsub_new()`, `fn mq_enqueue()`
 - Structs: document layout as comments — offsets, field sizes
 - Internal functions: prefix with `_` — `fn _set_contains()`
-- Globals for cross-call state: prefix with `_` — `var _pg_fd_g = 0` (`src/postgres_backend.cyr`)`
+- Globals for cross-call state: prefix with `_` — `var _err_msg_len = 0;` (`src/error.cyr`)
 - Constants via enums: `enum Priority { PRIORITY_HIGH = 1; }`
-- `\r` / `\n` escapes in string literals work (since cc4.x) — use them. Do **not** hand-emit byte 13 with `store8`; see `_sb_crlf` in `src/redis_backend.cyr`
+- `\r` / `\n` escapes in string literals work — use them (`memcpy(frame + p, "\r\n", 2)` in `src/redis_backend.cyr`). Do **not** hand-emit byte 13 with `store8`
 - Use `fl_alloc` for structs that will be freed; `alloc` for long-lived collections
 
 ## Testing
 
-- Unit tests go in `src/main.cyr` or `tests/test_core.tcyr`
+- Unit tests go in `src/main.cyr` (core suite) or `tests/test_core.tcyr` (expanded suite)
 - Backend protocol tests go in `tests/test_backends.tcyr`
 - Durable / patra-backed queue tests go in `tests/test_patra_queue.tcyr` — a
   separate entry point on purpose; it was split out of `test_backends.tcyr`
@@ -91,8 +92,10 @@ Before opening a PR, run `cyrius audit` to verify everything passes.
 
 ## Known Compiler Limitations
 
-- **Local variable clobbering**: function calls may overwrite caller's local variables.
-  Save values to globals before calling other functions when they must survive the call.
+- **Local variable clobbering**: on the cc5 5.10.x line a call deep in a chain could
+  overwrite a caller's local; the fix was to hold the value in a global across the call.
+  Not re-observed in majra on cyrius 6.x — see `docs/development/cyrius-quirks.md` §1
+  for the diagnosis recipe if it ever recurs.
 - **Fixup table cap**: on cc5 5.x (16384) and cc3 (8192) a program with more forward references than the table held failed with `fixup table full`; at the current 6.x pin the table starts at 1,048,576 and doubles on demand (64M ceiling), so the failure is `fixup table exceeds 64M entries` and no real program reaches it. If it ever does, split the entry point — reordering will not help. See `docs/development/cyrius-quirks.md` §2.
 
 ## License

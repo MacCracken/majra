@@ -2,6 +2,7 @@
 
 **Status:** 🔴 **OPEN — MEASURED** at majra **2.9.1** (latest tag at filing, worktree clean). The
 behaviour dates from **2.8.1**'s "evict only a bucket that has refilled to burst" change.
+**Re-checked:** 2026-10-15 at majra **2.11.0** — still open (no force-evict / key-cap call); scheduled as the headline of [`roadmap.md` § 2.12.0](../roadmap.md).
 **Filed:** 2026-09-26, by agnosai (the 2.0.10 bump from majra 2.7.2 → 2.9.1). The request is for a new
 opt-in call. It is not a request to revert 2.8.1, whose metering fix is right.
 **Severity:** P2 for a consumer that bounds limiter memory under key-spraying. The memory is still

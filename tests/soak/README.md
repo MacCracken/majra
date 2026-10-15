@@ -22,24 +22,21 @@ on success / non-zero on invariant violation.
 
 | File              | Surface                                                  | Load |
 |-------------------|----------------------------------------------------------|------|
-| `soak_queue`      | ManagedQueue lifecycle (enqueue, priority dequeue, complete, invariants) | 1000 rounds × 5 jobs = 5k ops |
+| `soak_queue`      | ManagedQueue lifecycle (enqueue, priority dequeue, complete, invariants) | 100,000 rounds × 5 jobs = 500k ops |
 | `soak_pubsub`     | pubsub_new + topic-map growth + subscribe + publish dispatch | 2000 distinct topics |
 | `soak_relay`      | Relay dedup correctness + eviction under max_dedup cap   | 20 senders × 50 msgs × 2 passes + 200-sender eviction phase |
 | `soak_heartbeat`  | Register/heartbeat/deregister cycles + auto-eviction     | 100 nodes × 20 heartbeats + offline-timeout phase |
 
 ## Known limitations
 
-- Iteration counts are chosen to stay within the bump allocator's
-  working set. `cyrius alloc()` doesn't free, and several majra
-  paths (e.g. `_next_job_key` → `str_from_int` in `src/queue.cyr`)
-  leak small buffers per operation. A proper multi-million-op soak
-  will need either a freelist-backed key alloc or arena reset hooks
-  — tracked as follow-up work.
-- Map-size invariants that depend on Str-keyed hashmaps are affected
-  by an upstream cyrius stdlib bug (`hash_str` treats Str struct
-  pointers as cstrs, ~3% collision rate). Soak tests report these
-  counts informationally and assert on counter-backed invariants
-  instead. See `cyrius/docs/development/issues/stdlib-hashmap-str-key-collision.md`.
+- The pubsub, relay and heartbeat soaks are sized to finish in seconds,
+  not to probe memory growth. `soak_queue` was the one held down by a
+  per-operation leak — job keys came from the bump allocator, capping it
+  at 1,000 rounds — and has run 100,000 since 2.8.1 moved them to a
+  freelist block that `queue_item_free` releases.
+- The Str-keyed job map hashes by content (`map_new_str`, cyrius-quirks
+  §3). The ~3% `hash_str` collision majra's soaks surfaced in 2026-04
+  is fixed upstream; that cyrius issue is archived.
 
 ## Adding a new soak target
 

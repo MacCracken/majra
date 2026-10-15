@@ -8,8 +8,8 @@
 #     (the job-tracking map must not retain completed jobs)
 #
 # Usage:
-#   cyrius build tests/soak/soak_queue.cyr build/soak_queue
-#   ./build/soak_queue      # default: 10_000 rounds × 5 jobs = 50k ops
+#   cyrius build --no-deps tests/soak/soak_queue.cyr build/soak_queue
+#   ./build/soak_queue      # 100,000 rounds × 5 jobs = 500k ops
 #
 # Not in default CI — run on-demand before releases.
 

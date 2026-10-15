@@ -19,7 +19,7 @@ For *the dev workflow*, see CLAUDE.md § Process.
 
 ### 1. Local variable clobbering across deep call chains
 
-A local's value can look wrong after returning from a nested call. Rare under cc5 at the 5.10.x line, much rarer than cc3 / early-cc5, but still real on deep chains.
+A local's value can look wrong after returning from a nested call. Seen under cc3 / early cc5 and, rarely, at cc5 5.10.x on deep chains; **not re-observed in majra on the cyrius 6.x line** (through 6.7.9). Kept for the diagnosis recipe.
 
 **Workaround**: promote the local to a module-level global. The pattern is well-trodden — sigil uses it heavily for AES / SHA / ed25519 state; majra reaches for it sparingly because most call chains aren't deep enough to trip it.
 
@@ -40,7 +40,7 @@ cyrius 5.4.14+ added `map_new_str()` + content-derived `hash_str_v` to fix a `St
 - `map_new()` for cstr keys (legacy / default).
 - `map_new_str()` for `Str`-struct keys.
 
-`src/queue.cyr` is the canonical `map_new_str()` user (managed-queue job map keyed on `str_from_int(id)`). Other modules keyed on cstrs keep `map_new()`.
+`src/queue.cyr` is the canonical `map_new_str()` user (the managed-queue job map, keyed on the job-key `Str` that `_next_job_key` builds in a freelist block). Other modules keyed on cstrs keep `map_new()`.
 
 Picking the wrong one compiles cleanly but corrupts at runtime via silent collisions. Match the key type at the call site.
 

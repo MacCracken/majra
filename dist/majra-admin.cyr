@@ -2423,9 +2423,9 @@ fn mq_new(name, max_concurrent) {
     var mq = fl_alloc(64);
     store64(mq, cpq_new());
     # map_new_str: keys are job-key Strs (_next_job_key), hashed by content.
-    # Cyrius 5.4.14+ fixed the collision bug where the legacy map_new()
-    # cstr hash walked Str struct bytes as chars. See docs/development
-    # /roadmap.md and cyrius/.../stdlib-hashmap-str-key-collision.md.
+    # map_new()'s cstr hash would walk the Str header's bytes as chars and
+    # collide (~3%); cyrius 5.4.14 added map_new_str for exactly this. See
+    # docs/development/cyrius-quirks.md §3.
     store64(mq + 8, map_new_str());
     store64(mq + 16, mutex_new());
     store64(mq + 24, name);

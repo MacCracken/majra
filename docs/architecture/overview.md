@@ -6,11 +6,11 @@ is a `.cyr` file included via `include` directives in dependency order.
 ## Module Map
 
 ```
-majra (v2.7.3, ~7,500 lines across 22 modules; state.md's `src/` total of 8,212 lines / 23 files also counts the 680-line src/main.cyr self-test entry)
+majra (v2.11.0, ~10,100 lines across 22 modules; state.md's `src/` total of 11,008 lines / 23 files also counts the 872-line src/main.cyr self-test entry)
 │
 │ ── Core (always included) ────────────────────
 ├── error           Error codes (enum) + result helpers
-├── counter         Mutex-protected i64 counter
+├── counter         Lock-free atomic counter + majra's freelist vec / map helpers
 ├── envelope        Universal message envelope (UUID, routing, payload)
 ├── namespace       Multi-tenant scoping (topic, key, node_id prefixing)
 ├── metrics         22-slot function pointer vtable for observability
@@ -61,20 +61,22 @@ Four bundles are produced by `cyrius distlib`. Consumers pick the smallest profi
 | `dist/majra-admin.cyr`    | `[lib.admin]`     | 15 core + `admin`  | no  | Operator-facing HTTP observability endpoint |
 | `dist/majra-backends.cyr` | `[lib.backends]`  | 15 core + signed + admin + 4 network modules (ipc_encrypted, ws, redis_backend, postgres_backend) + patra_queue (durable, file-backed) | **yes** | Full cross-process distribution with durability |
 
-"Needs sigil?" means majra's own code calls into it. Every `.deps` sidecar names `sigil` regardless — the core one because `sigil` sits in the declared `[deps].stdlib` list it mirrors, the admin one transitively via sandhi → tls — so a consumer provisioning from any sidecar gets it in `lib/`.
+"Needs sigil?" means majra's own code calls into it. Since cyrius 6.6.18 each `.deps` sidecar is computed from what its bundle actually includes rather than mirroring `[deps].stdlib`, so only the signed sidecar names `sigil`; the admin and backends sidecars name `sandhi`, which reaches it (sandhi → tls), and the core sidecar does not name it at all. The per-profile leaf lists are in the README's *Using majra as a dependency*.
 
 ## Design Principles
 
 1. **Zero core dependencies** — `dist/majra.cyr` pulls nothing beyond the Cyrius stdlib. Richer profiles (`signed`, `backends`) reach sigil — first-party, and since 2.6.8 a folded cyrius stdlib module rather than a git dep, no external crates.
-2. **Thread-safe by default** — concurrent variants use mutex + futex.
-3. **Globals for cross-call state** — cc5 is better than cc3, but deeply nested
-   call chains can still clobber locals. `postgres_backend` still promotes its
-   connect-path values to globals (serialised behind `_pg_connect_mtx`).
-   `relay` and `barrier` **no longer do**: their file-scope globals (relay's
-   inputs and dedup state, barrier's results) were removed at 2.6.0 and 2.6.9
-   respectively, because a global serialised only by a per-object mutex is
-   clobbered by a second object using a different lock.
-   Prefer a caller-provided out-buffer.
+2. **Thread-safe by default** — concurrent variants use the stdlib mutex, a
+   futex where a caller blocks, and atomics for counters, job ids and relay
+   refcounts.
+3. **No per-call state in globals** — a file-scope global serialised only by a
+   per-object mutex is clobbered by a second object using a different lock.
+   `relay` and `barrier` dropped theirs at 2.6.0 and 2.6.9, and
+   `postgres_backend` its connect-path globals and `_pg_connect_mtx` at 2.8.1;
+   they were a workaround for cc3/cc5 local clobbering that cyrius 6.x has not
+   shown in majra. Prefer locals and caller-provided out-buffers. The one
+   holdout is `metrics`, whose four hooks with a third or fourth argument still
+   pass it through `_metrics_arg3` / `_metrics_arg4` (see the roadmap).
 4. **Fixed-point math** — no floating point; token buckets use x1000 scaling.
 5. **Eviction where it is asked for** — the keyed collections expose TTL
    eviction (`ratelimit_evict_stale`, `sliding_window_evict_stale`,
@@ -106,9 +108,9 @@ Four bundles are produced by `cyrius distlib`. Consumers pick the smallest profi
 ## Data Flow
 
 ```
-Producer ──► DirectChannel ──────────────────────► chan_recv     (send only ~390 ns/op, 2.7.3)
+Producer ──► DirectChannel ──────────────────────► chan_recv     (send only ~82 ns/op, 2.11.0)
 Producer ──► HashedChannel ──► topic hash lookup ► chan_recv
-Producer ──► PubSub ──► exact O(1) + pattern ───► chan_recv     (publish + recv ~1.1 us/op, 2.7.3)
+Producer ──► PubSub ──► exact O(1) + pattern ───► chan_recv     (publish + recv ~350 ns/op, 2.11.0)
                                                 └──► consumer accept loop ──► majra_ws_send_text ──► WebSocket clients
 
 Producer ──► ManagedQueue ──► priority dequeue ──► Consumer
@@ -121,7 +123,7 @@ FleetQueue ──► select_node (least loaded) ──► ManagedQueue on target
             ──► rebalance() ──► steal from overloaded ──► redistribute
 ```
 
-The two latencies are 5-trial medians from the 2.7.3 `cyrius bench` run: `direct_channel_send` (send only, no receive) and `pubsub_1sub_publish` (publish plus one `chan_recv`), so they are not a like-for-like comparison (see `benches/bench_all.bcyr`); point-in-time perf snapshots live in `docs/benchmarks/`.
+The two latencies are 9-trial medians from the 2.11.0 `cyrius bench` run (the `bench-history.csv` row): `direct_channel_send` (send only, no receive) and `pubsub_1sub_publish` (publish plus one `chan_recv`), so they are not a like-for-like comparison (see `benches/bench_all.bcyr`); point-in-time perf snapshots live in `docs/benchmarks/`.
 
 The WebSocket leg is consumer-owned: `ws` ships framing primitives only — there is no pub/sub → WebSocket loop in majra, and `ws_bridge_new` is a configuration holder with accessors (see the `src/ws.cyr` header).
 

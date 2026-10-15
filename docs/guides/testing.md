@@ -23,6 +23,9 @@ cyrius build --no-deps tests/test_core.tcyr        build/test_core        && ./b
 cyrius build --no-deps tests/test_backends.tcyr    build/test_backends    && ./build/test_backends
 cyrius build --no-deps tests/test_patra_queue.tcyr build/test_patra_queue && ./build/test_patra_queue
 
+# The four above, then the benches, in one go (exits non-zero if any suite fails)
+sh tests/test.sh
+
 # Live integration tests (requires Redis on :6379, PostgreSQL on :5432)
 cyrius build --no-deps tests/test_live.tcyr build/test_live && ./build/test_live
 

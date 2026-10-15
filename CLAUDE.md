@@ -68,7 +68,7 @@ Full test matrix + soak + fuzz + bench commands in [`docs/guides/testing.md`](do
 - **No magic.** Every operation measurable, auditable, traceable. If you can't measure it, you can't ship it.
 - **Numbers don't lie.** Benchmark before claiming perf. Test before claiming correctness. `0 failed` or it didn't pass.
 - **`fl_alloc` for structs, `alloc` for hashmaps.** Freelist supports individual free; bump allocator is for long-lived collections.
-- **Reach for globals when cc5 clobbers locals.** Rare under 5.10.x but real on deep call chains — see [`docs/development/cyrius-quirks.md`](docs/development/cyrius-quirks.md) §1.
+- **Reach for globals if the compiler clobbers a local on a deep call chain.** Last seen under cc5 5.10.x, not re-observed in majra on cyrius 6.x — the diagnosis recipe is in [`docs/development/cyrius-quirks.md`](docs/development/cyrius-quirks.md) §1.
 - **The dist bundles ARE the distribution contract.** Four `cyrius distlib` profiles — every tagged release commits all four. CI's freshness gate fails on stale diff.
 
 ## Rules (Hard Constraints)
@@ -157,9 +157,9 @@ How we write majra code in cyrius. For *compiler gotchas* (clobbering, fixup cap
 
 - All struct fields are 8 bytes (`i64`), accessed via `load64` / `store64` with explicit offset.
 - Heap allocation: `fl_alloc()` / `fl_free()` (freelist) for structs with explicit lifetimes; `alloc()` for long-lived collections (hashmaps, vec internals, anything that lives until process exit).
-- `match` is reserved — don't use as a variable name.
-- `return;` without value is invalid — always `return 0;`.
-- All `var` declarations are function-scoped — no block scoping.
+- Reserved words a name cannot use: `match`, plus the 6.7 line's `trait`, `const`, `true`, `false`, `do`, `dyn` (`loop` is contextual — a keyword only as `loop {` at a statement's start).
+- Write `return 0;`, not a bare `return;` — a bare one compiles on cyrius 6.x (re-checked 6.6.0 → 6.7.9) but is refused in a `: bool` fn, and majra's functions return a value on every path (an older cyrius refused it outright).
+- `var` is **block-scoped** (re-checked at 6.7.9): a `var` declared inside `{ }` is undefined after the block, so declare at function level whatever the code after it reads.
 
 ## Docs
 
@@ -167,7 +167,7 @@ How we write majra code in cyrius. For *compiler gotchas* (clobbering, fixup cap
 - [`CHANGELOG.md`](CHANGELOG.md) — source of truth for shipped work.
 - [`docs/architecture/overview.md`](docs/architecture/overview.md) — system-level module map + data flow.
 - [`docs/architecture/`](docs/architecture/) — design notes about majra (numbered, never-renumbered). Empty beyond `overview.md` today; add an entry when a load-bearing majra invariant earns one. *Not* the place for "cyrius did X weird"-style notes — toolchain conventions live in this file's Cyrius Conventions section; toolchain-version-tied gotchas live in [`docs/development/dependency-watch.md`](docs/development/dependency-watch.md).
-- [`docs/development/roadmap.md`](docs/development/roadmap.md) — **forward-facing only**: Now / Next / Backlog / Waiting-on-upstream / Non-goals, each backlog entry naming the trigger that would promote it. Shipped work belongs in `CHANGELOG.md` and current state in `state.md`; when a roadmap item ships, delete it rather than converting it into a shipped entry. (It had accumulated ~100 lines of per-release "Recently shipped" sections — a shadow changelog — which were removed at 2.6.9.)
+- [`docs/development/roadmap.md`](docs/development/roadmap.md) — **forward-facing only**: items scheduled against release targets (next MINOR / its PATCHes / later MINORs / 3.0.0), plus Waiting-on-upstream and Non-goals, each item naming the trigger that moves it. Shipped work belongs in `CHANGELOG.md` and current state in `state.md`; when a roadmap item ships, delete it rather than converting it into a shipped entry. (It had accumulated ~100 lines of per-release "Recently shipped" sections — a shadow changelog — which were removed at 2.6.9.)
 - [`docs/development/state.md`](docs/development/state.md) — **live state, refreshed every release.**
 - [`docs/development/dependency-watch.md`](docs/development/dependency-watch.md) — per-dep version tracking, upgrade rationale.
 - [`docs/development/cyrius-quirks.md`](docs/development/cyrius-quirks.md) — toolchain gotchas affecting how majra is written. Strikethrough-and-archive resolved entries when the cyrius pin moves.
