@@ -1022,9 +1022,10 @@ fn test_ratelimit_evict_reclaims() {
     # ⚠ The bucket probe must match the TokenBucket's real size, because
     # fl_alloc buckets by size class — a mismatched probe lands in a different
     # class and cannot observe the recycled block. The bucket grew 16 -> 32
-    # bytes at 2.7.0 when it gained per-key allowed/rejected counters.
+    # bytes at 2.7.0 (per-key allowed/rejected counters) and 32 -> 40 at 2.12.0
+    # (the last-seen clock ratelimit_evict_to ranks by).
     var reused_key = fl_alloc(41);
-    var reused_bucket = fl_alloc(32);
+    var reused_bucket = fl_alloc(40);
     assert_eq(reused_key, owned_key, "evict returned the key block to the freelist");
     assert_eq(reused_bucket, owned_bucket, "evict returned the bucket to the freelist");
     assert_eq(load64(ratelimit_stats(rl) + 24), 1, "evict is counted in stats");
@@ -3863,6 +3864,327 @@ fn test_mq_concurrency_cap_threaded() {
 # Main
 # =============================================================================
 
+# --- 2.12.0: evict-to-count holds a hard key cap (agnosai, 2026-09-26) -------
+
+fn _t12_has(rl, key) {
+    var s = ratelimit_stats_for_key(rl, key);
+    if (s == 0) { return 0; }
+    ratelimit_stats_free(s);
+    return 1;
+}
+
+# The issue's repro: 20,000 one-request keys at 1 req/s, burst 200.
+fn test_ratelimit_evict_to_holds_cap() {
+    var rl = ratelimit_new(1000, 200);
+    var i = 0;
+    while (i < 20000) { ratelimit_check(rl, _t8_intkey(i)); i = i + 1; }
+    assert_eq(ratelimit_key_count(rl), 20000, "spray: 20,000 keys tracked");
+    assert_eq(ratelimit_evict_stale(rl, 0), 0,
+      "spray: evict_stale still keeps every spent bucket (the 2.8.1 guarantee)");
+    assert_eq(ratelimit_evict_to(rl, 4096), 15904, "spray: evict_to trims the excess");
+    assert_eq(ratelimit_key_count(rl), 4096, "spray: the cap holds");
+    assert_eq(_t12_has(rl, _t8_intkey(0)), 0, "spray: the oldest key went");
+    assert_eq(_t12_has(rl, _t8_intkey(19999)), 1, "spray: the newest key stayed");
+    var kept = 0;
+    i = 15904;
+    while (i < 20000) { kept = kept + _t12_has(rl, _t8_intkey(i)); i = i + 1; }
+    assert_eq(kept, 4096, "spray: the survivors are exactly the 4,096 most recently seen");
+    assert_eq(ratelimit_evict_to(rl, 4096), 0, "spray: at the cap there is nothing to evict");
+    assert_eq(ratelimit_evict_to(rl, 0), 4096, "spray: evict_to(0) evicts all 20,000 in total");
+    assert_eq(ratelimit_key_count(rl), 0, "spray: no keys left");
+    var st = ratelimit_stats(rl);
+    assert_eq(load64(st + 24), 20000, "spray: forced evictions count in total_evicted");
+    ratelimit_stats_free(st);
+    var rn = ratelimit_new(1000, 1);
+    ratelimit_check(rn, "x");
+    ratelimit_check(rn, "y");
+    assert_eq(ratelimit_evict_to(rn, 0 - 5), 2, "a negative max_keys counts as 0");
+    println("  ratelimit_evict_to_holds_cap: ok");
+}
+
+fn test_ratelimit_evict_to_keeps_hot_key() {
+    # rate 0: a drained bucket never refills, so its credited-until clock never
+    # moves after the first request. Ranked by that clock, the key being
+    # rejected RIGHT NOW would look oldest and be evicted into a fresh burst.
+    var rl = ratelimit_new(0, 1);
+    assert_eq(ratelimit_check(rl, "hot"), 1, "hot: first request allowed");
+    var i = 0;
+    while (i < 100) { ratelimit_check(rl, _t8_intkey(700000 + i)); i = i + 1; }
+    assert_eq(ratelimit_check(rl, "hot"), 0, "hot: drained, rejected");
+    assert_eq(ratelimit_evict_to(rl, 1), 100, "hot: the 100 sprayed keys go");
+    assert_eq(_t12_has(rl, "hot"), 1, "hot: the most recently seen key stays");
+    assert_eq(ratelimit_check(rl, "hot"), 0, "hot: and is still rejected after the trim");
+
+    var rl2 = ratelimit_new(1000, 5);
+    ratelimit_check(rl2, "a");
+    _majra_sleep_ns(1000000);
+    ratelimit_check(rl2, "b");
+    _majra_sleep_ns(1000000);
+    ratelimit_check(rl2, "c");
+    _majra_sleep_ns(1000000);
+    ratelimit_check(rl2, "a");
+    assert_eq(ratelimit_evict_to(rl2, 2), 1, "lru: one over the cap");
+    assert_eq(_t12_has(rl2, "b"), 0, "lru: b, the least recently seen, went");
+    assert_eq(_t12_has(rl2, "a") + _t12_has(rl2, "c"), 2, "lru: a (re-seen) and c stayed");
+
+    # Documented on the call: a force-evicted drained key gets a fresh burst.
+    var rl3 = ratelimit_new(1000, 3);
+    i = 0;
+    while (i < 3) { ratelimit_check(rl3, "c"); i = i + 1; }
+    assert_eq(ratelimit_check(rl3, "c"), 0, "lossy: drained");
+    assert_eq(ratelimit_evict_to(rl3, 0), 1, "lossy: force-evicted");
+    assert_eq(ratelimit_check(rl3, "c"), 1, "lossy: the next check starts a fresh burst");
+    println("  ratelimit_evict_to_keeps_hot_key: ok");
+}
+
+# One limiter-map entry whose value is an 8-byte struct with its last-seen
+# clock at offset 0.
+fn _t12_entry(m, key, seen) {
+    var v = fl_alloc(8);
+    store64(v, seen);
+    map_set(m, _ratelimit_key_own(key), v);
+    return 0;
+}
+
+fn test_ratelimit_evict_lru_ties() {
+    var m = map_new();
+    _t12_entry(m, "a", 1);
+    _t12_entry(m, "b", 1);
+    _t12_entry(m, "c", 2);
+    _t12_entry(m, "d", 2);
+    _t12_entry(m, "e", 2);
+    _t12_entry(m, "f", 3);
+    assert_eq(_ratelimit_evict_lru(m, 2, 0, 12345), 4, "ties: evicts exactly the excess");
+    assert_eq(map_size(m), 2, "ties: two left");
+    assert(map_get(m, "a") == 0 && map_get(m, "b") == 0, "ties: both oldest went");
+    assert(map_get(m, "f") != 0, "ties: the newest stayed");
+    var mid = 0;
+    if (map_get(m, "c") != 0) { mid = mid + 1; }
+    if (map_get(m, "d") != 0) { mid = mid + 1; }
+    if (map_get(m, "e") != 0) { mid = mid + 1; }
+    assert_eq(mid, 1, "ties: one of the three tied at the cutoff stayed");
+
+    var m2 = map_new();
+    var i = 0;
+    while (i < 10) { _t12_entry(m2, _t8_intkey(900000 + i), 7); i = i + 1; }
+    assert_eq(_ratelimit_evict_lru(m2, 6, 0, 99), 4, "all tied: evicts exactly the excess");
+    assert_eq(map_size(m2), 6, "all tied: six left");
+    assert_eq(_ratelimit_evict_lru(m2, 6, 0, 99), 0, "at the cap: nothing evicted");
+    assert_eq(_ratelimit_evict_lru(m2, 60, 0, 99), 0, "under the cap: nothing evicted");
+
+    # Slot order is seeded per process, so the six-key case above only sometimes
+    # puts a tied entry ahead of an older one. With 40 / 40 / 20 at seen 1 / 2 / 3
+    # and a cap of 40, an eviction that took ties in slot order would keep one of
+    # the forty 1s almost surely.
+    var m3 = map_new();
+    i = 0;
+    while (i < 100) {
+        var sv = 1;
+        if (i >= 40) { sv = 2; }
+        if (i >= 80) { sv = 3; }
+        _t12_entry(m3, _t8_intkey(910000 + i), sv);
+        i = i + 1;
+    }
+    assert_eq(_ratelimit_evict_lru(m3, 40, 0, 7), 60, "ties at scale: evicts exactly the excess");
+    var e3 = map_entries(m3);
+    var by = fl_alloc(32);
+    store64(by + 8, 0);
+    store64(by + 16, 0);
+    store64(by + 24, 0);
+    i = 0;
+    while (i < map_cap(m3)) {
+        if (load64(e3 + i * 24 + 16) == 1) {
+            var sl = by + load64(load64(e3 + i * 24 + 8)) * 8;
+            store64(sl, load64(sl) + 1);
+        }
+        i = i + 1;
+    }
+    assert_eq(load64(by + 8), 0, "ties at scale: every entry older than the cutoff went");
+    assert_eq(load64(by + 16), 20, "ties at scale: half the cutoff ties stayed");
+    assert_eq(load64(by + 24), 20, "ties at scale: every newer entry stayed");
+    fl_free(by);
+
+    # The no-scratch fallback holds the cap in slot order.
+    var m4 = map_new();
+    i = 0;
+    while (i < 10) { _t12_entry(m4, _t8_intkey(920000 + i), i); i = i + 1; }
+    assert_eq(_ratelimit_evict_slot_order(m4, 4), 4, "fallback: evicts exactly the excess");
+    assert_eq(map_size(m4), 6, "fallback: six left");
+    println("  ratelimit_evict_lru_ties: ok");
+}
+
+fn _t12_isort(a, n) {
+    var i = 1;
+    while (i < n) {
+        var v = load64(a + i * 8);
+        var j = i - 1;
+        while (j >= 0 && load64(a + j * 8) > v) {
+            store64(a + (j + 1) * 8, load64(a + j * 8));
+            j = j - 1;
+        }
+        store64(a + (j + 1) * 8, v);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn test_ratelimit_select_matches_sort() {
+    var n = 64;
+    var src = fl_alloc(n * 8);
+    var tmp = fl_alloc(n * 8);
+    var srt = fl_alloc(n * 8);
+    var bad = 0;
+    var p = 0;
+    while (p < 4) {
+        var x = 77;
+        var i = 0;
+        while (i < n) {
+            var v = 0;
+            if (p == 0) {
+                x = x * 1103515245 + 12345;
+                v = ((x >> 16) & 0x7FFF) % 9;
+            } elif (p == 1) {
+                v = i;
+            } elif (p == 2) {
+                v = n - i;
+            } else {
+                v = 5;
+            }
+            store64(src + i * 8, v);
+            i = i + 1;
+        }
+        memcpy(srt, src, n * 8);
+        _t12_isort(srt, n);
+        var k = 0;
+        while (k < n) {
+            memcpy(tmp, src, n * 8);
+            if (_ratelimit_select(tmp, n, k, 1000 + k) != load64(srt + k * 8)) { bad = bad + 1; }
+            k = k + 1;
+        }
+        p = p + 1;
+    }
+    assert_eq(bad, 0, "select: every k-th smallest matches a sort (dups, ascending, descending, all-equal)");
+    fl_free(src);
+    fl_free(tmp);
+    fl_free(srt);
+    println("  ratelimit_select_matches_sort: ok");
+}
+
+fn test_sliding_window_evict_to_holds_cap() {
+    var sw = sliding_window_new(1, 10000000000);
+    assert_eq(sliding_window_check(sw, "hot"), 1, "sw hot: first request allowed");
+    var i = 0;
+    while (i < 1000) { sliding_window_check(sw, _t8_intkey(800000 + i)); i = i + 1; }
+    assert_eq(sliding_window_check(sw, "hot"), 0, "sw hot: at quota, rejected");
+    assert_eq(sliding_window_evict_stale(sw, 0), 0, "sw: the two-window floor keeps every sprayed key");
+    assert_eq(sliding_window_evict_to(sw, 1), 1000, "sw: evict_to trims the 1,000 sprayed keys");
+    assert_eq(sliding_window_key_count(sw), 1, "sw: the cap holds");
+    assert_eq(sliding_window_check(sw, "hot"), 0, "sw: the hot key stayed and is still rejected");
+    assert_eq(sliding_window_evict_to(sw, 0), 1, "sw: evict_to(0) empties it");
+    assert_eq(sliding_window_check(sw, "hot"), 1, "sw lossy: the next check starts a fresh quota");
+    println("  sliding_window_evict_to_holds_cap: ok");
+}
+
+# --- 2.12.0: the wide metrics hooks pass their arguments --------------------
+
+var _t12_m_a = 0;
+var _t12_m_b = 0;
+var _t12_m_c = 0;
+var _t12_m_d = 0;
+
+fn _t12_m_on3(a, b, c) {
+    _t12_m_a = a;
+    _t12_m_b = b;
+    _t12_m_c = c;
+    return 0;
+}
+
+fn _t12_m_on4(a, b, c, d) {
+    _t12_m_a = a;
+    _t12_m_b = b;
+    _t12_m_c = c;
+    _t12_m_d = d;
+    return 0;
+}
+
+# A pre-2.12.0 callback: two parameters, the rest read from the globals.
+fn _t12_m_legacy(a, b) {
+    _t12_m_a = a;
+    _t12_m_b = b;
+    _t12_m_c = _metrics_arg3;
+    _t12_m_d = _metrics_arg4;
+    return 0;
+}
+
+fn test_metrics_wide_hooks_get_arguments() {
+    var vt = noop_metrics();
+    store64(vt + 16, &_t12_m_on3);
+    store64(vt + 56, &_t12_m_on3);
+    store64(vt + 120, &_t12_m_on3);
+    store64(vt + 168, &_t12_m_on4);
+    var nm = "q";
+    metrics_queue_state_changed(vt, nm, 11, 12);
+    assert(_t12_m_a == nm, "metrics: state_changed name");
+    assert_eq(_t12_m_b, 11, "metrics: state_changed from");
+    assert_eq(_t12_m_c, 12, "metrics: state_changed to, as a parameter");
+    metrics_heartbeat_transition(vt, nm, 21, 22);
+    assert_eq(_t12_m_b * 100 + _t12_m_c, 2122, "metrics: heartbeat_transition from / to");
+    metrics_barrier_arrived(vt, nm, 3, 5);
+    assert_eq(_t12_m_b * 100 + _t12_m_c, 305, "metrics: barrier_arrived arrived / expected");
+    metrics_workflow_step_finished(vt, nm, 41, 7, 250);
+    assert_eq(_t12_m_b, 41, "metrics: step_finished step_id");
+    assert_eq(_t12_m_c, 7, "metrics: step_finished status, as a parameter");
+    assert_eq(_t12_m_d, 250, "metrics: step_finished duration_ms, as a parameter");
+
+    # Deprecated, still honoured: a two-parameter callback reading the globals.
+    store64(vt + 16, &_t12_m_legacy);
+    store64(vt + 168, &_t12_m_legacy);
+    metrics_queue_state_changed(vt, nm, 31, 32);
+    assert_eq(_t12_m_b * 100 + _t12_m_c, 3132, "metrics legacy: to via _metrics_arg3");
+    metrics_workflow_step_finished(vt, nm, 51, 8, 300);
+    assert_eq(_t12_m_c, 8, "metrics legacy: status via _metrics_arg3");
+    assert_eq(_t12_m_d, 300, "metrics legacy: duration via _metrics_arg4");
+
+    # The default no-op takes two parameters and sits in the wide slots too.
+    var nv = noop_metrics();
+    metrics_barrier_arrived(nv, nm, 1, 2);
+    metrics_workflow_step_finished(nv, nm, 1, 2, 3);
+    println("  metrics_wide_hooks_get_arguments: ok");
+}
+
+var _t12_mt_vt = 0;
+var _t12_mt_bad = 0;
+
+fn _t12_mt_check(name, arrived, expected) {
+    if (expected != arrived * 2) { atomic_fetch_add(&_t12_mt_bad, 1); }
+    return 0;
+}
+
+fn _t12_mt_worker(arg) {
+    var base = (load8(arg) - 48) * 1000000;
+    var i = 0;
+    while (i < 20000) {
+        metrics_barrier_arrived(_t12_mt_vt, "b", base + i, (base + i) * 2);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Through 2.11.0 the third argument crossed in `_metrics_arg3`, which another
+# thread could overwrite between the store and the callback's read.
+fn test_metrics_wide_hooks_threads() {
+    _t12_mt_vt = noop_metrics();
+    store64(_t12_mt_vt + 120, &_t12_mt_check);
+    _t12_mt_bad = 0;
+    var t1 = thread_create(&_t12_mt_worker, "1");
+    var t2 = thread_create(&_t12_mt_worker, "2");
+    var t3 = thread_create(&_t12_mt_worker, "3");
+    var t4 = thread_create(&_t12_mt_worker, "4");
+    thread_join(t1); thread_join(t2); thread_join(t3); thread_join(t4);
+    assert_eq(_t12_mt_bad, 0, "metrics threads: 80,000 dispatches, every callback got its own arguments");
+    println("  metrics_wide_hooks_threads: ok");
+}
+
 fn main() {
     alloc_init();
     fl_init();
@@ -3884,6 +4206,8 @@ fn main() {
     test_mq_take_queued_keeps_cancelled_handle();
     test_mq_job_key_returns_to_freelist();
     test_mq_metrics_dispatch();
+    test_metrics_wide_hooks_get_arguments();
+    test_metrics_wide_hooks_threads();
     test_cpq_dequeue_wait_park_and_wake();
     test_mq_concurrency_cap_threaded();
 
@@ -3955,6 +4279,11 @@ fn main() {
     test_sliding_window_huge_window_holds();
     test_sliding_window_evict_spares_active();
     test_ratelimit_churn_reclaims_tombstones();
+    test_ratelimit_evict_to_holds_cap();
+    test_ratelimit_evict_to_keeps_hot_key();
+    test_ratelimit_evict_lru_ties();
+    test_ratelimit_select_matches_sort();
+    test_sliding_window_evict_to_holds_cap();
     test_ratelimit_high_rate_refill();
 
     # Fleet

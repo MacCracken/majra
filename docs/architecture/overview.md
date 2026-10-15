@@ -6,7 +6,7 @@ is a `.cyr` file included via `include` directives in dependency order.
 ## Module Map
 
 ```
-majra (v2.11.0, ~10,100 lines across 22 modules; state.md's `src/` total of 11,008 lines / 23 files also counts the 872-line src/main.cyr self-test entry)
+majra (v2.12.0, ~10,350 lines across 22 modules; state.md's `src/` total of 11,227 lines / 23 files also counts the 874-line src/main.cyr self-test entry)
 │
 │ ── Core (always included) ────────────────────
 ├── error           Error codes (enum) + result helpers
@@ -23,6 +23,7 @@ majra (v2.11.0, ~10,100 lines across 22 modules; state.md's `src/` total of 11,0
 ├── barrier         N-way barrier (sync + concurrent with futex)
 ├── heartbeat       FSM health tracker + GPU telemetry + fleet stats
 ├── ratelimit       Token bucket + sliding window (fixed-point math)
+│                   TTL sweeps + an LRU key cap (evict_to, 2.12.0)
 │
 │ ── Networking (ipc_encrypted, ws: [lib.backends] only) ─
 ├── ipc             Unix domain socket framing (4-byte BE length prefix)
@@ -74,13 +75,16 @@ Four bundles are produced by `cyrius distlib`. Consumers pick the smallest profi
    `relay` and `barrier` dropped theirs at 2.6.0 and 2.6.9, and
    `postgres_backend` its connect-path globals and `_pg_connect_mtx` at 2.8.1;
    they were a workaround for cc3/cc5 local clobbering that cyrius 6.x has not
-   shown in majra. Prefer locals and caller-provided out-buffers. The one
-   holdout is `metrics`, whose four hooks with a third or fourth argument still
-   pass it through `_metrics_arg3` / `_metrics_arg4` (see the roadmap).
+   shown in majra. Prefer locals and caller-provided out-buffers. `metrics`
+   was the last holdout: its four hooks with a third or fourth argument passed
+   it through `_metrics_arg3` / `_metrics_arg4` until 2.12.0, and now pass it as
+   a parameter (the globals are still written, deprecated, until 3.0.0).
 4. **Fixed-point math** — no floating point; token buckets use x1000 scaling.
 5. **Eviction where it is asked for** — the keyed collections expose TTL
    eviction (`ratelimit_evict_stale`, `sliding_window_evict_stale`,
-   `relay_evict_stale_dedup`), but **the caller must schedule it**; only
+   `relay_evict_stale_dedup`), and the two limiters a count cap
+   (`ratelimit_evict_to`, `sliding_window_evict_to`, least recently seen
+   first, lossy — 2.12.0), but **the caller must schedule it**; only
    heartbeat evicts autonomously, via `eviction_cycles`. Pubsub releases
    subscribers on explicit `pubsub_unsubscribe`, or bounds them per-subscriber
    through a `PUBSUB_LAG_*` policy.

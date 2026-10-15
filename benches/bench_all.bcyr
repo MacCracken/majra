@@ -211,6 +211,33 @@ fn main() {
     bench_batch_stop(b, N);
     vec_push(benches, b);
 
+    # --- RateLimit evict_to: one pressure sweep, agnosai's shape — 256 fresh
+    # keys land on a limiter held at 4,096, and the sweep trims them back.
+    # Per sweep; the 256 inserts sit outside the timed window. ---
+    var erl = ratelimit_new(1000, 200);
+    var ekeys = vec_new();
+    i = 0;
+    while (i < 4096 + 100 * 256) {
+        vec_push(ekeys, str_cstr(str_from_int(i)));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4096) { ratelimit_check(erl, vec_get(ekeys, i)); i = i + 1; }
+    b = bench_new("ratelimit_evict_to");
+    var round = 0;
+    while (round < 100) {
+        var j = 0;
+        while (j < 256) {
+            ratelimit_check(erl, vec_get(ekeys, 4096 + round * 256 + j));
+            j = j + 1;
+        }
+        bench_start(b);
+        ratelimit_evict_to(erl, 4096);
+        bench_stop(b);
+        round = round + 1;
+    }
+    vec_push(benches, b);
+
     # --- Relay send ---
     var relay = relay_new("bench-node");
     b = bench_new("relay_send");

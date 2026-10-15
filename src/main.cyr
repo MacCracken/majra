@@ -243,6 +243,8 @@ fn test_ratelimit() {
     assert_eq(sliding_window_key_count(swn), 0, "sw null key created no entry");
     assert_eq(ratelimit_evict_stale(0, 0), 0, "null rl evict");
     assert_eq(sliding_window_evict_stale(0, 0), 0, "null sw evict");
+    assert_eq(ratelimit_evict_to(0, 0), 0, "null rl evict_to");
+    assert_eq(sliding_window_evict_to(0, 0), 0, "null sw evict_to");
     # The guards must not have eaten a real key's first check.
     assert_eq(ratelimit_check(rln, "k"), 1, "rl real key still allowed after null probes");
 

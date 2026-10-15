@@ -5,18 +5,120 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.12.0] - 2026-10-15
+
+**A rate-limiter key cap that holds under key-spraying, and metrics hooks that pass their
+arguments.** The two 2.12.0 roadmap items. Additive: two new public functions, no signature,
+wire or bundle-profile change, and existing code compiles unchanged. **1,560 assertions**
+(core 205 · expanded 727 · backends 557 · patra-queue 71), natively and cross-built under
+`qemu-aarch64`; the expanded suite looped 100× natively and 50× under qemu with 0 failures,
+and again 50× / 25× after the eviction pass was restructured; fuzz and the four soaks clean.
+Sidecars unchanged.
+
+### Added
+
+- **`ratelimit_evict_to(rl, max_keys)`** — evicts the least-recently-seen buckets until at most
+  `max_keys` remain, regardless of fill; returns the count, which also lands in
+  `ratelimit_stats`' `total_evicted`. Closes agnosai's
+  [issue](docs/development/issues/archived/2026-09-26-agnosai-ratelimit-no-way-to-enforce-a-key-cap.md):
+  since 2.8.1 `ratelimit_evict_stale` evicts only buckets that have refilled to burst, so a
+  key that spent one token is unevictable for `1/rate` seconds and a client minting a key per
+  request outgrew agnosai's 4,096-key cap to 72,447 at 1 req/s. On the issue's repro (20,000
+  one-request keys) `ratelimit_evict_stale(rl, 0)` still evicts 0, `ratelimit_evict_to(rl,
+  4096)` evicts 15,904 and keeps exactly the 4,096 most recently seen, and
+  `ratelimit_evict_to(rl, 0)` takes the rest.
+  - **Option 2 of the issue, not option 1.** A count is the invariant a pressure sweep holds,
+    and oldest-first keeps the keys being metered: a key hammered right now is the most
+    recently seen and survives, where a force variant of `evict_stale(rl, 0)` would have
+    handed it a fresh burst on every sweep.
+  - ⚠ **Lossy by design**, and documented on the call: a partly drained bucket evicted here
+    gets a fresh full burst at its next check. Call it from a key-count check under memory
+    pressure; keep `ratelimit_evict_stale`, which is unchanged and lossless, on the idle timer.
+  - Ranked by a new per-bucket **last-seen clock** stamped on every check (TokenBucket grows
+    32 → 40 bytes; the layout is internal). `last_access_ns` would not do: it lags the last
+    request by any fractional credit, and on a rate-0 limiter a drained bucket's never moves,
+    so the key being rejected right now would rank oldest.
+  - Cost: one walk of the slot array (recording each live entry's clock and slot), a
+    quickselect over the clocks, and an eviction pass over the recorded slots only — the
+    stdlib grows the slot array to several times the live count under churn (16,384 slots
+    for 4,352 keys in the bench). Scratch is one `fl_alloc` of 16 bytes per key, released
+    before return; if it cannot be allocated the sweep evicts in slot order, which still
+    holds the cap. The pivot is pseudo-random, so a caller-chosen key set cannot make a sweep
+    quadratic; ties at the cutoff never over-evict. Measured at 275 µs per sweep trimming
+    4,352 keys to 4,096 (the new `ratelimit_evict_to` bench, 9-trial median) — about 1.1 µs
+    per evicted key, below the ~1.5 µs `ratelimit_check` that created it. A first cut that walked the full slot
+    array twice measured ~320 µs. An intrusive LRU list would make a sweep O(excess), but at
+    the price of a list update on every check and 16 more bytes per key; not taken while the
+    sweep stays cheaper than the traffic it trims.
+- **`sliding_window_evict_to(sw, max_keys)`** — the same call for the sliding-window limiter,
+  whose `sliding_window_evict_stale` two-window floor has the identical gap (a one-request
+  key stays for two windows). Same ranking (a last-seen clock; WindowCounter 24 → 32 bytes),
+  same ⚠: an evicted key's next check starts a fresh window with its full quota. Not asked
+  for by the issue; shipped with it so the twin does not keep the gap.
+- `_ratelimit_select` / `_ratelimit_evict_lru` / `_ratelimit_evict_slot_order` (internal) —
+  the selection, the eviction pass and its no-scratch fallback, shared by both limiters.
+
+### Changed
+
+- **Metrics: the four wider hooks pass every argument.** `metrics_queue_state_changed`,
+  `metrics_heartbeat_transition`, `metrics_barrier_arrived` and
+  `metrics_workflow_step_finished` dispatched through `fncall2` and parked their third and
+  fourth arguments in `_metrics_arg3` / `_metrics_arg4` — unsynchronised file-scope globals
+  that two threads dispatching at once overwrote between the store and the callback's read.
+  A LOW finding of the [2026-08-22 pass-2 audit](docs/audit/2026-08-22-audit-pass2.md) that
+  was never fixed or scheduled until the 2.11.0 doc sweep found it. They now dispatch through
+  `fncall3` / `fncall4`, so a callback takes the values as parameters. A callback may still
+  declare fewer parameters than its slot passes (the default no-op takes two), and the
+  globals are still written before each call, so an existing callback that reads them keeps
+  working single-threaded.
+
+### Deprecated
+
+- `_metrics_arg3` / `_metrics_arg4` — take the value as a callback parameter instead.
+  Removal at 3.0.0 ([`semver.md`](docs/development/semver.md) § Deprecations,
+  [`roadmap.md`](docs/development/roadmap.md) § 3.0.0).
+
+### Tests
+
+- Expanded suite 668 → 727: the issue's 20,000-key repro and the cap it holds; LRU order,
+  including the rate-0 hot key that ranking by `last_access_ns` would evict; the fresh burst
+  after a forced eviction; ties at the cutoff (a 100-entry case, since the hashmap's seeded
+  slot order made a six-key case catch an over-evicting walk only some of the time); the
+  no-scratch fallback; `_ratelimit_select` against a sort on duplicate-heavy, ascending,
+  descending and all-equal input; the sliding-window twin; the wider hooks' parameters, the legacy global readers, and
+  80,000 dispatches from four threads with every callback seeing its own arguments. The
+  bucket-reuse probe in `test_ratelimit_evict_reclaims` follows the bucket to 40 bytes. Core
+  203 → 205 (null-handle `*_evict_to`).
+- Every new test was mutation-checked: ranking by `last_access_ns` or by `window_start_ns`,
+  dropping the last-seen stamp, over-evicting ties, an off-by-one in the select, and
+  reverting the hooks to `fncall2` each turn at least one assertion red.
+
+### Benchmarks
+
+- Interleaved A/B against the 2.11.0 tree, 9 trials each, medians: every shared target
+  within noise — `ratelimit_check` 1,535 → 1,533 ns, so the last-seen store on every check
+  does not show. New target `ratelimit_evict_to`, 275 µs per sweep. `bench-history.csv` gains
+  the 2.12.0 row and the new column (empty for earlier rows).
+
+### Docs
+
+- The agnosai issue is archived with its resolution; both roadmap items are deleted, and the
+  roadmap's next MINOR is now trigger-gated (nothing has fired). `semver.md` gains the
+  metrics deprecation; `threat-model.md`, `SECURITY.md` and `overview.md` describe the key
+  cap; `state.md`, `testing.md`, `README.md` and `doc-health.md` re-measured.
+
+### Roadmap and doc sweep (on `main` after the 2.11.0 tag)
 
 **Roadmap re-organised and a repo-wide doc sweep.** No code change: `src/queue.cyr`
 re-points one comment, so each bundle moves by three comment lines; sidecars unchanged.
 All four suites pass (203 · 668 · 557 · 71).
 
-### Roadmap
+#### Roadmap
 
 - Re-checked every open item against the 2.11.0 tree and, for upstream items, the latest
   **tagged** cyrius (6.7.11) and sigil (3.13.12), then scheduled them by release target:
-  **2.12.0** (rate-limiter force-evict for agnosai's key cap; metrics hook arguments),
-  **2.12.x** (aarch64 run lane, agnos-portable suites, pin move past 6.7.9, retiring
+  **2.12.0** (rate-limiter force-evict for agnosai's key cap; metrics hook arguments — both
+  shipped above), **2.12.x** (aarch64 run lane, agnos-portable suites, pin move past 6.7.9, retiring
   `_majra_map_compact`), **later MINORs** (PostgreSQL SCRAM + `SSLRequest`, WebSocket
   pub/sub bridge, QUIC, shared-memory IPC) and **3.0.0** (the bare `ERR_*` aliases, the
   metrics globals).
@@ -26,10 +128,10 @@ All four suites pass (203 · 668 · 557 · 71).
 - **New item, found by the sweep:** `src/metrics.cyr` still passes the third / fourth
   argument of four hooks through the unsynchronised globals `_metrics_arg3` /
   `_metrics_arg4` — a LOW finding from the 2026-08-22 pass-2 audit that was never fixed
-  or scheduled. Now 2.12.0 (dispatch through `fncall3` / `fncall4`), with the globals'
-  removal at 3.0.0.
+  or scheduled. Scheduled for 2.12.0 with the globals' removal at 3.0.0, and fixed in this
+  release — see Changed above.
 
-### Docs
+#### Docs
 
 - `README.md`, `docs/architecture/overview.md`: line counts and module notes re-measured
   at 2.11.0; the sidecar description matches the computed sidecars (only `signed` names
@@ -48,7 +150,7 @@ All four suites pass (203 · 668 · 557 · 71).
   re-anchored. The soak README's two "known limitations" were both resolved (job keys on
   a freelist since 2.8.1; the Str-key hash collision fixed upstream).
 
-### Tests
+#### Tests
 
 - `tests/test.sh` builds with `--no-deps`, runs the patra-queue suite it had skipped, and
   fails if any of the four suites fails (it ignored the backends result).
@@ -3272,7 +3374,7 @@ refresh libro did in its 1.1.0 → 2.0 arc, catching majra up.
 - `error` — Shared error types (MajraError, IpcError)
 - Feature-gated modules: default = pubsub + queue + relay + heartbeat
 
-[Unreleased]: https://github.com/MacCracken/majra/compare/2.11.0...HEAD
+[Unreleased]: https://github.com/MacCracken/majra/compare/2.12.0...HEAD
 [1.0.4]: https://github.com/MacCracken/majra/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/MacCracken/majra/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/MacCracken/majra/compare/v1.0.1...v1.0.2

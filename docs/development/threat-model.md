@@ -77,7 +77,7 @@ is the toolchain snapshot, covered by `cyrius.lock`'s 113 hashes and CI's
 |--------|---------|------|------------|
 | pubsub | Pattern matching with untrusted topics | Deep nesting DoS | Character-by-character scan, no recursion |
 | queue | Unbounded enqueue | Memory exhaustion | Consumer responsibility (apply max queue size) |
-| ratelimit | Per-key bucket allocation | Unbounded key growth | `ratelimit_evict_stale()` for periodic cleanup |
+| ratelimit | Per-key bucket allocation | Unbounded key growth | `ratelimit_evict_stale()` for periodic, lossless cleanup — but it keeps any bucket not yet refilled, so a client minting a key per request outgrows any cap through it (agnosai: 72,447 keys against 4,096 at 1 req/s). Since **2.12.0** `ratelimit_evict_to(rl, max_keys)` / `sliding_window_evict_to` hold a hard cap, evicting least recently seen first so a key being hammered survives. ⚠ Lossy: an evicted drained key's next check gets a fresh burst — call it under memory pressure, not on the idle timer |
 | relay | Sequence dedup map | Unbounded sender tracking | `relay_set_max_dedup()` + `relay_evict_stale_dedup()` |
 | relay | Shared RelayMessage across subscriber threads | Use-after-free / double free | Since **2.10.1** the 2.9.0 refcount is atomic and the fan-out retains before it publishes the pointer; through 2.10.0 a consumer releasing in that window could free a message still being offered |
 | heartbeat | Node registration | Unbounded node tracking | Eviction policy auto-removes stale nodes |

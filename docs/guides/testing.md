@@ -37,14 +37,14 @@ cyrius build --no-deps tests/soak/soak_queue.cyr build/soak_queue && ./build/soa
 
 | Suite | File | Assertions | Coverage |
 |-------|------|-----------|----------|
-| Core | `src/main.cyr` | 203 | All 15 core modules + relay dedup, envelope-id entropy (non-zero *and* distinct), `_majra_sleep_ns` floor |
-| Expanded | `tests/test_core.tcyr` | 668 | Deep: queue lifecycle, pubsub patterns, DAG retry (outcome + elapsed backoff), fleet routing, circuit breaker, integration, multi-threaded barrier (proves blocking, not just a counter), concurrency + wildcard-alignment, relay / ratelimit / priority-queue regressions. Per-release additions: CHANGELOG.md |
+| Core | `src/main.cyr` | 205 | All 15 core modules + relay dedup, envelope-id entropy (non-zero *and* distinct), `_majra_sleep_ns` floor |
+| Expanded | `tests/test_core.tcyr` | 727 | Deep: queue lifecycle, pubsub patterns, DAG retry (outcome + elapsed backoff), fleet routing, circuit breaker, integration, multi-threaded barrier (proves blocking, not just a counter), concurrency + wildcard-alignment, relay / ratelimit / priority-queue regressions. Per-release additions: CHANGELOG.md |
 | Backends | `tests/test_backends.tcyr` | 557 | base64, SHA-1, AES-256-GCM, signed envelopes, admin endpoint, WebSocket, RESP, PG wire |
 | Patra queue | `tests/test_patra_queue.tcyr` | 71 | Durable enqueue / priority dequeue / complete / counts / reopen persistence |
-| Live | `tests/test_live.tcyr` | 36 | 7 Redis + 4 PostgreSQL test functions in `tests/test_live.tcyr`. **CI-only** — needs Redis on :6379 + PostgreSQL on :5432, so a dev-box "full matrix" run is 1,499, not 1,535 |
-| **Total** | | **1,535** (1,499 CI + 36 live) | |
+| Live | `tests/test_live.tcyr` | 36 | 7 Redis + 4 PostgreSQL test functions in `tests/test_live.tcyr`. **CI-only** — needs Redis on :6379 + PostgreSQL on :5432, so a dev-box "full matrix" run is 1,560, not 1,596 |
+| **Total** | | **1,596** (1,560 CI + 36 live) | |
 
-Every non-live suite, fuzz harness, soak, example and the benchmark binary also passes cross-built for aarch64 under `qemu-aarch64` (since 2.7.3; re-verified at 2.9.3 under 6.6.20, at 2.10.0 under 6.7.9, at 2.10.1 and at 2.11.0 — the expanded suite reports three fewer there (665 at 2.11.0), its one x86-only test carrying three asserts) — see [aarch64 cross-build](#aarch64-cross-build-qemu-user) below.
+Every non-live suite, fuzz harness, soak, example and the benchmark binary also passes cross-built for aarch64 under `qemu-aarch64` (since 2.7.3; re-verified at 2.9.3 under 6.6.20, at 2.10.0 under 6.7.9, at 2.10.1, 2.11.0 and 2.12.0 — the expanded suite reports three fewer there (724 at 2.12.0), its one x86-only test carrying three asserts) — see [aarch64 cross-build](#aarch64-cross-build-qemu-user) below.
 
 `test_patra_queue` was split out at 2.4.0 to stay under the then-16384 cc5 fixup cap (patra pulls sakshi + io + fs transitively); the table starts at 1,048,576 entries and grows on demand at the 6.7.9 pin (growable since cyrius 6.2.0), and the split is kept as documented architecture.
 
@@ -82,7 +82,7 @@ cyrius bench
 cyrius build --no-deps benches/bench_all.bcyr build/bench_all && ./build/bench_all
 ```
 
-19 benchmarks covering: envelope creation, priority queue, pattern matching (4 variants), pubsub publish, direct channel, heartbeat, fleet stats, rate limiting, relay send, barrier cycle, circuit breaker, counter increment, managed-queue lifecycle and 4-producer enqueue (the last two since 2.8.2).
+20 benchmarks covering: envelope creation, priority queue, pattern matching (4 variants), pubsub publish, direct channel, heartbeat, fleet stats, rate limiting, relay send, barrier cycle, circuit breaker, counter increment, managed-queue lifecycle and 4-producer enqueue (the last two since 2.8.2), and one `ratelimit_evict_to` pressure sweep — 256 fresh keys trimmed back to a 4,096 cap, timed per sweep (since 2.12.0).
 
 ## Soak tests
 
@@ -108,7 +108,7 @@ cyrius build --aarch64 --no-deps src/main.cyr                build/majra_aarch64
 cyrius build --aarch64 --no-deps tests/test_core.tcyr        build/test_core_aarch64        && qemu-aarch64 ./build/test_core_aarch64
 cyrius build --aarch64 --no-deps tests/test_backends.tcyr    build/test_backends_aarch64    && qemu-aarch64 ./build/test_backends_aarch64
 cyrius build --aarch64 --no-deps tests/test_patra_queue.tcyr build/test_patra_queue_aarch64 && qemu-aarch64 ./build/test_patra_queue_aarch64
-cyrius build --aarch64 --no-deps benches/bench_all.bcyr      build/bench_all_aarch64        && qemu-aarch64 ./build/bench_all_aarch64   # all 19 targets print; the numbers are TCG's, not the CPU's
+cyrius build --aarch64 --no-deps benches/bench_all.bcyr      build/bench_all_aarch64        && qemu-aarch64 ./build/bench_all_aarch64   # all 20 targets print; the numbers are TCG's, not the CPU's
 
 for f in fuzz/*.fcyr; do            # usage: <harness> [iterations] [seed]; the seed is printed, and an oracle failure exits 1 with it
   n=$(basename "$f" .fcyr); cyrius build --aarch64 --no-deps "$f" "build/${n}_aarch64" && qemu-aarch64 "./build/${n}_aarch64" || { echo "FUZZ CRASH: $n"; exit 1; }

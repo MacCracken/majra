@@ -132,6 +132,7 @@ Documented exceptions above.
 | Deprecated | Replacement | Since | Why |
 |---|---|---|---|
 | bare `ERR_*` error codes (all 20: `ERR_NONE` … `ERR_WORKFLOW_STORAGE`, `ERR_IPC_FRAME_TOO_LARGE` … `ERR_IPC_JSON`) | `MAJRA_ERR_*`, same values | 2.8.0 | Enum constants share one flat namespace across linked libraries, and bare `ERR_*` is reserved for the sakshi base logger (cyrius lint, proposal `2026-07-11-error-enum-namespace-lint-gate`). Nothing collided at 2.8.0; the prefix keeps it that way. `src/main.cyr`'s `test_error` asserts every alias still equals its replacement. |
+| `_metrics_arg3` / `_metrics_arg4` (read by a callback in the `queue_state_changed`, `heartbeat_transition`, `barrier_arrived` or `workflow_step_finished` slot) | take the value as the callback's third / fourth parameter | 2.12.0 | Unsynchronised file-scope globals: two threads dispatching at once overwrote each other's values between the store and the callback's read (2026-08-22 pass-2 audit). The hooks now pass every argument (`fncall3` / `fncall4`) and still write the globals before each call, so a callback that reads them keeps working single-threaded. |
 
 ## API stability
 
@@ -141,7 +142,7 @@ under Documented exceptions above:
 | Module | Stable since |
 |--------|-------------|
 | error, counter, envelope, namespace | 2.0.0 (error codes `MAJRA_ERR_*` since 2.8.0; bare `ERR_*` deprecated — see Deprecations) |
-| metrics, ratelimit, heartbeat | 2.0.0 |
+| metrics, ratelimit, heartbeat | 2.0.0 (the four wider metrics hooks pass all their arguments since 2.12.0; `_metrics_arg3` / `_metrics_arg4` deprecated — see Deprecations) |
 | queue, pubsub, relay, barrier | 2.0.0 |
 | ipc, transport, fleet, dag | 2.0.0 |
 | redis_backend, postgres_backend, ws | 2.0.0 (`ws_send_text` / `ws_recv_frame` renamed `majra_ws_*` at 2.8.0 — see Documented exceptions) |

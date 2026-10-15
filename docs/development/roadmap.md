@@ -5,9 +5,10 @@
 test counts, bundle sizes — lives in [`state.md`](state.md). When an item here
 ships, **delete it**; do not convert it into a changelog entry.
 
-Every item below was re-checked against the 2.11.0 tree on 2026-10-15: still
-open in the code, and — where it depends on upstream — still open at the latest
-**tagged** cyrius (6.7.11) and sigil (3.13.12).
+Every item below was re-checked against the 2.11.0 tree on 2026-10-15 (and
+is untouched by 2.12.0): still open in the code, and — where it depends on
+upstream — still open at the latest **tagged** cyrius (6.7.11) and sigil
+(3.13.12).
 
 ## How to read this
 
@@ -18,9 +19,8 @@ promotion is a decision rather than a mood.
 
 | Target | What goes there |
 |---|---|
-| **2.12.0** | The next MINOR: work whose trigger has fired and that adds public API. |
-| **2.12.x** | PATCHes after it: work that adds no API (CI, tests, toolchain, internal). |
-| **Later MINORs (2.13+)** | Larger capabilities, each taking the next MINOR when its trigger fires. |
+| **2.12.x** | PATCHes on the current minor: work that adds no API (CI, tests, toolchain, internal). |
+| **Later MINORs (2.13+)** | Work that adds public API, each taking the next MINOR when its trigger fires. None has fired. |
 | **3.0.0** | What 2.x has promised to break, and the fallback for anything gated on consumers. |
 | **Waiting on upstream** | Blocked outside this repo; names the blocker. |
 | **Non-goals** | Deliberately out of scope, so the question stops recurring. |
@@ -29,46 +29,6 @@ promotion is a decision rather than a mood.
 > performance and documentation with no API change, so anything that adds a
 > public function takes a MINOR. Two capabilities never share a MINOR by
 > accident — each later-MINOR item takes the next one when it is ready.
-
----
-
-## 2.12.0 — the next MINOR
-
-### Rate limiter: a force-evict that can hold a hard key cap
-
-Filed by agnosai on 2026-09-26:
-[`issues/2026-09-26-agnosai-ratelimit-no-way-to-enforce-a-key-cap.md`](issues/2026-09-26-agnosai-ratelimit-no-way-to-enforce-a-key-cap.md).
-Since 2.8.1, `ratelimit_evict_stale` evicts only buckets that have refilled to
-burst. That is the right metering rule, but it means a sprayed key (one request,
-one token spent) is unevictable for `1/rate` seconds, so a consumer that bounds
-the map under key-spraying cannot hold its cap: 72,447 tracked keys against
-agnosai's 4,096 at 1 req/s. **Still open at 2.11.0** — no force-evict, key-cap
-or evict-to-count call exists in `src/ratelimit.cyr`.
-
-**Scope**: the issue's option 1 (`ratelimit_evict_stale_force(rl, max_idle_ns)`,
-today's walk without the refill gate) or option 2 (`ratelimit_evict_to(rl,
-max_keys)`, least-recently-seen first). Leave `ratelimit_evict_stale` exactly as
-it is. Carry the issue's §4 checks: the repro evicts all 20,000 through the new
-call and 0 through the old one; a force-evicted drained key gets a fresh burst,
-documented on the new call so nobody uses it on the idle path. Archive the issue
-on ship.
-**Trigger**: met — a consumer filed it and will adopt it.
-
-### Metrics: pass hook arguments as arguments, not through globals
-
-`metrics_queue_state_changed`, `metrics_heartbeat_transition`,
-`metrics_barrier_arrived` and `metrics_workflow_step_finished` carry their
-third and fourth arguments in `_metrics_arg3` / `_metrics_arg4` — unsynchronised
-file-scope globals that two threads dispatching at once overwrite. Filed LOW by
-the [2026-08-22 pass-2 audit](../audit/2026-08-22-audit-pass2.md) and never
-scheduled; **still so at 2.11.0**. majra itself never dispatches those four
-hooks, so the exposure is consumers calling them from more than one thread. The
-globals predate `fncall3` / `fncall4`, which the pinned `lib/fnptr.cyr` ships.
-
-**Scope**: dispatch through `fncall3` / `fncall4` so a callback can take the
-extras as parameters; keep writing the globals for callbacks that read them, and
-document them as deprecated. Removing them is a 3.0.0 item.
-**Trigger**: met — an audit finding with nothing upstream in the way.
 
 ---
 
@@ -81,7 +41,7 @@ CI cross-**builds** the four suites for aarch64 and fails on any
 all a build can give: of the three raw-syscall defects 2.7.3 fixed, two emitted
 no build-time warning on any toolchain, so a build-only lane cannot see the
 class it exists to catch. Most releases since have run the suites under
-`qemu-aarch64` by hand (2.11.0 last). **Still open at 2.11.0**: no CI job installs or runs
+`qemu-aarch64` by hand (2.12.0 last). **Still open at 2.11.0**: no CI job installs or runs
 `qemu-user`.
 
 **Scope**: `qemu-user` on the runner, then `cyrius build --aarch64 --no-deps
@@ -127,13 +87,14 @@ time.
 cyrius 6.6.20's `lib/hashmap.cyr` counts `map_delete`'s tombstones and
 rebuilds on a new-key insert, so under the pinned stdlib the sweep-time
 compaction in `ratelimit_evict_stale`, `sliding_window_evict_stale` and both
-heartbeat status sweeps never fires (the expanded suite starves those maps by
+heartbeat status sweeps never fires (2.12.0's `_ratelimit_evict_lru`, behind
+both `*_evict_to` calls, carries the same call for the same reason) (the expanded suite starves those maps by
 hand to reach it). It stays because a bundle compiles against the *consumer's*
 stdlib, and on an older hashmap it is what keeps a churned limiter from probing
 every slot under its lock. `relay.cyr`'s `seen` keeps it regardless — its drops
 write tombstones the stdlib never counts.
 
-**Scope**: delete the four call sites and the two hand-starve test halves that
+**Scope**: delete the five call sites and the two hand-starve test halves that
 exist only to reach them; keep the helper and relay's tests.
 **Trigger**: every consumer in [`state.md`](state.md)'s table pins cyrius
 ≥ 6.6.20 — or 3.0.0, whichever is first.
@@ -204,8 +165,9 @@ then, and `cyrius lint` notes them while they live.
 
 ### Remove `_metrics_arg3` / `_metrics_arg4`
 
-Once 2.12.0 passes the extras as arguments, the globals exist only for
-callbacks that still read them; they go at 3.0.0.
+Since 2.12.0 the four wider metrics hooks receive their third and fourth
+arguments as parameters; the globals are still written only for callbacks that
+read them, and are deprecated in [`semver.md`](semver.md). They go at 3.0.0.
 
 ### Fallbacks that land here at the latest
 

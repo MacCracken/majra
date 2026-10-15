@@ -1,6 +1,7 @@
-version,date,trials,envelope_new,pq_enqueue,pq_dequeue,pattern_exact,pattern_wildcard_+,pattern_wildcard_#,pattern_no_match,pubsub_publish_nosub,pubsub_1sub_publish,direct_channel_send,heartbeat_100nodes,fleet_stats_100,ratelimit_check,relay_send,barrier_cycle,circuit_state,counter_inc,mq_lifecycle,mq_enqueue_4producers
-2.8.0,2026-09-15,5,2057,608,32,113,109,68,53,197,1108,409,1422,10942,1699,1533,2240,3,48,,
-2.8.1,2026-09-15,5,2062,616,13,63,67,28,5,99,1034,410,1440,2229,1563,1426,1703,3,4,,
-2.10.0,2026-10-15,7,2053,621,13,76,75,34,6,107,328,81,1516,2350,1657,1497,1881,3,5,1286,912
-2.10.1,2026-10-15,15,2026,678,14,75,77,35,6,116,352,84,1574,2525,1611,1581,2285,3,5,1391,1172
-2.11.0,2026-10-15,9,2064,650,14,73,75,33,6,110,350,82,1512,2436,1693,1504,2172,4,5,1322,917
+version,date,trials,envelope_new,pq_enqueue,pq_dequeue,pattern_exact,pattern_wildcard_+,pattern_wildcard_#,pattern_no_match,pubsub_publish_nosub,pubsub_1sub_publish,direct_channel_send,heartbeat_100nodes,fleet_stats_100,ratelimit_check,relay_send,barrier_cycle,circuit_state,counter_inc,mq_lifecycle,mq_enqueue_4producers,ratelimit_evict_to
+2.8.0,2026-09-15,5,2057,608,32,113,109,68,53,197,1108,409,1422,10942,1699,1533,2240,3,48,,,
+2.8.1,2026-09-15,5,2062,616,13,63,67,28,5,99,1034,410,1440,2229,1563,1426,1703,3,4,,,
+2.10.0,2026-10-15,7,2053,621,13,76,75,34,6,107,328,81,1516,2350,1657,1497,1881,3,5,1286,912,
+2.10.1,2026-10-15,15,2026,678,14,75,77,35,6,116,352,84,1574,2525,1611,1581,2285,3,5,1391,1172,
+2.11.0,2026-10-15,9,2064,650,14,73,75,33,6,110,350,82,1512,2436,1693,1504,2172,4,5,1322,917,
+2.12.0,2026-10-15,9,2073,589,13,65,68,30,5,101,316,76,1464,2230,1533,1430,1945,3,4,1215,919,275421

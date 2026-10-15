@@ -1,8 +1,23 @@
-# `ratelimit_evict_stale` can no longer enforce a hard key cap — a consumer needs an explicit force-evict
+# `ratelimit_evict_stale` can no longer enforce a hard key cap — a consumer needs an explicit force-evict — RESOLVED
 
-**Status:** 🔴 **OPEN — MEASURED** at majra **2.9.1** (latest tag at filing, worktree clean). The
-behaviour dates from **2.8.1**'s "evict only a bucket that has refilled to burst" change.
-**Re-checked:** 2026-10-15 at majra **2.11.0** — still open (no force-evict / key-cap call); scheduled as the headline of [`roadmap.md` § 2.12.0](../roadmap.md).
+**Status:** ✅ **RESOLVED in majra 2.12.0** (2026-10-15, pin 6.7.9). Was 🔴 **OPEN — MEASURED** at
+majra **2.9.1** (latest tag at filing, worktree clean); the behaviour dates from **2.8.1**'s "evict only
+a bucket that has refilled to burst" change.
+**Resolution:** §3's option 2 shipped as `ratelimit_evict_to(rl, max_keys)` — evict the
+least-recently-seen buckets until at most `max_keys` remain, regardless of fill — with
+`sliding_window_evict_to(sw, max_keys)` as its twin, since the sliding-window sweep's two-window floor
+has the same gap. Option 2 over option 1 because it bounds the map by count, which is the invariant a
+pressure sweep is holding, and because it evicts oldest first: a key being hammered right now is the
+most recently seen and survives, where `evict_stale_force(rl, 0)` would have handed it a fresh burst on
+every sweep. Ranking uses a new per-bucket last-seen clock stamped on every check, not
+`last_access_ns`, which lags the last request and never moves on a rate-0 limiter's drained bucket.
+`ratelimit_evict_stale` is unchanged. §4, as run in `tests/test_core.tcyr`
+(`test_ratelimit_evict_to_holds_cap`): with the repro's 20,000 keys, `ratelimit_evict_stale(rl, 0)`
+still evicts **0**; `ratelimit_evict_to(rl, 4096)` evicts **15,904** and leaves exactly the 4,096 most
+recently seen; `ratelimit_evict_to(rl, 0)` takes the rest — **20,000** in all, **0** after. The
+fresh-burst consequence is a ⚠ on the new call and has its own test. **Adoption in agnosai:** replace
+the pressure sweep's `ratelimit_evict_stale(rl, 0)` (`src/server/rate_limit.cyr:409`) with
+`ratelimit_evict_to(rl, 4096)`, and keep `ratelimit_evict_stale` on the idle timer.
 **Filed:** 2026-09-26, by agnosai (the 2.0.10 bump from majra 2.7.2 → 2.9.1). The request is for a new
 opt-in call. It is not a request to revert 2.8.1, whose metering fix is right.
 **Severity:** P2 for a consumer that bounds limiter memory under key-spraying. The memory is still
