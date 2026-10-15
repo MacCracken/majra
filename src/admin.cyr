@@ -19,9 +19,9 @@
 
 # Requires: lib/sandhi.cyr. Included HERE (a no-op after an entry point's own
 # include) so `cyrius distlib` seeds its sidecar verify with sandhi: HTTP_OK /
-# HTTP_NOT_FOUND are also declared by lib/http.cyr, and cyrius 6.6.20's verify
-# otherwise credits them to whichever its snapshot directory LISTS first — so the
-# admin / backends sidecars differed between hosts (2.9.3).
+# HTTP_NOT_FOUND are also declared by lib/http.cyr, which the verify otherwise
+# credits — an extra `http` leaf since cyrius 6.7.7, and under 6.6.18–6.7.6 a
+# host-dependent one (it followed the snapshot's listing order; 2.9.3).
 include "lib/sandhi.cyr"
 
 # Tracker kinds, mirroring src/heartbeat.cyr's HB_KIND_* tags.

@@ -12,14 +12,14 @@ names the version it is aimed at and the condition that would move it.
 
 | Target | Theme |
 |---|---|
-| **2.9 line** | Larger capabilities, each taking the next MINOR as its trigger fires — or the next PATCH, where it adds no API. |
+| **2.10 line** | Larger capabilities, each taking the next MINOR as its trigger fires — or the next PATCH, where it adds no API. |
 | **3.0.0** | The one thing 2.x has promised to break. |
 | **Waiting on upstream** | Blocked outside this repo. Names the blocker. |
 | **Non-goals** | Deliberately out of scope, recorded so the question stops recurring. |
 
 > **Why these can't all be patch releases.** [`semver.md`](semver.md) reserves
 > PATCH for bug fixes, performance and documentation with no API changes, so
-> anything adding a public function takes the next MINOR. "The 2.9 line" below
+> anything adding a public function takes the next MINOR. "The 2.10 line" below
 > is therefore a *development line*, not a run of patch numbers — PostgreSQL
 > SCRAM and QUIC cannot share one.
 
@@ -29,7 +29,7 @@ promotion is a decision rather than a mood.
 
 ---
 
-## 2.9 line — larger capabilities
+## 2.10 line — larger capabilities
 
 Each takes the next available MINOR when its trigger fires — or the next
 PATCH, where it adds no public API. The item whose trigger has already fired
@@ -95,7 +95,7 @@ since 2.7.3 with one warning, and with none since the 6.6.6 pin closed the
 `tests/test_backends.tcyr` and `tests/test_patra_queue.tcyr` call `sys_unlink`
 / `sys_stat` with the Linux arity and name `SYS_SOCKETPAIR` / `SYS_RECVFROM` /
 `SYS_GETSOCKNAME`, which the agnos peer does not declare (re-measured under
-6.6.20 at 2.9.3: core and expanded suites build `OK` with `--agnos`; the other
+6.7.9 at 2.10.0, as at 6.6.20: core and expanded suites build `OK` with `--agnos`; the other
 two fail at those sites). Until they build, "agnos-clean" is a claim about linking, not
 about behaviour.
 
@@ -145,12 +145,12 @@ and `cyrius lint` keeps noting them while they live.
 
 ## Waiting on upstream
 
-Nothing at 2.9.3. The one item that sat here — the `_agnos_getenv` warning on
+Nothing at 2.10.0. The one item that sat here — the `_agnos_getenv` warning on
 an agnos build of the `backends` profile — closed upstream: cyrius 6.6.6's
 `lib/io.cyr` includes `lib/args_agnos.cyr` itself, and a clean-room probe of
 `dist/majra-backends.cyr` plus its sidecar leaves cross-builds `OK` under
 `--agnos` with **zero** undefined functions (2.9.1). The majra-side half moved
-to the 2.9 line (agnos-portable backends + patra-queue suites).
+to the 2.10 line (agnos-portable backends + patra-queue suites).
 
 ---
 
@@ -171,7 +171,8 @@ to the 2.9 line (agnos-portable backends + patra-queue suites).
 ## Upstream cleanup (not majra work)
 
 - cyrius `lib/thread.cyr` `chan_new` multiplies `cap * 8` unchecked (found by
-  the 2.8.1 sweep; the zero-allocation half is checked at 6.6.20).
+  the 2.8.1 sweep; the zero-allocation half is checked since 6.6.20 — the multiply still
+  is not at 6.7.9).
 
 - `cyrius/docs/development/issues/majra-cbarrier-arrive-and-wait-crash.md` was
   fixed in cyrius 5.4.10 but never moved to `issues/archived/` with a

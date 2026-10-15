@@ -5,6 +5,70 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.0] - 2026-10-15
+
+Toolchain minor — **cyrius 6.6.20 → 6.7.9**, the 6.7 language line (traits, generics, `const`,
+`bool`, if-expressions, `loop` / `do`, tuples, default and named arguments, checked `dyn`, an
+opt-in bounds-checked mode), and with it the stdlib snapshot (sigil 3.13.10 → 3.13.11, patra
+1.15.2 → 1.16.0, sandhi 1.10.8 → 1.10.9, sakshi 2.5.7 → 2.5.8, bayan 1.5.12 → 1.5.13). No public API
+change and no `src/` code change — one comment in `src/admin.cyr`. **1,468 assertions** pass
+(core 203 · expanded 647 · backends 547 · patra-queue 71) on the first build under the new pin,
+natively and cross-built under `qemu-aarch64` (644 expanded there — the x86-only test); three fuzz
+harnesses, four soaks and both examples are clean on both arches; the expanded suite looped 100×
+natively and 50× under qemu with no failure. Benchmarks, interleaved A/B against a 6.6.20 build of the
+same tree (2 × 15 trials): within ±2 % except the three `pattern_*` matchers, slower in both
+batches — 3–4 % by minimum (+8.5 % worst median) on the quieter one, 5–12 % by minimum on a
+noisier one. Below the 10 % line on the clean batch; recorded, not chased. `build/majra` 249,224 → 248,728 B.
+
+### Changed
+
+- **Pin 6.6.20 → 6.7.9.** Snapshot holds at 113 files; 67 changed, every first-party fold among
+  them. `cyrius.lock` is 113 sorted hashes plus a `cyrius\t6.7.9` trailer; `--verify` 113/0, and
+  6.7.6's `cyrius deps --locked` agrees.
+- **`dist/`** — all four bundles and sidecars regenerate identically apart from the version stamp
+  and `src/admin.cyr`'s comment: sidecars stay core 14 · signed 16 · admin 2 · backends 3. Each
+  bundle builds clean-room against only its sidecar's leaves with 0 undefined for x86_64, aarch64
+  and agnos, and runs natively and under qemu.
+
+### Verified (no change needed)
+
+The 6.7 line changes what some existing code *means*, not only what compiles, so each item cyrius's
+`ecosystem-migration.md` § 6.7.x lists was checked against every majra source (`src/`, `tests/`,
+`fuzz/`, `benches/`, `examples/`, the soaks):
+
+- **`!` is a real operator since 6.7.3** — before it the lexer silently DROPPED a lone `!`, so
+  `if (!ok)` meant `if (ok)`. majra has no lone `!` in code (every hit is inside a string).
+- **New reserved words** — `trait` (6.7.0), `const` (6.7.2), `true` / `false` (6.7.3), `do`
+  (6.7.5), `dyn` (6.7.8): none is a majra identifier.
+- **Unary `-` / `~` on a constant before a literal operator** now binds as written (6.7.9; `-K + 10`
+  was computed as `K + 10`): majra spells no such expression and no `~` at all.
+- **Typed-pointer, `self`, struct-copy, tuple and generic rules** (6.7.0–6.7.9) reach only typed
+  `*T` / `impl` / generic code; majra's structs are untyped `i64` offsets through `load64` /
+  `store64`. Forward-call arity checks (6.7.7), the `for`-step and module-scope `}` refusals
+  (6.7.9) and the `#bounds` directive (6.7.8) all pass — the tree builds with no new diagnostic.
+- **New stdlib names** (`sys_ppoll`, `sock_set_nodelay`, `f64_parse_n`, 6.7.9) collide with no
+  majra definition.
+- **patra 1.16.0** refuses five silent wrong answers (LIMIT 0, SUM / MIN / MAX on a non-INT column,
+  identifiers over 31 bytes, ORDER BY an unknown or TEXT / BYTES column). `src/patra_queue.cyr`'s
+  queries — `MAX(id)`, `ORDER BY priority ASC, id ASC LIMIT 1`, all INT columns — meet none.
+- **aarch64 `ESYSXLAT`**: re-derived at 6.7.9 — 82 rows, the same set as 6.6.20; majra's six spelled
+  numbers are routed.
+- **`distlib`'s listing-order dependence (the 2.9.3 CI failure) is fixed upstream in 6.7.7** — the
+  snapshot index is sorted. Re-checked under alphabetical and reverse listings: identical output.
+  `src/admin.cyr` keeps its `include "lib/sandhi.cyr"`: without it the now-deterministic rule
+  credits `HTTP_OK` / `HTTP_NOT_FOUND` to `lib/http.cyr` and the admin sidecar grows to 16 leaves
+  including `http`. Its comment says so now.
+- `cyrius fmt --check`, `cyrius vet`, `cyrius deny src/main.cyr` (28 deps, 0 violations) clean;
+  `cyrius lint` 0 warnings on 38 files — it notes the bare `ERR_*` aliases, deprecated until 3.0.0.
+
+### Known issues
+
+- sigil's over-budget `var buf[262144]` warning still prints (`lib/sigil.cyr:28103`).
+- `cyrius distlib` still warns six names undefined for x86_64-windows only; Windows is not a majra
+  target.
+- `tests/test_backends.tcyr` and `tests/test_patra_queue.tcyr` still do not build for agnos (Linux
+  arities, `SYS_SOCKETPAIR`) — the roadmap item, unchanged.
+
 ## [2.9.3] - 2026-10-15
 
 Toolchain patch — **cyrius 6.6.9 → 6.6.20**, and with it the stdlib snapshot majra consumes

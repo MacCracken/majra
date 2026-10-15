@@ -12,8 +12,8 @@ consumer's code.
 HMAC-SHA256, HKDF all live there. sigil's own `docs/audit/` directory documents
 its crypto audit surface. Since **2.6.8** sigil is a *folded cyrius stdlib
 module*, provisioned into `lib/sigil.cyr` by `cyrius lib sync --full` and
-version-tied to the toolchain pin (3.13.10 under cyrius 6.6.20; 3.13.3 under
-6.6.9) rather than to a `[deps.sigil]` git tag — so the supply-chain surface
+version-tied to the toolchain pin (3.13.11 under cyrius 6.7.9; 3.13.10 under
+6.6.20) rather than to a `[deps.sigil]` git tag — so the supply-chain surface
 is the toolchain snapshot, covered by `cyrius.lock`'s 113 hashes and CI's
 `cyrius deps --verify`. See
 [`dependency-watch.md`](dependency-watch.md) for why the git dep was retired.
