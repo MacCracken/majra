@@ -5,6 +5,108 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.3] - 2026-10-15
+
+Toolchain patch — **cyrius 6.6.9 → 6.6.20**, and with it the stdlib snapshot majra consumes
+(sigil 3.13.3 → 3.13.10, patra 1.15.0 → 1.15.2, sandhi 1.10.1 → 1.10.8, sakshi 2.5.5 → 2.5.7,
+bayan 1.5.7 → 1.5.12). No `src/` code change — three comment blocks the new hashmap made untrue.
+**1,468 assertions** pass (core 203 · expanded 647 · backends 547 · patra-queue 71), natively and
+cross-built under `qemu-aarch64` (644 expanded there — the x86-only test); three fuzz harnesses,
+four soaks and both examples are clean on both arches. Benchmarks, interleaved A/B against a
+6.6.9 build of the same tree (7 + 15 trials, on a box at load 9–14): `direct_channel_send`
+**−81 % / −83 %** and `pubsub_1sub_publish` **−69 % / −68 %** (median; −84 % / −68 % by
+minimum) — 6.6.16's channel no longer makes a syscall on an uncontended send or receive. The
+rest sit within the load's noise; the largest median regression, `mq_enqueue_4producers` (+17 %
+then +8 %), is +1.5 % by minimum. `build/majra` 219,952 → 249,224 B (+13 %, compiler growth).
+
+### Changed
+
+- **Pin 6.6.9 → 6.6.20.** Snapshot 111 → 113 files (`poison.cyr` and `tls_hostid.cyr` are new,
+  neither reached by majra's code; 85 others changed, every first-party fold among them).
+  `cyrius.lock` is 113 sorted hashes plus a `cyrius\t6.6.20` trailer; `--verify` 113/0.
+- **The `.deps` sidecars are now computed, and they shrank** (cyrius 6.6.18 makes the
+  compile-verify the only source of a sidecar). Core 27 → 14 leaves, signed 17 → 16, admin
+  20 → 15, backends 20 → 19. The core sidecar no longer mirrors `[deps].stdlib`, so it stops
+  naming `sigil`, `patra`, `tls`, `assert`, `bench` and the rest the core engine never calls; the
+  folds now include their own leaves, so `sys`, `random`, `keccak`, `bayan`, `thread_local`,
+  `tls`, `async` and `sakshi` left the named profiles (admin also drops `sigil`, `net` and `io`,
+  which `sandhi` brings); `result`, `sync` and `atomic` — which
+  majra's code calls directly — joined. ⚠ A consumer that compiled its *own* code against a leaf
+  only majra's old sidecar provisioned must now declare it in its own `[deps].stdlib` (cyrius
+  `docs/development/ecosystem-migration-6.6.18.md`).
+- **Every bundle opens with a compile-verified `# Requires` block** (6.6.18): one
+  `include "lib/<leaf>.cyr"` per sidecar leaf, so a bundle is raw-includable — a consumer
+  hand-including it under `--no-deps` no longer has to add `lib/chrono.cyr` / `lib/sys.cyr` itself.
+  Include-once is keyed on the literal path, so a `cyrius deps` consumer sees no change. A
+  clean-room build of each bundle against only its sidecar's leaves has 0 undefined functions for
+  x86_64, aarch64 (the core probe runs under qemu) and agnos.
+
+### Fixed
+
+- **Four expanded-suite failures under 6.6.20, all in tests that assumed a stdlib defect.**
+  6.6.20's `lib/hashmap.cyr` counts `map_delete`'s tombstones and rebuilds on a new-key insert,
+  so delete+insert churn no longer starves a map of empty slots — and
+  `test_ratelimit_churn_reclaims_tombstones` used churn to reach the starved state it then
+  asked `ratelimit_evict_stale` to repair. It now builds that state by hand (`_t8_starve`:
+  uncounted tombstones, the shape relay's drops leave). Its heartbeat twin still passed, but
+  vacuously — deleting `_majra_map_compact` from `src/heartbeat.cyr` no longer failed it — so
+  it is starved by hand too, with a precondition assert. Mutation-checked: removing the
+  compaction at the ratelimit, heartbeat or relay sites each fails the suite.
+- **`test_cbarrier_release_wakes_over_1000` flaked on a loaded box — pre-existing.** It slept a
+  fixed 500 ms before the release, assuming all 1010 waiters had arrived; at load 10–38 some had
+  not, the barrier could not release, and the 2 s wait saw 0. Measured with the old test: 2/100
+  failures under 6.6.20 and 1/100 under 6.6.9, interleaved on the same box. It now waits for
+  every arrival (bounded at 30 s, asserted), and the completion wait is 30 s, left early once
+  all are done. 100/100 afterwards; still fails a wake-only-1000 mutant.
+- **The rate limiter's fail-open regression test had a 1 ms window — pre-existing.** At 1000
+  tokens/s, "the limiter closes again immediately" required the very next check to refuse, so a
+  preemption of more than 1 ms between two checks refilled a token: 1 failure in 100
+  `qemu-aarch64` runs at load ~23 (a deliberate 2 ms gap fails it every time). It now asks for one
+  refusal among five back-to-back checks — a fail-open limiter allows every call — and a mutant
+  that re-opens the 2.6.10 bypass still fails it. Same assertion count.
+- **Five new compiler warnings in `tests/test_backends.tcyr`** (6.6.20 warns when a Str's data
+  pointer reaches `streq` / `strlen`). Those asserts deliberately check that the RESP reader and
+  the PG builder NUL-terminate their output; `_tb_cstr_is` now says that — contents equal *and*
+  a 0 byte at `str_len` — and the warnings are gone.
+- **Comments the new hashmap made untrue**: `src/counter.cyr` (`map_evict`,
+  `_majra_map_compact`), `src/ratelimit.cyr` and `src/relay.cyr` said the stdlib never reclaims
+  tombstones and that `_relay_dedup_drop_slot` does "exactly what `map_delete` does". Corrected:
+  `map_delete` now also counts the tombstone, in a word private to the stdlib, so relay's
+  hand-written tombstones go uncounted and `_majra_map_compact` stays the thing that reclaims
+  them.
+
+### Verified (no change needed)
+
+- **The hashmap change itself.** A new-key `map_set` can now move entries (an in-place
+  rebuild). No majra slot walk inserts into the map it walks, and relay's dedup insert happens
+  before its eviction scan, so no slot pointer outlives a `map_set`. `_majra_map_compact` stays
+  at all six call sites: under 6.6.20 it never fires for the ratelimit / heartbeat maps, but a bundle
+  compiles against the *consumer's* stdlib — the roadmap carries the trigger for retiring it.
+- **Channels** (6.6.16): the Linux channel is now an eventcount — the old one woke ONE thread on a
+  shared futex word, which could be a waiter of the wrong kind, so several producers and consumers
+  could deadlock, and a receiver could sleep through `chan_close`. majra's relay and pubsub fan-out
+  use `chan_try_send` and per-subscriber channels; nothing majra-side changes, and consumers that
+  park several receivers on one subscriber channel inherit the fix.
+- **SIGPIPE** (CYRIUS-2026-0025, 6.6.16 — `sock_send*` no longer `write(2)`s): majra's own
+  writers already send with `MSG_NOSIGNAL`; the admin endpoint's sandhi writes are now covered
+  upstream too.
+- **aarch64 `ESYSXLAT`**, re-derived per tag with the gate's own pipeline: 60 rows at 6.6.6, 68 at
+  6.6.9 (eight x86_64 rows 2.9.2 did not record: 125, 126, 155, 161, 259, 272, 310, 311), 82 at
+  6.6.20 (only cyrius-private aliases added). 6.6.18 folds a literal number's chain at compile
+  time and routes a variable through a shared stub — same translation. majra's six spelled
+  numbers are rows at every tag; CI's literal gate and the aarch64 cross-build gate are clean.
+- **`duplicate fn 'uname_release'` is gone** — sigil 3.13.x takes it from `lib/sys.cyr` (already
+  true at 6.6.9; 2.9.2 did not record it).
+- `cyrius lint` 0 warnings on all 37 files (the `src/main.cyr` false positive is gone);
+  `cyrius fmt --check`, `cyrius vet`, `cyrius deny src/main.cyr` (28 deps, 0 violations) clean.
+
+### Known issues
+
+- sigil's over-budget `var buf[262144]` warning still prints (`lib/sigil.cyr:28046`) on every
+  unit that links sigil. Same static storage as before; upstream's to move.
+- `cyrius distlib` warns six names undefined for **x86_64-windows only** (`SYS_FUTEX`,
+  `FUTEX_WAIT` / `_WAKE`, `sys_lstat`, `sys_fchmod`, `sys_accept4`). Windows is not a majra target.
+
 ## [2.9.2] - 2026-09-28
 
 Toolchain patch — **cyrius 6.6.6 → 6.6.9**, from cyrius 6.6.10 bite 14. No `src/` change.

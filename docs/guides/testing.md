@@ -35,15 +35,15 @@ cyrius build --no-deps tests/soak/soak_queue.cyr build/soak_queue && ./build/soa
 | Suite | File | Assertions | Coverage |
 |-------|------|-----------|----------|
 | Core | `src/main.cyr` | 203 | All 15 core modules + relay dedup, envelope-id entropy (non-zero *and* distinct), `_majra_sleep_ns` floor |
-| Expanded | `tests/test_core.tcyr` | 645 | Deep: queue lifecycle, pubsub patterns, DAG retry (outcome + elapsed backoff), fleet routing, circuit breaker, integration, multi-threaded barrier (proves blocking, not just a counter), concurrency + wildcard-alignment, relay / ratelimit / priority-queue regressions. Per-release additions: CHANGELOG.md |
+| Expanded | `tests/test_core.tcyr` | 647 | Deep: queue lifecycle, pubsub patterns, DAG retry (outcome + elapsed backoff), fleet routing, circuit breaker, integration, multi-threaded barrier (proves blocking, not just a counter), concurrency + wildcard-alignment, relay / ratelimit / priority-queue regressions. Per-release additions: CHANGELOG.md |
 | Backends | `tests/test_backends.tcyr` | 547 | base64, SHA-1, AES-256-GCM, signed envelopes, admin endpoint, WebSocket, RESP, PG wire |
 | Patra queue | `tests/test_patra_queue.tcyr` | 71 | Durable enqueue / priority dequeue / complete / counts / reopen persistence |
-| Live | `tests/test_live.tcyr` | 36 | 7 Redis + 4 PostgreSQL test functions in `tests/test_live.tcyr`. **CI-only** — needs Redis on :6379 + PostgreSQL on :5432, so a dev-box "full matrix" run is 1,466, not 1,502 |
-| **Total** | | **1,502** (1,466 CI + 36 live) | |
+| Live | `tests/test_live.tcyr` | 36 | 7 Redis + 4 PostgreSQL test functions in `tests/test_live.tcyr`. **CI-only** — needs Redis on :6379 + PostgreSQL on :5432, so a dev-box "full matrix" run is 1,468, not 1,504 |
+| **Total** | | **1,504** (1,468 CI + 36 live) | |
 
-Every non-live suite, fuzz harness, soak, example and the benchmark binary also passes cross-built for aarch64 under `qemu-aarch64` as of 2.7.3 — see [aarch64 cross-build](#aarch64-cross-build-qemu-user) below.
+Every non-live suite, fuzz harness, soak, example and the benchmark binary also passes cross-built for aarch64 under `qemu-aarch64` (since 2.7.3; re-verified at 2.9.3 under 6.6.20 — the expanded suite reports 644 there, its one x86-only test carrying three asserts) — see [aarch64 cross-build](#aarch64-cross-build-qemu-user) below.
 
-`test_patra_queue` was split out at 2.4.0 to stay under the then-16384 cc5 fixup cap (patra pulls sakshi + io + fs transitively); the table starts at 1,048,576 entries and grows on demand at the 6.6.6 pin (growable since cyrius 6.2.0), and the split is kept as documented architecture.
+`test_patra_queue` was split out at 2.4.0 to stay under the then-16384 cc5 fixup cap (patra pulls sakshi + io + fs transitively); the table starts at 1,048,576 entries and grows on demand at the 6.6.20 pin (growable since cyrius 6.2.0), and the split is kept as documented architecture.
 
 ## Test Categories
 
@@ -93,7 +93,7 @@ Currently shipped (all four are run before a release, not in CI):
 
 ## aarch64 cross-build (qemu-user)
 
-CI only **cross-builds** the four suites for aarch64 (a build-only gate that fails on syscall / symbol diagnostics); the run half needs `qemu-user` on the runner and is still a roadmap item, so run this before a release and after touching anything that issues a syscall. cyrius's aarch64 backend renumbers 60 source numbers at runtime at the 6.6.6 pin (54 x86_64 numbers plus its six ≥1000 private aliases; 44 at 6.6.4 — 6.6.5 routed `nanosleep` 35 and `sendto` 44 among fourteen more, 6.6.6 added `statfs`/`fstatfs`) and passes every other number through **verbatim**, so a stray x86_64 number is not a build error — it is a different, valid syscall. Through 2.7.2 majra shipped three of them (fchmod 91 → capset, getrandom 318 → ENOSYS, nanosleep 35 → unlinkat) and two built without a warning on any toolchain (CHANGELOG.md § [2.7.3]), which is why a build-only `--aarch64` step proves little here (it catches a `var SYS_*` that redefines a stdlib name, like the 318 site, but not a raw literal or a uniquely named constant, like 35 and 91): **the binaries have to run.**
+CI only **cross-builds** the four suites for aarch64 (a build-only gate that fails on syscall / symbol diagnostics); the run half needs `qemu-user` on the runner and is still a roadmap item, so run this before a release and after touching anything that issues a syscall. cyrius's aarch64 backend renumbers 82 source numbers at the 6.6.20 pin (62 x86_64 numbers plus twenty ≥1000 private aliases; 68 at 6.6.9, 60 at 6.6.6, 44 at 6.6.4 — 6.6.5 routed `nanosleep` 35 and `sendto` 44 among fourteen more; per-tag detail in cyrius-quirks.md #9) and passes every other number through **verbatim**, so a stray x86_64 number is not a build error — it is a different, valid syscall. Through 2.7.2 majra shipped three of them (fchmod 91 → capset, getrandom 318 → ENOSYS, nanosleep 35 → unlinkat) and two built without a warning on any toolchain (CHANGELOG.md § [2.7.3]), which is why a build-only `--aarch64` step proves little here (it catches a `var SYS_*` that redefines a stdlib name, like the 318 site, but not a raw literal or a uniquely named constant, like 35 and 91): **the binaries have to run.**
 
 `qemu-aarch64` comes from the distro's `qemu-user` package (Arch: `qemu-user`, installs `/usr/bin/qemu-aarch64`). The same `lib/` serves both arches — `--aarch64` selects the peer stdlib and the emitter — so no second `lib sync`.
 
@@ -172,7 +172,7 @@ cyrius binaries carry no symbol table, so gdb shows every frame as `?? ()`. The 
 
 ## Compiler Limitations
 
-Cyrius's fixup table at the 6.6.6 pin starts at 1,048,576 forward references and grows ×2 on demand (8192 on cc3, 16384 across the cc5 5.x line; growable since 6.2.0). Large test entry points that aggregate many src modules are no longer near it — `test_patra_queue` was split out under the 16384 cap and the split is kept as documented architecture — but the advice stands: if adding significant new test code causes a "fixup table full" error, create a new `.tcyr` entry point scoped to what you're testing.
+Cyrius's fixup table at the 6.6.20 pin starts at 1,048,576 forward references and grows ×2 on demand (8192 on cc3, 16384 across the cc5 5.x line; growable since 6.2.0). Large test entry points that aggregate many src modules are no longer near it — `test_patra_queue` was split out under the 16384 cap and the split is kept as documented architecture — but the advice stands: if adding significant new test code causes a "fixup table full" error, create a new `.tcyr` entry point scoped to what you're testing.
 
 ## Live Test Setup
 

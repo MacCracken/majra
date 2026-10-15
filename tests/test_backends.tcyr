@@ -1786,6 +1786,15 @@ fn test_redis_resp() {
     println("  redis_resp: ok");
 }
 
+# 1 iff Str `s` holds exactly `want` AND its bytes are NUL-terminated at its
+# length — the C-string promise the RESP reader and the PG builder make. Since
+# cyrius 6.6.20 a Str's data pointer passed straight to streq/strlen warns.
+fn _tb_cstr_is(s, want) {
+    if (str_eq_cstr(s, want) != 1) { return 0; }
+    if (load8(str_data(s) + str_len(s)) != 0) { return 0; }
+    return 1;
+}
+
 # 2.8.1: resp_reply_free leaked. The +simple / -error Str pointed one byte into
 # its block, so fl_free read the size class off the type byte and the free
 # failed; the header came from the bump allocator. The freelist is LIFO, so the
@@ -1799,7 +1808,7 @@ fn test_resp_reply_free() {
     assert(r != 0, "+OK parsed");
     if (r == 0) { return 0; }
     assert_eq(str_len(r), 2, "+OK length 2");
-    assert_eq(streq(str_data(r), "OK"), 1, "+OK text is NUL-terminated at the block start");
+    assert_eq(_tb_cstr_is(r, "OK"), 1, "+OK text is NUL-terminated at the block start");
     var d = str_data(r);
     resp_reply_free(r);
     var x1 = fl_alloc(8);
@@ -1813,7 +1822,7 @@ fn test_resp_reply_free() {
     var e = _resp_read_reply(rc);
     assert(e != 0, "-ERR parsed");
     if (e == 0) { return 0; }
-    assert_eq(streq(str_data(e), "ERR bad"), 1, "-ERR text");
+    assert_eq(_tb_cstr_is(e, "ERR bad"), 1, "-ERR text");
     var ed = str_data(e);
     resp_reply_free(e);
     x1 = fl_alloc(8);
@@ -1830,7 +1839,7 @@ fn test_resp_reply_free() {
     assert(bs != 0, "bulk parsed");
     if (bs != 0) {
         assert_eq(str_len(bs), 5, "bulk length");
-        assert_eq(strlen(str_data(bs)), 5, "bulk reply is NUL-terminated");
+        assert_eq(_tb_cstr_is(bs, "hello"), 1, "bulk reply is NUL-terminated");
         resp_reply_free(bs);
     }
     syscall(SYS_WRITE, a, ":-42\r\n", 6);
@@ -2016,7 +2025,7 @@ fn _tb_qlit(s) {
 fn test_pg_literal_escaping() {
     var sb = str_builder_new();
     assert_eq(_pg_add_literal(sb, "plain"), 0, "literal returns ok");
-    assert_eq(streq(str_data(str_builder_build(sb)), "$m_$plain$m_$"), 1, "plain is dollar-quoted");
+    assert_eq(_tb_cstr_is(str_builder_build(sb), "$m_$plain$m_$"), 1, "plain is dollar-quoted");
     assert_eq(streq(_tb_lit(""), "$m_$$m_$"), 1, "empty string is an empty dollar literal");
     assert_eq(streq(_tb_lit("a__b"), "$m___$a__b$m___$"), 1, "an underscore run lengthens the tag");
     assert_eq(_pg_add_literal(str_builder_new(), 0), -1, "null is refused");
@@ -2452,7 +2461,7 @@ fn _resp_thr(arg) {
             var r = _resp_read_reply(rc);
             if (arg == 1) {
                 if (redis_is_alive(rc) == 0 || r == 0) { ok = 0; i = 50; round = 60; }
-                elif (streq(str_data(r), "AAAAAAAAAAAA") == 0) { ok = 0; i = 50; round = 60; }
+                elif (_tb_cstr_is(r, "AAAAAAAAAAAA") == 0) { ok = 0; i = 50; round = 60; }
                 else { resp_reply_free(r); }
             } else {
                 if (redis_is_alive(rc) == 0 || r != 123456789012) { ok = 0; i = 50; round = 60; }

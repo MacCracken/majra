@@ -1286,7 +1286,17 @@ fn test_ratelimit_subinterval_polling_accrues() {
     assert(t1 <= now, "fail-open: clock not in the future");
     assert(t2 >= t1, "fail-open: clock never moves backwards");
     assert(now - t1 < 60000000000, "fail-open: clock moved up to now, not left hours back");
-    assert_eq(ratelimit_check(rl2, "f"), 0, "fail-open: the limiter closes again immediately");
+    # "At once" is a 1 ms window at 1000 tokens/s: one preemption between two
+    # checks refills a token (1 run in 100 under qemu-aarch64 at load ~23,
+    # 2.9.3). A fail-open limiter allows EVERY call, so ask for one refusal
+    # among five back-to-back checks rather than from the very next one.
+    var refused = 0;
+    var ri = 0;
+    while (ri < 5 && refused == 0) {
+        if (ratelimit_check(rl2, "f") == 0) { refused = 1; }
+        ri = ri + 1;
+    }
+    assert_eq(refused, 1, "fail-open: the limiter closes again immediately");
     println("  ratelimit_subinterval_polling_accrues: ok");
 }
 
@@ -1906,6 +1916,20 @@ fn _t8_empty_slots(m) {
     return n;
 }
 
+# Tombstone EMPTY slots by hand, uncounted, until fewer than cap/4 remain; at
+# least one stays, so a miss still ends at an empty slot. Returns the empties.
+fn _t8_starve(m) {
+    var e = map_entries(m);
+    var cap = map_cap(m);
+    var left = _t8_empty_slots(m);
+    var i = 0;
+    while (i < cap && left * 4 >= cap) {
+        if (load64(e + i * 24 + 16) == 0) { store64(e + i * 24 + 16, 2); left = left - 1; }
+        i = i + 1;
+    }
+    return left;
+}
+
 # --- F105: counter_inc / counter_add are atomic ---------------------------
 
 var _t8_ctr = 0;
@@ -2070,9 +2094,12 @@ fn test_sliding_window_evict_spares_active() {
 
 # --- F005: sweeps reclaim tombstones ----------------------------------------
 
-# lib/hashmap.cyr never rehashes tombstones out and grows on live count only,
-# so key churn drove the empties to zero and every miss probed all `cap` slots
-# under the limiter lock. The sweeps now rebuild below cap/4 empties.
+# Before cyrius 6.6.20 lib/hashmap.cyr never rehashed tombstones out and grew
+# on live count only, so key churn drove the empties to zero and every miss
+# probed all `cap` slots under the limiter lock. The sweeps rebuild below cap/4
+# empties. 6.6.20's map_set counts tombstones and rebuilds first, so churn no
+# longer starves the map by itself; the sweep's rebuild stays for consumers on
+# an older stdlib, and the second half below builds the starved table by hand.
 fn test_ratelimit_churn_reclaims_tombstones() {
     # 1M tokens/s, burst 1: refilled to full within 1 µs, so every sweep after
     # a 1 ms sleep evicts every key.
@@ -2090,25 +2117,17 @@ fn test_ratelimit_churn_reclaims_tombstones() {
     }
     assert_eq(clean, 1, "churn: every sweep leaves >= cap/4 empty slots");
 
-    # Rebuild with LIVE keys: churn (without letting a sweep see the low state)
-    # until 8 fresh keys sit in a map with < cap/4 empties, then sweep with an
-    # idle threshold nothing meets. The sweep must rebuild and lose nothing.
-    var g = 0;
-    var reached = 0;
-    while (g < 2000 && reached == 0) {
-        var j2 = 0;
-        while (j2 < 8) { ratelimit_check(rl, _t8_intkey(500000 + g * 100 + j2)); j2 = j2 + 1; }
-        if (_t8_empty_slots(buckets) * 4 < map_cap(buckets)) {
-            reached = 1;
-        } else {
-            _majra_sleep_ns(1000000);
-            ratelimit_evict_stale(rl, 0);
-            g = g + 1;
-        }
-    }
-    assert_eq(reached, 1, "churn precondition: tombstones ate the empties with 8 live keys");
+    # Rebuild with LIVE keys: 9 live keys in a map with < cap/4 empties, then a
+    # sweep with an idle threshold nothing meets. The sweep must rebuild and
+    # lose nothing. Churn reached that state before 6.6.20; now the tombstones
+    # are written by hand (uncounted — the shape relay.cyr's drops leave).
+    var j2 = 0;
+    while (j2 < 8) { ratelimit_check(rl, _t8_intkey(500000 + j2)); j2 = j2 + 1; }
     ratelimit_check(rl, "live1");
     ratelimit_check(rl, "live1");
+    _t8_starve(buckets);
+    assert(_t8_empty_slots(buckets) * 4 < map_cap(buckets),
+      "churn precondition: tombstones ate the empties with 9 live keys");
     var live = ratelimit_key_count(rl);
     assert_eq(live, 9, "churn: 9 live keys before the rebuild sweep");
     assert_eq(ratelimit_evict_stale(rl, 3600000000000), 0, "churn: nothing is an hour idle");
@@ -2121,7 +2140,7 @@ fn test_ratelimit_churn_reclaims_tombstones() {
     var found = 0;
     var j3 = 0;
     while (j3 < 8) {
-        var sk = ratelimit_stats_for_key(rl, _t8_intkey(500000 + g * 100 + j3));
+        var sk = ratelimit_stats_for_key(rl, _t8_intkey(500000 + j3));
         if (sk != 0) { found = found + 1; ratelimit_stats_free(sk); }
         j3 = j3 + 1;
     }
@@ -2139,6 +2158,10 @@ fn test_ratelimit_churn_reclaims_tombstones() {
         r = r + 1;
     }
     chb_register(cht, "keep", 7);
+    # Since 6.6.20 the churn above leaves the map clean by itself; starve it by
+    # hand so the sweep's own rebuild is what the next assert sees.
+    _t8_starve(nodes);
+    assert(_t8_empty_slots(nodes) * 4 < map_cap(nodes), "heartbeat churn precondition: tombstones ate the empties");
     chb_update_statuses(cht);
     assert(_t8_empty_slots(nodes) * 4 >= map_cap(nodes), "heartbeat churn: the sweep reclaims tombstones");
     assert_eq(chb_len(cht), 1, "heartbeat churn: one live node");
@@ -2673,7 +2696,7 @@ fn test_relay_prunes_closed_subscribers() {
     println("  relay_prunes_closed_subscribers: ok");
 }
 
-# 2.8.2: relay dedup drops left tombstones lib/hashmap.cyr never reclaims, so a
+# 2.8.2: relay dedup drops left tombstones lib/hashmap.cyr never counts, so a
 # bounded table under sender churn ran out of empty slots and every new
 # sender's lookup probed the whole map under the relay mutex.
 fn test_relay_dedup_churn_reclaims_tombstones() {
@@ -3342,7 +3365,7 @@ fn _t8_mw_worker(name) {
     return 0;
 }
 
-# ⚠ ~0.6 s native, ~47 s under qemu-aarch64 (1010 TCG thread spawns) — main()
+# ⚠ ~47 s under qemu-aarch64 (1010 TCG thread spawns) — main()
 # runs it on x86_64 only; the release path is unchanged by arch.
 fn test_cbarrier_release_wakes_over_1000() {
     var N = 1010;
@@ -3366,15 +3389,29 @@ fn test_cbarrier_release_wakes_over_1000() {
         i = i + 1;
     }
     assert(spawned > 1000, "release precondition: more than 1000 waiters spawned");
-    _majra_sleep_ns(500000000);
+    # Wait for every waiter to ARRIVE before releasing, rather than a fixed
+    # 500 ms: on a loaded box (load ~25 on 16 cores, 2.9.3) some had not run
+    # by then, the barrier could not release, and the 2 s wait below saw 0 —
+    # under both the 6.6.9 and 6.6.20 builds. A waiter that has arrived parks a
+    # moment later; the released flag covers that window.
+    var state = map_get(load64(_t8_mw_cbs), "big");
+    var arrived = 0;
+    var aw = 0;
+    while (aw < 3000 && arrived < spawned) {
+        mutex_lock(load64(_t8_mw_cbs + 8));
+        arrived = vec_len(load64(state + 8));
+        mutex_unlock(load64(_t8_mw_cbs + 8));
+        if (arrived < spawned) { _majra_sleep_ns(10000000); aw = aw + 1; }
+    }
+    assert_eq(arrived, spawned, "release precondition: every waiter arrived before the release");
     cbarrier_arrive(_t8_mw_cbs, "big", vec_get(p, N));
     var w = 0;
     var done = 0;
-    while (w < 200) {
+    while (w < 3000) {
         mutex_lock(_t8_mw_mtx);
         done = _t8_mw_done;
         mutex_unlock(_t8_mw_mtx);
-        if (done >= spawned) { w = 200; }
+        if (done >= spawned) { w = 3000; }
         else { _majra_sleep_ns(10000000); w = w + 1; }
     }
     assert_eq(done, spawned, "a release wakes every parked waiter, not the first 1000");

@@ -95,8 +95,8 @@ since 2.7.3 with one warning, and with none since the 6.6.6 pin closed the
 `tests/test_backends.tcyr` and `tests/test_patra_queue.tcyr` call `sys_unlink`
 / `sys_stat` with the Linux arity and name `SYS_SOCKETPAIR` / `SYS_RECVFROM` /
 `SYS_GETSOCKNAME`, which the agnos peer does not declare (re-measured under
-6.6.6: core and expanded suites build `OK` with `--agnos`; the other two fail
-at those sites). Until they build, "agnos-clean" is a claim about linking, not
+6.6.20 at 2.9.3: core and expanded suites build `OK` with `--agnos`; the other
+two fail at those sites). Until they build, "agnos-clean" is a claim about linking, not
 about behaviour.
 
 **Scope**: port the two suites' Linux-only call sites behind the per-target
@@ -106,6 +106,25 @@ wrappers or `#ifdef` arms (the shape `src/ipc.cyr` already uses), then add
 **Trigger**: a consumer builds the `backends` profile for agnos (the daemon
 `--agnos` build that first exposed the profile), or the aarch64 run lane above
 lands and the matrix grows a second non-x86 column anyway.
+
+---
+
+### Retire `_majra_map_compact` at the ratelimit and heartbeat sites
+
+cyrius 6.6.20's `lib/hashmap.cyr` counts `map_delete`'s tombstones and
+rebuilds on a new-key insert, so under the pinned stdlib the sweep-time
+compaction in `ratelimit_evict_stale`, `sliding_window_evict_stale` and both
+heartbeat status sweeps never fires (the expanded suite has to starve those
+maps by hand to reach it). It stays for now because a bundle compiles against
+the *consumer's* stdlib, and on an older hashmap it is what keeps a churned
+limiter from probing every slot under its lock. `relay.cyr`'s `seen` keeps it
+regardless — its drops write tombstones the stdlib never counts.
+
+**Scope**: delete the four call sites and the two hand-starve test halves that
+exist only to reach them; keep the helper and relay's tests.
+**Aimed at**: a PATCH — no API change.
+**Trigger**: every consumer in [`state.md`](state.md)'s table pins cyrius
+≥ 6.6.20, or 3.0.0, whichever is first.
 
 ---
 
@@ -126,7 +145,7 @@ and `cyrius lint` keeps noting them while they live.
 
 ## Waiting on upstream
 
-Nothing at 2.9.1. The one item that sat here — the `_agnos_getenv` warning on
+Nothing at 2.9.3. The one item that sat here — the `_agnos_getenv` warning on
 an agnos build of the `backends` profile — closed upstream: cyrius 6.6.6's
 `lib/io.cyr` includes `lib/args_agnos.cyr` itself, and a clean-room probe of
 `dist/majra-backends.cyr` plus its sidecar leaves cross-builds `OK` under
@@ -151,10 +170,8 @@ to the 2.9 line (agnos-portable backends + patra-queue suites).
 
 ## Upstream cleanup (not majra work)
 
-- cyrius `lib/thread.cyr` `chan_new` multiplies `cap * 8` unchecked and does not
-  check for a zero allocation (found by the 2.8.1 sweep). `lib/hashmap.cyr`
-  never reclaims tombstones, so delete-heavy maps probe ever longer; majra works
-  around it with `_majra_map_compact`.
+- cyrius `lib/thread.cyr` `chan_new` multiplies `cap * 8` unchecked (found by
+  the 2.8.1 sweep; the zero-allocation half is checked at 6.6.20).
 
 - `cyrius/docs/development/issues/majra-cbarrier-arrive-and-wait-crash.md` was
   fixed in cyrius 5.4.10 but never moved to `issues/archived/` with a

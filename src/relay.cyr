@@ -345,7 +345,11 @@ fn _relay_alloc_dedup_entry(dmap, key, seq, now) {
 # different slot than the one scanned, the scanned slot stays live while its
 # entry is freed — a use-after-free that hands a live block back to fl_alloc.
 # Owned keys remove the known trigger; this makes it impossible. The two stores
-# are exactly what `map_delete` does to the slot and the map count.
+# are what `map_delete` does to the slot and the live count — but since cyrius
+# 6.6.20 map_delete also counts the tombstone, in a word private to
+# lib/hashmap.cyr. These go uncounted (the stdlib clamps its count at 0 when one
+# is reused), so its rebuild trigger never sees them and `_majra_map_compact`
+# is what reclaims them.
 fn _relay_dedup_drop_slot(seen, sp) {
     var k = load64(sp);
     var e = load64(sp + 8);
@@ -498,7 +502,7 @@ fn relay_receive_ex(r, msg) {
             # table's memory leaked one block per eviction.
             _relay_dedup_drop_slot(seen, oldest_sp);
             counter_inc(load64(r + 72));
-            # Drops leave tombstones lib/hashmap.cyr never reclaims (2.8.2).
+            # Drops leave tombstones lib/hashmap.cyr never counts (2.8.2).
             _majra_map_compact(seen, dempties);
         }
     }
@@ -583,10 +587,10 @@ fn relay_evict_stale_dedup(r, max_idle_ns) {
     # DedupEntry blocks without freeing them — so the routine whose whole job
     # is bounding the dedup table's memory leaked a block per eviction.
     #
-    # Now allocation-free, walking the slot array directly. Deleting during the
-    # walk is safe because map_delete leaves a tombstone rather than
-    # reshuffling: _map_find skips st == 2 and _map_grow_a rehashes only live
-    # entries, so no slot this loop has yet to visit moves.
+    # Now allocation-free, walking the slot array directly. Dropping during the
+    # walk is safe because a drop only writes a tombstone and nothing in the
+    # walk inserts (only a new-key map_set moves entries), so no slot this loop
+    # has yet to visit moves.
     var seen = load64(r + 16);
     var entries = map_entries(seen);
     var cap = map_cap(seen);

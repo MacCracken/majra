@@ -41,9 +41,8 @@ fn counter_get(c) {
 # eliminate at 2.6.4, still sitting here in the generic helper.
 #
 # It walks the slot array directly. Deleting during the walk is safe because
-# map_delete leaves a tombstone rather than reshuffling: _map_find skips
-# st == 2 and _map_grow_a rehashes only live entries, so no slot this loop has
-# yet to visit is moved.
+# map_delete leaves a tombstone and never moves an entry (only a NEW-key
+# map_set rebuilds the table), so no slot this loop has yet to visit is moved.
 #
 # ⚠ The caller owns key/value lifetime. This helper removes the ENTRY only; it
 # does not free the key or the value, because it cannot know how they were
@@ -72,12 +71,17 @@ fn map_evict(m, predicate_fn) {
 # the count of state-0 slots the caller's sweep walk just saw. Returns 1 if it
 # rebuilt.
 #
-# ⚠ lib/hashmap.cyr grows on LIVE count only and never rehashes tombstones out,
-# and `_map_find` stops only at an empty slot — so under key churn the empties
-# trend to zero and every miss (each new client's first check) probes all `cap`
-# slots while holding the caller's mutex. Shared by ratelimit, heartbeat and relay. Below cap/4 empties, copy the live
-# pairs out, map_clear, and re-insert: the live count already fit this capacity,
-# so no grow and no bump allocation. Key/value pointers are re-stored as-is.
+# ⚠ Before cyrius 6.6.20 lib/hashmap.cyr grew on LIVE count only and never
+# rehashed tombstones out, and `_map_find` stops only at an empty slot — so
+# under key churn the empties trended to zero and every miss (each new client's
+# first check) probed all `cap` slots while holding the caller's mutex. 6.6.20
+# counts map_delete's tombstones and rebuilds on a new-key insert, so for the
+# ratelimit and heartbeat maps this no longer fires under the pinned stdlib; it
+# stays for consumers building a bundle against an older one, and relay's
+# `seen` still needs it — its drops write tombstones the stdlib never counts.
+# Below cap/4 empties, copy the live pairs out, map_clear, and re-insert: the
+# live count already fit this capacity, so no grow and no bump allocation.
+# Key/value pointers are re-stored as-is.
 fn _majra_map_compact(m, empties) {
     var cap = map_cap(m);
     if (empties * 4 >= cap) { return 0; }

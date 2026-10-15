@@ -255,9 +255,9 @@ fn ratelimit_evict_stale(rl, max_idle_ns) {
                     map_delete(buckets, k);
                     # Free strictly AFTER the delete, which needs the key to
                     # find the entry. The tombstone it leaves is never
-                    # key-compared (`_map_find` skips `st == 2`) and
-                    # `_map_grow_a` rehashes only live entries, so the stale
-                    # pointer in the slot is never read.
+                    # key-compared (`_map_find` skips `st == 2`) and a
+                    # rebuild (a grow, or 6.6.20's in-place one) moves only
+                    # live entries, so the stale pointer is never read.
                     fl_free(bucket_ptr);
                     fl_free(k);
                     evicted = evicted + 1;
