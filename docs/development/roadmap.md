@@ -33,21 +33,6 @@ promotion is a decision rather than a mood.
 
 ## 2.12.x — patches (no API)
 
-### Move the aarch64 run lane off Ubuntu 24.04's qemu 8.2.2
-
-The `aarch64-qemu` job installs the runner's `qemu-user`, which is 8.2.2, and
-under it the patra-queue stall test refuses one INSERT in about 400 runs
-(`PATRA_ERR_IO` inside the transaction; the queue returns 0, no job is lost).
-The same binaries are clean under qemu 11.1.3 in 3,000 runs, and natively. With
-25 runs per push, the lane fails about one push in sixteen for a reason that is
-the emulator's. CHANGELOG § [2.12.2] Known issues has the measurements.
-
-**Scope**: run the lane on something other than 8.2.2: a newer qemu on the x86
-runner, or GitHub's native arm64 runner (`ubuntu-24.04-arm`) with cyrius's
-`aarch64-linux` tarball (the 6.7.18 release publishes one), which drops the
-emulator. Either way, re-measure there before trusting it.
-**Trigger**: open now — the lane fails on an emulator defect until this lands.
-
 ### Retire `_majra_map_compact` at the ratelimit and heartbeat sites
 
 cyrius 6.6.20's `lib/hashmap.cyr` counts `map_delete`'s tombstones and

@@ -6,7 +6,7 @@ type: state
 
 # Current State — majra
 
-> **Last refresh**: 2026-10-30 (2.12.2) | **Refresh cadence**: every release (ideally bumped by the release post-hook).
+> **Last refresh**: 2026-10-31 (2.12.3) | **Refresh cadence**: every release (ideally bumped by the release post-hook).
 > **What this file is**: volatile state. The companion `CLAUDE.md` holds durable rules; this file holds whatever drifts release-to-release. Per [first-party-documentation § CLAUDE.md](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/first-party-documentation.md#claudemd), version numbers, test counts, consumer lists, and in-flight work all live here, not in `CLAUDE.md`.
 
 ---
@@ -15,9 +15,9 @@ type: state
 
 | File | Value | Source |
 |---|---|---|
-| `VERSION` | **2.12.2** | single source of truth |
+| `VERSION` | **2.12.3** | single source of truth |
 | `cyrius.cyml [package].version` | `${file:VERSION}` | reads `VERSION` |
-| Latest git tag | `2.12.1` (2.12.2 pending tag) | release workflow asserts `VERSION == tag` |
+| Latest git tag | `2.12.2` (2.12.3 pending tag) | release workflow asserts `VERSION == tag` |
 
 ## Toolchain
 
@@ -25,7 +25,7 @@ type: state
 |---|---|---|
 | Cyrius | **6.7.18** | `cyrius.cyml [package].cyrius` |
 | Cyrius floor for `signed`/`backends` | **≥ 6.4.64** | historical — sigil 3.12.x calls `thread_local_alloc()`, absent before 6.4.64. Since 2.6.8 this is no longer a *pairing* constraint: sigil is a folded stdlib module, so the cyrius pin and the sigil version are one knob |
-| aarch64 cross-build (`cycc_aarch64`) | **run in CI since 2.12.2** — the `aarch64-qemu` job cross-builds the four suites and runs each 25× under `qemu-aarch64`, then the fuzz harnesses and examples once. Soaks and the benchmark binary stay by hand (most releases since 2.7.3, last at 2.12.1 under 6.7.18) | `.github/workflows/ci.yml` job "aarch64 under qemu-user" and step "Cross-build gate (aarch64, agnos)" |
+| aarch64 cross-build (`cycc_aarch64`) | **run in CI since 2.12.2** — the `aarch64-qemu` job cross-builds the four suites and runs each 25× under `qemu-aarch64`, then the fuzz harnesses and examples once. Since 2.12.3 the job runs a pinned qemu 11.1.3 (Debian's static build, hash-checked), not the runner's 8.2.2, whose `EFAULT` race failed the patra-queue stall test. Soaks and the benchmark binary stay by hand (most releases since 2.7.3, last at 2.12.1 under 6.7.18) | `.github/workflows/ci.yml` job "aarch64 under qemu-user" and step "Cross-build gate (aarch64, agnos)" |
 | agnos cross-build (`--agnos`) | **all four bundles and all four suites build** — `backends` and `patra-queue` since 2.12.2, when they moved to the per-target wrappers; CI's cross-build gate covers them. No agnos runner, so this proves linking, not behaviour | `.github/workflows/ci.yml` step "Cross-build gate (aarch64, agnos)" |
 
 > **Cyrius 6.x build workflow**: stdlib provisioning is split from git-dep
@@ -184,6 +184,7 @@ x86_64-windows only (`SYS_FUTEX`, `FUTEX_WAIT`/`_WAKE`, `sys_lstat`,
 
 | Tag | Date | Headline |
 |---|---|---|
+| 2.12.3 | 2026-10-31 | **CI patch: the aarch64 lane's patra-queue failure was a qemu bug.** Under `-strace` the failing run shows another thread's `munmap` racing a WAL-record `write` on a valid buffer, which qemu 8.2.2 failed with `EFAULT`. qemu's `page_check_range` read a page-flags node that an `munmap` was shrinking in place (fixed upstream in `e03b7dac65`: 11.1.0, 11.0.4). patra writes each 4,112-byte WAL record from a fresh `mmap`, so three writer threads churn the map. The `aarch64-qemu` job now installs Debian's static qemu 11.1.3, hash-pinned. 8.2.2: 2 failures in 3,000 runs; pinned 11.1.3: 0 in 9,000. No `src/` or API change; bundles differ only in the version stamp. 1,577 assertions. |
 | 2.12.2 | 2026-10-30 | **CI patch: the aarch64 run lane and the agnos column.** A new `aarch64-qemu` job runs the four suites 25× each, the fuzz harnesses and the examples under `qemu-aarch64` (CI had cross-built for aarch64 since 2.7.3 but never ran the builds). The cross-build gate adds `--agnos`, and the backends and patra-queue suites now build for it: they call the per-target wrappers (27 and 6 errors at 2.12.1). No `src/` or API change; bundles differ only in the version stamp. 1,577 assertions. The lane's first GitHub run failed once in 25 patra-queue runs (899 of 900 jobs in the stall test): one refused INSERT that only the runner's qemu 8.2.2 produces (about 1 in 400 runs; 0 in 3,000 under 11.1.3). The stall test now names refused vs lost (82 → 88), and the corrupt-ref test no longer patches a coincidental match. Retiring `_majra_map_compact` stays deferred: the consumers pin 6.6.2–6.6.14. |
 | 2.12.1 | 2026-10-30 | **Toolchain patch: cyrius 6.7.9 → 6.7.18**, every first-party fold at its latest tag (sigil 3.13.15, patra 1.16.6, sandhi 1.13.7, sakshi 2.5.10, bayan 1.11.1). Snapshot holds at 113, 66 files changed; sidecars unchanged; sigil's static-buffer warning gone. One `src/` fix the new patra made necessary: a corrupt TEXT cell, which patra 1.16.5 now reports as length -1, took the queue's legacy-STR fallback and was delivered empty and marked running — the column's type now decides, and the job stays queued (new test, mutation-checked). One test line refused by 6.7.17 (a discarded `rethi()`). 1,571 assertions natively and under qemu-aarch64; loops clean; benchmarks within ±3 % of a 6.7.9 build. |
 | 2.12.0 | 2026-10-15 | **A rate-limiter key cap that holds under key-spraying, and metrics hooks that pass their arguments.** `ratelimit_evict_to` / `sliding_window_evict_to` evict least recently seen first until at most `max_keys` remain (agnosai's issue, archived); lossy by design, documented. The four wider metrics hooks dispatch through `fncall3` / `fncall4`; `_metrics_arg3` / `_metrics_arg4` still written, deprecated until 3.0.0. Additive. 1,560 assertions natively and under qemu-aarch64; every new test mutation-checked. |
@@ -228,7 +229,6 @@ in the CHANGELOG.
 
 | Item | Status | Where to look |
 |---|---|---|
-| **aarch64 run lane fails on qemu 8.2.2** | Open — under Ubuntu 24.04's qemu 8.2.2 the patra-queue stall test refuses one INSERT in about 400 runs (`PATRA_ERR_IO`; the queue returns 0, no job lost). 0 in 3,000 runs of the same binaries under qemu 11.1.3, and none natively. About one push in sixteen fails until the lane moves off 8.2.2 | roadmap § 2.12.x · CHANGELOG § [2.12.2] Known issues |
 | **PostgreSQL: cleartext auth, no TLS** | Open — credentials and queries cross the wire in the clear; the connect fails closed on SCRAM rather than downgrading. Trigger-gated | roadmap § Later MINORs |
 | **Shared-memory IPC transport** | Parked until a consumer hits the syscall-per-message ceiling | roadmap § Later MINORs |
 

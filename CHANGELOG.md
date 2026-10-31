@@ -5,6 +5,64 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.12.3] - 2026-10-31
+
+CI patch: the aarch64 run lane's patra-queue failure (2.12.2's Known issue) is a **qemu bug**, now
+identified at the syscall. The lane now runs on a qemu that has the upstream fix. No `src/` change
+and no API change; the four bundles differ from 2.12.2 only in their version stamp. **1,577
+assertions**, unchanged.
+
+### Fixed
+
+- **The aarch64 run lane failed on an emulator race, not on majra or patra.** Under Ubuntu 24.04's
+  `qemu-user` 8.2.2, the patra-queue stall test came up one INSERT short about once in 400 runs.
+  It failed CI again on the 2.12.2 push: run 17 of 25, "every enqueue on C returned an id".
+  - **The failing syscall.** A failing run under `qemu-aarch64 -strace` shows one worker's
+    `munmap` of a 4,128-byte block racing another worker's `write(6, 0x11737010, 4112)` of a WAL
+    record. The write returned `-1 errno=14 (Bad address)`. The buffer is valid: it sits inside
+    the live block mapped at `0x11737000`, directly above the block being unmapped. qemu refused
+    the call before the kernel saw it. The WAL write fails, `page_write` returns `PATRA_ERR_IO`,
+    and the INSERT is refused. 2.12.2 had localised the failure to that step.
+  - **The qemu bug.** qemu-user checks every syscall buffer with `page_check_range()`, which reads
+    its page-flags interval tree without the lock. An `munmap` on another thread shrank a tree
+    node in place. A reader that had already found that node then stepped into the hole and
+    reported the range invalid, which is `EFAULT`. qemu fixed this in commit `e03b7dac65`
+    ("accel/tcg: Make PageFlagsNodes' start and last immutable", 2026-07-06).
+    - Fixed in 11.1.0 and in the 11.0.4 stable release.
+    - Not fixed in Ubuntu 24.04's 8.2.2.
+    - Fixed in the 11.1.3 this machine runs, which is why 2.12.2's 3,000 runs here were clean.
+  - **Why only this test.** patra's WAL record is 4,112 bytes. That is over `fl_alloc`'s
+    4,096-byte size-class cap, so every logged page is a fresh `mmap` and `munmap`, and the record
+    is written from that block. One run of the suite makes about 4,100 `mmap` and 4,400 `munmap`
+    calls, three writer threads at a time; the other tests are single-threaded. A native run
+    cannot hit it, because the check that fails is qemu's, not the kernel's.
+  - **Why 2.12.2's diagnostics hid it.** The window is a few instructions inside qemu, so any
+    change to the guest's timing moves the odds. That explains 2.12.2's ~20,000 clean runs with
+    diagnostics added.
+- **`aarch64-qemu` installs a pinned qemu 11.1.3** instead of the runner's `qemu-user`. It is
+  Debian's static `qemu-user_11.1.3+ds-1_amd64.deb`, fetched from snapshot.debian.org with
+  deb.debian.org as fallback and checked against its sha256. `qemu-aarch64` goes to
+  `/usr/local/bin`. The step fails on a hash mismatch, if `PATH` finds another `qemu-aarch64`, or
+  if the version is not 11.1.3.
+- **`dist/`** — the version stamp only; sidecars unchanged.
+
+### Verified
+
+- **Reproduced under the runner's qemu** (Ubuntu's `qemu-user-static 8.2.2+ds-0ubuntu1.19`), each
+  run with its own `/tmp` on tmpfs:
+  - plain: 2 of 3,000 runs failed, both with 2.12.2's signature;
+  - with `-strace`: 1 of 360 failed, which produced the `EFAULT` above.
+- **Under the pinned 11.1.3 binary** (byte-identical to the one the step installs): 9,000 runs of
+  the patra-queue suite, all clean. 8.2.2's rate predicts about 6 failures.
+- **The `aarch64-qemu` job**, with its steps extracted from `ci.yml` and run under the workflow
+  `env`, using that binary as `qemu-aarch64`. Run twice, both clean:
+  - each suite 25 / 25 (205 · 724 · 557 · 88);
+  - fuzz and both examples ok.
+- **The install step, replayed locally** (`dpkg-deb` shimmed, a non-root install target): it
+  fetches, verifies and installs the binary and reports 11.1.3. A wrong hash fails it.
+- **Native:** `tests/test.sh` passes all four suites (205 · 727 · 557 · 88), and
+  `cyrius deps --verify` passes 113 / 0.
+
 ## [2.12.2] - 2026-10-30
 
 CI patch — the two 2.12.x roadmap items whose triggers had fired: CI now **runs** the aarch64 builds
