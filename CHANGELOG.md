@@ -9,8 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 CI patch — the two 2.12.x roadmap items whose triggers had fired: CI now **runs** the aarch64 builds
 under `qemu-aarch64`, and every suite cross-builds for agnos. No `src/` change and no API change;
-the four bundles differ from 2.12.1 only in their version stamp. **1,571 assertions**, unchanged
-(core 205 · expanded 727 · backends 557 · patra-queue 82), natively and under `qemu-aarch64`.
+the four bundles differ from 2.12.1 only in their version stamp. **1,577 assertions** (core 205 ·
+expanded 727 · backends 557 · patra-queue 88), natively and under `qemu-aarch64`.
+
+The new lane's first run on GitHub failed once in 25 runs of the patra-queue suite: the concurrent
+stall test counted 899 of its 900 jobs. Reproduced under the runner's qemu, it is one refused INSERT
+that only Ubuntu 24.04's qemu 8.2.2 produces; no job is lost (see Known issues).
 
 ### Added
 
@@ -40,13 +44,56 @@ the four bundles differ from 2.12.1 only in their version stamp. **1,571 asserti
     `sys_exit_group`.
 
   Each wrapper issues the same syscall on both Linux peers, so the Linux runs are unchanged: 557
-  and 82 assertions, natively and under qemu. On agnos the IPC and socketpair tests would fail by
+  and 82 assertions before the stall-test change below, natively and under qemu. On agnos the IPC and socketpair tests would fail by
   design, since `ipc_bind` fails closed and the peer's `sys_socketpair` returns -38.
 - **`.github/workflows/release.yml`** — a comment still said the aarch64 cross-build was skipped
   over an old cyrius bug. It now says `needs: [ci]` makes a release wait for both lanes.
+- **The patra-queue stall test now says which failure it saw** (82 → 88 assertions). Its workers
+  ignored `patra_queue_enqueue`'s return, so a short total could not tell two different defects
+  apart. Each worker now counts the enqueues that returned 0, and after the join each queue gets
+  two checks: every enqueue returned an id, and every id returned is in the file. The first
+  failing means patra refused a write and the queue reported it. The second means a committed job
+  was lost. Both are mutation-checked:
+  - a null payload on one of B's enqueues fails only "every enqueue on B returned an id";
+  - a row deleted behind the queue's back fails only "every id returned on A is durable".
+- **The 2.12.1 corrupt-ref test could patch the wrong word.**
+  - **What it did:** it corrupts the row's TEXT length on disk by scanning the file byte by byte
+    for the first 8-byte window equal to 3333. Across 200 runs the only bytes that vary before the
+    row are the header's random database id. An id whose top two bytes are `05 0D`, followed by the
+    zeroed bytes after it, also reads as 3333. Such a run patched the id instead of the row, and
+    four of the test's assertions failed.
+  - **Where it showed:** once in about 1,100 runs under qemu while the stall failure was being
+    reproduced. The odds are 1 in 65,536 per run on a random id alone, so that one sighting is
+    unexplained; the fix stands either way.
+  - **The fix:** the test now tries each match in turn. It patches it, reopens the file, and keeps
+    it only when patra reports the cell's length as -1; a wrong match is put back. The 11
+    assertions are unchanged.
+  - **Mutation-checked:** with that id planted in the header, the 2.12.1 test fails with exactly
+    those four assertions and the new one passes. With the 2.12.1 `src/` fix reverted, it still
+    fails 3.
 - **`dist/`** — the version stamp only; sidecars unchanged.
 
-### Deferred
+### Known issues
+
+- **The patra-queue stall test came up one job short on CI's qemu lane** (`aarch64-qemu`, run 7 of
+  25, on the first GitHub run): "stall: 900 jobs durable across A..C (got 899, expected 900)". Three
+  workers each enqueue 300 jobs to their own file while the main thread opens and closes a fourth.
+  All three finished all 300, and nothing else in the run failed.
+  - **It is a refused enqueue, not a lost job.** Run under the runner's own qemu (Ubuntu 24.04's
+    `qemu-user-static` 8.2.2, hash-checked against the archive index), the suite fails about once
+    in 400 runs. Every failure trips "every enqueue on … returned an id", never "is durable". A
+    diagnostic that records the failing step on the failure branch only places it at the INSERT:
+    `patra_exec_prepared` returns `PATRA_ERR_IO` inside the transaction. The queue rolls back and
+    returns 0, as documented.
+  - **It is specific to qemu 8.2.2.** The same binaries ran 3,000 times under qemu 11.1.3 in the same
+    four-loop setup with no failure, where 8.2.2's rate predicts about 6. More than 15,000 other
+    runs here, under 11.1.3 and natively, loaded and not, were also clean. The test has never
+    failed in native CI.
+  - **It hides when the code moves.** Diagnostics that add locals on the hot path — first in
+    `patra_queue_enqueue`, then in patra's page and WAL I/O functions — ran about 20,000 times
+    under 8.2.2 with no failure. That points at qemu's emulation rather than at patra's logic. It
+    is not a refused large-block `mmap`: a counter on that branch stayed at 0 through a failure.
+  - The CI lane still runs on 8.2.2; moving it off is roadmap § 2.12.x.
 
 - **Retiring `_majra_map_compact`** at the ratelimit and heartbeat sites stays on the roadmap. Its
   trigger is every consumer pinning cyrius ≥ 6.6.20, and the local checkouts pin 6.6.2 to 6.6.14:
@@ -55,8 +102,8 @@ the four bundles differ from 2.12.1 only in their version stamp. **1,571 asserti
 ### Verified
 
 - **The new CI steps, run locally.** Each was extracted from `ci.yml` and run with `bash` under the
-  workflow's own `env` (`CYRIUS_DCE=1`). The workflow itself has not yet run on a GitHub runner;
-  qemu there will be slower than this machine, where the job's two qemu steps take about 5 minutes.
+  workflow's own `env` (`CYRIUS_DCE=1`). The job's two qemu steps take about 5 minutes on this
+  machine. On GitHub the lane failed once, which is the Known issue above.
   - Cross-build gate: 8 builds, 0 diagnostics. It fails on the 2.12.1 suites, which stop on 27 and
     6 agnos errors.
   - qemu loop: 25 / 25 clean for every suite (205 · 724 · 557 · 82), with and without
@@ -65,7 +112,8 @@ the four bundles differ from 2.12.1 only in their version stamp. **1,571 asserti
   - A stub `qemu-aarch64` that exits 139 for one suite makes the loop step report each crashed run
     with its log and exit 1.
 - **Native:** `tests/test.sh` passes all four suites, and the two edited suites ran 10× each with
-  no failure. The raw-syscall gate is clean, `cyrius fmt --check` and `cyrius lint` report 0
+  no failure. After the stall-test change, the patra-queue suite (88) ran 25× natively and 25×
+  under qemu with no failure. The raw-syscall gate is clean, `cyrius fmt --check` and `cyrius lint` report 0
   warnings on both suites, and `cyrius deps --verify` passes 113 / 0.
 
 ## [2.12.1] - 2026-10-30

@@ -180,7 +180,7 @@ cyrius build --no-deps src/main.cyr build/majra
 # Run core tests
 ./build/majra
 
-# Full test matrix — 1,571 assertions at 2.12.1.
+# Full test matrix — 1,577 assertions at 2.12.2.
 # Counts move every release; docs/development/state.md carries the current ones.
 cyrius build --no-deps tests/test_core.tcyr        build/test_core        && ./build/test_core
 cyrius build --no-deps tests/test_backends.tcyr    build/test_backends    && ./build/test_backends

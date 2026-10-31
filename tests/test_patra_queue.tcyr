@@ -295,37 +295,58 @@ fn test_patra_queue_corrupt_text_ref() {
     assert_eq(patra_queue_enqueue(q, PRIORITY_NORMAL, pay), 1, "corrupt ref: enqueued");
     patra_queue_close(q);
 
-    # The row's ref holds the length as an i64; the first such word in the file
-    # is the row's (the chain page that follows repeats it).
+    # The row's ref holds the length as an i64 (the chain page after it repeats
+    # it). A byte-by-byte scan can also match by chance — the header's random
+    # database id with its top bytes 05 0D, then the zeroed bytes after it, reads
+    # as 3333 — and 2.12.1 patched the FIRST match, so such a run corrupted the
+    # id and the test failed (once in ~1,100 runs under qemu at 2.12.2). Each
+    # match is tried in turn and kept only when patra then reports the cell's
+    # length as -1; a wrong one is put back.
     var cap = 1048576;
     var buf = fl_alloc(cap);
     var n = file_read_all(p, buf, cap);
     assert(n > 0, "corrupt ref: file read");
-    var at = 0 - 1;
+    var tried = 0;
+    var bad_writes = 0;
+    var hit = 0;
+    q = 0;
     var i = 0;
-    while (at < 0 && i + 8 <= n) {
-        if (load64(buf + i) == 3333) { at = i; }
+    while (hit == 0 && i + 8 <= n) {
+        if (load64(buf + i) == 3333) {
+            tried = tried + 1;
+            store64(buf + i, 1099511627776);
+            if (file_write_all(p, buf, n) != n) { bad_writes = bad_writes + 1; }
+            q = patra_queue_new(p);
+            if (q != 0) {
+                var probe = patra_query(load64(q), "SELECT * FROM jobs WHERE status = 0");
+                if (probe != 0) {
+                    if (patra_result_get_text_len(probe, 0, 2) == 0 - 1) { hit = 1; }
+                    patra_result_free(probe);
+                }
+                if (hit == 0) { patra_queue_close(q); q = 0; }
+            }
+            if (hit == 0) { store64(buf + i, 3333); }
+        }
         i = i + 1;
     }
-    assert(at >= 0, "corrupt ref: length word found");
-    if (at >= 0) { store64(buf + at, 1099511627776); }
-    assert_eq(file_write_all(p, buf, n), n, "corrupt ref: file written");
-
-    q = patra_queue_new(p);
+    assert(tried > 0, "corrupt ref: length word found");
+    assert_eq(bad_writes, 0, "corrupt ref: file written");
     assert(q != 0, "corrupt ref: queue reopened");
-    # Precondition: the patched word is the row's, and patra reports it.
-    var rs = patra_query(load64(q), "SELECT * FROM jobs WHERE status = 0");
-    assert(rs != 0, "corrupt ref: raw query");
-    if (rs != 0) {
-        assert_eq(patra_result_get_text_len(rs, 0, 2), 0 - 1, "corrupt ref: getter answers -1");
-        patra_result_free(rs);
+    if (q != 0) {
+        # Precondition: the patched word is the row's, and patra reports it.
+        var rs = patra_query(load64(q), "SELECT * FROM jobs WHERE status = 0");
+        assert(rs != 0, "corrupt ref: raw query");
+        if (rs != 0) {
+            assert_eq(patra_result_get_text_len(rs, 0, 2), 0 - 1, "corrupt ref: getter answers -1");
+            patra_result_free(rs);
+        }
+        var j = patra_queue_dequeue(q);
+        assert_eq(j, 0, "corrupt ref: not delivered");
+        if (j != 0) { patra_job_free(j); }
+        assert_eq(patra_queue_queued_count(q), 1, "corrupt ref: job stays queued");
+        assert_eq(patra_queue_running_count(q), 0, "corrupt ref: nothing marked running");
+        patra_queue_close(q);
     }
-    var j = patra_queue_dequeue(q);
-    assert_eq(j, 0, "corrupt ref: not delivered");
-    if (j != 0) { patra_job_free(j); }
-    assert_eq(patra_queue_queued_count(q), 1, "corrupt ref: job stays queued");
-    assert_eq(patra_queue_running_count(q), 0, "corrupt ref: nothing marked running");
-    patra_queue_close(q);
     fl_free(buf);
     fl_free(pay);
     _pq_unlink(p);
@@ -339,14 +360,29 @@ fn test_patra_queue_corrupt_text_ref() {
 # without joining.
 var _pqs_q[3];
 var _pqs_done[3];
+var _pqs_refused[3];
 fn _pqs_worker(k) {
     var q = load64(&_pqs_q + k * 8);
     var i = 0;
     while (i < 300) {
-        patra_queue_enqueue(q, PRIORITY_NORMAL, "w");
+        # 0 is the queue saying the INSERT did not commit. Counted, so a short
+        # total says which failure it was (2.12.2: CI's qemu lane saw 899).
+        if (patra_queue_enqueue(q, PRIORITY_NORMAL, "w") == 0) {
+            store64(&_pqs_refused + k * 8, load64(&_pqs_refused + k * 8) + 1);
+        }
         store64(&_pqs_done + k * 8, i + 1);
         i = i + 1;
     }
+    return 0;
+}
+
+# A worker's queue after the join: every enqueue returned an id, and every id
+# returned is in the file. The first failing is patra refusing a write it then
+# reported; the second is a committed job lost.
+fn _pqs_check(k, refused_msg, durable_msg) {
+    var refused = load64(&_pqs_refused + k * 8);
+    assert_eq(refused, 0, refused_msg);
+    assert_eq(patra_queue_queued_count(load64(&_pqs_q + k * 8)), 300 - refused, durable_msg);
     return 0;
 }
 
@@ -363,6 +399,7 @@ fn test_patra_queue_open_during_concurrent_use() {
     assert(load64(&_pqs_q) != 0 && load64(&_pqs_q + 8) != 0 && load64(&_pqs_q + 16) != 0,
       "stall: worker queues opened");
     store64(&_pqs_done, 0); store64(&_pqs_done + 8, 0); store64(&_pqs_done + 16, 0);
+    store64(&_pqs_refused, 0); store64(&_pqs_refused + 8, 0); store64(&_pqs_refused + 16, 0);
 
     var t0 = thread_create(&_pqs_worker, 0);
     var t1 = thread_create(&_pqs_worker, 1);
@@ -393,6 +430,9 @@ fn test_patra_queue_open_during_concurrent_use() {
         sys_exit_group(assert_summary() + 1);
     }
     thread_join(t0); thread_join(t1); thread_join(t2);
+    _pqs_check(0, "stall: every enqueue on A returned an id", "stall: every id returned on A is durable");
+    _pqs_check(1, "stall: every enqueue on B returned an id", "stall: every id returned on B is durable");
+    _pqs_check(2, "stall: every enqueue on C returned an id", "stall: every id returned on C is durable");
     var total = patra_queue_queued_count(load64(&_pqs_q))
     + patra_queue_queued_count(load64(&_pqs_q + 8))
     + patra_queue_queued_count(load64(&_pqs_q + 16));
