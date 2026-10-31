@@ -124,7 +124,7 @@ pg_save_workflow_def(conn, "wf-1", "my workflow", "[]");
 ## Architecture
 
 ```
-majra (v2.12.0, ~10,350 lines across 22 modules; 11,227 across 23 files counting the src/main.cyr self-test entry — see docs/development/state.md)
+majra (v2.12.1, ~10,365 lines across 22 modules; 11,239 across 23 files counting the src/main.cyr self-test entry — see docs/development/state.md)
 │
 │ ── Core ──────────────────────────────────────
 ├── error           Error codes + result helpers
@@ -180,7 +180,7 @@ cyrius build --no-deps src/main.cyr build/majra
 # Run core tests
 ./build/majra
 
-# Full test matrix — 1,560 assertions at 2.12.0.
+# Full test matrix — 1,571 assertions at 2.12.1.
 # Counts move every release; docs/development/state.md carries the current ones.
 cyrius build --no-deps tests/test_core.tcyr        build/test_core        && ./build/test_core
 cyrius build --no-deps tests/test_backends.tcyr    build/test_backends    && ./build/test_backends
@@ -225,16 +225,16 @@ modules = ["dist/majra.cyr"]             # core engine only — lean, no crypto
 
 `cyrius deps` resolves the tag and copies the chosen bundle into `lib/` under its own name — `lib/majra.cyr`, `lib/majra-signed.cyr`, `lib/majra-admin.cyr` or `lib/majra-backends.cyr`. A plain `cyrius build` prepends it (and the sidecar leaves) to your entry point automatically; an entry point built with `--no-deps` `include`s it by hand.
 
-Each bundle opens with a compile-verified `# Requires` block — one `include "lib/<leaf>.cyr"` per leaf of its `.deps` sidecar — so it is raw-includable: hand-included under `--no-deps`, it needs those leaves in your `lib/` (a `cyrius lib sync --full` provides them) and nothing else. Since cyrius 6.6.18 a sidecar names only the leaves nothing else in the bundle includes; the folded modules (sigil, sandhi, patra) pull their own. At 2.11.0 each bundle was built by a clean consumer against only its sidecar's leaves — 0 undefined on x86_64, aarch64 and agnos:
+Each bundle opens with a compile-verified `# Requires` block — one `include "lib/<leaf>.cyr"` per leaf of its `.deps` sidecar — so it is raw-includable: hand-included under `--no-deps`, it needs those leaves in your `lib/` (a `cyrius lib sync --full` provides them) and nothing else. Since cyrius 6.6.18 a sidecar names only the leaves nothing else in the bundle includes; the folded modules (sigil, sandhi, patra) pull their own. At 2.12.1 (cyrius 6.7.18) each bundle was built by a clean consumer against only its sidecar's leaves — 0 undefined on x86_64, aarch64 and agnos:
 
-| Profile | `.deps` sidecar at 2.12.0 |
+| Profile | `.deps` sidecar at 2.12.1 |
 |---|---|
 | `majra` (core) | 14 leaves — `syscalls`, `str`, `result`, `freelist`, `sync`, `atomic`, `hashmap`, `fnptr`, `string`, `alloc`, `vec`, `chrono`, `fmt`, `thread` |
 | `majra-signed` | 16 — core's 14 + `ct`, `sigil` |
 | `majra-admin` | 2 — `sandhi`, `syscalls` (sandhi brings `net`, `tls`, `sigil`, … itself) |
 | `majra-backends` | 3 — `sandhi`, `patra`, `syscalls` |
 
-> **Toolchain floor (measured at 2.11.0; the core re-checked at 2.12.0).** The core bundle builds on cyrius **6.6.0** and later (the oldest tested; at 2.12.0 a clean room holding only the bundle and its sidecar's leaves builds and runs `ratelimit_evict_to` and a three-argument metrics hook on 6.6.0 and 6.7.9). The signed, admin and backends sidecars assume folds that include their own leaves, which the snapshot ships from **6.6.20** (tested on 6.6.20, 6.7.0 and 6.7.9); provisioned from the sidecar alone on 6.6.9 they leave names undefined (signed 36, admin 217). The code itself still builds on 6.6.9 — a consumer on an older pin includes the folds' leaves itself from a full `lib sync`, or moves its pin.
+> **Toolchain floor (measured at 2.11.0; the core re-checked at 2.12.0, the backends profile at 2.12.1).** The core bundle builds on cyrius **6.6.0** and later (the oldest tested; at 2.12.0 a clean room holding only the bundle and its sidecar's leaves builds and runs `ratelimit_evict_to` and a three-argument metrics hook on 6.6.0 and 6.7.9). The signed, admin and backends sidecars assume folds that include their own leaves, which the snapshot ships from **6.6.20** (tested on 6.6.20, 6.7.0, 6.7.9 and 6.7.18; at 2.12.1 the backends bundle, whose durable queue now calls `patra_result_col_type`, was re-checked from its sidecar alone on 6.6.20, 6.7.0 and 6.7.9 and round-trips a job on each); provisioned from the sidecar alone on 6.6.9 they leave names undefined (signed 36, admin 217). The code itself still builds on 6.6.9 — a consumer on an older pin includes the folds' leaves itself from a full `lib sync`, or moves its pin.
 
 > **Sidecar history.** Through 2.6.7 the `majra-signed` and `majra-backends` sidecars omitted `sigil` (a `[deps.sigil]` git dep made `distlib` classify it out of the stdlib leaves), so a sidecar-only consumer built `OK` and SIGILLed on its first `ed25519_*` call. Fixed at 2.6.8; if you pin 2.6.7 or earlier, add `sigil` yourself.
 
@@ -256,12 +256,12 @@ There is no separate sigil profile to pull for a `signed`-only consumer: sigil r
 
 Majra was originally a Rust library (v1.0.4, ~13,000 lines). It was ported to Cyrius via `cyrius port`, re-implementing all modules from scratch.
 
-| Metric | Rust v1.0.4 | Cyrius v2.12.0 |
+| Metric | Rust v1.0.4 | Cyrius v2.12.1 |
 |--------|-------------|---------------|
-| Source lines | 12,969 | 11,227 (all of `src/`, incl. the 874-line `src/main.cyr` test entry; 10,353 in the 22 modules — much of the growth since the port is rationale comments from four hardening passes) |
+| Source lines | 12,969 | 11,239 (all of `src/`, incl. the 874-line `src/main.cyr` test entry; 10,365 in the 22 modules — much of the growth since the port is rationale comments from four hardening passes) |
 | Modules | 22 | 22 (QUIC transport not ported — deferred until a consumer needs multiplexed streams or connection migration; see roadmap § QUIC transport) |
 | Dependencies | 25 crates | 0 — sigil is a folded stdlib module |
-| Toolchain | cargo + rustc + LLVM | cyrius 6.7.9 |
+| Toolchain | cargo + rustc + LLVM | cyrius 6.7.18 |
 
 ## License
 

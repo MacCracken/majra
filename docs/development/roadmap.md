@@ -5,10 +5,9 @@
 test counts, bundle sizes — lives in [`state.md`](state.md). When an item here
 ships, **delete it**; do not convert it into a changelog entry.
 
-Every item below was re-checked against the 2.11.0 tree on 2026-10-15 (and
-is untouched by 2.12.0): still open in the code, and — where it depends on
-upstream — still open at the latest **tagged** cyrius (6.7.11) and sigil
-(3.13.12).
+Every item below was re-checked against the 2.12.1 tree on 2026-10-30: still
+open in the code, and — where it depends on upstream — still open at the
+latest **tagged** cyrius (6.7.18) and sigil (3.13.15).
 
 ## How to read this
 
@@ -41,7 +40,7 @@ CI cross-**builds** the four suites for aarch64 and fails on any
 all a build can give: of the three raw-syscall defects 2.7.3 fixed, two emitted
 no build-time warning on any toolchain, so a build-only lane cannot see the
 class it exists to catch. Most releases since have run the suites under
-`qemu-aarch64` by hand (2.12.0 last). **Still open at 2.11.0**: no CI job installs or runs
+`qemu-aarch64` by hand (2.12.1 last). **Still open at 2.12.1**: no CI job installs or runs
 `qemu-user`.
 
 **Scope**: `qemu-user` on the runner, then `cyrius build --aarch64 --no-deps
@@ -57,8 +56,8 @@ The four bundles cross-build clean for agnos. The **suites** cannot follow:
 `tests/test_backends.tcyr` and `tests/test_patra_queue.tcyr` call `sys_unlink`
 / `sys_stat` with the Linux arity and name `SYS_SOCKETPAIR` / `SYS_RECVFROM` /
 `SYS_GETSOCKNAME`, which the agnos peer does not declare. **Re-measured at
-2.11.0 (cyrius 6.7.9)**: core and expanded build `OK` with `--agnos`; backends
-stops on 27 errors and patra-queue on 6. Until they build, "agnos-clean" is a
+2.12.1 (cyrius 6.7.18)**: core and expanded build `OK` with `--agnos`; backends
+stops on 27 errors and patra-queue on 6, as at 2.11.0 (cyrius 6.7.9). Until they build, "agnos-clean" is a
 claim about linking, not about behaviour.
 
 **Scope**: port the two suites' Linux-only call sites behind the per-target
@@ -66,21 +65,6 @@ wrappers or `#ifdef` arms (the shape `src/ipc.cyr` already uses), then add
 `--agnos` to the cross-build gate next to `--aarch64`. No `src/` change.
 **Trigger**: a consumer builds the `backends` profile for agnos, or the aarch64
 run lane above lands and the matrix grows a second non-x86 column anyway.
-
-### Move the cyrius pin past 6.7.9
-
-The one upstream warning every signed / admin / backends build prints — sigil's
-over-budget `var buf[262144]` ("array local … gets STATIC storage") — is gone
-from sigil **3.13.12**, which cyrius folds from **6.7.10**. 6.7.10 and 6.7.11
-are tagged; 6.7.12 is still in progress.
-
-**Scope**: the pin-bump procedure (baseline under the old pin, snapshot and fold
-diff, `ESYSXLAT` re-derivation, the 6.7.x `ecosystem-migration.md` entries
-grepped across the tree, loops natively and under qemu, interleaved A/B
-benches), then drop the warning from `state.md`, `dependency-watch.md` and the
-CHANGELOG's known issues.
-**Trigger**: the next toolchain bump — take the newest *tagged* release at the
-time.
 
 ### Retire `_majra_map_compact` at the ratelimit and heartbeat sites
 
@@ -117,7 +101,7 @@ the largest capability gap majra ships.
 
 **Scope**: SCRAM-SHA-256 (SASL, RFC 5802) and `SSLRequest` (code 80877103) +
 TLS via `lib/tls.cyr`. SCRAM's `Hi()` is PBKDF2-HMAC-SHA-256, which sigil still
-does not ship (re-checked at 3.13.12: `hmac_sha256` yes, no PBKDF2) — so it is
+does not ship (re-checked at 3.13.15: `hmac_sha256` yes, no PBKDF2) — so it is
 majra-side code over `hmac_sha256`, or a sigil ask first.
 **Trigger**: a consumer needing PostgreSQL over anything other than loopback or
 an already-confidential channel.
@@ -180,11 +164,9 @@ read them, and are deprecated in [`semver.md`](semver.md). They go at 3.0.0.
 
 ## Waiting on upstream
 
-**Nothing blocks a majra item.** Re-checked at 2.11.0 against cyrius 6.7.11
-and sigil 3.13.12:
+**Nothing blocks a majra item.** Re-checked at 2.12.1 against cyrius 6.7.18
+and sigil 3.13.15:
 
-- sigil's static-buffer warning is **fixed upstream** (sigil 3.13.12, cyrius
-  6.7.10) — majra adopts it with the pin move under 2.12.x.
 - PBKDF2 for SCRAM is a *choice*, not a block: majra can build `Hi()` over
   `hmac_sha256` (see the SCRAM item).
 
@@ -207,6 +189,6 @@ and sigil 3.13.12:
 ## Upstream cleanup (not majra work)
 
 - cyrius `lib/thread.cyr` `chan_new` multiplies `cap * 8` unchecked (found by
-  the 2.8.1 sweep; still so at the 6.7.11 tag — the zero-allocation half has
+  the 2.8.1 sweep; still so at the 6.7.18 tag — the zero-allocation half has
   been checked since 6.6.20). majra is not exposed: `relay_with_capacity` caps a
   ring at 16,777,216 slots.

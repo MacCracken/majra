@@ -2128,7 +2128,6 @@ fn _resp_parse(bytes, len) {
 # to be parsed as the next reply; now it poisons the connection.
 fn _tb_resp_dead(bytes, len) {
     var c = _resp_parse(bytes, len);
-    rethi();
     return redis_is_alive(c) == 0;
 }
 

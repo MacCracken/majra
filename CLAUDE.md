@@ -158,8 +158,8 @@ How we write majra code in cyrius. For *compiler gotchas* (clobbering, fixup cap
 - All struct fields are 8 bytes (`i64`), accessed via `load64` / `store64` with explicit offset.
 - Heap allocation: `fl_alloc()` / `fl_free()` (freelist) for structs with explicit lifetimes; `alloc()` for long-lived collections (hashmaps, vec internals, anything that lives until process exit).
 - Reserved words a name cannot use: `match`, plus the 6.7 line's `trait`, `const`, `true`, `false`, `do`, `dyn` (`loop` is contextual — a keyword only as `loop {` at a statement's start).
-- Write `return 0;`, not a bare `return;` — a bare one compiles on cyrius 6.x (re-checked 6.6.0 → 6.7.9) but is refused in a `: bool` fn, and majra's functions return a value on every path (an older cyrius refused it outright).
-- `var` is **block-scoped** (re-checked at 6.7.9): a `var` declared inside `{ }` is undefined after the block, so declare at function level whatever the code after it reads.
+- Write `return 0;`, not a bare `return;` — a bare one compiles on cyrius 6.x (re-checked 6.6.0 → 6.7.18) but is refused in a `: bool` fn, and majra's functions return a value on every path (an older cyrius refused it outright).
+- `var` is **block-scoped** (re-checked at 6.7.18): a `var` declared inside `{ }` is undefined after the block, so declare at function level whatever the code after it reads.
 
 ## Docs
 

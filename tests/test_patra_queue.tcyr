@@ -279,6 +279,59 @@ fn test_patra_queue_legacy_str_payload() {
     println("  patra_queue_legacy_str_payload: ok");
 }
 
+# 2.12.1: patra 1.16.5 answers -1 from patra_result_get_text_len for a TEXT cell
+# whose ref names more bytes than the file holds, and -1 was this queue's
+# "pre-2.6.9 STR column" signal: the corrupt cell dequeued with an EMPTY payload
+# and was marked running. Corrupts the row's (page, len) ref on disk; the job
+# must stay queued, undelivered.
+fn test_patra_queue_corrupt_text_ref() {
+    var p = "/tmp/majra_patra_corrupt_ref_test.patra";
+    _pq_unlink(p);
+    var q = patra_queue_new(p);
+    assert(q != 0, "corrupt ref: queue opened");
+    var pay = fl_alloc(3334);
+    memset(pay, 120, 3333);
+    store8(pay + 3333, 0);
+    assert_eq(patra_queue_enqueue(q, PRIORITY_NORMAL, pay), 1, "corrupt ref: enqueued");
+    patra_queue_close(q);
+
+    # The row's ref holds the length as an i64; the first such word in the file
+    # is the row's (the chain page that follows repeats it).
+    var cap = 1048576;
+    var buf = fl_alloc(cap);
+    var n = file_read_all(p, buf, cap);
+    assert(n > 0, "corrupt ref: file read");
+    var at = 0 - 1;
+    var i = 0;
+    while (at < 0 && i + 8 <= n) {
+        if (load64(buf + i) == 3333) { at = i; }
+        i = i + 1;
+    }
+    assert(at >= 0, "corrupt ref: length word found");
+    if (at >= 0) { store64(buf + at, 1099511627776); }
+    assert_eq(file_write_all(p, buf, n), n, "corrupt ref: file written");
+
+    q = patra_queue_new(p);
+    assert(q != 0, "corrupt ref: queue reopened");
+    # Precondition: the patched word is the row's, and patra reports it.
+    var rs = patra_query(load64(q), "SELECT * FROM jobs WHERE status = 0");
+    assert(rs != 0, "corrupt ref: raw query");
+    if (rs != 0) {
+        assert_eq(patra_result_get_text_len(rs, 0, 2), 0 - 1, "corrupt ref: getter answers -1");
+        patra_result_free(rs);
+    }
+    var j = patra_queue_dequeue(q);
+    assert_eq(j, 0, "corrupt ref: not delivered");
+    if (j != 0) { patra_job_free(j); }
+    assert_eq(patra_queue_queued_count(q), 1, "corrupt ref: job stays queued");
+    assert_eq(patra_queue_running_count(q), 0, "corrupt ref: nothing marked running");
+    patra_queue_close(q);
+    fl_free(buf);
+    fl_free(pay);
+    _pq_unlink(p);
+    println("  patra_queue_corrupt_text_ref: ok");
+}
+
 # 2.8.1 (F013): patra_queue_new called patra_init on every open, replacing the
 # process-wide patra mutexes while other threads were parked on (or holding) the
 # old ones, so concurrent users on OTHER files hung forever. Run LAST: on a hang
@@ -360,6 +413,7 @@ fn main() {
     test_patra_queue_two_handles();
     test_patra_queue_legacy_dup_ids();
     test_patra_queue_legacy_str_payload();
+    test_patra_queue_corrupt_text_ref();
     # Must stay last — see its comment.
     test_patra_queue_open_during_concurrent_use();
     return assert_summary();

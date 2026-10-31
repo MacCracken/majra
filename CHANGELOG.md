@@ -5,6 +5,99 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.12.1] - 2026-10-30
+
+Toolchain patch — **cyrius 6.7.9 → 6.7.18**, and with it the stdlib snapshot majra consumes, every
+first-party fold now at its latest tag (sigil 3.13.11 → 3.13.15, patra 1.16.0 → 1.16.6, sandhi
+1.10.9 → 1.13.7, sakshi 2.5.8 → 2.5.10, bayan 1.5.13 → 1.11.1). No public API change. One `src/`
+fix the new patra made necessary: `patra_queue_dequeue` handed out a corrupt TEXT cell as an empty
+payload and marked the job running. **1,571 assertions** (core 205 · expanded 727 · backends 557 ·
+patra-queue 82), natively and cross-built under `qemu-aarch64` (724 expanded there — the x86-only
+test); three fuzz harnesses, four soaks and both examples clean on both arches; the expanded suite
+looped 100× natively and 50× under qemu, the patra-queue suite 30× natively, with no failure.
+Benchmarks, interleaved A/B against a 6.7.9 build of the same tree (25 + 50 trials): every target
+within ±3 % by median in both batches — the largest, `pubsub_1sub_publish`, +2.3 % / +2.7 %, is
+−1.9 % by minimum on the larger one. `build/majra` 256,952 → 261,072 B from the same source.
+
+### Fixed
+
+- **`patra_queue_dequeue` delivered a corrupt TEXT payload as an empty string and marked the job
+  running.** patra 1.16.5 (cyrius 6.7.15) answers -1 from `patra_result_get_text_len` for a TEXT
+  cell whose ref names more bytes than the file holds, and 1.16.6 does the same for a negative
+  stored length; `patra_result_read_text` answers `PATRA_ERR_PAGE` for both. Since 2.6.9 a -1 there
+  was the queue's signal for a pre-2.6.9 file whose payload column is STR, so the corrupt cell took
+  the STR fallback: `strlen` over the cell's reference (0 bytes — patra snapshots no payload it
+  cannot read), then the claim, and the caller got a job with an empty payload that
+  `patra_queue_running_count` counted. Under 6.7.9 the same cell was delivered empty too, by the
+  TEXT path, because patra 1.16.0 read it as length 0 — 6.7.18 is the first pin at which the queue
+  can tell. The column's type (`patra_result_col_type`, in every patra back to the 6.6.0 snapshot)
+  now picks the STR fallback, and a TEXT cell with no valid length fails the dequeue the way a
+  malformed chain already did: it returns 0 and the job stays queued.
+  - New `test_patra_queue_corrupt_text_ref`: enqueues a 3,333-byte job, rewrites the row's length
+    word on disk to 2^40, asserts the precondition (the getter answers -1), then that nothing is
+    delivered, the job stays queued and nothing is running. With the fix reverted it fails 3 of its
+    11 asserts and delivers the job; the pre-2.6.9 STR test still passes.
+  - As with a malformed chain since 2.6.9, a dequeue that meets such a row at the head of the
+    queue returns 0 each time it is the head: the job is kept, not skipped.
+
+### Changed
+
+- **Pin 6.7.9 → 6.7.18.** Snapshot holds at 113 files; 66 changed, every first-party fold among
+  them, none added or removed. `cyrius.lock` is 113 sorted hashes plus a `cyrius\t6.7.18` trailer;
+  `--verify` 113/0, and `cyrius deps --locked` agrees. A bare `lib sync` is still 54 files, and the
+  fixup table still starts at 1,048,576.
+- **`tests/test_backends.tcyr`** — a bare `rethi();` statement after `_resp_parse` (discarding the
+  parser's second value) is refused since 6.7.17 ("the value of 'rethi(..)' is discarded"); the
+  line is gone, which changes nothing the test checks. It was the only build break the pin brought.
+- **sigil's over-budget `var buf[262144]` warning is gone** (sigil 3.13.12): `test_backends`' static
+  data falls 456,736 → 137,056 B. The roadmap item that waited for it is deleted.
+- **`dist/`** — the four bundles regenerate identically apart from the version stamp and, in
+  `majra-backends.cyr`, the dequeue fix; sidecars unchanged (core 14 · signed 16 · admin 2 ·
+  backends 3). Each builds clean-room against only its sidecar's leaves with 0 undefined for
+  x86_64, aarch64 and agnos, and runs natively and under qemu. The backends bundle also builds from
+  its sidecar alone and round-trips a durable-queue job on 6.6.20, 6.7.0 and 6.7.9, the pins the
+  README's toolchain floor names.
+
+### Verified (no change needed)
+
+cyrius's `ecosystem-migration.md` § 6.7.10–6.7.18 was checked against every majra source (`src/`,
+`tests/`, `fuzz/`, `benches/`, `examples/`, the soaks), and searched for each of the 161 stdlib and
+fold function names majra calls:
+
+- **The language lanes** (6.7.10–6.7.17: struct and `Str` values, multi-value returns, receives and
+  closures, vector values, generics, narrow scalars, the declaration zone) change what *typed* code
+  means. majra has no `struct`, `: Str`, narrow type, generic, closure or `async fn` in any source,
+  so the one that reached it is the discarded-`rethi()` refusal above; its `ret2` functions return
+  on every path, so 6.7.13's off-the-end-is-0 rule does not apply. 6.7.18 changed no language rule.
+- **sigil 3.13.14's crypto lanes** (CYRIUS-2026-0040): `cbank()` now answers the lane a thread holds,
+  or 0. `ed25519_sign` / `ed25519_verify` index it into function-scope arrays — per-call stack
+  storage, so nothing is shared — and the paths that refuse or exit 70 without a free lane are ECDSA
+  P-256 / P-384, which majra never calls. 3.13.15's X.509 nameConstraints reach no majra call.
+- **sandhi 1.10.9 → 1.13.7** — no API change for a server caller (the movement is HTTP/2 client flow
+  control and HPACK limits); `src/admin.cyr`'s `sandhi_server_*` calls and `HTTP_*` constants are
+  untouched. sandhi 1.13.7 and bayan 1.11.1 need `lib/slice.cyr` (bayan also `lib/hashseed.cyr`) in
+  a hand-written include list, and both folds now include them themselves, so majra's lists need
+  nothing.
+- **patra 1.16.2–1.16.6**, beyond the getter above: a commit it cannot make durable rolls back and
+  fails — `patra_queue_enqueue` already treats any non-OK commit as failure; `patra_open` without
+  `patra_init` returns 0 — `patra_queue_new` initialises patra when nothing has; a negative TEXT
+  length is refused at the write — the queue binds `strlen(payload)`.
+- **6.7.18's network hardening** (`http_get*` deadlines, `ws_server_*`, `ws_connect`,
+  `async_resolve`) reaches no majra call; majra's WebSocket code is its own (`majra_ws_*`).
+- **aarch64 `ESYSXLAT`**: re-derived at 6.7.18 — 82 rows, the same set as 6.7.9; majra's six spelled
+  numbers are routed.
+- `cyrius fmt --check` clean and `cyrius lint` 0 warnings on 38 files; `cyrius vet src/main.cyr` OK;
+  `cyrius deny src/main.cyr` 28 deps, 0 violations. Re-checked and unchanged at 6.7.18: `chan_new`'s
+  unchecked `cap * 8`, no PBKDF2 in sigil, and the backends / patra-queue suites stopping at 27 / 6
+  errors under `--agnos`.
+
+### Known issues
+
+- `cyrius distlib` still warns six names undefined for x86_64-windows only; Windows is not a majra
+  target.
+- `tests/test_backends.tcyr` and `tests/test_patra_queue.tcyr` still do not build for agnos — the
+  roadmap item, unchanged.
+
 ## [2.12.0] - 2026-10-15
 
 **A rate-limiter key cap that holds under key-spraying, and metrics hooks that pass their

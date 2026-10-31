@@ -6,7 +6,7 @@ type: state
 
 # Current State — majra
 
-> **Last refresh**: 2026-10-15 (2.12.0) | **Refresh cadence**: every release (ideally bumped by the release post-hook).
+> **Last refresh**: 2026-10-30 (2.12.1) | **Refresh cadence**: every release (ideally bumped by the release post-hook).
 > **What this file is**: volatile state. The companion `CLAUDE.md` holds durable rules; this file holds whatever drifts release-to-release. Per [first-party-documentation § CLAUDE.md](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/first-party-documentation.md#claudemd), version numbers, test counts, consumer lists, and in-flight work all live here, not in `CLAUDE.md`.
 
 ---
@@ -15,28 +15,28 @@ type: state
 
 | File | Value | Source |
 |---|---|---|
-| `VERSION` | **2.12.0** | single source of truth |
+| `VERSION` | **2.12.1** | single source of truth |
 | `cyrius.cyml [package].version` | `${file:VERSION}` | reads `VERSION` |
-| Latest git tag | `2.11.0` (2.12.0 pending tag) | release workflow asserts `VERSION == tag` |
+| Latest git tag | `2.12.0` (2.12.1 pending tag) | release workflow asserts `VERSION == tag` |
 
 ## Toolchain
 
 | Pin | Value | Source |
 |---|---|---|
-| Cyrius | **6.7.9** | `cyrius.cyml [package].cyrius` |
+| Cyrius | **6.7.18** | `cyrius.cyml [package].cyrius` |
 | Cyrius floor for `signed`/`backends` | **≥ 6.4.64** | historical — sigil 3.12.x calls `thread_local_alloc()`, absent before 6.4.64. Since 2.6.8 this is no longer a *pairing* constraint: sigil is a folded stdlib module, so the cyrius pin and the sigil version are one knob |
-| aarch64 cross-build (`cycc_aarch64`) | **verified locally at 2.7.3, re-verified at 2.9.3 under 6.6.20 and at 2.10.0 under 6.7.9; CI has a build-only cross-build gate, the run lane is still unwired** — every suite, fuzz harness, soak and example passes cross-built (`cyrius build --aarch64 --no-deps`) under `qemu-aarch64` | `.github/workflows/ci.yml` "aarch64 cross-build gate" (build-only); why the lane must *run* the binaries: see In-flight |
+| aarch64 cross-build (`cycc_aarch64`) | **verified locally at 2.7.3, re-verified at 2.9.3 under 6.6.20, at 2.10.0 under 6.7.9 and at 2.12.1 under 6.7.18; CI has a build-only cross-build gate, the run lane is still unwired** — every suite, fuzz harness, soak and example passes cross-built (`cyrius build --aarch64 --no-deps`) under `qemu-aarch64` | `.github/workflows/ci.yml` "aarch64 cross-build gate" (build-only); why the lane must *run* the binaries: see In-flight |
 
 > **Cyrius 6.x build workflow**: stdlib provisioning is split from git-dep
 > resolution. Run `cyrius lib sync --full` (copies the version-pinned snapshot —
-> **113 files under 6.6.20–6.7.9**, 106 top-level + 7 under `lib/unicode/` — into `./lib/`)
+> **113 files under 6.6.20–6.7.18**, 106 top-level + 7 under `lib/unicode/` — into `./lib/`)
 > **before** `cyrius deps`, and build
 > with `cyrius build --no-deps` so the build's auto-`deps` doesn't perturb the
 > synced lib. **The `--full` flag is load-bearing**: since cyrius 6.4.x a bare
 > `cyrius lib sync` copies only the declared `[deps].stdlib` *subset* and omits
 > the toolchain modules sigil/sandhi reach into that the list does not name
 > (`ct`/`keccak`/`bayan`/`result`/`thread_local` among them; the bare subset is
-> 54 files at 6.6.20–6.7.9, 53 at 6.6.6, 52 at 6.6.4).
+> 54 files at 6.6.20–6.7.18, 53 at 6.6.6, 52 at 6.6.4).
 > A missing toolchain module compiles to a runtime `ud2` (**SIGILL, not a build
 > error**). CI + release both run `cyrius lib sync --full`.
 >
@@ -55,10 +55,10 @@ type: state
 
 | Dep | Resolved version | Pull path | Used by |
 |---|---|---|---|
-| `lib/sigil.cyr` | **3.13.11** (stdlib fold; 3.13.10 at 6.6.20, 3.13.3 at 6.6.9, 3.12.18 at 6.6.4–6.6.6; sigil's latest tag 3.13.12 arrives with a later pin) | `[deps].stdlib` → `cyrius lib sync --full` | `src/ipc_encrypted.cyr` (`aes_gcm_*`), `src/signed_envelope.cyr` (`ed25519_*`) — 6 symbols total. **Moved off `[deps.sigil]` at 2.6.8** — see below. Since 3.12.18 sigil itself reaches into `lib/sys.cyr` (`sys_uname`), so `sys` must be *present* in any hand-written include list — order is not load-bearing; forward references resolve via the fixup table ([cyrius-quirks.md](cyrius-quirks.md) #2) |
-| `lib/patra.cyr` | **1.16.0** (stdlib fold; 1.15.2 at 6.6.20 — 1.16.0 refuses five silent wrong answers, none of which `src/patra_queue.cyr`'s INT-only queries meet) | `cyrius lib sync --full` | `src/patra_queue.cyr` (durable queue) |
-| `lib/sandhi.cyr` | **1.10.9** (stdlib fold; 1.10.8 at 6.6.20) | `cyrius lib sync --full` | `src/admin.cyr` (`HTTP_*` consts, `sandhi_server_*` server API) |
-| `lib/sakshi.cyr` | **2.5.8** (stdlib fold; 2.5.7 at 6.6.20) | `cyrius lib sync --full` | structured logging, pulled transitively by patra + sigil. majra's own `src/` calls no sakshi symbol. **Moved off `[deps.sakshi]` at the 6.5.18 pin** |
+| `lib/sigil.cyr` | **3.13.15** (stdlib fold, sigil's latest tag; 3.13.11 at 6.7.9, 3.13.10 at 6.6.20, 3.13.3 at 6.6.9, 3.12.18 at 6.6.4–6.6.6) | `[deps].stdlib` → `cyrius lib sync --full` | `src/ipc_encrypted.cyr` (`aes_gcm_*`), `src/signed_envelope.cyr` (`ed25519_*`) — 6 symbols total. **Moved off `[deps.sigil]` at 2.6.8** — see below. Since 3.12.18 sigil itself reaches into `lib/sys.cyr` (`sys_uname`), so `sys` must be *present* in any hand-written include list — order is not load-bearing; forward references resolve via the fixup table ([cyrius-quirks.md](cyrius-quirks.md) #2) |
+| `lib/patra.cyr` | **1.16.6** (stdlib fold, patra's latest tag; 1.16.0 at 6.7.9, 1.15.2 at 6.6.20 — 1.16.5 / 1.16.6 answer -1 for a TEXT cell with no valid length, which `src/patra_queue.cyr` read as its legacy-STR signal until 2.12.1) | `cyrius lib sync --full` | `src/patra_queue.cyr` (durable queue) |
+| `lib/sandhi.cyr` | **1.13.7** (stdlib fold, sandhi's latest tag; 1.10.9 at 6.7.9, 1.10.8 at 6.6.20 — no API change for a server caller) | `cyrius lib sync --full` | `src/admin.cyr` (`HTTP_*` consts, `sandhi_server_*` server API) |
+| `lib/sakshi.cyr` | **2.5.10** (stdlib fold, sakshi's latest tag; 2.5.8 at 6.7.9, 2.5.7 at 6.6.20) | `cyrius lib sync --full` | structured logging, pulled transitively by patra + sigil. majra's own `src/` calls no sakshi symbol. **Moved off `[deps.sakshi]` at the 6.5.18 pin** |
 | `lib/chrono.cyr` | (stdlib fold) | `[deps].stdlib` (declared at 2.7.1) → `cyrius lib sync --full` | **direct since 2.7.3** — `src/envelope.cyr` (`clock_now_ns`, `clock_epoch_ns`, `sleep_ms`, behind `time_now_ns` / `time_epoch_ns` / `_majra_sleep_ns`). Fourteen entry points reach it: thirteen gained the include at 2.7.3, each right after `lib/syscalls.cyr`; `tests/test_backends.tcyr` already had it. `examples/pubsub_tiers.cyr` does not reach envelope/dag and needs none. Core and signed sidecars name it; admin / backends reach it through sandhi (all four named it 2.7.1 → 2.9.2). Was transitive-only before the raw-syscall sweep |
 | `lib/sys.cyr` | (stdlib fold) | `[deps].stdlib` (declared at 2.7.3) → `cyrius lib sync --full` | transitive — sigil's `agnosys_uname` routes through `sys_uname` (since 3.12.18), and sigil ≥ 3.13 includes `lib/sys.cyr` itself. majra's own `src/` calls no `lib/sys.cyr` symbol. Declared so `cyrius audit` / `cyrius bench` (which prepend the declared list) build clean and a bare `cyrius lib sync` copies it; no sidecar names it since 2.9.3 (6.6.18's compile-verified sidecars), all four did before. `tests/test_backends.tcyr` includes it before `lib/sigil.cyr` — without it the build reported `OK` and lowered `sys_uname` to a trapping `ud2` |
 | `lib/ct.cyr` | (stdlib fold) | `cyrius lib sync --full` | `src/signed_envelope.cyr`, `src/ipc_encrypted.cyr` (`ct_eq_bytes_lens`) |
@@ -77,11 +77,12 @@ type: state
 
 Lockfile (`cyrius.lock`) carries SHA-256 over **113** resolved files — the whole
 `lib sync --full` snapshot (106 top-level + 7 under `lib/unicode/`), **sorted**, plus a
-`cyrius<TAB>6.7.9` trailer stamping the pin. Both are 6.6.x resolver changes:
+`cyrius<TAB>6.7.18` trailer stamping the pin. Both are 6.6.x resolver changes:
 6.6.3 sorts the lock (readdir order could not verify across filesystems), and
 6.6.4 stamps the pin and **refuses** a stdlib leaf whose snapshot hash moved
 under an unchanged pin (`cyrius deps --relock` is the explicit accept). The
-2.10.0 pin move (6.6.20 → 6.7.9) rewrote 67 hashes and added or removed none;
+2.12.1 pin move (6.7.9 → 6.7.18) rewrote 66 hashes and added or removed none (2.10.0's,
+6.6.20 → 6.7.9, rewrote 67);
 6.7.6's `cyrius deps --locked` (check, write nothing) agrees. **No commit-pin
 line since 2.6.8** (zero git deps). A bare `cyrius deps` into an *empty* `lib/`
 resolves only the declared `[deps].stdlib` subset — how 2.7.2 shipped a
@@ -95,13 +96,12 @@ enforces match: 113 verified, 0 failed.
 | `dist/majra.cyr` (core) | 6,493 | 235 KB |
 | `dist/majra-signed.cyr` | 6,758 | 247 KB |
 | `dist/majra-admin.cyr` | 6,831 | 249 KB |
-| `dist/majra-backends.cyr` | 10,429 | 384 KB |
-| `src/` total | 11,227 lines across 23 files | — |
+| `dist/majra-backends.cyr` | 10,441 | 385 KB |
+| `src/` total | 11,239 lines across 23 files | — |
 
-> 2.12.0 added `ratelimit_evict_to` / `sliding_window_evict_to` and their shared
-> select / eviction walk, and dispatches the wider metrics hooks with all their
-> arguments (`src/` +219 lines, mostly `src/ratelimit.cyr`); sidecars unchanged.
-> `build/majra` 256,952 B.
+> 2.12.1 moves the pin to 6.7.18 and adds `src/patra_queue.cyr`'s column-type check
+> (`src/` +12 lines, all in the backends bundle); sidecars unchanged. `build/majra`
+> 256,952 → 261,072 B from the same source (compiler growth).
 
 > Earlier per-release footprint moves are recorded in each release's
 > CHANGELOG stanza.
@@ -113,14 +113,14 @@ enforces match: 113 verified, 0 failed.
 | Core | `src/main.cyr` (binary self-tests) | 205 | runs as part of `cyrius build` smoke; 203 → 205 at 2.12.0 (null-handle `*_evict_to`) |
 | Expanded | `tests/test_core.tcyr` | 727 | broader unit coverage. 668 → 727 at 2.12.0 (the key cap, LRU order, ties and the no-scratch fallback, select-vs-sort, the sliding-window twin, wider metrics hooks incl. four threads); 724 under qemu, where one x86-only test's three asserts do not run. Per-release growth is in the CHANGELOG |
 | Backends | `tests/test_backends.tcyr` | 557 | redis / pg / ws / aes-gcm / signed_envelope / admin; 547 → 557 at 2.10.1 (P(-1): mixed-seed sk, admin arena, strict RESP integers) |
-| Patra-queue | `tests/test_patra_queue.tcyr` | 71 | separate entry — split out at 2.4.0 to stay under the then-16384 cc5 fixup cap (the table starts at 1,048,576 and grows on demand at the 6.7.9 pin — growable since cyrius 6.2.0); split kept as documented architecture |
-| **CI total** | | **1,560** | |
+| Patra-queue | `tests/test_patra_queue.tcyr` | 82 | 71 → 82 at 2.12.1 (a corrupt TEXT ref stays queued, undelivered). Separate entry — split out at 2.4.0 to stay under the then-16384 cc5 fixup cap (the table starts at 1,048,576 and grows on demand at the 6.7.18 pin — growable since cyrius 6.2.0); split kept as documented architecture |
+| **CI total** | | **1,571** | |
 | Live integration | `tests/test_live.tcyr` | 36 | requires Redis + PostgreSQL. **CI-only** — not runnable on a dev box without `redis:7-alpine` + `postgres:16-alpine` up; 7 Redis + 4 PostgreSQL categories |
 | Fuzz harnesses | `fuzz/*.fcyr` | 3 binaries | model/oracle-checked since 2.8.2; `<harness> [iterations] [seed]`, seed printed; CI runs 500 iterations × 10 s timeout |
-| Benchmarks | `benches/bench_all.bcyr` | 20 targets (`ratelimit_evict_to` since 2.12.0) | history in `bench-history.csv` (tracked; rows for 2.8.0, 2.8.1, 2.10.0, 2.10.1, 2.11.0, 2.12.0). Rows taken on different days and loads are not comparable, so a release head-to-head rebuilds the prior tree and runs interleaved A/B |
+| Benchmarks | `benches/bench_all.bcyr` | 20 targets (`ratelimit_evict_to` since 2.12.0) | history in `bench-history.csv` (tracked; rows for 2.8.0, 2.8.1, 2.10.0, 2.10.1, 2.11.0, 2.12.0, 2.12.1). Rows taken on different days and loads are not comparable, so a release head-to-head rebuilds the prior tree and runs interleaved A/B |
 | Examples | `examples/*.cyr` | 2 binaries | `managed_queue`, `pubsub_tiers`; CI builds + runs both |
-| Soak | `tests/soak/soak_*.cyr` (4 files) | queue 500k ops, pubsub 2k topics, relay dedup+evict, heartbeat 100×20 + auto-evict | on-demand; all 4 clean under 6.7.9 at 2.10.0, natively and under `qemu-aarch64` |
-| **aarch64, cross-built** | every entry above via `cyrius build --aarch64 --no-deps <entry> build/<name>_aarch64 && qemu-aarch64 ./build/<name>_aarch64` | same counts (expanded 724 under qemu) | **verified by hand at most releases since 2.7.3** (last at 2.12.0 under 6.7.9); CI cross-builds the four suites (build-only gate) and nothing runs them — roadmap § 2.12.x. Loop the expanded suite: single green runs have hidden 1-in-100 timing defects twice (2.9.3). Recipe in [`../guides/testing.md`](../guides/testing.md) |
+| Soak | `tests/soak/soak_*.cyr` (4 files) | queue 500k ops, pubsub 2k topics, relay dedup+evict, heartbeat 100×20 + auto-evict | on-demand; all 4 clean under 6.7.18 at 2.12.1, natively and under `qemu-aarch64` |
+| **aarch64, cross-built** | every entry above via `cyrius build --aarch64 --no-deps <entry> build/<name>_aarch64 && qemu-aarch64 ./build/<name>_aarch64` | same counts (expanded 724 under qemu) | **verified by hand at most releases since 2.7.3** (last at 2.12.1 under 6.7.18); CI cross-builds the four suites (build-only gate) and nothing runs them — roadmap § 2.12.x. Loop the expanded suite: single green runs have hidden 1-in-100 timing defects twice (2.9.3). Recipe in [`../guides/testing.md`](../guides/testing.md) |
 
 ## Distribution bundles (4 profiles)
 
@@ -149,7 +149,7 @@ gave CI an extra `http` leaf on admin / backends at 2.9.3. 6.7.7 sorts the index
 `src/admin.cyr` keeps its own `include "lib/sandhi.cyr"`, which seeds the verify —
 without it the sorted rule credits those names to `http` and the admin sidecar is
 16 leaves. Output is byte-identical under alphabetical and reverse listings at
-6.7.9. Clean-room at 2.10.0: each bundle plus only its sidecar's leaves builds with
+6.7.9. Clean-room at 2.12.1 (6.7.18): each bundle plus only its sidecar's leaves builds with
 0 undefined for x86_64, aarch64 and agnos, and runs natively and under qemu. `distlib` warns six names undefined for
 x86_64-windows only (`SYS_FUTEX`, `FUTEX_WAIT`/`_WAKE`, `sys_lstat`,
 `sys_fchmod`, `sys_accept4`) — Windows is not a majra target.
@@ -183,6 +183,7 @@ x86_64-windows only (`SYS_FUTEX`, `FUTEX_WAIT`/`_WAKE`, `sys_lstat`,
 
 | Tag | Date | Headline |
 |---|---|---|
+| 2.12.1 | 2026-10-30 | **Toolchain patch: cyrius 6.7.9 → 6.7.18**, every first-party fold at its latest tag (sigil 3.13.15, patra 1.16.6, sandhi 1.13.7, sakshi 2.5.10, bayan 1.11.1). Snapshot holds at 113, 66 files changed; sidecars unchanged; sigil's static-buffer warning gone. One `src/` fix the new patra made necessary: a corrupt TEXT cell, which patra 1.16.5 now reports as length -1, took the queue's legacy-STR fallback and was delivered empty and marked running — the column's type now decides, and the job stays queued (new test, mutation-checked). One test line refused by 6.7.17 (a discarded `rethi()`). 1,571 assertions natively and under qemu-aarch64; loops clean; benchmarks within ±3 % of a 6.7.9 build. |
 | 2.12.0 | 2026-10-15 | **A rate-limiter key cap that holds under key-spraying, and metrics hooks that pass their arguments.** `ratelimit_evict_to` / `sliding_window_evict_to` evict least recently seen first until at most `max_keys` remain (agnosai's issue, archived); lossy by design, documented. The four wider metrics hooks dispatch through `fncall3` / `fncall4`; `_metrics_arg3` / `_metrics_arg4` still written, deprecated until 3.0.0. Additive. 1,560 assertions natively and under qemu-aarch64; every new test mutation-checked. |
 | 2.11.0 | 2026-10-15 | **Release functions for every block the API still handed out unpaired** (the roadmap item 2.10.1 filed): `majra_list_free` for the five list calls (`hb_list_by_status`, `chb_list_by_status`, `hb_online`, `chb_online`, `storage_list_defs` — now freelist vecs; they were bump vecs nothing could free), `barrier_result_free`, `relay_stats_free`, `fleet_stats_free`, `chb_fleet_stats_free`. Additive only. 1,499 assertions natively and under qemu-aarch64; the new test fails both mutants. |
 | 2.10.1 | 2026-10-15 | **P(-1) hardening pass after two language bumps** — 12 findings (1 high, 5 medium, 6 low), report `docs/audit/2026-10-15-audit.md`. High: the 2.9.0 RelayMessage refcount was non-atomic and retained after publishing the pointer (use-after-free window). Medium: `sliding_window_check` failed open past 2^62 ns; `signed_envelope_new` shipped a zero signature on sigil's refusal; `workflow_execute` leaked ~2.9 KB per run; barrier sets borrowed the caller's name keys; every admin request leaked bump memory. Low: conn-pool keys, strict RESP integers, two PG leaks, two comments, and a 2.11.0 roadmap item (release functions). 1,495 assertions, natively and under qemu-aarch64; every code fix but two has a test that fails on 2.10.0. `barrier_cycle` +13.6 % (flagged: freelist vecs, the price of releasing barriers). |
@@ -225,9 +226,8 @@ in the CHANGELOG.
 
 | Item | Status | Where to look |
 |---|---|---|
-| **aarch64 CI lane (run, not just build)** | Open — CI cross-builds the four suites (build-only gate) but nothing runs them under `qemu-aarch64`, and two of the three raw-syscall defects 2.7.3 fixed emitted no build-time warning. Every suite passes under qemu when run by hand (2.11.0). Trigger met (daimon ships `daimon-aarch64`) | roadmap § 2.12.x · recipe: [`../guides/testing.md`](../guides/testing.md) · [archived issue](issues/archived/2026-09-14-raw-x86-syscall-numbers-aarch64.md) |
-| **agnos-portable `backends` / `patra-queue` suites** | Open, majra-side — all four bundles build agnos-clean (since the 6.6.6 pin, 2.9.1); the two suites do not (Linux `sys_unlink` / `sys_stat` arities, socket syscalls the agnos peer does not declare): 27 and 6 errors at 2.11.0 | roadmap § 2.12.x |
-| **`array local over the per-fn frame budget gets STATIC storage` — `lib/sigil.cyr:28103`** | **Fixed upstream, not yet adopted** — harmless: sigil's crypto-bank init declares `var buf[262144]`, which has always fallen back to static storage (cyrius 6.6.5 made the note a warning). Printed by `test_backends` and by any sidecar-provisioned signed / admin / backends consumer at the 6.7.9 pin. Gone from sigil 3.13.12, folded from cyrius 6.7.10; clears with the 2.12.x pin move | roadmap § 2.12.x · [dependency-watch.md](dependency-watch.md) |
+| **aarch64 CI lane (run, not just build)** | Open — CI cross-builds the four suites (build-only gate) but nothing runs them under `qemu-aarch64`, and two of the three raw-syscall defects 2.7.3 fixed emitted no build-time warning. Every suite passes under qemu when run by hand (2.12.1). Trigger met (daimon ships `daimon-aarch64`) | roadmap § 2.12.x · recipe: [`../guides/testing.md`](../guides/testing.md) · [archived issue](issues/archived/2026-09-14-raw-x86-syscall-numbers-aarch64.md) |
+| **agnos-portable `backends` / `patra-queue` suites** | Open, majra-side — all four bundles build agnos-clean (since the 6.6.6 pin, 2.9.1); the two suites do not (Linux `sys_unlink` / `sys_stat` arities, socket syscalls the agnos peer does not declare): 27 and 6 errors at 2.11.0 and again at 2.12.1 | roadmap § 2.12.x |
 | **PostgreSQL: cleartext auth, no TLS** | Open — credentials and queries cross the wire in the clear; the connect fails closed on SCRAM rather than downgrading. Trigger-gated | roadmap § Later MINORs |
 | **Shared-memory IPC transport** | Parked until a consumer hits the syscall-per-message ceiling | roadmap § Later MINORs |
 
