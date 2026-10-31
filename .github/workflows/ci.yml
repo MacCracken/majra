@@ -127,25 +127,26 @@ jobs:
           fi
           echo "no raw syscall literals; no stray SYS_ declarations"
 
-      - name: aarch64 cross-build gate
-        # Build-only (the runner has no qemu-user): the cross-compile is
-        # free, and a `duplicate symbol 'SYS_…' redefined` or raw-syscall
-        # diagnostic from the aarch64 backend is what a stray x86_64 number
-        # looks like at build time when it looks like anything at all. The
-        # RUN half of the lane — every suite under qemu-aarch64, which is
-        # what actually caught the 2.7.3 defects — is verified locally
-        # (docs/guides/testing.md) and stays a roadmap item.
+      - name: Cross-build gate (aarch64, agnos)
+        # Build-only, and cheap: a `duplicate symbol 'SYS_…' redefined` or
+        # raw-syscall diagnostic is what a stray x86_64 number looks like at
+        # build time when it looks like anything at all. aarch64 binaries
+        # also RUN, in the aarch64-qemu job below — that is what caught the
+        # 2.7.3 defects. agnos has no runner, so its column proves linking
+        # only; the backends and patra-queue suites joined it at 2.12.2.
         run: |
           set -e
           fail=0
-          for entry in src/main.cyr tests/test_core.tcyr tests/test_backends.tcyr tests/test_patra_queue.tcyr; do
-            out=$(cyrius build --aarch64 --no-deps "$entry" build/aarch64_probe 2>&1) || { echo "FAIL: aarch64 cross-build of $entry"; echo "$out"; fail=1; continue; }
-            if echo "$out" | grep -qE "duplicate symbol 'SYS_|redefined with conflicting value|raw syscall|undefined function"; then
-              echo "FAIL: aarch64 cross-build of $entry emitted a syscall/symbol diagnostic:"
-              echo "$out" | grep -E "duplicate symbol 'SYS_|redefined with conflicting value|raw syscall|undefined function"
-              fail=1
-            fi
-            echo "  $entry: aarch64 ELF ok"
+          for target in aarch64 agnos; do
+            for entry in src/main.cyr tests/test_core.tcyr tests/test_backends.tcyr tests/test_patra_queue.tcyr; do
+              out=$(cyrius build --$target --no-deps "$entry" build/${target}_probe 2>&1) || { echo "FAIL: $target cross-build of $entry"; echo "$out"; fail=1; continue; }
+              if echo "$out" | grep -qE "duplicate symbol 'SYS_|redefined with conflicting value|raw syscall|undefined function"; then
+                echo "FAIL: $target cross-build of $entry emitted a syscall/symbol diagnostic:"
+                echo "$out" | grep -E "duplicate symbol 'SYS_|redefined with conflicting value|raw syscall|undefined function"
+                fail=1
+              fi
+              echo "  $entry: $target ELF ok"
+            done
           done
           [ $fail -eq 0 ] || exit 1
           xxd -l 20 build/aarch64_probe | grep -q "b700" && echo "e_machine = AArch64"
@@ -222,6 +223,77 @@ jobs:
           done
           [ $fail -eq 0 ] || exit 1
           echo "all 4 dist bundles match src/"
+
+  aarch64-qemu:
+    name: aarch64 under qemu-user
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Cyrius toolchain
+        # Upstream installer — see build-and-test job for rationale.
+        run: |
+          set -e
+          CYRIUS_VERSION="$(grep -E '^cyrius[[:space:]]*=' cyrius.cyml | head -1 | sed -E 's/^cyrius[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
+
+      - name: Install qemu-user
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-user
+          qemu-aarch64 --version | head -1
+
+      - name: Resolve deps
+        # Same snapshot serves both arches — `--aarch64` picks the peer
+        # stdlib and the emitter. See build-and-test "Resolve dependencies".
+        run: |
+          cyrius lib sync --full
+          cyrius deps
+
+      - name: Suites under qemu-aarch64, looped
+        # cyrius's aarch64 backend passes every syscall number outside its
+        # ESYSXLAT table through verbatim, so a stray x86_64 number is a
+        # different, valid syscall — two of 2.7.3's three built without a
+        # warning. Only running catches that class. Looped because a single
+        # green run hid 2.7.3's ~7 % barrier crash. SEQUENTIAL: the suites
+        # use fixed /tmp paths and concurrent copies clobber each other.
+        run: |
+          set -e
+          mkdir -p build
+          LOOPS=25
+          fail=0
+          for pair in src/main.cyr:majra tests/test_core.tcyr:test_core tests/test_backends.tcyr:test_backends tests/test_patra_queue.tcyr:test_patra_queue; do
+            entry=${pair%%:*}; name=${pair##*:}
+            cyrius build --aarch64 --no-deps "$entry" "build/${name}_aarch64"
+            bad=0
+            for i in $(seq $LOOPS); do
+              qemu-aarch64 "./build/${name}_aarch64" > "build/${name}_aarch64.log" 2>&1 || {
+                rc=$?; bad=$((bad + 1))
+                echo "::error::$name run $i/$LOOPS exited $rc (139 = SIGSEGV)"
+                tail -20 "build/${name}_aarch64.log"
+              }
+            done
+            echo "  $name: $((LOOPS - bad)) / $LOOPS clean — $(grep -E '[0-9]+ passed' "build/${name}_aarch64.log" | tail -1)"
+            [ $bad -eq 0 ] || fail=1
+          done
+          [ $fail -eq 0 ] || exit 1
+
+      - name: Fuzz + examples under qemu-aarch64
+        run: |
+          set -e
+          for f in fuzz/*.fcyr; do
+            name=$(basename "$f" .fcyr)
+            cyrius build --aarch64 --no-deps "$f" "build/${name}_aarch64"
+            timeout 60 qemu-aarch64 "./build/${name}_aarch64" 500 || { echo "FUZZ CRASH: $name"; exit 1; }
+            echo "  $name: ok"
+          done
+          for f in examples/managed_queue.cyr examples/pubsub_tiers.cyr; do
+            name=$(basename "$f" .cyr)
+            cyrius build --aarch64 --no-deps "$f" "build/${name}_aarch64"
+            qemu-aarch64 "./build/${name}_aarch64"
+          done
 
   live-tests:
     name: Live Integration Tests

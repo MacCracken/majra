@@ -619,7 +619,7 @@ var _fa_resp[512];      # global: 4096 bytes
 # Send `req` (len bytes) through majra_admin_handler; the response lands in
 # _fa_resp, NUL-terminated. Returns the response length.
 fn _fa_roundtrip_n(admin, req, n) {
-    syscall(SYS_SOCKETPAIR, 1, 1, 0, &_fa_sv);
+    sys_socketpair(1, 1, 0, &_fa_sv);
     var a = load32(&_fa_sv);
     var b = load32(&_fa_sv + 4);
     majra_admin_handler(admin, a, req, n);
@@ -759,7 +759,7 @@ fn test_ws_framing() {
     # These assertions used to run against fd = -1, where every path returns
     # -1 and removing the guards would not have failed the test.
     var sv[8];
-    syscall(SYS_SOCKETPAIR, 1, 1, 0, &sv);
+    sys_socketpair(1, 1, 0, &sv);
     var wa = load32(&sv);
     var wb = load32(&sv + 4);
 
@@ -1163,7 +1163,7 @@ fn test_ipc() {
 
     # socketpair(AF_UNIX, SOCK_STREAM, 0, sv) — a real connected pair.
     var sv[8];
-    var rc = syscall(SYS_SOCKETPAIR, 1, 1, 0, &sv);
+    var rc = sys_socketpair(1, 1, 0, &sv);
     assert_eq(rc, 0, "socketpair created");
     var a = load32(&sv);
     var b = load32(&sv + 4);
@@ -1199,20 +1199,20 @@ fn test_ipc() {
     # connect(2) checks the filesystem inode created by bind, so the mode stayed
     # umask-derived (0755 under a typical 022) while the module header promised
     # 0600. Nothing tested ipc_bind at all, which is why it shipped.
-    sys_unlink("/tmp/majra_ipc_mode_test.sock");
+    xunlink("/tmp/majra_ipc_mode_test.sock");
     var br_t, br_v = ipc_bind("/tmp/majra_ipc_mode_test.sock");
     assert_eq(is_err_result(br_t), 0, "ipc_bind succeeded");
     var st[144];
     memset(&st, 0, 144);
-    # `sys_stat` + the peer's `STAT_MODE` offset, not a raw `syscall(4, …)`
+    # `xstat` (`sys_stat` off agnos) + the peer's `STAT_MODE` offset, not a raw `syscall(4, …)`
     # and a hardcoded 24: aarch64 has no bare stat (the peer routes to
     # newfstatat) and its generic layout puts st_mode at 16 — a 24 there
     # reads st_uid.
-    assert_eq(sys_stat("/tmp/majra_ipc_mode_test.sock", &st), 0, "stat on the bound socket");
+    assert_eq(xstat("/tmp/majra_ipc_mode_test.sock", &st), 0, "stat on the bound socket");
     var mode = load32(&st + STAT_MODE) & 511;
     assert_eq(mode, 384, "bound socket is 0600, not umask-derived");
     ipc_close(br_v);
-    sys_unlink("/tmp/majra_ipc_mode_test.sock");
+    xunlink("/tmp/majra_ipc_mode_test.sock");
 
     # An over-long or empty path must fail rather than truncate or bind
     # into the abstract namespace.
@@ -1232,7 +1232,7 @@ fn test_ipc() {
 # suite. Every read these tests expect to succeed has its bytes queued already.
 fn _tb_pair() {
     var sv[8];
-    syscall(SYS_SOCKETPAIR, 1, 1, 0, &sv);
+    sys_socketpair(1, 1, 0, &sv);
     var a = load32(&sv);
     var b = load32(&sv + 4);
     #ifdef CYRIUS_TARGET_LINUX
@@ -1250,7 +1250,7 @@ fn _tb_pair() {
 # Those tests are guarded by the watchdog instead.
 fn _tb_pair_raw() {
     var sv[8];
-    syscall(SYS_SOCKETPAIR, 1, 1, 0, &sv);
+    sys_socketpair(1, 1, 0, &sv);
     ret2(load32(&sv), load32(&sv + 4));
 }
 
@@ -1288,12 +1288,23 @@ fn test_ipc_sigpipe() {
     println("  ipc_sigpipe: ok");
 }
 
+# lstat in the peer's arity — agnos paths carry their length. lib/io.cyr has
+# `xunlink` / `xstat` for the other two and no lstat twin.
+fn _tb_lstat(path, buf) {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return sys_lstat(path, strlen(path), buf);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return sys_lstat(path, buf);
+    #endif
+}
+
 # 2.8.1: ipc_bind unlinked its path unconditionally — deleting a regular file
 # of that name, or silently hijacking a LIVE server's path. And no fd was
 # close-on-exec, so an exec'd child inherited the listener.
 fn test_ipc_bind_safety() {
     var path = "/tmp/majra_tb_bind_safety.sock";
-    sys_unlink(path);
+    xunlink(path);
     var fd = sys_open(path, 65, 420);
     assert(fd >= 0, "regular file created at the socket path");
     syscall(SYS_CLOSE, fd);
@@ -1302,31 +1313,31 @@ fn test_ipc_bind_safety() {
     if (is_err_result(f_t) == 0) { ipc_close(f_v); }
     var st[144];
     memset(&st, 0, 144);
-    assert_eq(sys_lstat(path, &st), 0, "the path still exists");
+    assert_eq(_tb_lstat(path, &st), 0, "the path still exists");
     assert_eq(load32(&st + STAT_MODE) & 61440, 32768, "and is still the regular file (S_IFREG), not unlinked");
-    sys_unlink(path);
+    xunlink(path);
 
     var b_t, b_v = ipc_bind(path);
     assert_eq(is_err_result(b_t), 0, "ipc_bind on a clean path");
     if (is_err_result(b_t) == 1) { return 0; }
-    assert_eq(syscall(SYS_FCNTL, b_v, 1, 0) & 1, 1, "listener is FD_CLOEXEC");
+    assert_eq(sys_fcntl(b_v, 1, 0) & 1, 1, "listener is FD_CLOEXEC");
     # Non-blocking listener, so a missing liveness probe fails an assertion
     # below instead of parking this suite in accept(2).
-    syscall(SYS_FCNTL, b_v, 4, 2048);
+    sys_fcntl(b_v, 4, 2048);
 
     var d_t, d_v = ipc_bind(path);
     assert_eq(is_err_result(d_t), 1, "a second ipc_bind on a LIVE path is refused");
     if (is_err_result(d_t) == 0) {
         ipc_close(d_v);
         ipc_close(b_v);
-        sys_unlink(path);
+        xunlink(path);
         return 0;
     }
 
     var c_t, c_v = ipc_connect(path);
     assert_eq(is_err_result(c_t), 0, "ipc_connect still reaches the first server");
-    if (is_err_result(c_t) == 1) { ipc_close(b_v); sys_unlink(path); return 0; }
-    assert_eq(syscall(SYS_FCNTL, c_v, 1, 0) & 1, 1, "connected client fd is FD_CLOEXEC");
+    if (is_err_result(c_t) == 1) { ipc_close(b_v); xunlink(path); return 0; }
+    assert_eq(sys_fcntl(c_v, 1, 0) & 1, 1, "connected client fd is FD_CLOEXEC");
 
     # The refused bind's liveness probe is the first queued connection; it
     # closes without sending a byte.
@@ -1340,7 +1351,7 @@ fn test_ipc_bind_safety() {
     var a_t, a_v = ipc_accept(b_v);
     assert_eq(is_err_result(a_t), 0, "the real client is accepted next");
     if (is_err_result(a_t) == 0) {
-        assert_eq(syscall(SYS_FCNTL, a_v, 1, 0) & 1, 1, "accepted fd is FD_CLOEXEC");
+        assert_eq(sys_fcntl(a_v, 1, 0) & 1, 1, "accepted fd is FD_CLOEXEC");
         ipc_send_frame(c_v, "hi", 2);
         var h_t, h_v = ipc_recv_frame(a_v);
         assert_eq(is_err_result(h_t), 0, "frame from client to the first server");
@@ -1357,11 +1368,11 @@ fn test_ipc_bind_safety() {
     # it is safe to replace.
     var st2[144];
     memset(&st2, 0, 144);
-    assert_eq(sys_lstat(path, &st2), 0, "stale socket file is still on disk");
+    assert_eq(_tb_lstat(path, &st2), 0, "stale socket file is still on disk");
     var s_t, s_v = ipc_bind(path);
     assert_eq(is_err_result(s_t), 0, "ipc_bind replaces a stale socket");
     if (is_err_result(s_t) == 0) { ipc_close(s_v); }
-    sys_unlink(path);
+    xunlink(path);
     println("  ipc_bind_safety: ok");
 }
 
@@ -1395,7 +1406,7 @@ fn test_ipc_recv_errors() {
     assert_eq(err_code_of(t3, v3), MAJRA_ERR_IPC_CONN_CLOSED, "EOF before any byte is CONN_CLOSED");
     syscall(SYS_CLOSE, b3);
 
-    sys_unlink("/tmp/majra_tb_nonexistent.sock");
+    xunlink("/tmp/majra_tb_nonexistent.sock");
     assert_eq(is_err_result(ipc_connect("/tmp/majra_tb_nonexistent.sock")), 1, "ipc_connect to a missing path is Err");
     println("  ipc_recv_errors: ok");
 }
@@ -1707,7 +1718,7 @@ fn test_eipc_same_role_kill() {
     assert_eq(streq(err_name(MAJRA_ERR_IPC_ROLE), "ipc_role"), 1, "the role code has a name");
     assert_eq(load64(same + 56), 1, "same-role frame KILLS the handle");
     assert_eq(load64(same), b, "kill keeps the fd number (shutdown, not close)");
-    assert(syscall(SYS_FCNTL, b, 1, 0) >= 0, "the descriptor is still open after the kill");
+    assert(sys_fcntl(b, 1, 0) >= 0, "the descriptor is still open after the kill");
     assert_eq(is_err_result(encrypted_ipc_send(same, "y", 1)), 1, "send after the kill is Err");
     assert_eq(is_err_result(encrypted_ipc_recv(same)), 1, "recv after the kill is Err");
     assert(load64(same + 8) != 0, "the kill leaves the key for close to wipe");
@@ -1741,7 +1752,7 @@ fn test_eipc_oversize_kill() {
     assert_eq(err_code_of(t, v), MAJRA_ERR_IPC_FRAME_TOO_LARGE, "reported as FRAME_TOO_LARGE");
     assert_eq(load64(ov + 56), 1, "oversized header poisons the handle");
     assert_eq(load64(ov), b, "fd number kept (shutdown, not close)");
-    assert(syscall(SYS_FCNTL, b, 1, 0) >= 0, "the descriptor is still open");
+    assert(sys_fcntl(b, 1, 0) >= 0, "the descriptor is still open");
     assert_eq(is_err_result(encrypted_ipc_send(ov, "x", 1)), 1, "send after the kill is Err");
     assert_eq(syscall(SYS_READ, a, &hdr, 4), 0, "the peer observes the shutdown as EOF");
 
@@ -1756,7 +1767,7 @@ fn test_eipc_oversize_kill() {
 
 # Everything readable right now (MSG_DONTWAIT), or 0.
 fn _tb_drain(fd, buf, cap) {
-    var n = syscall(SYS_RECVFROM, fd, buf, cap, 0x40, 0, 0);
+    var n = sys_recvfrom(fd, buf, cap, 0x40, 0, 0);
     if (n < 0) { return 0; }
     return n;
 }
@@ -2109,7 +2120,7 @@ fn _mk_conn(fd) {
 # Returns the conn so the caller can inspect liveness; reply via ret2.
 fn _resp_parse(bytes, len) {
     var sv[8];
-    syscall(SYS_SOCKETPAIR, 1, 1, 0, &sv);
+    sys_socketpair(1, 1, 0, &sv);
     var a = load32(&sv);
     var b = load32(&sv + 4);
     syscall(SYS_WRITE, a, bytes, len);
@@ -2394,7 +2405,7 @@ fn _tb_watchdog(gen) {
     }
     if (_wd_gen == gen) {
         println("  FAIL: watchdog - a blocking call never returned (deadlock regression)");
-        syscall(SYS_EXIT_GROUP, 3);
+        sys_exit_group(3);
     }
     return 0;
 }
@@ -2556,7 +2567,7 @@ fn _listen_any() {
     var sa[16];
     var sl[8];
     store64(&sl, 16);
-    syscall(SYS_GETSOCKNAME, fd, &sa, &sl);
+    sys_getsockname(fd, &sa, &sl);
     var port = (load8(&sa + 2) << 8) | load8(&sa + 3);
     ret2(fd, port);
 }
@@ -2647,7 +2658,7 @@ fn test_pg_connect_startup_cap() {
     var buf = fl_alloc(64);
     assert(c >= 0, "the refused client's connection was queued");
     if (c >= 0) {
-        assert(syscall(SYS_RECVFROM, c, buf, 64, 0x40, 0, 0) <= 0, "and it sent nothing before closing");
+        assert(sys_recvfrom(c, buf, 64, 0x40, 0, 0) <= 0, "and it sent nothing before closing");
         syscall(SYS_CLOSE, c);
     }
     fl_free(buf);

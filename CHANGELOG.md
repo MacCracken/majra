@@ -5,6 +5,69 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.12.2] - 2026-10-30
+
+CI patch — the two 2.12.x roadmap items whose triggers had fired: CI now **runs** the aarch64 builds
+under `qemu-aarch64`, and every suite cross-builds for agnos. No `src/` change and no API change;
+the four bundles differ from 2.12.1 only in their version stamp. **1,571 assertions**, unchanged
+(core 205 · expanded 727 · backends 557 · patra-queue 82), natively and under `qemu-aarch64`.
+
+### Added
+
+- **aarch64 run lane** — new `aarch64-qemu` job. It installs `qemu-user`, cross-builds the four
+  suites and runs each 25× in turn under `qemu-aarch64`, failing on any non-zero exit and printing
+  the log tail of each failed run. It then runs the three fuzz harnesses (500 iterations each) and
+  both examples once. CI has cross-built for aarch64 since 2.7.3, but two of that release's three
+  raw-syscall defects built without a warning on any toolchain. A stray x86_64 number is a
+  different, valid syscall there, and only a run sees it. The trigger had been met since daimon
+  started shipping `daimon-aarch64`. Soaks and the benchmark binary stay manual.
+  - The 25 runs are a per-push check, not a substitute for the 100× loop by hand: they catch a
+    7 % crash (2.7.3's) 84 % of the time and a 1-in-100 one 22 % of the time.
+- **agnos column in the cross-build gate** — the step, renamed "Cross-build gate (aarch64, agnos)",
+  builds the four entry points with `--agnos` as well as `--aarch64`. agnos has no runner, so the
+  column proves linking, not behaviour.
+
+### Changed
+
+- **`tests/test_backends.tcyr` and `tests/test_patra_queue.tcyr` build for agnos.** At 2.12.1 they
+  stopped on 27 and 6 errors. They used the Linux arities of `sys_unlink`, `sys_stat` and
+  `sys_lstat`, where agnos paths carry their length. They also made raw
+  `syscall(SYS_SOCKETPAIR | SYS_FCNTL | SYS_RECVFROM | SYS_GETSOCKNAME | SYS_EXIT_GROUP, …)` calls,
+  which the agnos peer does not declare. They now call:
+  - `lib/io.cyr`'s `xunlink` and `xstat`;
+  - a local `_tb_lstat` with an agnos arm and a non-agnos arm;
+  - the peers' `sys_socketpair`, `sys_fcntl`, `sys_recvfrom`, `sys_getsockname` and
+    `sys_exit_group`.
+
+  Each wrapper issues the same syscall on both Linux peers, so the Linux runs are unchanged: 557
+  and 82 assertions, natively and under qemu. On agnos the IPC and socketpair tests would fail by
+  design, since `ipc_bind` fails closed and the peer's `sys_socketpair` returns -38.
+- **`.github/workflows/release.yml`** — a comment still said the aarch64 cross-build was skipped
+  over an old cyrius bug. It now says `needs: [ci]` makes a release wait for both lanes.
+- **`dist/`** — the version stamp only; sidecars unchanged.
+
+### Deferred
+
+- **Retiring `_majra_map_compact`** at the ratelimit and heartbeat sites stays on the roadmap. Its
+  trigger is every consumer pinning cyrius ≥ 6.6.20, and the local checkouts pin 6.6.2 to 6.6.14:
+  daimon and hoosh 6.6.6, agnosai 6.6.14, stiva 6.6.10, ifran 6.6.2.
+
+### Verified
+
+- **The new CI steps, run locally.** Each was extracted from `ci.yml` and run with `bash` under the
+  workflow's own `env` (`CYRIUS_DCE=1`). The workflow itself has not yet run on a GitHub runner;
+  qemu there will be slower than this machine, where the job's two qemu steps take about 5 minutes.
+  - Cross-build gate: 8 builds, 0 diagnostics. It fails on the 2.12.1 suites, which stop on 27 and
+    6 agnos errors.
+  - qemu loop: 25 / 25 clean for every suite (205 · 724 · 557 · 82), with and without
+    `CYRIUS_DCE=1`.
+  - Fuzz and examples: three harnesses and two examples, all clean.
+  - A stub `qemu-aarch64` that exits 139 for one suite makes the loop step report each crashed run
+    with its log and exit 1.
+- **Native:** `tests/test.sh` passes all four suites, and the two edited suites ran 10× each with
+  no failure. The raw-syscall gate is clean, `cyrius fmt --check` and `cyrius lint` report 0
+  warnings on both suites, and `cyrius deps --verify` passes 113 / 0.
+
 ## [2.12.1] - 2026-10-30
 
 Toolchain patch — **cyrius 6.7.9 → 6.7.18**, and with it the stdlib snapshot majra consumes, every

@@ -147,6 +147,7 @@ Every tagged release MUST ship all four bundles. A consumer pinning a profile th
 - **`cyrius deps` runs before any build/test step.** With `cyrius.lock` committed, `cyrius deps --verify` enforces hash match.
 - **Manifest completeness gate**: every `include "src/<file>.cyr"` in `src/main.cyr` must appear under `[lib] modules` in `cyrius.cyml`.
 - **Distribution freshness gate**: all four `cyrius distlib` invocations run; CI fails on `git diff dist/` non-empty.
+- **Cross-arch lanes**: the four suites cross-build for aarch64 and agnos, and the aarch64 builds run under `qemu-user`, looped. agnos has no runner — its column proves linking only.
 - **Release tag pattern**: `v[0-9]+.[0-9]+.[0-9]+` or `[0-9]+.[0-9]+.[0-9]+` (semver shape enforced post-trigger).
 - **Version gate**: release asserts `VERSION == git tag` before building.
 - **Docs gate**: CI verifies `VERSION` appears as `[x.y.z]` heading in `CHANGELOG.md`.

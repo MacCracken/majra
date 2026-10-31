@@ -4,7 +4,7 @@
 
 Majra provides shared messaging primitives for the [AGNOS](https://github.com/MacCracken) ecosystem, eliminating duplicate pub/sub, queue, relay, and heartbeat implementations across [AgnosAI](https://github.com/MacCracken/agnosai), [ifran](https://github.com/MacCracken/ifran), [SecureYeoman](https://github.com/MacCracken/secureyeoman), and [daimon](https://github.com/MacCracken/daimon).
 
-**Written in [Cyrius](https://github.com/MacCracken/cyrius)** — compiles to a statically linked binary via `cyrius build`, for x86_64-Linux natively and for aarch64-Linux via `cyrius build --aarch64` (verified under `qemu-aarch64`; CI cross-builds the suites for aarch64 but does not yet run them there — see docs/development/state.md). Optional crypto surface (signed envelopes, encrypted IPC) pulls [sigil](https://github.com/MacCracken/sigil), a folded cyrius stdlib module — since majra 2.6.8 it is declared under `[deps].stdlib` and arrives with the toolchain snapshot rather than as a separate git dep. The core profile has no crypto surface at all, and majra declares **zero git dependencies**.
+**Written in [Cyrius](https://github.com/MacCracken/cyrius)** — compiles to a statically linked binary via `cyrius build`, for x86_64-Linux natively and for aarch64-Linux via `cyrius build --aarch64` (CI runs the four non-live suites under `qemu-aarch64` — see docs/development/state.md). Optional crypto surface (signed envelopes, encrypted IPC) pulls [sigil](https://github.com/MacCracken/sigil), a folded cyrius stdlib module — since majra 2.6.8 it is declared under `[deps].stdlib` and arrives with the toolchain snapshot rather than as a separate git dep. The core profile has no crypto surface at all, and majra declares **zero git dependencies**.
 
 ## Modules
 
@@ -187,8 +187,8 @@ cyrius build --no-deps tests/test_backends.tcyr    build/test_backends    && ./b
 cyrius build --no-deps tests/test_patra_queue.tcyr build/test_patra_queue && ./build/test_patra_queue
 
 # aarch64-Linux: cross-build any entry point the same way and run it under
-# qemu-aarch64 (full recipe in docs/guides/testing.md; CI cross-builds the
-# suites for aarch64 but the run-under-qemu lane is not wired yet)
+# qemu-aarch64 (full recipe in docs/guides/testing.md; CI runs the four suites
+# this way, 25x each)
 cyrius build --aarch64 --no-deps src/main.cyr build/majra_aarch64 && qemu-aarch64 ./build/majra_aarch64
 
 # Benchmarks

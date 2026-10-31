@@ -82,8 +82,8 @@ jobs:
           cyrius build --no-deps src/main.cyr build/majra
           echo "majra: $(wc -c < build/majra) bytes"
 
-      # aarch64 cross-build intentionally skipped — see ci.yml for the
-      # rationale (upstream lib/agnosys.cyr:791 SYS_OPEN bug).
+      # No aarch64 / agnos step here: `needs: [ci]` already gated this job
+      # on ci.yml's cross-build gate and its aarch64-qemu run lane.
 
       - name: Smoke test
         run: |

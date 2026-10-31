@@ -44,7 +44,7 @@ cyrius build --no-deps tests/soak/soak_queue.cyr build/soak_queue && ./build/soa
 | Live | `tests/test_live.tcyr` | 36 | 7 Redis + 4 PostgreSQL test functions in `tests/test_live.tcyr`. **CI-only** — needs Redis on :6379 + PostgreSQL on :5432, so a dev-box "full matrix" run is 1,571, not 1,607 |
 | **Total** | | **1,607** (1,571 CI + 36 live) | |
 
-Every non-live suite, fuzz harness, soak, example and the benchmark binary also passes cross-built for aarch64 under `qemu-aarch64` (since 2.7.3; re-verified at 2.9.3 under 6.6.20, at 2.10.0 under 6.7.9, at 2.10.1, 2.11.0 and 2.12.0, and at 2.12.1 under 6.7.18 — the expanded suite reports three fewer there (724 at 2.12.1), its one x86-only test carrying three asserts) — see [aarch64 cross-build](#aarch64-cross-build-qemu-user) below.
+Every non-live suite, fuzz harness, soak, example and the benchmark binary also passes cross-built for aarch64 under `qemu-aarch64` (since 2.7.3; re-verified at 2.9.3 under 6.6.20, at 2.10.0 under 6.7.9, at 2.10.1, 2.11.0 and 2.12.0, and at 2.12.1 under 6.7.18 — the expanded suite reports three fewer there (724 at 2.12.1), its one x86-only test carrying three asserts). Since 2.12.2 CI runs the four suites (25× each), the fuzz harnesses and the examples there on every push; soaks and the benchmark binary stay by hand — see [aarch64 cross-build](#aarch64-cross-build-qemu-user) below.
 
 `test_patra_queue` was split out at 2.4.0 to stay under the then-16384 cc5 fixup cap (patra pulls sakshi + io + fs transitively); the table starts at 1,048,576 entries and grows on demand at the 6.7.18 pin (growable since cyrius 6.2.0), and the split is kept as documented architecture.
 
@@ -96,7 +96,7 @@ Currently shipped (all four are run before a release, not in CI):
 
 ## aarch64 cross-build (qemu-user)
 
-CI only **cross-builds** the four suites for aarch64 (a build-only gate that fails on syscall / symbol diagnostics); the run half needs `qemu-user` on the runner and is still a roadmap item, so run this before a release and after touching anything that issues a syscall. cyrius's aarch64 backend renumbers 82 source numbers at the 6.7.18 pin, as at 6.7.9 and 6.6.20 (62 x86_64 numbers plus twenty ≥1000 private aliases; 68 at 6.6.9, 60 at 6.6.6, 44 at 6.6.4 — 6.6.5 routed `nanosleep` 35 and `sendto` 44 among fourteen more; per-tag detail in cyrius-quirks.md #9) and passes every other number through **verbatim**, so a stray x86_64 number is not a build error — it is a different, valid syscall. Through 2.7.2 majra shipped three of them (fchmod 91 → capset, getrandom 318 → ENOSYS, nanosleep 35 → unlinkat) and two built without a warning on any toolchain (CHANGELOG.md § [2.7.3]), which is why a build-only `--aarch64` step proves little here (it catches a `var SYS_*` that redefines a stdlib name, like the 318 site, but not a raw literal or a uniquely named constant, like 35 and 91): **the binaries have to run.**
+CI cross-builds the four suites for aarch64 and agnos (a gate that fails on syscall / symbol diagnostics) and, since 2.12.2, **runs** the aarch64 builds under `qemu-user`: the `aarch64-qemu` job loops each suite 25×, then runs the fuzz harnesses and examples once. The soaks and the benchmark binary are not in it, so run the recipe below before a release and after touching anything that issues a syscall. cyrius's aarch64 backend renumbers 82 source numbers at the 6.7.18 pin, as at 6.7.9 and 6.6.20 (62 x86_64 numbers plus twenty ≥1000 private aliases; 68 at 6.6.9, 60 at 6.6.6, 44 at 6.6.4 — 6.6.5 routed `nanosleep` 35 and `sendto` 44 among fourteen more; per-tag detail in cyrius-quirks.md #9) and passes every other number through **verbatim**, so a stray x86_64 number is not a build error — it is a different, valid syscall. Through 2.7.2 majra shipped three of them (fchmod 91 → capset, getrandom 318 → ENOSYS, nanosleep 35 → unlinkat) and two built without a warning on any toolchain (CHANGELOG.md § [2.7.3]), which is why a build-only `--aarch64` step proves little here (it catches a `var SYS_*` that redefines a stdlib name, like the 318 site, but not a raw literal or a uniquely named constant, like 35 and 91): **the binaries have to run.**
 
 `qemu-aarch64` comes from the distro's `qemu-user` package (Arch: `qemu-user`, installs `/usr/bin/qemu-aarch64`). The same `lib/` serves both arches — `--aarch64` selects the peer stdlib and the emitter — so no second `lib sync`.
 
@@ -142,6 +142,8 @@ binaries were 0/25 run one at a time.
 
 2.7.3 baseline: `test_core` 0 / 100 under qemu and 0 / 200 native; core / backends / patra-queue 25× under qemu and 40× native, 0 failures. A non-zero count is a finding even when the plain run passes.
 
+CI's 25 runs per suite are a per-push belt, not this loop: they catch a 7 % crash 84 % of the time (1 − 0.93²⁵) and a 1-in-100 one only 22 % of the time. Loop 100× by hand after touching threads, hashmaps or timing.
+
 ### Localising a crash
 
 cyrius binaries carry no symbol table, so gdb shows every frame as `?? ()`. The recipe that found the barrier defect (`_map_find+0xf8`, reading through a hashmap *entry* that had been passed as a map):
@@ -172,6 +174,10 @@ cyrius binaries carry no symbol table, so gdb shows every frame as `?? ()`. The 
    ```
 
 4. **Read the frame.** cyrius's aarch64 frame convention is **parameters first, then locals, in declaration order, one 8-byte slot each below the frame pointer**: the first parameter at `[x29-8]`, the second at `[x29-16]`, the first local after the last parameter, and so on (`_map_find(m, key)` spills `x0` → `[x29-8]`, `x1` → `[x29-16]`, and its first local lands at `[x29-24]`). `x/4gx $x29-32` in the same session dumps the first four slots. `[x29]` is the caller's saved `x29` and `[x29+8]` the return address, so when the fault is inside a stdlib function — as it was — walk one frame up and read the caller's slots the same way; resolve the return address against the map to name it.
+
+## agnos cross-build
+
+All four suites cross-build with `--agnos` (CI's cross-build gate), `backends` and `patra-queue` since 2.12.2: they call `lib/io.cyr`'s `xunlink` / `xstat`, a local `_tb_lstat`, and the peers' `sys_socketpair` / `sys_fcntl` / `sys_recvfrom` / `sys_getsockname` / `sys_exit_group` wrappers, where they had Linux arities and `SYS_*` names the agnos peer does not declare. Nothing here runs agnos binaries, so the column proves linking only — and the IPC and socketpair tests would fail there by design (`ipc_bind` fails closed; the peer's `sys_socketpair` returns -38).
 
 ## Compiler Limitations
 

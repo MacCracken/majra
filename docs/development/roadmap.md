@@ -5,7 +5,7 @@
 test counts, bundle sizes — lives in [`state.md`](state.md). When an item here
 ships, **delete it**; do not convert it into a changelog entry.
 
-Every item below was re-checked against the 2.12.1 tree on 2026-10-30: still
+Every item below was re-checked against the 2.12.2 tree on 2026-10-30: still
 open in the code, and — where it depends on upstream — still open at the
 latest **tagged** cyrius (6.7.18) and sigil (3.13.15).
 
@@ -33,39 +33,6 @@ promotion is a decision rather than a mood.
 
 ## 2.12.x — patches (no API)
 
-### aarch64 CI lane — build **and run** under `qemu-aarch64`
-
-CI cross-**builds** the four suites for aarch64 and fails on any
-`duplicate symbol 'SYS_` or raw-syscall diagnostic. That is the cheap belt and
-all a build can give: of the three raw-syscall defects 2.7.3 fixed, two emitted
-no build-time warning on any toolchain, so a build-only lane cannot see the
-class it exists to catch. Most releases since have run the suites under
-`qemu-aarch64` by hand (2.12.1 last). **Still open at 2.12.1**: no CI job installs or runs
-`qemu-user`.
-
-**Scope**: `qemu-user` on the runner, then `cyrius build --aarch64 --no-deps
-<entry> build/<name>_aarch64 && qemu-aarch64 ./build/<name>_aarch64` for the
-four suites, looped — recipe and the sequential-loop caveat in
-[`testing.md`](../guides/testing.md).
-**Trigger**: met — daimon ships a `daimon-aarch64` asset with `dist/majra.cyr`
-inside it.
-
-### agnos-portable `backends` and `patra-queue` suites
-
-The four bundles cross-build clean for agnos. The **suites** cannot follow:
-`tests/test_backends.tcyr` and `tests/test_patra_queue.tcyr` call `sys_unlink`
-/ `sys_stat` with the Linux arity and name `SYS_SOCKETPAIR` / `SYS_RECVFROM` /
-`SYS_GETSOCKNAME`, which the agnos peer does not declare. **Re-measured at
-2.12.1 (cyrius 6.7.18)**: core and expanded build `OK` with `--agnos`; backends
-stops on 27 errors and patra-queue on 6, as at 2.11.0 (cyrius 6.7.9). Until they build, "agnos-clean" is a
-claim about linking, not about behaviour.
-
-**Scope**: port the two suites' Linux-only call sites behind the per-target
-wrappers or `#ifdef` arms (the shape `src/ipc.cyr` already uses), then add
-`--agnos` to the cross-build gate next to `--aarch64`. No `src/` change.
-**Trigger**: a consumer builds the `backends` profile for agnos, or the aarch64
-run lane above lands and the matrix grows a second non-x86 column anyway.
-
 ### Retire `_majra_map_compact` at the ratelimit and heartbeat sites
 
 cyrius 6.6.20's `lib/hashmap.cyr` counts `map_delete`'s tombstones and
@@ -81,7 +48,9 @@ write tombstones the stdlib never counts.
 **Scope**: delete the five call sites and the two hand-starve test halves that
 exist only to reach them; keep the helper and relay's tests.
 **Trigger**: every consumer in [`state.md`](state.md)'s table pins cyrius
-≥ 6.6.20 — or 3.0.0, whichever is first.
+≥ 6.6.20 — or 3.0.0, whichever is first. **Not met at 2.12.2** (local
+checkouts, 2026-10-30): daimon and hoosh pin 6.6.6, agnosai 6.6.14, stiva
+6.6.10, ifran 6.6.2; sutra and secureyeoman carry no `cyrius.cyml`.
 
 ---
 
@@ -164,7 +133,7 @@ read them, and are deprecated in [`semver.md`](semver.md). They go at 3.0.0.
 
 ## Waiting on upstream
 
-**Nothing blocks a majra item.** Re-checked at 2.12.1 against cyrius 6.7.18
+**Nothing blocks a majra item.** Re-checked at 2.12.2 against cyrius 6.7.18
 and sigil 3.13.15:
 
 - PBKDF2 for SCRAM is a *choice*, not a block: majra can build `Hi()` over
