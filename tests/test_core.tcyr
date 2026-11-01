@@ -1339,6 +1339,62 @@ fn test_namespace_prefix_validation() {
     println("  namespace_prefix_validation: ok");
 }
 
+# 2.13.0: every namespace_* result came off the bump heap with no release call,
+# so a caller namespacing each publish leaked each call. Each is now one owned
+# freelist block, released by namespace_str_free.
+fn _ns_is(s, want) {
+    if (s == 0) { return 0; }
+    if (str_len(s) != strlen(want)) { return 0; }
+    if (memeq(str_data(s), want, strlen(want)) == 0) { return 0; }
+    # NUL-terminated, so str_data is also a usable C string.
+    if (load8(str_data(s) + strlen(want)) != 0) { return 0; }
+    return 1;
+}
+
+fn _ns_round(ns, full_topic, full_key) {
+    namespace_str_free(namespace_topic(ns, "events/created"));
+    namespace_str_free(namespace_key(ns, "api_requests"));
+    namespace_str_free(namespace_node_id(ns, "gpu-node-1"));
+    namespace_str_free(namespace_pattern(ns, "events/+"));
+    namespace_str_free(namespace_wildcard(ns));
+    namespace_str_free(namespace_strip_topic(ns, full_topic));
+    namespace_str_free(namespace_strip_key(ns, full_key));
+    return 0;
+}
+
+fn test_namespace_strings_released() {
+    var buf = fl_alloc(16);
+    memcpy(buf, "tenant-7", 9);
+    var ns = namespace_new(buf);
+    # namespace_new copies the prefix: the caller's buffer is free to change.
+    memcpy(buf, "XXXXXXXX", 9);
+    assert(_ns_is(ns, "tenant-7") == 1, "namespace_new owns its copy of the prefix");
+    fl_free(buf);
+    var t = namespace_topic(ns, "events/created");
+    assert(_ns_is(t, "tenant-7/events/created") == 1, "topic built");
+    var k = namespace_key(ns, "api_requests");
+    assert(_ns_is(k, "tenant-7:api_requests") == 1, "key built");
+    var w = namespace_wildcard(ns);
+    assert(_ns_is(w, "tenant-7/#") == 1, "wildcard built");
+    var st = namespace_strip_topic(ns, t);
+    assert(_ns_is(st, "events/created") == 1, "topic stripped");
+    var sk = namespace_strip_key(ns, k);
+    assert(_ns_is(sk, "api_requests") == 1, "key stripped");
+    assert_eq(namespace_str_free(0), 0, "free(0) is a no-op");
+
+    _ns_round(ns, t, k);
+    var u0 = alloc_used();
+    var fa0 = _fl_arena;
+    var fp0 = _fl_arena_pos;
+    var r = 0;
+    while (r < 1000) { _ns_round(ns, t, k); r = r + 1; }
+    assert_eq(alloc_used() - u0, 0, "1000 rounds of every builder take no bump memory");
+    assert(_fl_arena == fa0 && _fl_arena_pos == fp0, "and carve no new freelist memory");
+    namespace_str_free(t); namespace_str_free(k); namespace_str_free(w);
+    namespace_str_free(st); namespace_str_free(sk); namespace_str_free(ns);
+    println("  namespace_strings_released: ok");
+}
+
 fn test_fleet_routing() {
     var cfg = fleet_config_new(10, 5, 0);
     var fq = fleet_new(cfg);
@@ -4288,6 +4344,7 @@ fn main() {
 
     # Fleet
     test_namespace_prefix_validation();
+    test_namespace_strings_released();
     test_sliding_window_evict();
     test_sliding_window_rejects_zero_window();
     test_ratelimit_subinterval_polling_accrues();

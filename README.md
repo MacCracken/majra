@@ -24,7 +24,7 @@ Majra provides shared messaging primitives for the [AGNOS](https://github.com/Ma
 | **namespace** | Multi-tenant scoping for topics, keys, and node IDs |
 | **metrics** | Pluggable metrics vtable with 22 hook points |
 | **redis_backend** | Cross-process pub/sub, sorted-set queues, hash-based rate limiter, heartbeat via RESP protocol |
-| **postgres_backend** | PostgreSQL workflow + queue storage via wire protocol v3 |
+| **postgres_backend** | PostgreSQL workflow + queue storage via wire protocol v3 — SCRAM-SHA-256 auth, and TLS with a verified certificate via `pg_connect_tls` (2.13.0) |
 | **ws** | WebSocket framing primitives (RFC 6455) — SHA-1 upgrade handshake, frame read/write, ping/pong/close, optional Origin policy (`ws_set_origin_check`, 2.9.0). **No pub/sub bridge**: drive `majra_ws_recv_frame` / `majra_ws_send_text` from your own accept loop |
 | **signed_envelope** | Ed25519 signatures over a canonical envelope encoding (via sigil) |
 | **admin** | Read-only HTTP admin/metrics endpoint (`/health`, `/fleet`, `/ratelimit`) |
@@ -116,7 +116,10 @@ var popped = redis_zpopmin(rc, "queue:jobs");
 ### PostgreSQL Workflow Storage
 
 ```cyrius
-var conn = pg_connect("127.0.0.1", 5432, "postgres", "majra", "password");
+# TLS, the certificate verified against a CA file and bound to the server's name.
+# pg_connect(host, port, user, db, password) is the plaintext form: loopback only.
+var conn = pg_connect_tls("10.0.0.5", 5432, "postgres", "majra", "password",
+  "db.internal.example", "/etc/majra/pg-ca.pem");
 pg_init_workflow_tables(conn);
 pg_save_workflow_def(conn, "wf-1", "my workflow", "[]");
 ```
@@ -124,7 +127,7 @@ pg_save_workflow_def(conn, "wf-1", "my workflow", "[]");
 ## Architecture
 
 ```
-majra (v2.12.1, ~10,365 lines across 22 modules; 11,239 across 23 files counting the src/main.cyr self-test entry — see docs/development/state.md)
+majra (v2.13.0, ~10,927 lines across 22 modules; 11,801 across 23 files counting the src/main.cyr self-test entry — see docs/development/state.md)
 │
 │ ── Core ──────────────────────────────────────
 ├── error           Error codes + result helpers
@@ -153,7 +156,7 @@ majra (v2.12.1, ~10,365 lines across 22 modules; 11,239 across 23 files counting
 │
 │ ── Backends ──────────────────────────────────
 ├── redis_backend    RESP2 protocol (SET/GET, ZADD/ZPOPMIN, PUBLISH, HSET, EVAL)
-├── postgres_backend PostgreSQL v3 wire protocol (startup, auth, query, CRUD)
+├── postgres_backend PostgreSQL v3 wire protocol (startup, SCRAM, TLS, query, CRUD)
 └── patra_queue      Durable priority queue backed by patra (survives restart)
 │
 │ ── Trust ─────────────────────────────────────
@@ -180,7 +183,7 @@ cyrius build --no-deps src/main.cyr build/majra
 # Run core tests
 ./build/majra
 
-# Full test matrix — 1,590 assertions at 2.12.4.
+# Full test matrix — 1,647 assertions at 2.13.0.
 # Counts move every release; docs/development/state.md carries the current ones.
 cyrius build --no-deps tests/test_core.tcyr        build/test_core        && ./build/test_core
 cyrius build --no-deps tests/test_backends.tcyr    build/test_backends    && ./build/test_backends
@@ -256,9 +259,9 @@ There is no separate sigil profile to pull for a `signed`-only consumer: sigil r
 
 Majra was originally a Rust library (v1.0.4, ~13,000 lines). It was ported to Cyrius via `cyrius port`, re-implementing all modules from scratch.
 
-| Metric | Rust v1.0.4 | Cyrius v2.12.1 |
+| Metric | Rust v1.0.4 | Cyrius v2.13.0 |
 |--------|-------------|---------------|
-| Source lines | 12,969 | 11,239 (all of `src/`, incl. the 874-line `src/main.cyr` test entry; 10,365 in the 22 modules — much of the growth since the port is rationale comments from four hardening passes) |
+| Source lines | 12,969 | 11,801 (all of `src/`, incl. the 874-line `src/main.cyr` test entry; 10,927 in the 22 modules — much of the growth since the port is rationale comments from five hardening passes) |
 | Modules | 22 | 22 (QUIC transport not ported yet — pinned to 2.15.0; see roadmap § 2.15.0) |
 | Dependencies | 25 crates | 0 — sigil is a folded stdlib module |
 | Toolchain | cargo + rustc + LLVM | cyrius 6.7.18 |

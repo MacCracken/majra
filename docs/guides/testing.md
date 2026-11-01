@@ -38,11 +38,11 @@ cyrius build --no-deps tests/soak/soak_queue.cyr build/soak_queue && ./build/soa
 | Suite | File | Assertions | Coverage |
 |-------|------|-----------|----------|
 | Core | `src/main.cyr` | 205 | All 15 core modules + relay dedup, envelope-id entropy (non-zero *and* distinct), `_majra_sleep_ns` floor |
-| Expanded | `tests/test_core.tcyr` | 727 | Deep: queue lifecycle, pubsub patterns, DAG retry (outcome + elapsed backoff), fleet routing, circuit breaker, integration, multi-threaded barrier (proves blocking, not just a counter), concurrency + wildcard-alignment, relay / ratelimit / priority-queue regressions. Per-release additions: CHANGELOG.md |
-| Backends | `tests/test_backends.tcyr` | 557 | base64, SHA-1, AES-256-GCM, signed envelopes, admin endpoint, WebSocket, RESP, PG wire |
+| Expanded | `tests/test_core.tcyr` | 736 | Deep: queue lifecycle, pubsub patterns, DAG retry (outcome + elapsed backoff), fleet routing, circuit breaker, integration, multi-threaded barrier (proves blocking, not just a counter), concurrency + wildcard-alignment, relay / ratelimit / priority-queue regressions. Per-release additions: CHANGELOG.md |
+| Backends | `tests/test_backends.tcyr` | 605 | base64, SHA-1, AES-256-GCM, signed envelopes, admin endpoint, WebSocket, RESP, PG wire, SCRAM-SHA-256 (RFC 7677 vector, a fake SCRAM server) and PG over TLS (fixture CA, `tests/fixtures/`) |
 | Patra queue | `tests/test_patra_queue.tcyr` | 101 | Durable enqueue / priority dequeue / complete / counts / reopen persistence, pre-2.6.9 STR files, a corrupt TEXT ref failed so the job behind it is delivered, open/close bump growth, one handle shared by three threads (watchdog-guarded), three writers on three files during opens of a fourth (refused vs lost told apart) |
-| Live | `tests/test_live.tcyr` | 36 | 7 Redis + 4 PostgreSQL test functions in `tests/test_live.tcyr`. **CI-only** — needs Redis on :6379 + PostgreSQL on :5432, so a dev-box "full matrix" run is 1,590, not 1,626 |
-| **Total** | | **1,626** (1,590 CI + 36 live) | |
+| Live | `tests/test_live.tcyr` | 47 | 7 Redis + 6 PostgreSQL test functions (SCRAM and TLS since 2.13.0) in `tests/test_live.tcyr`. **CI-only** — needs Redis on :6379 + PostgreSQL on :5432, so a dev-box "full matrix" run is 1,647, not 1,694 |
+| **Total** | | **1,694** (1,647 CI + 47 live) | |
 
 Every non-live suite, fuzz harness, soak, example and the benchmark binary also passes cross-built for aarch64 under `qemu-aarch64` (since 2.7.3; re-verified at 2.9.3 under 6.6.20, at 2.10.0 under 6.7.9, at 2.10.1, 2.11.0 and 2.12.0, and at 2.12.1 under 6.7.18 — the expanded suite reports three fewer there (724 at 2.12.1), its one x86-only test carrying three asserts). Since 2.12.2 CI runs the four suites (25× each), the fuzz harnesses and the examples there on every push; soaks and the benchmark binary stay by hand — see [aarch64 cross-build](#aarch64-cross-build-qemu-user) below.
 
@@ -191,11 +191,16 @@ docker run -d --name majra-redis -p 6379:6379 redis:7-alpine
 docker run -d --name majra-postgres -p 5432:5432 \
   -e POSTGRES_PASSWORD=majra -e POSTGRES_DB=majra postgres:16-alpine
 
-# Configure PostgreSQL for cleartext auth (required by Cyrius PG client)
-docker exec majra-postgres su postgres -c \
-  "echo 'host all all 0.0.0.0/0 password' > /var/lib/postgresql/data/pg_hba.conf && \
-   echo 'local all all trust' >> /var/lib/postgresql/data/pg_hba.conf && \
-   pg_ctl reload -D /var/lib/postgresql/data"
+# Configure PostgreSQL as CI's live job does: scram-sha-256 for every TCP login,
+# ssl = on with the test-only fixture RSA leaf (tests/fixtures/README.md).
+D=/var/lib/postgresql/data
+docker cp tests/fixtures/pg_tls_rsa_server.pem majra-postgres:$D/server.crt
+docker cp tests/fixtures/pg_tls_rsa_server.key majra-postgres:$D/server.key
+docker exec majra-postgres sh -c "chown postgres:postgres $D/server.crt $D/server.key && chmod 600 $D/server.key"
+docker exec majra-postgres su postgres -c "printf 'hostssl all all 0.0.0.0/0 scram-sha-256\nhost all all 0.0.0.0/0 scram-sha-256\nlocal all all trust\n' > $D/pg_hba.conf"
+docker exec majra-postgres su postgres -c "psql -qc 'ALTER SYSTEM SET ssl = on' && pg_ctl reload -D $D"
+# Or run CI's own step: it finds the container by image, so extract
+# jobs.live-tests "Configure PostgreSQL (scram-sha-256 + TLS)" from ci.yml.
 
 # Run live tests
 cyrius build --no-deps tests/test_live.tcyr build/test_live && ./build/test_live

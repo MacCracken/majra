@@ -2,6 +2,8 @@
 #
 # Redis:    localhost:6379
 # Postgres: localhost:5432 user=postgres password=majra db=majra
+#           scram-sha-256 for every TCP connection, ssl = on with the fixture
+#           RSA leaf (tests/fixtures/README.md) — CI's live job sets this up.
 
 include "lib/string.cyr"
 include "lib/fmt.cyr"
@@ -17,6 +19,17 @@ include "lib/fnptr.cyr"
 include "lib/thread.cyr"
 include "lib/assert.cyr"
 include "lib/net.cyr"
+include "lib/io.cyr"
+include "lib/ct.cyr"
+include "lib/async.cyr"
+include "lib/sakshi.cyr"
+include "lib/dynlib.cyr"
+include "lib/fdlopen.cyr"
+include "lib/tls.cyr"
+include "lib/keccak.cyr"
+include "lib/random.cyr"
+include "lib/sys.cyr"
+include "lib/sigil.cyr"
 
 include "src/error.cyr"
 include "src/counter.cyr"
@@ -25,6 +38,7 @@ include "src/namespace.cyr"
 include "src/ipc.cyr"
 include "src/redis_backend.cyr"
 include "src/postgres_backend.cyr"
+include "src/ipc_encrypted.cyr"
 
 # =============================================================================
 # Redis Live Tests
@@ -274,6 +288,62 @@ fn test_pg_workflow_storage() {
     println("  pg_workflow_storage: ok");
 }
 
+# The server's own view of a connection: "t" if it arrived over TLS, else "f".
+fn _pg_server_ssl(conn) {
+    var rows = pg_query(conn, "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()");
+    var v = 0;
+    if (rows != 0 && vec_len(rows) == 1) {
+        if (streq(vec_get(vec_get(rows, 0), 0), "t") == 1) { v = 1; }
+    }
+    pg_rows_free(rows);
+    return v;
+}
+
+# 2.13.0: pg_hba.conf allows only scram-sha-256, so connecting at all proves
+# the SCRAM exchange against a real server — and plaintext stays plaintext.
+fn test_pg_scram_live() {
+    var conn = pg_connect("127.0.0.1", 5432, "postgres", "majra", "majra");
+    assert(conn != 0, "pg scram: plaintext connect authenticated by SCRAM");
+    if (conn != 0) {
+        assert_eq(pg_conn_is_tls(conn), 0, "pg scram: the client reports no TLS");
+        assert_eq(_pg_server_ssl(conn), 0, "pg scram: the server agrees");
+        pg_close(conn);
+        fl_free(conn);
+    }
+    assert_eq(pg_connect("127.0.0.1", 5432, "postgres", "majra", "not-the-password"), 0,
+      "pg scram: a wrong password is refused");
+    println("  pg_scram_live: ok");
+}
+
+# 2.13.0: TLS to a real server presenting an RSA-2048 leaf, verified against
+# the fixture CA by name, with SCRAM inside the session.
+fn test_pg_tls_live() {
+    var ca = "tests/fixtures/pg_tls_ca.pem";
+    var conn = pg_connect_tls("127.0.0.1", 5432, "postgres", "majra", "majra", "majra-test.local", ca);
+    assert(conn != 0, "pg tls: connected, certificate verified");
+    if (conn != 0) {
+        assert_eq(pg_conn_is_tls(conn), 1, "pg tls: the client reports TLS");
+        assert_eq(_pg_server_ssl(conn), 1, "pg tls: the server reports TLS for this backend");
+        var rows = pg_query(conn, "SELECT version FROM pg_stat_ssl WHERE pid = pg_backend_pid()");
+        assert(rows != 0 && vec_len(rows) == 1, "pg tls: protocol version readable");
+        if (rows != 0 && vec_len(rows) == 1) {
+            var ver = vec_get(vec_get(rows, 0), 0);
+            assert(memeq(ver, "TLSv1.", 6) == 1, "pg tls: the session is TLS 1.2 or 1.3");
+            print("    server reports ", 19);
+            print(ver, strlen(ver));
+            println("");
+        }
+        pg_rows_free(rows);
+        pg_close(conn);
+        fl_free(conn);
+    }
+    assert_eq(pg_connect_tls("127.0.0.1", 5432, "postgres", "majra", "majra", "other.example", ca), 0,
+      "pg tls: a name the certificate does not carry is refused");
+    assert_eq(pg_connect_tls("127.0.0.1", 5432, "postgres", "majra", "majra", "majra-test.local", 0), 0,
+      "pg tls: the system roots do not trust the test CA");
+    println("  pg_tls_live: ok");
+}
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -300,6 +370,8 @@ fn main() {
     test_pg_simple_query();
     test_pg_create_table();
     test_pg_workflow_storage();
+    test_pg_scram_live();
+    test_pg_tls_live();
 
     return assert_summary();
 }

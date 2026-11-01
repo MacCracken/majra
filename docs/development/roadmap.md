@@ -5,9 +5,9 @@
 test counts, bundle sizes — lives in [`state.md`](state.md). When an item here
 ships, **delete it**; do not convert it into a changelog entry.
 
-Every item below was re-checked against the 2.12.4 tree on 2026-10-31, after its
-P(-1) pass: still open in the code, and — where it depends on upstream — still
-open at the latest **tagged** cyrius (6.7.18) and sigil (3.13.15).
+Every item below was re-checked against the 2.13.0 tree on 2026-10-31: still
+open in the code, and — where it depends on upstream — still open at the latest
+**tagged** cyrius (6.7.18) and sigil (3.13.15).
 
 ## The road to 3.0.0
 
@@ -18,7 +18,6 @@ longer waits for one to fire.
 
 | Release | Ships | Kind |
 |---|---|---|
-| **2.13.0** | PostgreSQL SCRAM-SHA-256 + `SSLRequest` / TLS, and a release function for the namespace builders | MINOR |
 | last 2.13.x | P(-1) hardening pass | PATCH |
 | **2.14.0** | WebSocket pub/sub bridge | MINOR |
 | last 2.14.x | P(-1) hardening pass | PATCH |
@@ -41,41 +40,6 @@ longer waits for one to fire.
   the next free 2.N.x on whatever line is current.
 - **Pulling forward.** `_majra_map_compact` retires in the next PATCH if its
   consumer-pin trigger fires before 3.0.0.
-
----
-
-## 2.13.0 — PostgreSQL SCRAM-SHA-256 + `SSLRequest`
-
-`postgres_backend.cyr` speaks **plaintext** and implements only
-`AuthenticationCleartextPassword`, so the password and every query and result
-row cross the wire in the clear. PostgreSQL has defaulted to `scram-sha-256`
-since v14, so reaching a modern server means weakening `pg_hba.conf` to
-`password` — which CI does today, and that is the tell. The connect fails closed
-on auth type 10 rather than downgrading, so the gap is at least honest. It is
-the largest capability gap majra ships.
-
-**Scope**: SCRAM-SHA-256 (SASL, RFC 5802) and `SSLRequest` (code 80877103) +
-TLS via `lib/tls.cyr`. SCRAM's `Hi()` is PBKDF2-HMAC-SHA-256, which sigil still
-does not ship (re-checked at 3.13.15: `hmac_sha256` yes, no PBKDF2) — so it is
-majra-side code over `hmac_sha256`, or a sigil ask first.
-**Done when**: CI's live job authenticates against `scram-sha-256` in
-`pg_hba.conf`, over TLS. Today the job weakens that line to `password`.
-**Pinned**: 2.13.0, first, because it is the largest capability gap and the only
-security one. It had waited for a consumer needing PostgreSQL over anything other
-than loopback or an already-confidential channel.
-
-### Also in 2.13.0: release the namespace builders' strings
-
-`namespace_topic`, `namespace_key` / `namespace_node_id`, `namespace_pattern` and
-`namespace_wildcard` return `Str`s built with `str_builder` on the bump heap,
-which never frees. There is no release function, so a consumer that namespaces
-on every publish leaks every call. The 2.12.4 P(-1) pass found it
-([`../audit/2026-10-31-audit.md`](../audit/2026-10-31-audit.md)); it is the class
-2.11.0 closed for the list and stats functions.
-
-**Scope**: build the result on the freelist and add `namespace_str_free`, or an
-`_a` variant taking the caller's allocator. Either is new public API, which is why
-it is not a patch.
 
 ---
 
@@ -167,11 +131,9 @@ is scheduled to break.
 
 ## Waiting on upstream
 
-**Nothing blocks a pinned release.** Re-checked at 2.12.2 against cyrius 6.7.18
-and sigil 3.13.15, and the patra item filed at 2.12.3:
+**Nothing blocks a pinned release.** Re-checked at 2.13.0 against cyrius 6.7.18
+and sigil 3.13.15:
 
-- PBKDF2 for SCRAM is a *choice*, not a block: majra can build `Hi()` over
-  `hmac_sha256` (see 2.13.0).
 - **patra logs a failed before-image read as a zero page.** Filed 2026-10-31 as
   patra's `docs/development/issues/2026-10-31-wal-before-image-read-error-logged-as-zeros.md`.
   - An `EIO` on that read inside a transaction leaves an all-zero undo record.

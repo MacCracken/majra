@@ -6,7 +6,7 @@ type: state
 
 # Current State — majra
 
-> **Last refresh**: 2026-10-31 (2.12.4) | **Refresh cadence**: every release (ideally bumped by the release post-hook).
+> **Last refresh**: 2026-10-31 (2.13.0) | **Refresh cadence**: every release (ideally bumped by the release post-hook).
 > **What this file is**: volatile state. The companion `CLAUDE.md` holds durable rules; this file holds whatever drifts release-to-release. Per [first-party-documentation § CLAUDE.md](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/first-party-documentation.md#claudemd), version numbers, test counts, consumer lists, and in-flight work all live here, not in `CLAUDE.md`.
 
 ---
@@ -15,9 +15,9 @@ type: state
 
 | File | Value | Source |
 |---|---|---|
-| `VERSION` | **2.12.4** | single source of truth |
+| `VERSION` | **2.13.0** | single source of truth |
 | `cyrius.cyml [package].version` | `${file:VERSION}` | reads `VERSION` |
-| Latest git tag | `2.12.3` (2.12.4 pending tag) | release workflow asserts `VERSION == tag` |
+| Latest git tag | `2.12.4` (2.13.0 pending tag) | release workflow asserts `VERSION == tag` |
 
 ## Toolchain
 
@@ -94,11 +94,11 @@ enforces match: 113 verified, 0 failed.
 
 | Target | Lines | Bytes |
 |---|---|---|
-| `dist/majra.cyr` (core) | 6,493 | 235 KB |
-| `dist/majra-signed.cyr` | 6,758 | 247 KB |
-| `dist/majra-admin.cyr` | 6,831 | 249 KB |
-| `dist/majra-backends.cyr` | 10,441 | 385 KB |
-| `src/` total | 11,239 lines across 23 files | — |
+| `dist/majra.cyr` (core) | 6,514 | 236 KB |
+| `dist/majra-signed.cyr` | 6,779 | 248 KB |
+| `dist/majra-admin.cyr` | 6,852 | 250 KB |
+| `dist/majra-backends.cyr` | 11,003 | 407 KB |
+| `src/` total | 11,801 lines across 23 files (2.13.0) | — |
 
 > 2.12.1 moves the pin to 6.7.18 and adds `src/patra_queue.cyr`'s column-type check
 > (`src/` +12 lines, all in the backends bundle); sidecars unchanged. `build/majra`
@@ -112,13 +112,13 @@ enforces match: 113 verified, 0 failed.
 | Suite | Entry point | Assertions | Notes |
 |---|---|---|---|
 | Core | `src/main.cyr` (binary self-tests) | 205 | runs as part of `cyrius build` smoke; 203 → 205 at 2.12.0 (null-handle `*_evict_to`) |
-| Expanded | `tests/test_core.tcyr` | 727 | broader unit coverage. 668 → 727 at 2.12.0 (the key cap, LRU order, ties and the no-scratch fallback, select-vs-sort, the sliding-window twin, wider metrics hooks incl. four threads); 724 under qemu, where one x86-only test's three asserts do not run. Per-release growth is in the CHANGELOG |
-| Backends | `tests/test_backends.tcyr` | 557 | redis / pg / ws / aes-gcm / signed_envelope / admin; 547 → 557 at 2.10.1 (P(-1): mixed-seed sk, admin arena, strict RESP integers) |
+| Expanded | `tests/test_core.tcyr` | 736 | broader unit coverage. 668 → 727 at 2.12.0 (the key cap, LRU order, ties and the no-scratch fallback, select-vs-sort, the sliding-window twin, wider metrics hooks incl. four threads); 727 → 736 at 2.13.0 (the namespace builders' released strings); 733 under qemu, where one x86-only test's three asserts do not run. Per-release growth is in the CHANGELOG |
+| Backends | `tests/test_backends.tcyr` | 605 | redis / pg / ws / aes-gcm / signed_envelope / admin; 547 → 557 at 2.10.1 (P(-1): mixed-seed sk, admin arena, strict RESP integers); 557 → 605 at 2.13.0 (SCRAM: RFC 7677 vector, server-first refusals, a fake SCRAM server over plaintext and TLS; pooled TLS arenas) |
 | Patra-queue | `tests/test_patra_queue.tcyr` | 101 | 71 → 82 at 2.12.1 (a corrupt TEXT ref is not delivered); 82 → 88 at 2.12.2 (the stall test tells a refused enqueue from a lost job); 88 → 101 at 2.12.4 (one handle shared by three threads, a corrupt job failed rather than blocking the queue, open/close bump growth). Separate entry — split out at 2.4.0 to stay under the then-16384 cc5 fixup cap (the table starts at 1,048,576 and grows on demand at the 6.7.18 pin — growable since cyrius 6.2.0); split kept as documented architecture |
-| **CI total** | | **1,590** | |
-| Live integration | `tests/test_live.tcyr` | 36 | requires Redis + PostgreSQL. **CI-only** — not runnable on a dev box without `redis:7-alpine` + `postgres:16-alpine` up; 7 Redis + 4 PostgreSQL categories |
+| **CI total** | | **1,647** | |
+| Live integration | `tests/test_live.tcyr` | 47 | requires Redis + PostgreSQL configured as CI's live job does (scram-sha-256, ssl on) — see testing.md § Live Test Setup for the docker recipe; 7 Redis + 6 PostgreSQL categories, SCRAM and TLS since 2.13.0 |
 | Fuzz harnesses | `fuzz/*.fcyr` | 3 binaries | model/oracle-checked since 2.8.2; `<harness> [iterations] [seed]`, seed printed; CI runs 500 iterations × 10 s timeout |
-| Benchmarks | `benches/bench_all.bcyr` | 20 targets (`ratelimit_evict_to` since 2.12.0) | history in `bench-history.csv` (tracked; rows for 2.8.0, 2.8.1, 2.10.0, 2.10.1, 2.11.0, 2.12.0, 2.12.1, 2.12.3). Rows taken on different days and loads are not comparable, so a release head-to-head rebuilds the prior tree and runs interleaved A/B |
+| Benchmarks | `benches/bench_all.bcyr` | 20 targets (`ratelimit_evict_to` since 2.12.0) | history in `bench-history.csv` (tracked; rows for 2.8.0, 2.8.1, 2.10.0, 2.10.1, 2.11.0, 2.12.0, 2.12.1, 2.12.3, 2.13.0). Rows taken on different days and loads are not comparable, so a release head-to-head rebuilds the prior tree and runs interleaved A/B |
 | Examples | `examples/*.cyr` | 2 binaries | `managed_queue`, `pubsub_tiers`; CI builds + runs both |
 | Soak | `tests/soak/soak_*.cyr` (4 files) | queue 500k ops, pubsub 2k topics, relay dedup+evict, heartbeat 100×20 + auto-evict | on-demand; all 4 clean under 6.7.18 at 2.12.1, natively and under `qemu-aarch64` |
 | **aarch64, cross-built** | every entry above via `cyrius build --aarch64 --no-deps <entry> build/<name>_aarch64 && qemu-aarch64 ./build/<name>_aarch64` | same counts (expanded 724 under qemu) | **CI since 2.12.2**: the four suites 25× each, then fuzz and examples (`aarch64-qemu` job). Soaks and the benchmark binary by hand at most releases since 2.7.3 (last at 2.12.1 under 6.7.18). Loop the expanded suite 100× by hand after touching threads, hashmaps or timing: single green runs have hidden 1-in-100 timing defects twice (2.9.3). Recipe in [`../guides/testing.md`](../guides/testing.md) |
@@ -184,6 +184,7 @@ x86_64-windows only (`SYS_FUTEX`, `FUTEX_WAIT`/`_WAKE`, `sys_lstat`,
 
 | Tag | Date | Headline |
 |---|---|---|
+| 2.13.0 | 2026-10-31 | **PostgreSQL SCRAM-SHA-256 + TLS.** `pg_connect` and the new `pg_connect_tls` authenticate with SCRAM-SHA-256 (RFC 5802/7677; `Hi()` over sigil's HMAC, RFC 7677 vector byte-exact; the server signature verified; a skipped SASLFinal refused). `pg_connect_tls` runs SSLRequest + TLS on lib/tls.cyr's native stack with the certificate always verified (`ca_file` or system roots, bound to `server_name`) and never falls back; its arenas are pooled. `namespace_str_free` releases the namespace builders' strings (now owned freelist copies). CI's live job runs scram-sha-256 + ssl and asserts it. 1,647 assertions + 47 live. |
 | 2.12.4 | 2026-10-31 | **P(-1) hardening pass for the 2.12 line**, report `docs/audit/2026-10-31-audit.md`. 4 findings (1 high, 1 medium, 2 low), three fixed in `src/patra_queue.cyr`. High: one handle used from two threads lost committed jobs (93 of 300 in one run), because `complete` / `fail` / the counts skipped the handle mutex and ran inside another thread's patra transaction. Medium: one unreadable job blocked the whole queue; it now goes to FAILED. Low: 448 → 40 bump bytes per open. The namespace builders' unreleasable strings are roadmapped for 2.13.0. No API or wire change. 1,590 assertions. |
 | 2.12.3 | 2026-10-31 | **CI patch: the aarch64 lane's patra-queue failure was a qemu bug.** Under `-strace` the failing run shows another thread's `munmap` racing a WAL-record `write` on a valid buffer, which qemu 8.2.2 failed with `EFAULT`. qemu's `page_check_range` read a page-flags node that an `munmap` was shrinking in place (fixed upstream in `e03b7dac65`: 11.1.0, 11.0.4). patra writes each 4,112-byte WAL record from a fresh `mmap`, so three writer threads churn the map. The `aarch64-qemu` job now installs Debian's static qemu 11.1.3, hash-pinned. 8.2.2: 2 failures in 3,000 runs; pinned 11.1.3: 0 in 9,000. No `src/` or API change; bundles differ only in the version stamp. 1,577 assertions. |
 | 2.12.2 | 2026-10-30 | **CI patch: the aarch64 run lane and the agnos column.** A new `aarch64-qemu` job runs the four suites 25× each, the fuzz harnesses and the examples under `qemu-aarch64` (CI had cross-built for aarch64 since 2.7.3 but never ran the builds). The cross-build gate adds `--agnos`, and the backends and patra-queue suites now build for it: they call the per-target wrappers (27 and 6 errors at 2.12.1). No `src/` or API change; bundles differ only in the version stamp. 1,577 assertions. The lane's first GitHub run failed once in 25 patra-queue runs (899 of 900 jobs in the stall test): one refused INSERT that only the runner's qemu 8.2.2 produces (about 1 in 400 runs; 0 in 3,000 under 11.1.3). The stall test now names refused vs lost (82 → 88), and the corrupt-ref test no longer patches a coincidental match. Retiring `_majra_map_compact` stays deferred: the consumers pin 6.6.2–6.6.14. |
@@ -230,7 +231,6 @@ in the CHANGELOG.
 
 | Item | Status | Where to look |
 |---|---|---|
-| **PostgreSQL: cleartext auth, no TLS** | Open — credentials and queries cross the wire in the clear; the connect fails closed on SCRAM rather than downgrading. Pinned to 2.13.0 | roadmap § 2.13.0 |
 | **Shared-memory IPC transport** | Pinned to 2.16.0, behind a benchmark gate: it ships only if the syscall per message is shown to be the bottleneck | roadmap § 2.16.0 |
 | **patra: a failed before-image read is logged as zeros** | Filed upstream 2026-10-31. An `EIO` on that read inside a transaction makes a rollback, or crash recovery, write zeros over the live page; the header case loses the whole queue file. `patra_queue_enqueue`'s rollback path reaches it. majra takes the fix with the cyrius pin that folds it | roadmap § Waiting on upstream |
 

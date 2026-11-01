@@ -2250,10 +2250,13 @@ fn test_resp_limits() {
 
 # ---- PostgreSQL wire, offline over a socketpair ----
 
+# A plaintext PgConn over `fd` (32 bytes since 2.13.0: no TLS ctx, no arena).
 fn _mk_pg(fd) {
-    var c = fl_alloc(16);
+    var c = fl_alloc(32);
     store64(c, fd);
     store64(c + 8, 1);
+    store64(c + 16, 0);
+    store64(c + 24, 0);
     return c;
 }
 
@@ -2667,6 +2670,388 @@ fn test_pg_connect_startup_cap() {
     println("  pg_connect_startup_cap: ok");
 }
 
+# --- 2.13.0: SCRAM-SHA-256 and TLS for the PostgreSQL client ---
+
+# RFC 7677 §3's worked example: user "user", password "pencil". It fixes the
+# whole computation — Hi(), the keys, the AuthMessage, the proof, the server
+# signature — byte for byte against the published exchange.
+fn test_pg_scram_rfc7677_vector() {
+    var cn = "rOprNGfwEbeRWgbNEkqO";
+    var cfb = "n=user,r=rOprNGfwEbeRWgbNEkqO";
+    var sfm = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+    var sf = _pg_scram_parse_first(sfm, strlen(sfm), cn, strlen(cn));
+    assert(sf != 0, "scram vector: server-first parsed");
+    if (sf != 0) {
+        assert_eq(load64(sf + 32), 4096, "scram vector: 4096 iterations");
+        assert_eq(load64(sf + 24), 16, "scram vector: 16-byte salt decoded");
+        var ssig[32];
+        var cf = _pg_scram_final("pencil", cfb, strlen(cfb), sfm, strlen(sfm), sf, &ssig);
+        var cflen = rethi();
+        # RFC 7677's client-final, split at the proof.
+        var want1 = "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
+        var want2 = ",p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=";
+        var w1 = strlen(want1);
+        assert(cf != 0, "scram vector: client-final built");
+        if (cf != 0) {
+            assert_eq(cflen, w1 + strlen(want2), "scram vector: client-final length");
+            assert(memeq(cf, want1, w1) == 1, "scram vector: client-final echoes the combined nonce");
+            assert(memeq(cf + w1, want2, strlen(want2)) == 1, "scram vector: and carries RFC 7677's proof");
+            fl_free(cf);
+        }
+        var v = "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=";
+        assert_eq(_pg_scram_check_final(v, strlen(v), &ssig), 1, "scram vector: RFC 7677's server signature verifies");
+        # The first character, not the last: before '=' the last one's low bits
+        # are padding, and flipping only those decodes to the same bytes.
+        var bad = "v=7rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=";
+        assert_eq(_pg_scram_check_final(bad, strlen(bad), &ssig), 0, "scram vector: a changed signature does not");
+        var err = "e=invalid-proof";
+        assert_eq(_pg_scram_check_final(err, strlen(err), &ssig), 0, "scram vector: a server error is not a signature");
+        _pg_scram_first_free(sf);
+    }
+    println("  pg_scram_rfc7677_vector: ok");
+}
+
+fn _sf_bad(m, label) {
+    var cn = "abcdefghijklmnopqrstuvwx";
+    var sf = _pg_scram_parse_first(m, strlen(m), cn, 24);
+    assert_eq(sf, 0, label);
+    if (sf != 0) { _pg_scram_first_free(sf); }
+    return 0;
+}
+
+# Every server-first a client must refuse, and the mechanism list.
+fn test_pg_scram_parse_refusals() {
+    _sf_bad("m=ext,r=abcdefghijklmnopqrstuvwxSRV,s=QUJD,i=4096", "server-first: a mandatory extension is refused");
+    _sf_bad("r=zzzdefghijklmnopqrstuvwxSRV,s=QUJD,i=4096", "server-first: a nonce not starting with ours");
+    _sf_bad("r=abcdefghijklmnopqrstuvwx,s=QUJD,i=4096", "server-first: a nonce with no server part");
+    _sf_bad("r=abcdefghijklmnopqrstuvwxSRV,s=QUJD,i=0", "server-first: zero iterations");
+    _sf_bad("r=abcdefghijklmnopqrstuvwxSRV,s=QUJD,i=04096", "server-first: a leading zero");
+    _sf_bad("r=abcdefghijklmnopqrstuvwxSRV,s=QUJD,i=1000001", "server-first: past PG_SCRAM_MAX_ITERATIONS");
+    _sf_bad("r=abcdefghijklmnopqrstuvwxSRV,s=QUJD,i=40x6", "server-first: a non-digit count");
+    _sf_bad("r=abcdefghijklmnopqrstuvwxSRV,s=QU*D,i=4096", "server-first: a salt that is not base64");
+    _sf_bad("r=abcdefghijklmnopqrstuvwxSRV,s=,i=4096", "server-first: an empty salt");
+    _sf_bad("r=abcdefghijklmnopqrstuvwxSRV,i=4096", "server-first: no salt");
+    _sf_bad("r=abcdefghijklmnopqrstuvwxSRV,s=QUJD", "server-first: no count");
+    _sf_bad("r=abcdefghijklmnopqrstuvwxS\tV,s=QUJD,i=4096", "server-first: a control byte in the nonce");
+    var good = "r=abcdefghijklmnopqrstuvwxSRV,s=QUJD,i=4096,x=future";
+    var sf = _pg_scram_parse_first(good, strlen(good), "abcdefghijklmnopqrstuvwx", 24);
+    assert(sf != 0, "server-first: a trailing extension is allowed");
+    if (sf != 0) { _pg_scram_first_free(sf); }
+
+    var m[64];
+    memset(&m, 0, 64);
+    memcpy(&m + 4, "SCRAM-SHA-256-PLUS", 18);
+    memcpy(&m + 23, "SCRAM-SHA-256", 13);
+    assert_eq(_pg_sasl_offers_scram(&m, 38), 1, "mechanisms: SCRAM-SHA-256 found after -PLUS");
+    assert_eq(_pg_sasl_offers_scram(&m, 23), 0, "mechanisms: -PLUS alone is not it");
+    assert_eq(_pg_sasl_offers_scram(&m, 30), 0, "mechanisms: an unterminated name is refused");
+    println("  pg_scram_parse_refusals: ok");
+}
+
+# A fake PostgreSQL server that runs the server side of SCRAM-SHA-256, over
+# plaintext or (after answering an SSLRequest) TLS with the fixture leaf.
+# _fs_mode: 0 honest, 1 wrong signature, 2 skips SASLFinal, 3 offers only -PLUS,
+# 4 asks for MD5, 5 declines TLS and then serves plaintext.
+var _fs_mode = 0;
+var _fs_tls = 0;        # 1: expect an SSLRequest
+var _fs_pw = 0;         # the password the server knows
+var _fs_proof_ok = 0;   # 1 once the client's proof verified
+var _fs_term = 0;       # 1 once Terminate arrived after ReadyForQuery
+var _fs_arena = 0;      # the server's TLS arena, reset per connection
+var _fs_creds[4];       # cert, cert_len, key, key_len (DER)
+
+fn _fs_read(c, t, buf, n) {
+    if (t == 0) { return _pg_read_full(c, buf, n); }
+    var got = 0;
+    while (got < n) {
+        var r = tls_read(t, buf + got, n - got);
+        if (r <= 0) { return 0 - 1; }
+        got = got + r;
+    }
+    return got;
+}
+
+fn _fs_write(c, t, buf, n) {
+    if (t == 0) { return _pg_write_full(c, buf, n); }
+    var put = 0;
+    while (put < n) {
+        var w = tls_write(t, buf + put, n - put);
+        if (w <= 0) { return 0 - 1; }
+        put = put + w;
+    }
+    return put;
+}
+
+# One backend Authentication message: 'R', length, auth code, body.
+fn _fs_auth(c, t, code, body, blen) {
+    var m = fl_alloc(9 + blen);
+    store8(m, 82);
+    _pg_write_be32(m, 1, 8 + blen);
+    _pg_write_be32(m, 5, code);
+    if (blen > 0) { memcpy(m + 9, body, blen); }
+    _fs_write(c, t, m, 9 + blen);
+    fl_free(m);
+    return 0;
+}
+
+# Read one frontend message into buf: type at buf[0], body from buf + 5.
+# Returns the body length, or -1.
+fn _fs_msg(c, t, buf, cap) {
+    if (_fs_read(c, t, buf, 5) != 5) { return 0 - 1; }
+    var len = _pg_read_be32(buf, 1);
+    if (len < 4 || len - 4 > cap - 5) { return 0 - 1; }
+    if (len > 4) {
+        if (_fs_read(c, t, buf + 5, len - 4) != len - 4) { return 0 - 1; }
+    }
+    return len - 4;
+}
+
+fn _fake_scram_srv(arg) {
+    var c = syscall(_SYS_ACCEPT, _srv_listen, 0, 0);
+    var t = 0;
+    var buf = fl_alloc(8192);
+    var go = 1;
+    if (_fs_tls == 1) {
+        go = 0;
+        if (_pg_read_full(c, buf, 8) == 8) {
+            if (_pg_read_be32(buf, 4) == 80877103) {
+                if (_fs_mode == 5) {
+                    # Declined — and, like a real server, carry on in the clear,
+                    # so a client that fell back would get through.
+                    store8(buf, 78);
+                    _pg_write_full(c, buf, 1);
+                    go = 1;
+                } else {
+                    store8(buf, 83);
+                    _pg_write_full(c, buf, 1);
+                    var tc = tls_accept_alloc_in(_fs_arena, c, &_fs_creds, 0, 0);
+                    if (tc != 0) {
+                        if (tls_accept_complete(tc) == 1) { t = tc; go = 1; }
+                        else { tls_close(tc); }
+                    }
+                }
+            }
+        }
+    }
+    # Startup: length, then the rest.
+    if (go == 1) {
+        go = 0;
+        if (_fs_read(c, t, buf, 4) == 4) {
+            var sl = _pg_read_be32(buf, 0);
+            if (sl >= 8 && sl < 8192) {
+                if (_fs_read(c, t, buf + 4, sl - 4) == sl - 4) { go = 1; }
+            }
+        }
+    }
+    if (go == 1 && _fs_mode == 4) {
+        _fs_auth(c, t, 5, "salt", 4);
+        _fs_msg(c, t, buf, 8192);
+        go = 0;
+    }
+    var cnonce = 0;
+    if (go == 1) {
+        if (_fs_mode == 3) { _fs_auth(c, t, 10, "SCRAM-SHA-256-PLUS\0\0", 20); }
+        else { _fs_auth(c, t, 10, "SCRAM-SHA-256\0\0", 15); }
+        var n1 = _fs_msg(c, t, buf, 8192);
+        go = 0;
+        # 'p': "SCRAM-SHA-256\0", int32 length, "n,,n=,r=<24-char nonce>"
+        if (n1 == 4 + 14 + 32 && load8(buf) == 112) {
+            if (memeq(buf + 5, "SCRAM-SHA-256", 14) == 1 && memeq(buf + 23, "n,,n=,r=", 8) == 1) {
+                cnonce = fl_alloc(25);
+                memcpy(cnonce, buf + 31, 24);
+                store8(cnonce + 24, 0);
+                go = 1;
+            }
+        }
+    }
+    if (go == 1) {
+        go = 0;
+        var salt = "0123456789abcdef";
+        var s64 = majra_base64_encode(salt, 16);
+        var sfm = fl_alloc(128);
+        memcpy(sfm, "r=", 2);
+        memcpy(sfm + 2, cnonce, 24);
+        memcpy(sfm + 26, "Zp0server9,s=", 13);
+        memcpy(sfm + 39, s64, 24);
+        memcpy(sfm + 63, ",i=4096", 7);
+        var sfn = 70;
+        _fs_auth(c, t, 11, sfm, sfn);
+        var n2 = _fs_msg(c, t, buf, 8192);
+        if (n2 > 0 && load8(buf) == 112) {
+            # client-final = without-proof ",p=" base64(proof)
+            var cfm = buf + 5;
+            var pp = n2 - 47;
+            if (pp > 0 && memeq(cfm + pp, ",p=", 3) == 1) {
+                var alen = 29 + 1 + sfn + 1 + pp;
+                var auth = fl_alloc(alen);
+                memcpy(auth, "n=,r=", 5);
+                memcpy(auth + 5, cnonce, 24);
+                store8(auth + 29, 44);
+                memcpy(auth + 30, sfm, sfn);
+                store8(auth + 30 + sfn, 44);
+                memcpy(auth + 31 + sfn, cfm, pp);
+                var eproof[32];
+                var esig[32];
+                _pg_scram_compute(_fs_pw, strlen(_fs_pw), salt, 16, 4096, auth, alen, &eproof, &esig);
+                var got = majra_base64_decode(cfm + pp + 3, 44);
+                if (got != 0) {
+                    if (load64(got + 8) == 32) {
+                        if (ct_eq_bytes(load64(got), &eproof, 32) == 1) { _fs_proof_ok = 1; }
+                    }
+                    fl_free(load64(got));
+                    fl_free(got);
+                }
+                fl_free(auth);
+                if (_fs_proof_ok == 1) {
+                    if (_fs_mode != 2) {
+                        if (_fs_mode == 1) { store8(&esig, load8(&esig) ^ 1); }
+                        var v64 = majra_base64_encode(&esig, 32);
+                        var vm = fl_alloc(48);
+                        memcpy(vm, "v=", 2);
+                        memcpy(vm + 2, v64, 44);
+                        _fs_auth(c, t, 12, vm, 46);
+                        fl_free(vm);
+                        fl_free(v64);
+                    }
+                    _fs_auth(c, t, 0, 0, 0);
+                    store8(buf, 90);
+                    _pg_write_be32(buf, 1, 5);
+                    store8(buf + 5, 73);
+                    _fs_write(c, t, buf, 6);
+                    go = 1;
+                } else {
+                    # 28P01: invalid_password
+                    var e = "SFATAL\0C28P01\0Mpassword authentication failed\0\0";
+                    store8(buf, 69);
+                    _pg_write_be32(buf, 1, 4 + 47);
+                    memcpy(buf + 5, e, 47);
+                    _fs_write(c, t, buf, 52);
+                }
+            }
+        }
+        fl_free(sfm);
+        fl_free(s64);
+    }
+    if (go == 1) {
+        if (_fs_msg(c, t, buf, 8192) >= 0) {
+            if (load8(buf) == 88) { _fs_term = 1; }
+        }
+    }
+    if (cnonce != 0) { fl_free(cnonce); }
+    if (t != 0) { tls_close(t); }
+    syscall(SYS_CLOSE, c);
+    if (_fs_arena != 0) { reset_via(_fs_arena); }
+    fl_free(buf);
+    return 0;
+}
+
+var _fs_conn_ok = 0;
+var _fs_conn_tls = 0;
+
+# One connect against the fake server. Records whether it connected and over
+# TLS, then closes; the server thread is joined before return.
+fn _fs_case(use_tls, mode, client_pw, server_name, ca_file) {
+    _tb_wd_arm();
+    var lf = _listen_any();
+    var port = rethi();
+    _srv_listen = lf;
+    _fs_mode = mode;
+    _fs_tls = use_tls;
+    _fs_proof_ok = 0;
+    _fs_term = 0;
+    _fs_conn_ok = 0;
+    _fs_conn_tls = 0;
+    var st = thread_create(&_fake_scram_srv, 0);
+    var conn = 0;
+    if (use_tls == 1) { conn = pg_connect_tls("127.0.0.1", port, "alice", "db1", client_pw, server_name, ca_file); }
+    else { conn = pg_connect("127.0.0.1", port, "alice", "db1", client_pw); }
+    if (conn != 0) {
+        _fs_conn_ok = 1;
+        _fs_conn_tls = pg_conn_is_tls(conn);
+        pg_close(conn);
+        fl_free(conn);
+    }
+    thread_join(st);
+    syscall(SYS_CLOSE, lf);
+    _tb_wd_disarm();
+    return 0;
+}
+
+fn test_pg_scram_exchange() {
+    _fs_pw = "correct horse battery staple";
+    _fs_case(0, 0, "correct horse battery staple", 0, 0);
+    assert_eq(_fs_conn_ok, 1, "scram: connects with the right password");
+    assert_eq(_fs_proof_ok, 1, "scram: the server verified the client's proof");
+    assert_eq(_fs_term, 1, "scram: the connection carried Terminate after ReadyForQuery");
+    assert_eq(_fs_conn_tls, 0, "scram: plaintext connection reports no TLS");
+
+    _fs_case(0, 0, "wrong password", 0, 0);
+    assert_eq(_fs_proof_ok, 0, "scram: a wrong password's proof does not verify");
+    assert_eq(_fs_conn_ok, 0, "scram: and the connect fails");
+
+    _fs_case(0, 1, "correct horse battery staple", 0, 0);
+    assert_eq(_fs_proof_ok, 1, "scram: (bad signature) the proof itself verified");
+    assert_eq(_fs_conn_ok, 0, "scram: a server signature that does not match fails the connect");
+
+    _fs_case(0, 2, "correct horse battery staple", 0, 0);
+    assert_eq(_fs_conn_ok, 0, "scram: AuthenticationOk without SASLFinal fails the connect");
+
+    _fs_case(0, 3, "correct horse battery staple", 0, 0);
+    assert_eq(_fs_conn_ok, 0, "scram: a server offering only -PLUS is refused");
+
+    _fs_case(0, 4, "correct horse battery staple", 0, 0);
+    assert_eq(_fs_conn_ok, 0, "scram: MD5 is refused");
+    println("  pg_scram_exchange: ok");
+}
+
+fn _fs_load(path, out_ptr, out_len) {
+    var buf = fl_alloc(4096);
+    var n = file_read_all(path, buf, 4096);
+    store64(out_ptr, buf);
+    store64(out_len, n);
+    return n;
+}
+
+fn test_pg_connect_tls() {
+    var ca = "tests/fixtures/pg_tls_ca.pem";
+    var cl = _fs_load("tests/fixtures/pg_tls_ec_server.der", &_fs_creds, &_fs_creds + 8);
+    var kl = _fs_load("tests/fixtures/pg_tls_ec_server.key.der", &_fs_creds + 16, &_fs_creds + 24);
+    assert(cl > 0 && kl > 0, "tls: fixture leaf and key read");
+    _fs_arena = arena_allocator_growable(262144);
+    _fs_pw = "s3cret over tls";
+
+    _fs_case(1, 0, "s3cret over tls", "majra-test.local", ca);
+    assert_eq(_fs_conn_ok, 1, "tls: connects, verified against the fixture CA by DNS name");
+    assert_eq(_fs_conn_tls, 1, "tls: and reports TLS");
+    assert_eq(_fs_proof_ok, 1, "tls: SCRAM ran inside the session");
+    assert_eq(_fs_term, 1, "tls: Terminate arrived through the session");
+
+    _fs_case(1, 0, "s3cret over tls", 0, ca);
+    assert_eq(_fs_conn_ok, 1, "tls: server_name 0 verifies the host, an IP SAN");
+
+    _fs_case(1, 0, "s3cret over tls", "other.example", ca);
+    assert_eq(_fs_conn_ok, 0, "tls: a name the certificate does not carry is refused");
+
+    _fs_case(1, 0, "s3cret over tls", "majra-test.local", 0);
+    assert_eq(_fs_conn_ok, 0, "tls: the system roots do not trust the test CA");
+
+    _fs_case(1, 5, "s3cret over tls", "majra-test.local", ca);
+    assert_eq(_fs_conn_ok, 0, "tls: a server that declines TLS is refused, not fallen back from");
+
+    # Reconnecting reuses pooled arenas: after the first, no handshake's
+    # buffers are left on the bump heap.
+    _fs_case(1, 0, "s3cret over tls", "majra-test.local", ca);
+    var u0 = alloc_used();
+    var r = 0;
+    # Three: an unpooled connection leaves ~175 KB, so 3 already says which.
+    # Each handshake is P-256 work, which is slow under CI's qemu lane.
+    while (r < 3) { _fs_case(1, 0, "s3cret over tls", "majra-test.local", ca); r = r + 1; }
+    assert_eq(_fs_conn_ok, 1, "tls: three more connects succeed");
+    var per = (alloc_used() - u0) / 3;
+    assert(per < 8192, "tls: a reconnect leaves no handshake on the bump heap");
+    println("  pg_connect_tls: ok");
+}
+
 fn main() {
     alloc_init();
     fl_init();
@@ -2727,6 +3112,10 @@ fn main() {
     test_resp_threads();
     test_pg_connect();
     test_pg_connect_startup_cap();
+    test_pg_scram_rfc7677_vector();
+    test_pg_scram_parse_refusals();
+    test_pg_scram_exchange();
+    test_pg_connect_tls();
 
     return assert_summary();
 }

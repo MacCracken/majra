@@ -353,13 +353,25 @@ jobs:
           cyrius lib sync --full
           cyrius deps
 
-      - name: Configure PostgreSQL auth
+      - name: Configure PostgreSQL (scram-sha-256 + TLS)
+        # Every TCP login must be SCRAM, and ssl serves the fixture RSA leaf
+        # (test-only: tests/fixtures/README.md). The checks below fail the job
+        # if the server did not end up that way.
         run: |
+          set -e
           PGID=$(docker ps -q --filter "ancestor=postgres:16-alpine")
-          docker exec "$PGID" su postgres -c \
-            "echo 'host all all 0.0.0.0/0 password' > /var/lib/postgresql/data/pg_hba.conf && \
-             echo 'local all all trust' >> /var/lib/postgresql/data/pg_hba.conf && \
-             pg_ctl reload -D /var/lib/postgresql/data"
+          D=/var/lib/postgresql/data
+          docker cp tests/fixtures/pg_tls_rsa_server.pem "$PGID:$D/server.crt"
+          docker cp tests/fixtures/pg_tls_rsa_server.key "$PGID:$D/server.key"
+          docker exec "$PGID" sh -c "chown postgres:postgres $D/server.crt $D/server.key && chmod 600 $D/server.key"
+          docker exec "$PGID" su postgres -c "printf 'hostssl all all 0.0.0.0/0 scram-sha-256\nhost all all 0.0.0.0/0 scram-sha-256\nlocal all all trust\n' > $D/pg_hba.conf"
+          docker exec "$PGID" su postgres -c "psql -qc 'ALTER SYSTEM SET ssl = on' && pg_ctl reload -D $D"
+          sleep 2
+          q() { docker exec "$PGID" su postgres -c "psql -tAc \"$1\""; }
+          [ "$(q 'SHOW ssl')" = on ]
+          [ "$(q "SELECT rolpassword LIKE 'SCRAM-SHA-256\$%' FROM pg_authid WHERE rolname = 'postgres'")" = t ]
+          [ "$(q "SELECT count(*) FROM pg_hba_file_rules WHERE auth_method <> 'scram-sha-256' AND type <> 'local'")" = 0 ]
+          echo "ssl on; postgres has a SCRAM verifier; every TCP rule is scram-sha-256"
 
       - name: Run live tests
         run: |

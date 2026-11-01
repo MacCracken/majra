@@ -141,11 +141,11 @@ under Documented exceptions above:
 
 | Module | Stable since |
 |--------|-------------|
-| error, counter, envelope, namespace | 2.0.0 (error codes `MAJRA_ERR_*` since 2.8.0; bare `ERR_*` deprecated — see Deprecations) |
+| error, counter, envelope, namespace | 2.0.0 (error codes `MAJRA_ERR_*` since 2.8.0; bare `ERR_*` deprecated — see Deprecations; `namespace_str_free` since 2.13.0, and the namespace builders return owned copies) |
 | metrics, ratelimit, heartbeat | 2.0.0 (the four wider metrics hooks pass all their arguments since 2.12.0; `_metrics_arg3` / `_metrics_arg4` deprecated — see Deprecations) |
 | queue, pubsub, relay, barrier | 2.0.0 |
 | ipc, transport, fleet, dag | 2.0.0 |
-| redis_backend, postgres_backend, ws | 2.0.0 (`ws_send_text` / `ws_recv_frame` renamed `majra_ws_*` at 2.8.0 — see Documented exceptions) |
+| redis_backend, postgres_backend, ws | 2.0.0 (`ws_send_text` / `ws_recv_frame` renamed `majra_ws_*` at 2.8.0 — see Documented exceptions; `pg_connect_tls`, `pg_conn_is_tls`, `PG_SCRAM_MAX_ITERATIONS`, `PG_TLS_HANDSHAKE_NS` since 2.13.0) |
 | ipc_encrypted wire format | 2.0.0 framing; **session handshake at 2.9.0** — see Security fixes that require a wire change |
 | signed_envelope signing input | 2.4.0; **domain prefix at 2.9.0** — same exception |
 | ipc_encrypted (AES-256-GCM via sigil; framing, nonce/role separation, rekey) | 2.0.0 framing; role argument 2.6.9 — see Documented exceptions |

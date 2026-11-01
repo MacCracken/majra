@@ -5,6 +5,113 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.13.0] - 2026-10-31
+
+The PostgreSQL client speaks **SCRAM-SHA-256** and **TLS**. This was the largest capability gap
+majra shipped, and the roadmap's first pinned MINOR. A modern server no longer has to be weakened
+to `password` in `pg_hba.conf` to be reached, and CI's live job no longer does that. Also, the
+namespace builders' strings can be released. Additive: three new public functions and two tunables.
+Existing calls compile unchanged. **1,647 assertions** (core 205 · expanded 736 · backends 605 ·
+patra-queue 101), plus 47 live.
+
+### Added
+
+- **SCRAM-SHA-256 authentication** (RFC 5802 / RFC 7677) in `pg_connect` and `pg_connect_tls`.
+  It is used whenever the server asks for it, which every PostgreSQL ≥ 14 does by default.
+  - The password never crosses the wire.
+  - The server's final signature is checked in constant time. A server that skips SASLFinal and
+    sends AuthenticationOk is refused, as is a signature that does not match, so a server that
+    does not hold the verifier cannot complete the login.
+  - `Hi()` is PBKDF2-HMAC-SHA-256, built over sigil's `hmac_sha256`; sigil has no PBKDF2.
+  - The client nonce is 18 bytes from the OS CSPRNG. Every password-derived key is zeroed after
+    use.
+  - Refused: a server-first message with a mandatory extension (`m=`), a nonce that does not
+    extend ours, an iteration count of zero or with a leading zero, or a malformed salt.
+  - New tunable `PG_SCRAM_MAX_ITERATIONS` (default 1,000,000, about 1.6 s of PBKDF2 here) bounds
+    the work a hostile server can demand.
+  - **Limits, documented in the module:**
+    - No channel binding: a server offering only SCRAM-SHA-256-PLUS is refused.
+    - The password is used as its bytes. That is exact for ASCII; a non-ASCII password the server
+      SASLprep-normalised will not authenticate.
+    - MD5 and every other method still fail closed.
+- **`pg_connect_tls(host, port, user, database, password, server_name, ca_file)`** sends an
+  SSLRequest and runs TLS through `lib/tls.cyr`'s native stack. No system library is involved.
+  - **The certificate is always verified.** It is checked against `ca_file` (a PEM file, e.g. a
+    private CA), or the system roots when that is 0, and bound to `server_name` (a DNS name or an
+    IP literal; 0 means `host`). There is no unverified mode.
+  - A server that answers `N` is refused, never fallen back from.
+  - Exactly one byte is read before the handshake, so bytes injected after the `S` reach the TLS
+    stack, never the protocol parser (the CVE-2021-23222 class).
+  - The handshake is bounded by `PG_TLS_HANDSHAKE_NS` (30 s); queries are untimed, as over
+    plaintext.
+  - **Memory:** `lib/tls.cyr` draws a connection's handshake and record buffers (~175 KB for
+    TLS 1.3) from its allocator, and without one from the never-freeing bump heap. Closed
+    connections' arenas are reset and pooled, so reconnecting allocates nothing once warm.
+- **`pg_conn_is_tls(conn)`** — 1 for an open TLS connection.
+- **`namespace_str_free(s)`** releases any `Str` a `namespace_*` function returned, the namespace
+  itself included (the 2.12.4 audit's low API finding). Every result is now one freelist block
+  (the `Str` header, then the bytes and a NUL). They were bump allocations with no release, so a
+  caller namespacing every publish leaked about 664 bytes per round of builders.
+  ⚠ `namespace_new` and the two `namespace_strip_*` now return their own **copy**. They used to
+  borrow the caller's buffer or Str, so a reused prefix buffer changed every topic built from it.
+- **`tests/fixtures/`** — a test-only CA and two server leaves: P-256 for the in-process fake
+  server, RSA-2048 for the real PostgreSQL. The CA key was discarded (see its README).
+
+### Changed
+
+- **`PgConn` is 32 bytes** (was 16): the TLS ctx and its arena are appended at +16 / +24. `fd` and
+  `ready` keep their offsets.
+- **Every byte a connection sends or receives goes through one transport layer**
+  (`_pg_send_full` / `_pg_recv_full`), which uses the TLS ctx when there is one. `pg_close` sends
+  Terminate and then `close_notify` over TLS.
+- **Authentication is one state machine** (`_pg_authenticate`): a SCRAM step out of order, an
+  MD5 request, or any non-Authentication message before AuthenticationOk fails the connect.
+- **CI's live job** configures `scram-sha-256` for every TCP rule and `ssl = on` with the fixture
+  RSA leaf. It then asserts all three: ssl is on, the role has a SCRAM verifier, and no
+  non-SCRAM TCP rule remains. It had rewritten `pg_hba.conf` to `password`.
+- **`docs/development/roadmap.md`** — 2.13.0 shipped and is deleted. The PBKDF2 note leaves Waiting
+  on upstream, since `Hi()` is built here.
+
+### Tests
+
+- **`tests/test_backends.tcyr`: 557 → 605.**
+  - RFC 7677's worked example, byte for byte: the proof and the server signature.
+  - Twelve server-first refusals, and the mechanism-list parser.
+  - A fake server that runs the server side of SCRAM, over plaintext and over TLS with the fixture
+    P-256 leaf. Cases: a right and a wrong password, a wrong server signature, a skipped
+    SASLFinal, `-PLUS` only, MD5, a verified DNS name and IP SAN, a wrong name, the system roots,
+    a server that declines TLS, and reconnects that leave no handshake on the bump heap.
+  - Mutation-checked: accepting AuthenticationOk before a verified SASLFinal, a signature check
+    that always passes, falling back to plaintext after `N`, and an unpooled arena each fail the
+    suite.
+- **`tests/test_core.tcyr`: 727 → 736** — every namespace builder's output, and 1,000 rounds that
+  take no bump memory and carve no freelist memory. The 2.12.4 module fails 5 of them.
+- **`tests/test_live.tcyr`: 36 → 47.**
+  - SCRAM over plaintext, and a wrong password refused.
+  - `pg_connect_tls` against PostgreSQL 16's RSA leaf. The server's own `pg_stat_ssl` confirms TLS
+    (1.3 here) for the TLS connection and not for the plaintext one; a wrong name and the system
+    roots are refused.
+
+### Verified
+
+- **The live suite against a real `postgres:16-alpine`** configured by CI's new step, extracted
+  from `ci.yml` and run here: 47 / 47. The 2.12.4 client fails against the same server (it refuses
+  SASL), so the new tests are not passing vacuously.
+- **The suites under the CI lane's pinned `qemu-aarch64` 11.1.3**, 25 runs each: backends 605 and
+  expanded 733 (its three x86-only assertions do not run there), all clean.
+  - The new TLS handshakes are P-256 work under emulation: the backends suite takes about 21 s per
+    run there, against 2.3 s for 2.12.4's.
+  - Trimming the reconnect check from 10 connects to 3 took it from 32 s. CI's aarch64 lane grows
+    by about 8 minutes.
+- **Gates.** `cyrius fmt --check` and `cyrius lint` are clean. The raw-syscall and manifest gates
+  pass. The cross-build gate builds all eight, and the live suite builds for aarch64 and agnos too.
+- **Native.** All four suites report `0 failed`.
+- **Benchmarks.** `bench-history.csv` gains the 2.13.0 row (50 trials). Interleaved A/B against the 2.12.4 build, 25 trials each: every target within
+  −1.8 % to +3.7 % by median. The bench compiles the namespace module in but calls none of it.
+- **Bundles.** All four regenerated. The sidecars are unchanged (`majra-backends.deps` still
+  `sandhi` / `patra` / `syscalls`, compile-verified), because TLS, sigil, the CSPRNG and the
+  constant-time compare all arrive through sandhi.
+
 ## [2.12.4] - 2026-10-31
 
 The P(-1) hardening pass for the 2.12 line, before the 2.13.0 cut. Report:
