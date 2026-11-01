@@ -6,10 +6,13 @@ type: state
 
 # Documentation Health — majra
 
-> **Last refresh**: 2026-10-31 (2.12.3) — the aarch64 lane's patra-queue
+> **Last refresh**: 2026-10-31 (2.12.4) — the P(-1) pass: a new audit report
+> (`docs/audit/2026-10-31-audit.md`), CHANGELOG, state, roadmap (2.12.4 deleted,
+> the namespace item added to 2.13.0), testing guide, README count and
+> dependency-watch's patra bullet touched. 2.12.3 before it: the aarch64 lane's patra-queue
 > failure traced to a qemu 8.2.2 `EFAULT` race and the lane pinned to qemu
-> 11.1.3: CHANGELOG, state, roadmap (item deleted), testing guide and the
-> README count stamp touched. 2.12.2 before it: CI gained the aarch64 run lane and
+> 11.1.3: CHANGELOG, state, roadmap (item deleted, schedule pinned to 3.0.0), testing
+> guide and README (count stamp, QUIC row) touched. 2.12.2 before it: CI gained the aarch64 run lane and
 > the agnos column for every suite: the docs that described either lane as
 > unwired or the two suites as non-building were rewritten, and the two shipped
 > roadmap items deleted. The 2.12.1 refresh before it (the 6.7.18 pin move)
@@ -28,14 +31,14 @@ majra-shaped.
 
 ## At a glance — 2026-10-15
 
-**29 tracked markdown files**: 6 at the root, 22 under `docs/`, 1 under
+**30 tracked markdown files**: 6 at the root, 23 under `docs/`, 1 under
 `tests/soak/`.
 
 | Bucket | Count | What it means |
 |---|---|---|
 | ✅ **Fresh** — checked on 2026-10-15 (2.11.0 sweep, 2.12.0 touch-ups); the pin-carrying ones again on 2026-10-30 (2.12.1), the CI-lane ones at 2.12.2 | 15 | Living docs; refreshed every release |
 | 🔵 **Evergreen** — no version-tied claims | 1 | `CODE_OF_CONDUCT.md` (plus `LICENSE`, not markdown). Re-read annually |
-| 📦 **Frozen by design** — point-in-time records, never refreshed in place | 13 | 4 audit reports, 2 benchmark snapshots, 4 migration guides, 3 archived issues |
+| 📦 **Frozen by design** — point-in-time records, never refreshed in place | 14 | 5 audit reports, 2 benchmark snapshots, 4 migration guides, 3 archived issues |
 | 🟡 **Stale** | 0 | |
 
 ---
@@ -45,7 +48,7 @@ majra-shaped.
 | File | Last touched | Status | Notes |
 |---|---|---|---|
 | `README.md` | 2026-10-31 | ✅ Fresh | Module table (ratelimit names the key cap), architecture header (v2.12.1: 10,365 lines across 22 modules; 11,239 across 23 files with `src/main.cyr`), sidecar table and toolchain floor (backends re-checked on 6.6.20–6.7.9 at 2.12.1), test count 1,577 (stamped 2.12.3), toolchain row 6.7.18; the aarch64 note says CI runs the suites under qemu (2.12.2). Names the version in six places — re-measure each on every release |
-| `CHANGELOG.md` | 2026-10-31 | ✅ Fresh | Source of truth for shipped work. `[2.12.3]` is the qemu `EFAULT` root cause and the pinned qemu; `[2.12.2]` is the CI lanes (aarch64 run, agnos suites); `[2.12.1]` is the 6.7.18 pin move; `[2.12.0]` folds in the post-2.11.0 roadmap / doc sweep; the stray empty `[Unreleased]` heading between 2.1.1 and 2.1.0 (compare link to v1.0.4) is gone |
+| `CHANGELOG.md` | 2026-10-31 | ✅ Fresh | Source of truth for shipped work. `[2.12.4]` is the P(-1) pass (the shared-handle data loss, the corrupt-job queue block, the per-open leak) and the pinned roadmap; `[2.12.3]` is the qemu `EFAULT` root cause and the pinned qemu; `[2.12.2]` is the CI lanes (aarch64 run, agnos suites); `[2.12.1]` is the 6.7.18 pin move; `[2.12.0]` folds in the post-2.11.0 roadmap / doc sweep; the stray empty `[Unreleased]` heading between 2.1.1 and 2.1.0 (compare link to v1.0.4) is gone |
 | `CLAUDE.md` | 2026-10-30 | ✅ Fresh | Durable rules only — no inlined state. Language conventions re-checked at 6.7.18 (bare `return;` refused in a `: bool` fn, block-scoped `var`; reserved words at 6.7.9); the roadmap description matches its release-target shape; CI / Release shape names the cross-arch lanes (2.12.2) |
 | `CONTRIBUTING.md` | 2026-10-15 | ✅ Fresh | Points at `sh tests/test.sh`; `cyrius audit` vs `cyrius deny` split stated; style examples name code that exists. One toolchain-tied figure (the fixup table) tracks `cyrius-quirks.md` §2 |
 | `SECURITY.md` | 2026-10-15 | ✅ Fresh | Attack-surface rows re-checked against the code at 2.11.0; supported-versions table reads `current: see VERSION`, so it does not drift per release |
@@ -66,9 +69,9 @@ notes earned yet.
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `state.md` | 2026-10-31 | ✅ Fresh | Refreshed every release (2.12.3: the aarch64 row names the pinned qemu, the qemu-8.2.2 row dropped from In-flight. 2.12.2: the aarch64 and agnos rows say what CI covers; both lane rows dropped from In-flight, the qemu-8.2.2 row added. 2.12.1: pin 6.7.18, fold versions, lock, footprint, counts). In-flight table holds open items only, each pointing at its roadmap target; footprint and lockfile history condensed |
-| `roadmap.md` | 2026-10-31 | ✅ Fresh | Forward-facing only, by release target (2.12.x / later MINORs / 3.0.0); the aarch64 run lane and the agnos suites shipped at 2.12.2 and were deleted, and moving the lane off qemu 8.2.2 shipped at 2.12.3 and was deleted; the `_majra_map_compact` item stays (consumer pins 6.6.2–6.6.14, re-checked), and no MINOR has a fired trigger. Every item re-checked open at 2.12.2, upstream items at the latest *tagged* cyrius (6.7.18) and sigil (3.13.15) |
-| `dependency-watch.md` | 2026-10-30 | ✅ Fresh | sigil 3.13.15 / patra 1.16.6 / sandhi 1.13.7 / sakshi 2.5.10 / bayan 1.11.1 at the 6.7.18 pin, each its latest tag; the static-buffer watch resolved; `ESYSXLAT` re-derived (82, unchanged); the ESYSXLAT bullet names the CI run lane (2.12.2) |
+| `state.md` | 2026-10-31 | ✅ Fresh | Refreshed every release (2.12.4: patra-queue 88 → 101, CI total 1,590, the 2.12.3 bench row listed. 2.12.3: the aarch64 row names the pinned qemu, the qemu-8.2.2 row dropped from In-flight. 2.12.2: the aarch64 and agnos rows say what CI covers; both lane rows dropped from In-flight, the qemu-8.2.2 row added. 2.12.1: pin 6.7.18, fold versions, lock, footprint, counts). In-flight table holds open items only, each pointing at its roadmap target; footprint and lockfile history condensed |
+| `roadmap.md` | 2026-10-31 | ✅ Fresh | Forward-facing only, pinned release by release to 3.0.0 (2.12.4 shipped and deleted; the namespace release function added to 2.13.0 by the P(-1) pass); the aarch64 run lane and the agnos suites shipped at 2.12.2 and were deleted, and moving the lane off qemu 8.2.2 shipped at 2.12.3 and was deleted. Since 2.12.3 the schedule is **pinned**: 2.12.4 P(-1), 2.13.0 PostgreSQL SCRAM + TLS, 2.14.0 WebSocket bridge, 2.15.0 QUIC, 2.16.0 shared-memory IPC (benchmark-gated), 3.0.0 removals, a P(-1) patch closing each line; the patra before-image-read filing sits under Waiting on upstream; the `_majra_map_compact` item stays (consumer pins 6.6.2–6.6.14, re-checked), and no MINOR has a fired trigger. Every item re-checked open at 2.12.2, upstream items at the latest *tagged* cyrius (6.7.18) and sigil (3.13.15) |
+| `dependency-watch.md` | 2026-10-31 | ✅ Fresh | The patra bullet records patra's locking contract (no statement mutex inside an open transaction; one fd shares its lock), which `patra_queue` relies on since 2.12.4, and the upstream before-image filing; sigil 3.13.15 / patra 1.16.6 / sandhi 1.13.7 / sakshi 2.5.10 / bayan 1.11.1 at the 6.7.18 pin, each its latest tag; the static-buffer watch resolved; `ESYSXLAT` re-derived (82, unchanged); the ESYSXLAT bullet names the CI run lane (2.12.2) |
 | `cyrius-quirks.md` | 2026-10-30 | ✅ Fresh | Header stamped 6.7.18 (#2, #7, #9, #10 re-measured; hashmap byte-identical, so #3 / #13 hold); #1 re-tensed (not seen on 6.x); #3 names the current job-key shape; #9's verify bullet names the CI run lane (2.12.2) |
 | `semver.md` | 2026-10-15 | ✅ Fresh | Promise, documented exceptions (four renames, three 2.6.9 signature changes, two 2.9.0 wire breaks), deprecations (bare `ERR_*`; `_metrics_arg3` / `_metrics_arg4` since 2.12.0); MAJOR line points at roadmap § 3.0.0 |
 | `threat-model.md` | 2026-10-30 | ✅ Fresh | sigil version under the 6.7.18 pin. Audit history lists all four passes in order; nonce row carries the volume limits; the ratelimit row names the key cap and its ⚠ |
@@ -85,7 +88,7 @@ repo.
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `testing.md` | 2026-10-31 | ✅ Fresh | Counts at 2.12.2 (1,577 CI + 36 live); pin stamps 6.7.18; the qemu-aarch64 recipe and its qemu floor (11.1.0 / 11.0.4: the 8.2.2 `EFAULT` race, 2.12.3), what CI's run lane covers and what its 25 loops can catch, and a new agnos cross-build section (2.12.2); `tests/test.sh` |
+| `testing.md` | 2026-10-31 | ✅ Fresh | Counts at 2.12.4 (1,590 CI + 36 live); pin stamps 6.7.18; the qemu-aarch64 recipe and its qemu floor (11.1.0 / 11.0.4: the 8.2.2 `EFAULT` race, 2.12.3), what CI's run lane covers and what its 25 loops can catch, and a new agnos cross-build section (2.12.2); `tests/test.sh` |
 | `migration-2.9.0.md` | 2026-09-15 | 📦 Frozen | The 2.9.0 consumer guide (two wire breaks, fail-closed `verify(se, 0)`); about that release |
 | `migration-2.6.9.md` | 2026-08-22 | 📦 Frozen | The 2.6.9 / 2.6.10 hardening guide |
 | `migration-ifran.md` | 2026-08-22 | 📦 Frozen | Consumer recipe at ifran's adoption point; ⚠ banner — not safe to copy against today's API |
@@ -101,6 +104,7 @@ repo.
 | `docs/audit/2026-08-22-audit-pass2.md` | 2.6.10 | 📦 Frozen | Second pass, 68 findings (50 were 2.6.9 regressions). Its one never-scheduled LOW — the metrics globals — was fixed at 2.12.0 |
 | `docs/audit/2026-09-15-audit.md` | 2.8.1 | 📦 Frozen | Third pass, 130 findings |
 | `docs/audit/2026-10-15-audit.md` | 2.10.1 | 📦 Frozen | Fourth pass, 12 findings, after the 6.6.20 and 6.7.9 language bumps |
+| `docs/audit/2026-10-31-audit.md` | 2.12.4 | 📦 Frozen | Fifth pass, 4 findings, before the 2.13.0 cut; the high one is one `patra_queue` handle shared across threads |
 
 ## Tier 6 — Test READMEs
 

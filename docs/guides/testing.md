@@ -40,9 +40,9 @@ cyrius build --no-deps tests/soak/soak_queue.cyr build/soak_queue && ./build/soa
 | Core | `src/main.cyr` | 205 | All 15 core modules + relay dedup, envelope-id entropy (non-zero *and* distinct), `_majra_sleep_ns` floor |
 | Expanded | `tests/test_core.tcyr` | 727 | Deep: queue lifecycle, pubsub patterns, DAG retry (outcome + elapsed backoff), fleet routing, circuit breaker, integration, multi-threaded barrier (proves blocking, not just a counter), concurrency + wildcard-alignment, relay / ratelimit / priority-queue regressions. Per-release additions: CHANGELOG.md |
 | Backends | `tests/test_backends.tcyr` | 557 | base64, SHA-1, AES-256-GCM, signed envelopes, admin endpoint, WebSocket, RESP, PG wire |
-| Patra queue | `tests/test_patra_queue.tcyr` | 88 | Durable enqueue / priority dequeue / complete / counts / reopen persistence, pre-2.6.9 STR files, a corrupt TEXT ref left queued, three writers on three files during opens of a fourth (refused vs lost told apart) |
-| Live | `tests/test_live.tcyr` | 36 | 7 Redis + 4 PostgreSQL test functions in `tests/test_live.tcyr`. **CI-only** — needs Redis on :6379 + PostgreSQL on :5432, so a dev-box "full matrix" run is 1,577, not 1,613 |
-| **Total** | | **1,613** (1,577 CI + 36 live) | |
+| Patra queue | `tests/test_patra_queue.tcyr` | 101 | Durable enqueue / priority dequeue / complete / counts / reopen persistence, pre-2.6.9 STR files, a corrupt TEXT ref failed so the job behind it is delivered, open/close bump growth, one handle shared by three threads (watchdog-guarded), three writers on three files during opens of a fourth (refused vs lost told apart) |
+| Live | `tests/test_live.tcyr` | 36 | 7 Redis + 4 PostgreSQL test functions in `tests/test_live.tcyr`. **CI-only** — needs Redis on :6379 + PostgreSQL on :5432, so a dev-box "full matrix" run is 1,590, not 1,626 |
+| **Total** | | **1,626** (1,590 CI + 36 live) | |
 
 Every non-live suite, fuzz harness, soak, example and the benchmark binary also passes cross-built for aarch64 under `qemu-aarch64` (since 2.7.3; re-verified at 2.9.3 under 6.6.20, at 2.10.0 under 6.7.9, at 2.10.1, 2.11.0 and 2.12.0, and at 2.12.1 under 6.7.18 — the expanded suite reports three fewer there (724 at 2.12.1), its one x86-only test carrying three asserts). Since 2.12.2 CI runs the four suites (25× each), the fuzz harnesses and the examples there on every push; soaks and the benchmark binary stay by hand — see [aarch64 cross-build](#aarch64-cross-build-qemu-user) below.
 

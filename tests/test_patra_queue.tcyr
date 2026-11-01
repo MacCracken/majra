@@ -283,7 +283,8 @@ fn test_patra_queue_legacy_str_payload() {
 # whose ref names more bytes than the file holds, and -1 was this queue's
 # "pre-2.6.9 STR column" signal: the corrupt cell dequeued with an EMPTY payload
 # and was marked running. Corrupts the row's (page, len) ref on disk; the job
-# must stay queued, undelivered.
+# must not be delivered. 2.12.4: nor block the queue — it is moved to FAILED
+# and a job enqueued behind it is delivered.
 fn test_patra_queue_corrupt_text_ref() {
     var p = "/tmp/majra_patra_corrupt_ref_test.patra";
     _pq_unlink(p);
@@ -340,17 +341,128 @@ fn test_patra_queue_corrupt_text_ref() {
             assert_eq(patra_result_get_text_len(rs, 0, 2), 0 - 1, "corrupt ref: getter answers -1");
             patra_result_free(rs);
         }
+        # 2.12.4: the unreadable job goes to FAILED instead of staying queued,
+        # where it sat at the head and blocked every job behind it.
+        var good = patra_queue_enqueue(q, PRIORITY_LOW, "behind the corrupt one");
+        assert(good > 0, "corrupt ref: a good job enqueued behind it");
         var j = patra_queue_dequeue(q);
-        assert_eq(j, 0, "corrupt ref: not delivered");
-        if (j != 0) { patra_job_free(j); }
-        assert_eq(patra_queue_queued_count(q), 1, "corrupt ref: job stays queued");
-        assert_eq(patra_queue_running_count(q), 0, "corrupt ref: nothing marked running");
+        assert(j != 0, "corrupt ref: the job behind it is delivered");
+        if (j != 0) {
+            assert_eq(patra_job_id(j), good, "corrupt ref: the delivered job is the good one");
+            assert(streq(patra_job_payload(j), "behind the corrupt one") == 1, "corrupt ref: its payload intact");
+            patra_job_free(j);
+        }
+        assert_eq(patra_queue_queued_count(q), 0, "corrupt ref: nothing left queued");
+        assert_eq(patra_queue_running_count(q), 1, "corrupt ref: only the good job running");
+        assert_eq(_pq_count_where_status(q, 3), 1, "corrupt ref: the unreadable job is failed, not lost");
         patra_queue_close(q);
     }
     fl_free(buf);
     fl_free(pay);
     _pq_unlink(p);
     println("  patra_queue_corrupt_text_ref: ok");
+}
+
+# 2.12.4: patra_queue_new built its CREATE TABLE text with str_builder on the
+# bump heap, which never frees: 448 bytes left behind per open + close. What
+# remains is not majra's to free: patra keeps the WAL path (path + 5 bytes,
+# filed upstream by sit) and mutex_new has no release (8 bytes) — 40 here.
+fn test_patra_queue_open_close_bump() {
+    patra_init();
+    var p = "/tmp/majra_patra_open_bump.patra";
+    _pq_unlink(p);
+    var q = patra_queue_new(p);
+    assert(q != 0, "open bump: queue opened");
+    patra_queue_close(q);
+    var u0 = alloc_used();
+    var i = 0;
+    while (i < 100) {
+        q = patra_queue_new(p);
+        if (q != 0) { patra_queue_close(q); }
+        i = i + 1;
+    }
+    var per_open = (alloc_used() - u0) / 100;
+    assert(per_open <= 64, "open bump: at most patra's WAL path and the mutex cell per open");
+    _pq_unlink(p);
+    println("  patra_queue_open_close_bump: ok");
+}
+
+# 2.12.4: ONE handle shared by three threads. Through 2.12.3 complete / fail and
+# the counts took no handle mutex, so they ran while another thread's enqueue
+# held a patra transaction open on the same handle — where patra takes no
+# statement mutex and the file lock is the same fd's. A count re-read the
+# on-disk header into the handle mid-transaction, and the commit then wrote the
+# stale table directory back: committed jobs vanished (93 of 300 in one run) and
+# a completion reported as done reverted to running, every call returning
+# success. A producer, a dequeue+complete consumer and a count poller.
+var _psh_q = 0;
+var _psh_enq_fail = 0;
+var _psh_cmp_fail = 0;
+var _psh_delivered = 0;
+var _psh_prod_done = 0;
+var _psh_cons_done = 0;
+fn _psh_producer(k) {
+    var i = 0;
+    while (i < 300) {
+        if (patra_queue_enqueue(_psh_q, PRIORITY_NORMAL, "shared") == 0) { _psh_enq_fail = _psh_enq_fail + 1; }
+        i = i + 1;
+    }
+    _psh_prod_done = 1;
+    return 0;
+}
+fn _psh_consumer(k) {
+    var idle = 0;
+    while (idle < 20000 && _psh_delivered < 300) {
+        var j = patra_queue_dequeue(_psh_q);
+        if (j == 0) {
+            if (_psh_prod_done == 1) { idle = idle + 1; }
+        } else {
+            _psh_delivered = _psh_delivered + 1;
+            if (patra_queue_complete(_psh_q, patra_job_id(j)) != 1) { _psh_cmp_fail = _psh_cmp_fail + 1; }
+            patra_job_free(j);
+            idle = 0;
+        }
+    }
+    _psh_cons_done = 1;
+    return 0;
+}
+fn _psh_poller(k) {
+    while (_psh_cons_done == 0) {
+        patra_queue_queued_count(_psh_q);
+        patra_queue_running_count(_psh_q);
+    }
+    return 0;
+}
+
+fn test_patra_queue_shared_handle() {
+    patra_init();
+    var p = "/tmp/majra_patra_shared_handle.patra";
+    _pq_unlink(p);
+    _psh_q = patra_queue_new(p);
+    assert(_psh_q != 0, "shared: queue opened");
+    _psh_enq_fail = 0; _psh_cmp_fail = 0; _psh_delivered = 0;
+    _psh_prod_done = 0; _psh_cons_done = 0;
+    var tp = thread_create(&_psh_producer, 0);
+    var tc = thread_create(&_psh_consumer, 1);
+    var tq = thread_create(&_psh_poller, 2);
+    # The 2.12.3 source can also wedge here; report rather than join forever.
+    var deadline = clock_now_ns() + 30000000000;
+    while ((_psh_prod_done == 0 || _psh_cons_done == 0) && clock_now_ns() < deadline) { sleep_ms(10); }
+    if (_psh_prod_done == 0 || _psh_cons_done == 0) {
+        assert(0, "shared: producer and consumer finished within 30s");
+        println("  patra_queue_shared_handle: HUNG (not joining)");
+        sys_exit_group(assert_summary() + 1);
+    }
+    thread_join(tp); thread_join(tc); thread_join(tq);
+    assert_eq(_psh_enq_fail, 0, "shared: every enqueue returned an id");
+    assert_eq(_psh_delivered, 300, "shared: all 300 jobs delivered");
+    assert_eq(_psh_cmp_fail, 0, "shared: every complete moved its row");
+    assert_eq(patra_queue_queued_count(_psh_q), 0, "shared: none left queued");
+    assert_eq(patra_queue_running_count(_psh_q), 0, "shared: none left running");
+    assert_eq(patra_queue_completed_count(_psh_q), 300, "shared: all 300 completed and durable");
+    patra_queue_close(_psh_q);
+    _pq_unlink(p);
+    println("  patra_queue_shared_handle: ok");
 }
 
 # 2.8.1 (F013): patra_queue_new called patra_init on every open, replacing the
@@ -454,6 +566,8 @@ fn main() {
     test_patra_queue_legacy_dup_ids();
     test_patra_queue_legacy_str_payload();
     test_patra_queue_corrupt_text_ref();
+    test_patra_queue_open_close_bump();
+    test_patra_queue_shared_handle();
     # Must stay last — see its comment.
     test_patra_queue_open_during_concurrent_use();
     return assert_summary();

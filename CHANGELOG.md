@@ -5,6 +5,90 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.12.4] - 2026-10-31
+
+The P(-1) hardening pass for the 2.12 line, before the 2.13.0 cut. Report:
+[`docs/audit/2026-10-31-audit.md`](docs/audit/2026-10-31-audit.md). **4 findings: 1 high, 1
+medium, 2 low.** Three are fixed in `src/patra_queue.cyr`, each with a test that fails on the
+2.12.3 source; the fourth needs a new public function and is roadmapped for 2.13.0. No API, wire
+or struct-size change. **1,590 assertions** (core 205 · expanded 727 · backends 557 ·
+patra-queue 101).
+
+### Fixed
+
+- **[high] One `patra_queue` handle used from two threads lost committed jobs.** Enqueue and
+  dequeue took the handle's mutex; `patra_queue_complete`, `patra_queue_fail` and the three
+  counts did not.
+  - **Why that broke.** An enqueue holds a patra transaction open on the handle. patra runs any
+    statement on a handle with an open transaction without its statement mutex, and the file
+    lock is the same fd's. So a `complete`, or even a count, from another thread ran inside that
+    transaction. It re-read the on-disk header into the handle over the uncommitted one, and the
+    commit wrote the stale table directory back.
+  - **What it did.** Measured on 2.12.3, a producer and a consumer on one handle: 93 of 300
+    committed jobs gone in one run; a job `enqueue` had returned an id for, missing in another;
+    a completion reported as done, back to running in a third. Every call returned success.
+  - **The fix.** Both take the handle mutex, in the same order as enqueue and dequeue.
+- **[medium] One unreadable job blocked the whole durable queue.** 2.12.1 left a job whose TEXT
+  payload cannot be read queued and undelivered. Dequeue selects the head row, so every later
+  dequeue picked it again and returned 0, and no job behind it was ever delivered. Dequeue now
+  moves such a job to FAILED (status 3) and keeps searching. The row stays in the file, and is
+  never delivered. ⚠ This reverses 2.12.1's "the job stays queued".
+- **[low] Every `patra_queue_new` leaked its CREATE TABLE text on the bump heap**: 448 bytes per
+  open + close, now 40. The 40 left are patra's WAL path, filed in patra's repo by sit, and the
+  handle's mutex cell, which `mutex_new` cannot release.
+- **`dist/`** — `majra-backends.cyr` carries the `patra_queue` changes; the other three bundles
+  differ only in the version stamp. Sidecars unchanged.
+
+### Added
+
+- **`tests/test_patra_queue.tcyr`: 88 → 101.**
+  - `test_patra_queue_shared_handle` (7): a producer, a dequeue + complete consumer and a count
+    poller on one handle, with a 30 s watchdog. 2.12.3 fails it 10 of 10, with 203 of 300
+    enqueues refused. Without only the count lock it fails 10 of 10; without only the `complete`
+    lock the handle deadlocks and the watchdog reports it, 5 of 5.
+  - The corrupt-ref test (3 → 7): a good job enqueued behind the corrupt one is delivered, and
+    the corrupt one is counted as failed. The 2.12.3 behaviour fails 4 of them.
+  - `test_patra_queue_open_close_bump` (2): 100 opens grow the bump heap by at most 64 bytes
+    each. The 2.12.3 builder fails it.
+- **`bench-history.csv`** — the 2.12.3 baseline row, 50 trials, taken before any change.
+- **`docs/audit/2026-10-31-audit.md`** — the pass's report.
+
+### Changed
+
+- **`docs/development/roadmap.md` pins the road to 3.0.0.** Every open item now names the release
+  that ships it, in the order the trigger-gated list already had:
+  - 2.12.4: the P(-1) hardening pass;
+  - 2.13.0: PostgreSQL SCRAM + TLS;
+  - 2.14.0: the WebSocket bridge;
+  - 2.15.0: QUIC;
+  - 2.16.0: shared-memory IPC, behind a benchmark gate;
+  - 3.0.0: the removals, `_majra_map_compact` among them, with a pull-forward if its consumer-pin
+    trigger fires.
+
+  A P(-1) patch closes each line. The patra defect found while root-causing 2.12.3 (a failed
+  before-image read logged as zeros) is filed in patra's repo and tracked under Waiting on
+  upstream. 2.12.4's own section has since shipped and is deleted. The namespace release function
+  (the low API finding) is added to 2.13.0.
+
+### Verified
+
+- **Gates.** `cyrius fmt --check` and `cyrius lint` are clean across `src/` and `tests/`.
+  `cyrius vet` reports 28 deps, 0 untrusted; `cyrius deny` 0 violations; the manifest and
+  raw-syscall gates pass; the cross-build gate builds all eight (aarch64 and agnos × 4).
+- **Suites.** All four suites report `0 failed` natively. The three fuzz harnesses are clean at
+  5,000 iterations.
+- **Loops.** The patra-queue suite ran 100× natively and 50× under the CI lane's pinned
+  `qemu-aarch64` 11.1.3, clean.
+- **Benchmarks.** `bench_all` links no patra code, and its binary from this tree is byte-identical
+  to 2.12.3's, so nothing it measures changed. Interleaved runs of the two identical binaries
+  still differed by up to 9.8 % by median, which is this box's noise floor under load.
+- **The qemu pin.** Both of `ci.yml`'s URLs for the qemu 11.1.3 deb still resolve.
+
+### Upstream
+
+- **patra's fix for the zeroed before-image has not shipped** (filed 2026-10-31), so no pin bump
+  rides this patch. It stays under roadmap § Waiting on upstream.
+
 ## [2.12.3] - 2026-10-31
 
 CI patch: the aarch64 run lane's patra-queue failure (2.12.2's Known issue) is a **qemu bug**, now

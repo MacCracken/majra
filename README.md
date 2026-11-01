@@ -180,7 +180,7 @@ cyrius build --no-deps src/main.cyr build/majra
 # Run core tests
 ./build/majra
 
-# Full test matrix — 1,577 assertions at 2.12.3.
+# Full test matrix — 1,590 assertions at 2.12.4.
 # Counts move every release; docs/development/state.md carries the current ones.
 cyrius build --no-deps tests/test_core.tcyr        build/test_core        && ./build/test_core
 cyrius build --no-deps tests/test_backends.tcyr    build/test_backends    && ./build/test_backends
@@ -259,7 +259,7 @@ Majra was originally a Rust library (v1.0.4, ~13,000 lines). It was ported to Cy
 | Metric | Rust v1.0.4 | Cyrius v2.12.1 |
 |--------|-------------|---------------|
 | Source lines | 12,969 | 11,239 (all of `src/`, incl. the 874-line `src/main.cyr` test entry; 10,365 in the 22 modules — much of the growth since the port is rationale comments from four hardening passes) |
-| Modules | 22 | 22 (QUIC transport not ported — deferred until a consumer needs multiplexed streams or connection migration; see roadmap § QUIC transport) |
+| Modules | 22 | 22 (QUIC transport not ported yet — pinned to 2.15.0; see roadmap § 2.15.0) |
 | Dependencies | 25 crates | 0 — sigil is a folded stdlib module |
 | Toolchain | cargo + rustc + LLVM | cyrius 6.7.18 |
 
